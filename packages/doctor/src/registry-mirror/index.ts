@@ -108,8 +108,8 @@ export function createReplacer(from: string, to: string): { push(chunk: Buffer):
   }
 }
 
-/** Места для одновременных ответов: лишний запрос ждёт, не дождался — отказ. */
-function createSlots(max: number, waitMs: number): { acquire(): Promise<() => void> } {
+/** Места для одновременных ответов: лишний запрос ждёт, не дождался — отказ; ушёл из очереди — место не занимает. */
+function createSlots(max: number, waitMs: number): { acquire(signal: AbortSignal): Promise<() => void> } {
   let busy = 0
   const waiting: (() => void)[] = []
   const release = () => {
@@ -118,7 +118,7 @@ function createSlots(max: number, waitMs: number): { acquire(): Promise<() => vo
     else busy -= 1
   }
   return {
-    acquire() {
+    acquire(signal) {
       const once = () => {
         let done = false
         return () => {
@@ -132,15 +132,21 @@ function createSlots(max: number, waitMs: number): { acquire(): Promise<() => vo
         return Promise.resolve(once())
       }
       return new Promise((resolve, reject) => {
+        const leave = (refusal: Refusal) => {
+          clearTimeout(timer)
+          signal.removeEventListener('abort', gone)
+          waiting.splice(waiting.indexOf(grant), 1)
+          reject(refusal)
+        }
         const grant = () => {
           clearTimeout(timer)
+          signal.removeEventListener('abort', gone)
           resolve(once())
         }
-        const timer = setTimeout(() => {
-          waiting.splice(waiting.indexOf(grant), 1)
-          reject(new Refusal(503, 'зеркало занято, повторите позже'))
-        }, waitMs)
+        const gone = () => leave(new Refusal(499, 'клиент ушёл'))
+        const timer = setTimeout(() => leave(new Refusal(503, 'зеркало занято, повторите позже')), waitMs)
         waiting.push(grant)
+        signal.addEventListener('abort', gone, { once: true })
       })
     },
   }
@@ -156,7 +162,7 @@ export function createRegistryMirror(options: RegistryMirrorOptions): RegistryMi
   const slots = createSlots(options.maxConcurrentResponses ?? MAX_CONCURRENT_RESPONSES, options.queueTimeoutMs ?? QUEUE_TIMEOUT_MS)
 
   function reply(response: ServerResponse, status: number, text: string): void {
-    if (response.headersSent) {
+    if (response.headersSent || response.closed) {
       response.destroy()
       return
     }
@@ -169,11 +175,18 @@ export function createRegistryMirror(options: RegistryMirrorOptions): RegistryMi
     const target = registryPath(request.url ?? '')
     const accept = request.headers.accept
     const headers: Record<string, string> = { 'user-agent': 'remontnik-registry-mirror', ...(accept && ACCEPT.test(accept) ? { accept } : {}) }
-    const release = await slots.acquire()
-    response.once('close', release)
-    // Клиент ушёл — запрос к реестру отменяется; реестр молчит дольше срока — тоже.
+    // Клиент ушёл — место в очереди освобождается, запрос к реестру отменяется; реестр молчит дольше срока — тоже.
     const gone = new AbortController()
     response.once('close', () => gone.abort())
+    if (response.closed) gone.abort()
+    if (gone.signal.aborted) return
+    const release = await slots.acquire(gone.signal)
+    // Ответ закрылся, пока место выдавалось: оно возвращается сразу.
+    if (gone.signal.aborted) {
+      release()
+      return
+    }
+    response.once('close', release)
     const signal = AbortSignal.any([AbortSignal.timeout(upstreamTimeoutMs), gone.signal])
     let upstreamResponse: Response
     try {

@@ -345,6 +345,25 @@ describe('зеркало реестра: пределы', () => {
     expect((await raw(url, '/is-number')).status).toBe(200)
   })
 
+  it('клиент ушёл из очереди → место не потеряно', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url, { maxConcurrentResponses: 1, queueTimeoutMs: 3000 })
+    const first = await stalledClient(url, '/big/-/big-1.0.0.tgz')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    // Второй ждёт места и уходит, не дождавшись.
+    const queued = await stalledClient(url, '/is-number')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    queued.destroy()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    first.destroy()
+    await waitFor(() => registry.streamed.closed, 5000)
+    // Место первого не ушло ушедшему: следующий получает ответ сразу, а не 503 после очереди.
+    const started = Date.now()
+    expect((await raw(url, '/is-number')).status).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1000)
+    expect((await raw(url, '/is-number')).status).toBe(200)
+  })
+
   it('реестр по умолчанию — registry.npmjs.org по HTTPS; иной адрес реестра — только явно', () => {
     expect(createRegistryMirror({ publicUrl: PUBLIC_URL }).upstream).toBe('https://registry.npmjs.org')
     expect(() => createRegistryMirror({ publicUrl: 'http://user:pass@remontnik-gateway:7801' })).toThrow(/publicUrl/)

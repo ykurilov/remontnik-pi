@@ -458,7 +458,7 @@ describe('службы для тестов (checks.services)', () => {
   function setup(options: { upFails?: boolean; servicesPath?: string } = {}) {
     const base = tempDir()
     mkdirSync(join(base, 'test'))
-    writeFileSync(join(base, 'test/services.yml'), 'services:\n  db:\n    image: postgres:17\n')
+    writeFileSync(join(base, 'test/services.yml'), 'services:\n  db:\n    image: postgres:17@sha256:'+'a'.repeat(64)+'\n')
     const fake = fakeRunner({ tests: [{ exitCode: 0 }] })
     const journal: string[] = []
     const run = fake.runner.run.bind(fake.runner)

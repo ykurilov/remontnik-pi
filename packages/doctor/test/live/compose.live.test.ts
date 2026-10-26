@@ -404,10 +404,12 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
       '  db:',
       `    image: ${POSTGRES_IMAGE}`,
       '    environment:',
+      '      POSTGRES_USER: app',
       '      POSTGRES_HOST_AUTH_METHOD: trust',
       '    tmpfs: /var/lib/postgresql/data',
       '    healthcheck:',
-      '      test: ["CMD", "pg_isready", "-U", "postgres"]',
+      // `$$` уходит в compose как есть: имя пользователя берётся из окружения службы, а не врача.
+      '      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]',
       '      interval: 1s',
       '      retries: 120',
       '',

@@ -4,15 +4,15 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parse } from 'yaml'
-import type { CaseNetworks } from '../case-networks/index.js'
+import type { CaseNetworkLease, CaseNetworks } from '../case-networks/index.js'
 import { dockerClientEnv } from '../workbench/runner.js'
 
 // Службы для тестов приложения (`checks.services`, контракт app-integration.md, п. 5): например, временная база.
 // Врач поднимает их на время проверок отдельным проектом compose — у каждой копии случая свой — в её сети проверок.
 // Файл приложения не запускается как есть: из него берутся только поля из короткого списка (образ, команда,
 // окружение, проверка готовности, tmpfs и подобные), и врач собирает свой проект. Портов наружу, томов хоста,
-// сетей кроме сети проверок, секретов врача, `env_file`, сборки и лишних прав у служб нет. Подстановка `${…}`
-// выключена. После проверок проект убирается вместе с безымянными томами; после падения врача — на старте.
+// сетей кроме сети проверок, секретов врача, `env_file`, сборки и лишних прав у служб нет. Образ закреплён
+// по `@sha256:`. Подстановки переменных врача нет: одиночный `$` — отказ, `$$` уходит в compose как есть. После проверок проект убирается вместе с безымянными томами; после падения врача — на старте.
 
 export const CASE_SERVICES_LABEL = 'remontnik.case-services'
 const MEMORY = '1g'
@@ -67,6 +67,7 @@ const SERVICE_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 const HEALTHCHECK_KEYS = new Set(['test', 'interval', 'timeout', 'retries', 'start_period', 'start_interval', 'disable'])
 const CONDITIONS = new Set(['service_started', 'service_healthy', 'service_completed_successfully'])
+const PINNED_IMAGE = /^[^\s@$]+@sha256:[0-9a-f]{64}$/
 
 function refuse(message: string): never {
   throw new Error(`файл служб для тестов (checks.services): ${message}`)
@@ -77,7 +78,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function text(value: unknown, where: string): string {
-  if (typeof value === 'string') return value
+  if (typeof value === 'string') {
+    // Compose подставил бы переменную из окружения запуска — у врача там его секреты.
+    if (value.replaceAll('$$', '').includes('$')) refuse(`${where}: подстановка переменных врача запрещена, пишите $$`)
+    return value
+  }
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
   return refuse(`${where}: нужна строка`)
 }
@@ -137,6 +142,7 @@ function service(name: string, value: unknown): CaseService {
   if (!SERVICE_NAME.test(name)) refuse(`имя службы «${name}»: строчные латинские буквы, цифры, «-» и «_»`)
   if (!isRecord(value)) refuse(`${where}: нужен словарь`)
   if (typeof value.image !== 'string' || value.image.trim() === '') refuse(`${where}.image: нужен образ`)
+  if (!PINNED_IMAGE.test(value.image.trim())) refuse(`${where}.image: образ нужно закрепить по отпечатку — «имя@sha256:<64 знака>», а не «${value.image.trim()}»`)
   const result: CaseService = { image: value.image.trim() }
   for (const [key, item] of Object.entries(value)) {
     switch (key) {
@@ -193,14 +199,6 @@ export function parseServicesFile(source: string): Record<string, CaseService> {
   return services
 }
 
-/** `$` в compose — подстановка из окружения запуска; здесь она выключена: каждый `$` удваивается. */
-function literal<T>(value: T): T {
-  if (typeof value === 'string') return value.replaceAll('$', () => '$$') as T
-  if (Array.isArray(value)) return value.map(literal) as T
-  if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, literal(item)])) as T
-  return value
-}
-
 /** Проект compose врача для служб одной копии: только сеть проверок случая (по ID), метка, пределы, без лишних прав. */
 export function caseServicesCompose(input: { project: string; services: Record<string, CaseService>; networkId: string; memory: string; cpus: string }): object {
   return {
@@ -209,7 +207,7 @@ export function caseServicesCompose(input: { project: string; services: Record<s
       Object.entries(input.services).map(([name, item]) => [
         name,
         {
-          ...literal(item),
+          ...item,
           networks: { case: {} },
           labels: { [CASE_SERVICES_LABEL]: input.project },
           cap_drop: ['NET_RAW', 'NET_ADMIN', 'MKNOD', 'SYS_CHROOT', 'AUDIT_WRITE', 'SETFCAP'],
@@ -244,12 +242,23 @@ export function createCaseServices(options: CaseServicesOptions): CaseServices {
     async up(copyDir, source) {
       const services = parseServicesFile(source)
       const project = `remontnik-services-${createHash('sha256').update(copyDir).digest('hex').slice(0, 16)}`
-      const lease = await options.caseNetworks.use(copyDir, 'checks')
-      // Пустая папка проекта: compose не найдёт в ней ни `.env`, ни других файлов.
-      const dir = mkdtempSync(join(tmpdir(), 'remontnik-services-'))
-      const file = join(dir, 'compose.json')
-      writeFileSync(file, JSON.stringify(caseServicesCompose({ project, services, networkId: lease.network.id, memory: options.memory ?? MEMORY, cpus: options.cpus ?? CPUS })), { mode: 0o600 })
-      const compose = ['compose', '-p', project, '-f', file, '--project-directory', dir]
+      let lease: CaseNetworkLease | undefined
+      let dir: string | undefined
+      let file: string
+      try {
+        lease = await options.caseNetworks.use(copyDir, 'checks')
+        // Пустая папка проекта: compose не найдёт в ней ни `.env`, ни других файлов.
+        dir = mkdtempSync(join(tmpdir(), 'remontnik-services-'))
+        file = join(dir, 'compose.json')
+        writeFileSync(file, JSON.stringify(caseServicesCompose({ project, services, networkId: lease.network.id, memory: options.memory ?? MEMORY, cpus: options.cpus ?? CPUS })), { mode: 0o600 })
+      } catch (error) {
+        lease?.done()
+        if (dir) rmSync(dir, { recursive: true, force: true })
+        throw error
+      }
+      const held = lease
+      const projectDir = dir
+      const compose = ['compose', '-p', project, '-f', file, '--project-directory', projectDir]
       let downing: Promise<void> | undefined
       const down = () =>
         (downing ??= (async () => {
@@ -259,8 +268,8 @@ export function createCaseServices(options: CaseServicesOptions): CaseServices {
             log(`[врач] службы для тестов ${project} не убрались: ${(error as Error).message}`)
             await removeByLabel(`${CASE_SERVICES_LABEL}=${project}`)
           } finally {
-            lease.done()
-            rmSync(dir, { recursive: true, force: true })
+            held.done()
+            rmSync(projectDir, { recursive: true, force: true })
           }
         })())
       try {

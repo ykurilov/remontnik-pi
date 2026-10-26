@@ -1,9 +1,11 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { CaseNetworks } from '../case-networks/index.js'
 import { caseServicesCompose, createCaseServices, parseServicesFile } from './index.js'
+
+const PIN = `@sha256:${'a'.repeat(64)}`
 
 // Службы для тестов приложения (`checks.services`): врач поднимает их отдельным проектом compose в сети проверок
 // своего случая. Портов наружу, томов, секретов и прав сверх обычных у них нет; после проверок они убираются.
@@ -22,7 +24,7 @@ function tempDir(): string {
 const POSTGRES = `
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine${PIN}
     environment:
       POSTGRES_PASSWORD: test
       POSTGRES_HOST_AUTH_METHOD: trust
@@ -32,7 +34,7 @@ services:
       interval: 1s
       retries: 30
   cache:
-    image: redis:7
+    image: redis:7${PIN}
     command: redis-server --save ""
     depends_on:
       db:
@@ -43,16 +45,16 @@ describe('файл служб', () => {
   it('разрешённые поля переносятся как есть, окружение — словарём строк', () => {
     const services = parseServicesFile(POSTGRES)
     expect(services.db).toEqual({
-      image: 'postgres:17-alpine',
+      image: `postgres:17-alpine${PIN}`,
       environment: { POSTGRES_PASSWORD: 'test', POSTGRES_HOST_AUTH_METHOD: 'trust' },
       tmpfs: ['/var/lib/postgresql/data'],
       healthcheck: { test: ['CMD', 'pg_isready', '-U', 'postgres'], interval: '1s', retries: 30 },
     })
-    expect(services.cache).toEqual({ image: 'redis:7', command: 'redis-server --save ""', depends_on: { db: { condition: 'service_healthy' } } })
+    expect(services.cache).toEqual({ image: `redis:7${PIN}`, command: 'redis-server --save ""', depends_on: { db: { condition: 'service_healthy' } } })
   })
 
   it('окружение списком «ИМЯ=значение» и зависимость списком', () => {
-    const services = parseServicesFile('services:\n  db:\n    image: postgres:17\n    environment: ["A=1", "B=x=y"]\n  worker:\n    image: busybox\n    depends_on: [db]\n')
+    const services = parseServicesFile(`services:\n  db:\n    image: postgres:17${PIN}\n    environment: ["A=1", "B=x=y"]\n  worker:\n    image: busybox${PIN}\n    depends_on: [db]\n`)
     expect(services.db!.environment).toEqual({ A: '1', B: 'x=y' })
     expect(services.worker!.depends_on).toEqual({ db: { condition: 'service_started' } })
   })
@@ -74,7 +76,7 @@ describe('файл служб', () => {
     ['container_name', '    container_name: db'],
     ['labels', '    labels: { remontnik.case-services: other }'],
   ])('поле службы %s — отказ', (key, line) => {
-    expect(() => parseServicesFile(`services:\n  db:\n    image: postgres:17\n${line}\n`)).toThrow(new RegExp(key))
+    expect(() => parseServicesFile(`services:\n  db:\n    image: postgres:17${PIN}\n${line}\n`)).toThrow(new RegExp(key))
   })
 
   it.each([
@@ -83,21 +85,47 @@ describe('файл служб', () => {
     ['secrets', 'secrets:\n  key: { file: /etc/passwd }\n'],
     ['include', 'include: [other.yml]\n'],
   ])('раздел файла %s — отказ', (key, text) => {
-    expect(() => parseServicesFile(`services:\n  db:\n    image: postgres:17\n${text}`)).toThrow(new RegExp(key))
+    expect(() => parseServicesFile(`services:\n  db:\n    image: postgres:17${PIN}\n${text}`)).toThrow(new RegExp(key))
+  })
+
+  it.each([
+    ['без закрепления', 'postgres:17-alpine'],
+    ['только тег', 'postgres:latest'],
+    ['короткий отпечаток', 'postgres@sha256:abc'],
+  ])('образ %s — отказ: нужен @sha256', (_, image) => {
+    expect(() => parseServicesFile(`services:\n  db:\n    image: ${image}\n`)).toThrow(/services\.db\.image.*@sha256/)
+  })
+
+  it('образ, закреплённый по @sha256, принимается', () => {
+    expect(parseServicesFile(`services:\n  db:\n    image: postgres${PIN}\n`).db!.image).toBe(`postgres${PIN}`)
+  })
+
+  it.each([
+    ['$VAR в команде', 'command: echo $DEEPSEEK_API_KEY'],
+    ['${VAR} в окружении', 'environment: { KEY: "${DEEPSEEK_API_KEY}" }'],
+    ['${VAR:-x} в проверке готовности', 'healthcheck: { test: ["CMD-SHELL", "pg_isready -U ${USER:-postgres}"] }'],
+    ['одиночный $ в конце', 'command: echo cost$'],
+  ])('подстановка переменных: %s — отказ', (_, line) => {
+    expect(() => parseServicesFile(`services:\n  db:\n    image: postgres${PIN}\n    ${line}\n`)).toThrow(/подстановка переменных врача запрещена, пишите \$\$/)
+  })
+
+  it('«$$» принимается и сохраняется как есть', () => {
+    const services = parseServicesFile(`services:\n  db:\n    image: postgres${PIN}\n    healthcheck: { test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"] }\n`)
+    expect(services.db!.healthcheck!.test).toEqual(['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER'])
   })
 
   it('без служб, без образа, с чужой зависимостью или кривым именем — отказ', () => {
     expect(() => parseServicesFile('name: x\n')).toThrow(/services/)
     expect(() => parseServicesFile('services:\n  db:\n    command: x\n')).toThrow(/image/)
-    expect(() => parseServicesFile('services:\n  db:\n    image: x\n    depends_on: [nope]\n')).toThrow(/nope/)
-    expect(() => parseServicesFile('services:\n  Db.1:\n    image: x\n')).toThrow(/Db\.1/)
+    expect(() => parseServicesFile(`services:\n  db:\n    image: x${PIN}\n    depends_on: [nope]\n`)).toThrow(/nope/)
+    expect(() => parseServicesFile(`services:\n  Db.1:\n    image: x${PIN}\n`)).toThrow(/Db\.1/)
     expect(() => parseServicesFile('services: [\n')).toThrow(/разобрать/)
   })
 })
 
 describe('проект compose для случая', () => {
-  it('службы — только в сети проверок случая, с метками, пределами и без лишних прав; «$» не подставляется', () => {
-    const services = parseServicesFile('services:\n  db:\n    image: postgres:17\n    command: echo ${DEEPSEEK_API_KEY}\n')
+  it('службы — только в сети проверок случая, с метками, пределами и без лишних прав; «$$» остаётся как есть', () => {
+    const services = parseServicesFile(`services:\n  db:\n    image: postgres:17${PIN}\n    command: echo $$HOME\n`)
     const compose = caseServicesCompose({ project: 'remontnik-services-abc', services, networkId: 'net-id-1', memory: '1g', cpus: '1' }) as any
     expect(compose.name).toBe('remontnik-services-abc')
     expect(compose.networks).toEqual({ case: { external: true, name: 'net-id-1' } })
@@ -105,7 +133,8 @@ describe('проект compose для случая', () => {
     const db = compose.services.db
     expect(db.networks).toEqual({ case: {} })
     expect(db.labels).toEqual({ 'remontnik.case-services': 'remontnik-services-abc' })
-    expect(db.command).toBe('echo $${DEEPSEEK_API_KEY}')
+    // Compose сам превратит `$$` в `$` внутри контейнера; подставлять из окружения врача ему нечего.
+    expect(db.command).toBe('echo $$HOME')
     expect(db).toMatchObject({ mem_limit: '1g', memswap_limit: '1g', cpus: '1', pids_limit: 512, restart: 'no', security_opt: ['no-new-privileges:true'] })
     expect(db.cap_drop).toEqual(expect.arrayContaining(['NET_RAW']))
     expect(db.ports).toBeUndefined()
@@ -208,9 +237,47 @@ describe('подъём и уборка служб', () => {
     const fake = fakeDocker(root)
     const networks = fakeNetworks()
     const caseServices = createCaseServices({ docker: fake.docker, caseNetworks: networks.networks })
-    await expect(caseServices.up('/srv/worktrees/case-1-candidate', 'services:\n  db:\n    image: x\n    ports: ["5432:5432"]\n')).rejects.toThrow(/ports/)
+    await expect(caseServices.up('/srv/worktrees/case-1-candidate', `services:\n  db:\n    image: x${PIN}\n    ports: ["5432:5432"]\n`)).rejects.toThrow(/ports/)
     expect(fake.calls()).toEqual([])
     expect(networks.leases).toEqual([])
+  })
+
+  it('сеть взята, а папка проекта не создалась → сеть отпускается', async () => {
+    const root = tempDir()
+    const fake = fakeDocker(root)
+    const networks = fakeNetworks()
+    const caseServices = createCaseServices({ docker: fake.docker, caseNetworks: networks.networks })
+    const previous = process.env.TMPDIR
+    process.env.TMPDIR = join(root, 'no-such-dir')
+    try {
+      await expect(caseServices.up('/srv/worktrees/case-1-candidate', POSTGRES)).rejects.toThrow()
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = previous
+    }
+    expect(networks.leases).toEqual(['checks /srv/worktrees/case-1-candidate'])
+    expect(networks.open()).toBe(0)
+  })
+
+  it('сеть не далась → папки проекта не остаётся', async () => {
+    const root = tempDir()
+    const fake = fakeDocker(root)
+    const networks = fakeNetworks()
+    const caseServices = createCaseServices({
+      docker: fake.docker,
+      caseNetworks: { ...networks.networks, use: async () => Promise.reject(new Error('сеть не создалась')) },
+    })
+    const scratch = join(root, 'tmp')
+    mkdirSync(scratch)
+    const previous = process.env.TMPDIR
+    process.env.TMPDIR = scratch
+    try {
+      await expect(caseServices.up('/srv/worktrees/case-1-candidate', POSTGRES)).rejects.toThrow(/сеть не создалась/)
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = previous
+    }
+    expect(readdirSync(scratch)).toEqual([])
   })
 
   it('на старте врача службы прошлого запуска удаляются вместе с томами', async () => {
