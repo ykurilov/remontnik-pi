@@ -12,7 +12,7 @@ import {
 } from '@earendil-works/pi-ai'
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek'
 import { openrouterProvider } from '@earendil-works/pi-ai/providers/openrouter'
-import { DEFAULT_RETRY_PRIMARY_AFTER_MS, FALLBACK_MODEL } from '@ykurilov/remontnik-core/model-route'
+import { DEFAULT_RETRY_PRIMARY_AFTER_MS, FALLBACK_MODEL, PRIMARY_MODEL } from '@ykurilov/remontnik-core/model-route'
 
 // Модель врача для pi-durable: один поставщик pi-ai поверх двух путей (R2).
 // Основной — DeepSeek напрямую, запасной — OpenRouter. 429, 5xx, сбой сети или тайм-аут до начала ответа
@@ -21,8 +21,8 @@ import { DEFAULT_RETRY_PRIMARY_AFTER_MS, FALLBACK_MODEL } from '@ykurilov/remont
 
 export const DOCTOR_PROVIDER_ID = 'remontnik'
 export const DOCTOR_MODEL_ID = 'doctor'
-/** Модель DeepSeek V4.1 Flash в каталоге pi-ai 1.4.0. В core путь сторожа зовёт её `deepseek-4.1-flash`. */
-export const DEEPSEEK_CATALOG_MODEL = 'deepseek-flash'
+/** Модель основного пути: то же имя, что у сторожа, и то же, что в каталоге pi-ai 1.4.0. */
+export const DEEPSEEK_CATALOG_MODEL = PRIMARY_MODEL
 
 export type RouteName = 'primary' | 'fallback'
 
