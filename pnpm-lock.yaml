@@ -36,25 +36,6 @@ importers:
         specifier: workspace:*
         version: link:../../packages/watch
 
-  apps/patient-onboard:
-    dependencies:
-      '@ykurilov/remontnik-core':
-        specifier: workspace:*
-        version: link:../../packages/core
-      '@ykurilov/remontnik-watch':
-        specifier: workspace:*
-        version: link:../../packages/watch
-    devDependencies:
-      '@types/node':
-        specifier: ^22.20.5
-        version: 22.20.5
-      typescript:
-        specifier: 5.9.3
-        version: 5.9.3
-      vitest:
-        specifier: ^5.0.5
-        version: 5.0.5(@types/node@22.20.5)(vite@8.3.5(@types/node@22.20.5)(yaml@2.9.1))
-
   examples/mini-app:
     dependencies:
       '@ykurilov/remontnik-watch':
