@@ -13,6 +13,7 @@ import { signBody } from '@ykurilov/remontnik-core/signed-http'
 import { createTelegramClient, type TelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { createIncidentNotifier, formatIncidentAlert } from '../notify/index.js'
 import { openOutbox, type Outbox, type OutboxEntry, type OutboxStats } from '../outbox/index.js'
+import { createStopButtonHandler } from '../stop-button/index.js'
 import {
   BAD_ANSWER_LABELS,
   createConversationReviewer,
@@ -115,6 +116,11 @@ export interface Watch {
    * в пределах суточного бюджета. Плохие ответы становятся случаями `bad_answer`.
    */
   conversationFinished(conversation: FinishedConversation): void
+  /**
+   * Нажатие кнопки «Остановить автовыкатку» (`callback_query` из Bot API) под отчётом врача. Нажатие в чате тревог
+   * включает стоп-кран у врача. Возвращает текст для `answerCallbackQuery`; `null` — кнопка не сторожа. Не бросает.
+   */
+  handleStopButton(callbackQuery: unknown): Promise<string | null>
   /** Немедленно пробует доставить всё ожидающее. `true` — очередь пуста и тревоги отправлены. */
   flush(timeoutMs: number): Promise<boolean>
   stats(): WatchStats
@@ -219,6 +225,14 @@ export function createWatch(options: WatchOptions): Watch {
     const { chatId } = options.telegram
     return typeof chatId === 'string' ? chatId : chatId()
   }
+
+  const handleStopButton = createStopButtonHandler({
+    doctor: options.doctor,
+    alertChatId: resolveChatId,
+    fetch: fetchImpl,
+    now,
+    onError: ownError,
+  })
 
   /** Тревога о событии; `eventIds` — все записи очереди, которые она закрывает (склеенные остатки). */
   function sendAlert(
@@ -618,6 +632,7 @@ export function createWatch(options: WatchOptions): Watch {
   return {
     capture,
     installProcessHandlers,
+    handleStopButton,
     wrapModelCatalog<C extends ModelCatalogLike>(catalog: C): C {
       const wrapProvider = (provider: C['providers'][number]) =>
         new Proxy(provider, {

@@ -1,3 +1,4 @@
+import { checkConfigCommand, CHECK_CONFIG_USAGE } from './check-config.js'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 import { deploysCommand, DEPLOYS_USAGE } from './deploys-commands.js'
 import { fingerprintCommand, FINGERPRINT_USAGE } from './fingerprint-commands.js'
@@ -14,11 +15,12 @@ const COMMAND_GROUPS: Readonly<Record<string, CommandGroup>> = {
   reports: reportsCommand,
   fingerprint: fingerprintCommand,
   start: startCommand,
+  'check-config': checkConfigCommand,
   deploys: deploysCommand,
 }
 
 const USAGE = `Использование:
-${SERVICE_USAGE}${REPORTS_USAGE}${FINGERPRINT_USAGE}${DEPLOYS_USAGE}`
+${SERVICE_USAGE}${CHECK_CONFIG_USAGE}${REPORTS_USAGE}${FINGERPRINT_USAGE}${DEPLOYS_USAGE}`
 
 export async function runDoctorCommand(argv: string[], io: DoctorCommandIo): Promise<number> {
   const [group, ...args] = argv

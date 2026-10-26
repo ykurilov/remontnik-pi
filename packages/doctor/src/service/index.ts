@@ -17,7 +17,7 @@ import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
-import { createControls } from '../ledgers/controls.js'
+import { createControls, readControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
@@ -192,6 +192,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   const reports = createReports({
     store: opened.records,
     telegram: { client: telegram, chatId: options.telegram.chatId },
+    autoDeploy: async () => (await readControls(opened.records)).autoDeploy,
     now,
     onSendError: (error, report) => log(`[врач] отчёт ${report.reportId} не ушёл в Telegram: ${describeError(error)}`),
   })

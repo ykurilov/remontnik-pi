@@ -58,6 +58,12 @@ describe('отчёт решения о выкатке', () => {
     expect(text.short).toContain('правка готова')
     expect(text.short).toContain('стоп-кран')
     expect(text.short).not.toContain('Нужен человек')
+    expect(text.stopSwitch).toBe(true)
+  })
+
+  it('без стоп-крана среди причин признака stopSwitch нет', () => {
+    const text = gateReport({ case: sick, diagnosis, fix, branch: 'b', commit: 'abc', pushed: true, checks: green, decision: { verdict: 'report_only', reasons: [{ code: 'eval_worse', message: 'eval хуже' }] } })
+    expect(text.stopSwitch).toBeUndefined()
   })
 })
 

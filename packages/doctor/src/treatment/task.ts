@@ -261,6 +261,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return {
       short: redactSecrets(text.short, { knownSecrets }),
       full: redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets }),
+      ...(text.stopSwitch ? { stopSwitch: true as const } : {}),
     }
   }
 
@@ -271,7 +272,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   /** Отчёт и состояние случая внутри фиксации задачи. */
   async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: ReportText): Promise<number> {
     const opened = await setCaseStateIn(records, caseId, state)
-    const report = await deps.reports.addIn(records, { type, caseId, ...text, telegram: 'pending' })
+    const report = await deps.reports.addIn(records, { type, caseId, short: text.short, full: text.full, telegram: 'pending', ...(text.stopSwitch ? { stopSwitch: true } : {}) })
     opened.reportIds.push(report.reportId)
     return report.reportId
   }

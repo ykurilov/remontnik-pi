@@ -1,4 +1,4 @@
-import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
+import { STOP_DEPLOYS_CALLBACK, createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createMemoryRecordStore } from '../records/index.js'
@@ -8,11 +8,12 @@ const start = Date.parse('2026-10-26T10:00:00Z')
 let telegram: FakeTelegramServer
 let now: number
 
-function reportsWithTelegram(store = createMemoryRecordStore()) {
+function reportsWithTelegram(store = createMemoryRecordStore(), autoDeploy?: () => Promise<'on' | 'stopped'>) {
   return createReports({
     store,
     telegram: { client: createTelegramClient({ botToken: '123456:test-bot-token', apiBaseUrl: telegram.baseUrl }), chatId: 'owner-chat' },
     now: () => now,
+    ...(autoDeploy ? { autoDeploy } : {}),
   })
 }
 
@@ -119,5 +120,84 @@ describe('отчёты врача', () => {
     const added = await reports.add({ type: 'doctor_problem', short: 'x'.repeat(5000), telegram: 'not_needed' })
 
     expect(added.short.length).toBeLessThanOrEqual(1000)
+  })
+})
+
+describe('кнопка стоп-крана под отчётами', () => {
+  const stopButton = { inline_keyboard: [[{ text: 'Остановить автовыкатку', callback_data: STOP_DEPLOYS_CALLBACK }]] }
+
+  it('под отчётами о выкатке и готовой правке — кнопка «Остановить автовыкатку»', async () => {
+    expect(STOP_DEPLOYS_CALLBACK).toBe('remontnik:stop')
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => 'on')
+    for (const type of ['fix_ready', 'deployed', 'rolled_back', 'not_helped'] as const) {
+      await reports.add({ type, caseId: 1, short: type, telegram: 'pending' })
+    }
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([
+      ['fix_ready', stopButton],
+      ['deployed', stopButton],
+      ['rolled_back', stopButton],
+      ['not_helped', stopButton],
+    ])
+  })
+
+  it('под прочими отчётами кнопки нет', async () => {
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => 'on')
+    await reports.add({ type: 'needs_human', caseId: 1, short: 'нужен человек', telegram: 'pending' })
+    await reports.add({ type: 'doctor_problem', short: 'врач', telegram: 'pending' })
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => item.replyMarkup)).toEqual([undefined, undefined])
+  })
+
+  it('стоп-кран включён — кнопки нет, в тексте сказано, что он включён', async () => {
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => 'stopped')
+    await reports.add({ type: 'deployed', caseId: 1, short: 'Случай 1: правка выкачена.', telegram: 'pending' })
+    await reports.add({ type: 'fix_ready', caseId: 2, short: 'Случай 2: не выкатывал.', telegram: 'pending', stopSwitch: true })
+    // Слово в тексте ничего не решает: решает признак отчёта.
+    await reports.add({ type: 'fix_ready', caseId: 3, short: 'Случай 3: стоп-кран был, но снят.', telegram: 'pending' })
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([
+      ['Случай 1: правка выкачена.\n\nСтоп-кран включён: новые выкатки не начнутся.', undefined],
+      ['Случай 2: не выкатывал.', undefined],
+      ['Случай 3: стоп-кран был, но снят.\n\nСтоп-кран включён: новые выкатки не начнутся.', undefined],
+    ])
+  })
+
+  it('состояние стоп-крана берётся в момент отправки, а не записи', async () => {
+    let state: 'on' | 'stopped' = 'on'
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => state)
+    await reports.add({ type: 'fix_ready', caseId: 1, short: 'готово', telegram: 'pending' })
+    state = 'stopped'
+
+    await reports.pump()
+
+    expect(telegram.messages[0]?.replyMarkup).toBeUndefined()
+  })
+
+  it('состояние стоп-крана не прочиталось — отчёт уходит без кнопки и приписки, повторы не тратятся', async () => {
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => {
+      throw new Error('хранилище недоступно')
+    })
+    const added = await reports.add({ type: 'deployed', caseId: 1, short: 'выкачена', telegram: 'pending' })
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([['выкачена', undefined]])
+    expect((await reports.get(added.reportId))?.telegram).toEqual({ state: 'sent', attempts: 1, messageId: 1 })
+  })
+
+  it('без сведений о стоп-кране кнопки нет', async () => {
+    const reports = reportsWithTelegram()
+    await reports.add({ type: 'deployed', caseId: 1, short: 'выкачена', telegram: 'pending' })
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([['выкачена', undefined]])
   })
 })
