@@ -82,7 +82,7 @@ export function gateReport(input: {
     ...(checks ? checksLines(checks) : []),
     ...(input.sdkTask ? ['', 'Задача для агента Agent Chat SDK:', input.sdkTask] : []),
   ].join('\n')
-  return { short, full }
+  return { short, full, ...(decision.reasons.some((reason) => reason.code === 'stop_switch') ? { stopSwitch: true as const } : {}) }
 }
 
 /** Готовый текст задачи для агента, который отвечает за Agent Chat SDK: его можно переслать как есть. */

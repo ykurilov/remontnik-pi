@@ -1,5 +1,6 @@
 # Браузер Ремонтника: служба врача и живой экран владельца. Только Chromium, прокси нет, пока не задан в профиле.
 # Сборка из корня репозитория: docker build -f deploy/browser.Dockerfile -t remontnik-browser .
+# Команда `remontnik-browser` в PATH: `docker compose exec -T browser remontnik-browser logins add … --password-stdin`.
 # Порт 7700 — только во внутреннюю сеть compose или на частный адрес (`-p 10.0.0.5:7700:7700`), не на все адреса хоста.
 # Базовые образы закреплены по digest: тег можно перезаписать, digest — нет. Обновление — новый digest здесь.
 FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
@@ -9,7 +10,7 @@ COPY deploy/install-pnpm.mjs /tmp/install-pnpm.mjs
 RUN node /tmp/install-pnpm.mjs
 COPY . .
 RUN pnpm install --frozen-lockfile --filter @ykurilov/remontnik-browser... \
- && pnpm --filter @ykurilov/remontnik-browser build \
+ && pnpm --filter @ykurilov/remontnik-browser... build \
  && pnpm --filter @ykurilov/remontnik-browser deploy --legacy --prod /app
 
 FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
@@ -23,7 +24,9 @@ COPY --from=build /app /app
 RUN node /app/node_modules/playwright-core/cli.js install --with-deps --only-shell chromium \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 remontnik \
- && mkdir -p /data && chown remontnik /data
+ && mkdir -p /data && chown remontnik /data \
+ && printf '#!/bin/sh\nexec node /app/dist/cli/main.js "$@"\n' > /usr/local/bin/remontnik-browser \
+ && chmod 755 /usr/local/bin/remontnik-browser
 USER remontnik
 VOLUME /data
 EXPOSE 7700

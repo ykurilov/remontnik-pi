@@ -4,6 +4,14 @@ import { truncateText } from '../incident/index.js'
 export const TELEGRAM_MESSAGE_LIMIT = 4096
 export const DEFAULT_TELEGRAM_API_BASE_URL = 'https://api.telegram.org'
 
+/** `callback_data` кнопки стоп-крана: её ставит врач под отчётами, нажатие разбирает сторож в приложении. */
+export const STOP_DEPLOYS_CALLBACK = 'remontnik:stop'
+
+/** Кнопка «Остановить автовыкатку» для `replyMarkup`. */
+export function stopDeploysKeyboard(): { inline_keyboard: { text: string; callback_data: string }[][] } {
+  return { inline_keyboard: [[{ text: 'Остановить автовыкатку', callback_data: STOP_DEPLOYS_CALLBACK }]] }
+}
+
 export interface TelegramOptions {
   botToken: string
   /** Адрес Bot API или прокси перед ним. */

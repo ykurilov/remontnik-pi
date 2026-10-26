@@ -2,6 +2,7 @@
 # Сборка из корня репозитория: docker build -f deploy/doctor.Dockerfile -t remontnik-doctor .
 # В образе: Node, git (врачу — для веток и меток) и клиент Docker (контейнеры верстака через сокет хоста).
 # Секретов в образе нет: всё — из окружения сервера при запуске (deploy/compose.remontnik.yml).
+# Команда `remontnik-doctor` в PATH: `docker compose exec doctor remontnik-doctor deploys stop`.
 # Базовые образы закреплены по digest: тег можно перезаписать, digest — нет. Обновление — новый digest здесь.
 FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
 WORKDIR /src
@@ -20,7 +21,9 @@ FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --create-home --uid 10001 remontnik
+ && useradd --create-home --uid 10001 remontnik \
+ && printf '#!/bin/sh\nexec node /app/dist/cli/remontnik-doctor.js "$@"\n' > /usr/local/bin/remontnik-doctor \
+ && chmod 755 /usr/local/bin/remontnik-doctor
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 COPY --from=build /app /app

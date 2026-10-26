@@ -1,5 +1,5 @@
 import { truncateText } from '@ykurilov/remontnik-core/incident'
-import type { TelegramClient } from '@ykurilov/remontnik-core/telegram'
+import { stopDeploysKeyboard, type TelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
 
 // Отчёты врача: номера по порядку (курсор для Paseo) и очередь сообщений в Telegram с повторами.
@@ -35,6 +35,10 @@ export type ReportTelegram =
   | { state: 'failed'; attempts: number }
   | { state: 'not_needed'; attempts: number }
 
+/** Отчёты о выкатке и о готовой к выкатке правке: под ними кнопка стоп-крана. */
+const STOP_BUTTON_REPORTS: ReadonlySet<ReportType> = new Set(['fix_ready', 'deployed', 'rolled_back', 'not_helped'])
+const STOPPED_NOTE = 'Стоп-кран включён: новые выкатки не начнутся.'
+
 /** Сколько снимков экрана хранить в одном отчёте. */
 export const REPORT_SCREENSHOTS_LIMIT = 10
 
@@ -48,6 +52,8 @@ export interface Report {
   createdAt: string
   /** Пути к снимкам экрана браузера врача. */
   screenshots?: string[]
+  /** Текст сам говорит, что выкатки нет из-за стоп-крана. */
+  stopSwitch?: true
 }
 
 export interface AddReportInput {
@@ -57,6 +63,7 @@ export interface AddReportInput {
   full?: string
   telegram: 'pending' | 'not_needed'
   screenshots?: string[]
+  stopSwitch?: true
 }
 
 export interface Reports {
@@ -83,6 +90,8 @@ export interface Reports {
 export interface CreateReportsOptions {
   store: RecordStore
   telegram?: { client: TelegramClient; chatId: string }
+  /** Состояние стоп-крана в момент отправки. Без него кнопки под отчётами нет. */
+  autoDeploy?: () => Promise<'on' | 'stopped'>
   now?: () => number
   /** Сбой отправки: для журнала врача. */
   onSendError?: (error: unknown, report: Report) => void
@@ -131,6 +140,22 @@ export function createReports(options: CreateReportsOptions): Reports {
     })
   }
 
+  /**
+   * Включён стоп-кран — кнопки нет, а в тексте сказано, что он включён (если отчёт сам об этом не говорит).
+   * Состояние не прочиталось — отчёт уходит как есть: это не сбой отправки и не повод тратить повторы.
+   */
+  async function telegramMessage(report: Report): Promise<{ text: string; replyMarkup?: unknown }> {
+    if (!options.autoDeploy || !STOP_BUTTON_REPORTS.has(report.type)) return { text: report.short }
+    let autoDeploy: 'on' | 'stopped'
+    try {
+      autoDeploy = await options.autoDeploy()
+    } catch {
+      return { text: report.short }
+    }
+    if (autoDeploy === 'on') return { text: report.short, replyMarkup: stopDeploysKeyboard() }
+    return { text: report.stopSwitch ? report.short : `${report.short}\n\n${STOPPED_NOTE}` }
+  }
+
   async function pumpOnce(): Promise<void> {
     const telegram = options.telegram
     if (!telegram) return
@@ -138,7 +163,8 @@ export function createReports(options: CreateReportsOptions): Reports {
       if (report.telegram.state !== 'pending' || report.telegram.nextAttemptAt > now()) continue
       const attempts = report.telegram.attempts + 1
       try {
-        const { messageId } = await telegram.client.sendMessage(telegram.chatId, report.short)
+        const { text, replyMarkup } = await telegramMessage(report)
+        const { messageId } = await telegram.client.sendMessage(telegram.chatId, text, replyMarkup ? { replyMarkup } : {})
         await settle(report.reportId, { state: 'sent', attempts, messageId })
       } catch (error) {
         options.onSendError?.(error, report)
@@ -160,6 +186,7 @@ export function createReports(options: CreateReportsOptions): Reports {
           telegram: input.telegram === 'pending' ? { state: 'pending', attempts: 0, nextAttemptAt: 0 } : { state: 'not_needed', attempts: 0 },
           createdAt: new Date(now()).toISOString(),
           ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: input.screenshots.slice(0, REPORT_SCREENSHOTS_LIMIT) } : {}),
+          ...(input.stopSwitch ? { stopSwitch: true as const } : {}),
         }
         if (input.telegram === 'pending') index.pending.push(reportId)
         return copyRecord(await tx.doc<Report>('report', reportKey(reportId), report))
