@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import type { DocumentReader } from '@earendil-works/pi-durable'
 import { describe, expect, it } from 'vitest'
+import { BROWSER_TOOL_NAMES, createBrowserTools } from '../browser-tools/index.js'
 import { createLocalRunner } from '../workbench/index.js'
 import { bashCallPolicy, createWorkbenchEnvFactory, DOCTOR_TOOL_NAMES, doctorTools, TreatmentDoc, type TreatmentDocState } from './index.js'
 
@@ -39,8 +40,22 @@ describe('правило вызова bash', () => {
 describe('набор инструментов врача', () => {
   it('постоянный: те же имена в том же порядке', () => {
     expect(doctorTools().map((tool) => tool.name)).toEqual([...DOCTOR_TOOL_NAMES])
-    expect(DOCTOR_TOOL_NAMES).toEqual(['read', 'write', 'edit', 'bash', 'case_info', 'finish_diagnosis', 'finish_fix'])
+    expect(DOCTOR_TOOL_NAMES).toEqual([
+      'read',
+      'write',
+      'edit',
+      'bash',
+      'case_info',
+      ...BROWSER_TOOL_NAMES,
+      'finish_diagnosis',
+      'finish_fix',
+    ])
     expect(doctorTools().map((tool) => tool.description)).toEqual(doctorTools().map((tool) => tool.description))
+  })
+
+  it('инструменты браузера есть всегда, даже без службы: набор не зависит от настройки', () => {
+    const names = doctorTools(createBrowserTools()).map((tool) => tool.name)
+    expect(names).toEqual([...DOCTOR_TOOL_NAMES])
   })
 })
 

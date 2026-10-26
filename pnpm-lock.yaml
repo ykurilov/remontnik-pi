@@ -23,6 +23,9 @@ importers:
 
   apps/patient:
     devDependencies:
+      '@ykurilov/remontnik-browser':
+        specifier: workspace:*
+        version: link:../../packages/browser
       '@ykurilov/remontnik-core':
         specifier: workspace:*
         version: link:../../packages/core

@@ -23,6 +23,7 @@ import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls, readControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
+import type { BrowserClient } from '../browser-tools/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, TREATMENT_TASK_NAME, type Treatment, type TreatmentInput } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
 import { createCaseRetry } from './case-retry.js'
@@ -86,6 +87,11 @@ export interface DoctorTreatmentOptions {
   appDescription?: string
   /** Выкатчик приложения (`createServerDeployer`). Не задан — врач правку не выкатывает, а сообщает «правка готова». */
   deployer?: Deployer
+  /**
+   * Служба браузера врача (`browserClientFromEnv`) и окружение для ссылки на живой экран (`browser.live.linkEnv`).
+   * Без клиента инструменты `browser_*` отвечают `unavailable`, а выкатка идёт «без проверки в браузере».
+   */
+  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>>; pollMs?: number }
 }
 
 export interface DoctorService {
@@ -323,6 +329,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       ...(treatmentOptions.deployer ? { deployer: treatmentOptions.deployer } : {}),
+      ...(treatmentOptions.browser ? { browser: treatmentOptions.browser } : {}),
       modelBudget,
       boot,
       onReport: pump,

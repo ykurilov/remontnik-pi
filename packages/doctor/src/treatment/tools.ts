@@ -3,13 +3,23 @@ import type { Context } from '@earendil-works/chord/context'
 import { defineTool, hook, ToolTask, type EnvTarget, type JsonObject } from '@earendil-works/pi-durable'
 import type { ExecutionEnv } from '@earendil-works/pi-durable/env'
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools'
+import { BROWSER_TOOL_NAMES, createBrowserTools } from '../browser-tools/index.js'
 import { ContainerExecutionEnv, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type CaseBadAnswer, type Diagnosis, type FixSummary, type TreatmentCaseInfo } from './doc.js'
 
 // Инструменты модели-врача. Набор постоянный: одни и те же инструменты в одном порядке для любого случая,
 // иначе кэш модели сбрасывается. Файлы и команды — только через окружение верстака (см. createWorkbenchEnvFactory).
 
-export const DOCTOR_TOOL_NAMES = ['read', 'write', 'edit', 'bash', 'case_info', 'finish_diagnosis', 'finish_fix'] as const
+export const DOCTOR_TOOL_NAMES = [
+  'read',
+  'write',
+  'edit',
+  'bash',
+  'case_info',
+  ...BROWSER_TOOL_NAMES,
+  'finish_diagnosis',
+  'finish_fix',
+] as const
 
 export function describeCase(info: TreatmentCaseInfo): string {
   return [
@@ -96,10 +106,12 @@ const finishFix = defineTool({
   },
 })
 
-const DOCTOR_TOOLS = [createReadTool(), createWriteTool(), createEditTool(), createBashTool(), caseInfo, finishDiagnosis, finishFix] as const
+const WORKBENCH_TOOLS = [createReadTool(), createWriteTool(), createEditTool(), createBashTool(), caseInfo] as const
+const DEFAULT_BROWSER_TOOLS = createBrowserTools()
 
-export function doctorTools() {
-  return DOCTOR_TOOLS
+/** Набор постоянный: инструменты браузера есть всегда, без службы они отвечают `unavailable` — кэш модели не ломается. */
+export function doctorTools(browserTools: ReturnType<typeof createBrowserTools> = DEFAULT_BROWSER_TOOLS) {
+  return [...WORKBENCH_TOOLS, ...browserTools, finishDiagnosis, finishFix] as const
 }
 
 export interface BashLimits {

@@ -9,6 +9,7 @@ import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
 import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
+import { browserClientFromEnv } from '../browser-tools/index.js'
 import { loadMainBranchConfig } from './config-source.js'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions, type DoctorTreatmentOptions } from './index.js'
 
@@ -96,6 +97,7 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const apiBaseUrl = telegram.apiBaseUrlEnv ? env[telegram.apiBaseUrlEnv]?.trim() : undefined
   const proxyToken = telegram.proxyTokenEnv ? env[telegram.proxyTokenEnv]?.trim() : undefined
   const model = createDoctorModels(env)
+  const browserClient = browserClientFromEnv(env)
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
   const sharedSecret = required(env, 'REMONTNIK_SHARED_SECRET')
   // Секрет владельца снимает стоп-кран выкаток: утечка общего секрета не должна давать того же.
@@ -141,6 +143,7 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
         models: model.models,
         model: model.model,
         evalEnv: env,
+        browser: { ...(browserClient ? { client: browserClient } : {}), env },
       },
     },
   }

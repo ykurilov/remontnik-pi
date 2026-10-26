@@ -235,8 +235,8 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T098 [US8] HTTP-служба с ключом по contracts/browser-api.md в `packages/browser/src/service/`
 - [X] T099 [US8] Консольная `remontnik-browser`, в том числе `logins add --password-stdin` и `logins remove`, в `packages/browser/src/cli/`
 - [X] T100 [US8] Образ `deploy/browser.Dockerfile` (Chromium, без прокси по умолчанию)
-- [ ] T101 [US8] Инструменты `browser_*` у врача: постоянный набор, ответ `unavailable`, снимки в отчёт, проверка `pagesToCheck` после выкатки, в `packages/doctor/src/browser-tools/`
-- [ ] T102 [US8] Интеграционный тест `apps/patient/test/cycle/us8-browser.test.ts`: ошибка «только на странице» воспроизведена и после выкатки страница работает; браузер выключен → цикл проходит с пометкой «без проверки в браузере»
+- [X] T101 [US8] Инструменты `browser_*` у врача: постоянный набор, ответ `unavailable`, снимки в отчёт, проверка `pagesToCheck` после выкатки, в `packages/doctor/src/browser-tools/`
+- [X] T102 [US8] Интеграционный тест `apps/patient/test/cycle/us8-browser.test.ts`: ошибка «только на странице» воспроизведена и после выкатки страница работает; браузер выключен → цикл проходит с пометкой «без проверки в браузере»
 
 
 ### Живой экран (решение Юрия)
@@ -247,7 +247,7 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
 - [X] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
 - [X] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
-- [ ] T109 [US8] Ссылка на живой экран в отчётах `needs_human` от браузера (по `browser.live.linkEnv`), продолжение после «Вернуть», в `packages/doctor/src/browser-tools/` и `packages/doctor/src/reports/texts.ts`
+- [X] T109 [US8] Ссылка на живой экран в отчётах `needs_human` от браузера (по `browser.live.linkEnv`), продолжение после «Вернуть», в `packages/doctor/src/browser-tools/` и `packages/doctor/src/reports/texts.ts`
 
 ---
 
