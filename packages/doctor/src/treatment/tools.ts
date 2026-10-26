@@ -44,6 +44,7 @@ const finishDiagnosis = defineTool({
     evidence: Type.Array(Type.String(), { description: 'Улики: файлы, строки, вывод команд' }),
     confidence: Type.Union([Type.Literal('low'), Type.Literal('medium'), Type.Literal('high')]),
     fixPlan: Type.Optional(Type.String({ description: 'Как исправить, коротко' })),
+    causeInPackage: Type.Optional(Type.String({ description: 'Если причина внутри установленного пакета (node_modules), а не в коде приложения, — имя пакета' })),
   }),
   replay: 'safe',
   execute: async (args, api, context) => {
@@ -53,6 +54,7 @@ const finishDiagnosis = defineTool({
       evidence: [...args.evidence],
       confidence: args.confidence,
       ...(args.fixPlan === undefined ? {} : { fixPlan: args.fixPlan }),
+      ...(args.causeInPackage === undefined ? {} : { causeInPackage: args.causeInPackage }),
     }
     await api.commit(async (tx) => {
       ;(await tx.doc(TreatmentDoc, api.conversationId)).diagnosis = diagnosis
