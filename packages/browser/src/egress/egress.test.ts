@@ -251,6 +251,16 @@ describe('прокси выхода', () => {
     await expect.poll(() => opened).toBe(2)
     socket.destroy()
     await expect.poll(() => closed, { timeout: 2_000 }).toBe(2)
+
+    // До готовности туннеля клиент шлёт больше 64 КБ — соединение рвётся, неготовое к прокси профиля тоже.
+    const flood = connect(slow.port, '127.0.0.1', () => flood.write(`CONNECT site.example.test:443 HTTP/1.1\r\nProxy-Authorization: ${slow.auth}\r\n\r\n`))
+    flood.on('error', () => {})
+    let floodClosed = false
+    flood.on('close', () => (floodClosed = true))
+    await expect.poll(() => opened).toBe(3)
+    flood.write(Buffer.alloc(64 * 1024 + 1))
+    await expect.poll(() => floodClosed, { timeout: 2_000 }).toBe(true)
+    await expect.poll(() => closed, { timeout: 2_000 }).toBe(3)
   })
 
   it('isInternalAddress: внутренние диапазоны IPv4 и IPv6, в том числе IPv4 внутри IPv6; внешние — нет', () => {

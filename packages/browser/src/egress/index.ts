@@ -54,6 +54,8 @@ export interface EgressOptions {
 
 const DEFAULT_PORTS: Record<string, number> = { 'http:': 80, 'https:': 443 }
 const CONNECT_TIMEOUT_MS = 15_000
+/** Сколько байт клиент может прислать до готовности туннеля; больше — соединение рвётся. */
+const EARLY_BYTES_LIMIT = 64 * 1024
 
 /** Адрес из разрешённых origin: для запроса http:// — точный origin, для туннеля — тот же хост и порт. */
 export function isAllowedTarget(target: EgressTarget, allowedOrigins: readonly string[]): boolean {
@@ -384,7 +386,12 @@ export async function startEgressProxy(options: EgressOptions): Promise<EgressPr
     const signal = deadline(client)
     // Пока туннель не готов, сокет клиента читается: иначе его закрытие не видно, и неготовое соединение висит.
     const early: Buffer[] = head.length > 0 ? [head] : []
-    const keep = (chunk: Buffer) => early.push(chunk)
+    let earlyBytes = head.length
+    const keep = (chunk: Buffer) => {
+      earlyBytes += chunk.length
+      if (earlyBytes > EARLY_BYTES_LIMIT) return void client.destroy()
+      early.push(chunk)
+    }
     const gone = () => client.destroy()
     client.on('data', keep)
     client.once('end', gone)
