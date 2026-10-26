@@ -7,6 +7,7 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import {
+  admitAutoDeployIn,
   createGitGuard,
   createLocalRunner,
   createServerDeployer,
@@ -15,13 +16,15 @@ import {
   type Deployment,
   type DoctorService,
   type DoctorServiceOptions,
+  runDoctorCommand,
 } from '@ykurilov/remontnik-doctor'
-import { callTool, createScriptedModel, testRemontnikConfig, type ScriptedModel, type ScriptStep } from '@ykurilov/remontnik-doctor/testing'
+import { callTool, createScriptedModel, seedDoctorRecords, testRemontnikConfig, type ScriptedModel, type ScriptStep } from '@ykurilov/remontnik-doctor/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 // История 3 на «Пациенте»: сбой → правка → выкатка настоящими командами «Пациента» на папках (deploy/remontnik-deploy.ts)
 // → окно наблюдения → правка держится и влита в main, или стало хуже и откат. Часы врача перескакивают на время
 // пробуждения спящей задачи: окно наблюдения проходит за секунды. Модель — по сценарию, без сети и денег.
+// После отката учёт выкаток не пускает новую правку того же сбоя, пока владелец не снимет пометку.
 
 const patientRoot = fileURLToPath(new URL('../../', import.meta.url))
 const PATIENT_FILES = ['src/bugs.ts', 'src/bot/bot.ts', 'src/bot/fake-model.ts', 'src/bot/plans.ts', 'src/bot/tools.ts', 'deploy/remontnik-deploy.ts']
@@ -30,6 +33,7 @@ const BOT = 'src/bot/bot.ts'
 const NEW_TEST = 'test/default-plan.test.ts'
 const DEPLOY_SCRIPT = 'deploy/remontnik-deploy.ts'
 const SHARED_SECRET = 'shared-test-secret'
+const CONTROL_SECRET = 'owner-test-secret'
 
 const BOT_TEST = `import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -180,6 +184,7 @@ async function startDoctor(r: SickPatient, model: ScriptedModel, clock: Clock, d
     stateDir: r.stateDir,
     sharedSecret: SHARED_SECRET,
     listen: { host: '127.0.0.1', port: 0 },
+    controlSecret: CONTROL_SECRET,
     telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: telegram.baseUrl },
     exit: () => {},
     log: () => {},
@@ -192,7 +197,6 @@ async function startDoctor(r: SickPatient, model: ScriptedModel, clock: Clock, d
       models: model.models,
       model: model.model,
       evalEnv: {},
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
       deployer,
@@ -214,12 +218,12 @@ function priceCrash() {
   })
 }
 
-async function settledCase(doctor: DoctorService, timeoutMs = 60_000) {
+async function settledCase(doctor: DoctorService, caseId = 1, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const found = await doctor.caseBook.getCase(1)
+    const found = await doctor.caseBook.getCase(caseId)
     if (found && ['healed', 'rolled_back', 'not_helped', 'report_only', 'needs_human', 'no_cause_found', 'stand_broken'].includes(found.state)) return found
-    if (Date.now() > deadline) throw new Error(`случай 1 не закончился: ${found?.state}`)
+    if (Date.now() > deadline) throw new Error(`случай ${caseId} не закончился: ${found?.state}`)
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
 }
@@ -317,6 +321,42 @@ describe('история 3 на «Пациенте»: выкатка, наблю
     expect(report.type).toBe('rolled_back')
     expect(report.short).toContain('откатил')
   }, 120_000)
+
+  it('откат → тот же сбой снова: правка готова, но выкатки нет, нужен человек; после `fingerprint release` выкатка снова возможна', async () => {
+    const r = sickPatient()
+    const model = createScriptedModel()
+    model.script(...cure(r), ...cure(r))
+    const clock = fakeClock()
+    const doctor = await startDoctor(r, model, clock, [])
+    worseAfterPromote(r, clock, () => doctor)
+    await doctor.receiveEvents([priceCrash()])
+    expect((await settledCase(doctor)).state).toBe('rolled_back')
+
+    // Тот же сбой после отката — новый случай: новая правка проверена, но по этому отпечатку выкатывает только человек.
+    await doctor.receiveEvents([priceCrash()])
+    const again = await settledCase(doctor, 2)
+
+    expect(again.state).toBe('report_only')
+    expect(server(r).current).toBe(r.base)
+    expect(git(r.origin, 'tag', '--list', 'remontnik/pre-deploy/*').split('\n')).toHaveLength(1)
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*').split('\n')).toHaveLength(2)
+    const report = await lastReport(doctor)
+    expect(report.type).toBe('needs_human')
+    expect(report.full).toContain('после отката эта причина ждёт человека')
+
+    // Владелец снимает пометку своим секретом: учёт снова пускает автовыкатку по отпечатку.
+    const { fingerprint } = priceCrash()
+    const output: string[] = []
+    const io = { env: { REMONTNIK_DOCTOR_URL: doctor.url, REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }, stdout: (text: string) => output.push(text), stderr: (text: string) => output.push(text) }
+    expect(await runDoctorCommand(['fingerprint', fingerprint, 'release', '--by', 'owner'], io)).toBe(0)
+    expect(JSON.parse(output.join(''))).toMatchObject({ fingerprint, needsHuman: false })
+    await doctor.close()
+    let admission: Awaited<ReturnType<typeof admitAutoDeployIn>> | undefined
+    await seedDoctorRecords(r.stateDir, async (tx) => {
+      admission = await admitAutoDeployIn(tx, { fingerprint, deploymentId: 99, at: clock.now(), timeZone: 'UTC', limits: testRemontnikConfig().limits })
+    })
+    expect(admission).toEqual({ admitted: true })
+  }, 180_000)
 
   it('no-git: удалённый репозиторий пропал до отката → откат из сохранённой сборки', async () => {
     const r = sickPatient()

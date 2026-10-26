@@ -31,8 +31,11 @@ export type CaseState =
   | 'healed_by_paseo'
   | 'reclaimed'
 
-/** После этих состояний новый сбой с тем же отпечатком открывает новый случай. */
-export const CLOSED_CASE_STATES: readonly CaseState[] = ['healed', 'healed_by_paseo']
+/**
+ * После этих состояний новый сбой с тем же отпечатком открывает новый случай. После отката правки — тоже: новое лечение
+ * найдёт правку, а выкатить её сам врач не сможет, пока владелец не снимет пометку «нужен человек» (учёт выкаток).
+ */
+export const CLOSED_CASE_STATES: readonly CaseState[] = ['healed', 'healed_by_paseo', 'rolled_back']
 
 export interface Case {
   caseId: number

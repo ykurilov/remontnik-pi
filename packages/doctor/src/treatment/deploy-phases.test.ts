@@ -16,6 +16,9 @@ import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
 import { callTool, createScriptedModel, type ScriptedModel } from '../testing/scripted-model.js'
 import { createLocalRunner } from '../workbench/index.js'
+import { emptyFingerprintLedger, LEDGER, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
+import { copyRecord } from '../records/index.js'
+import { seedDoctorRecords } from '../testing/doctor-records.js'
 
 // Лечение до выкатки (T070): решение `gated` о выкатке — в чекпойнте, дальше `deploying` → `observing` →
 // `healed` | `rolled_back` | `not_helped`. Приложение подставное (сборки в памяти), git настоящий, часы врача
@@ -245,6 +248,16 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
+/** Учёт выкаток по отпечатку сбоя случая — из записей врача (врач уже закрыт). */
+async function ledgerOf(r: Repo): Promise<FingerprintLedger['fingerprints'][string] | undefined> {
+  let found: FingerprintLedger['fingerprints'][string] | undefined
+  await seedDoctorRecords(r.stateDir, async (tx) => {
+    const ledger = await tx.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger())
+    found = copyRecord(ledger.fingerprints[priceCrash().fingerprint])
+  })
+  return found
+}
+
 describe('лечение до выкатки: deploying → observing → итог', () => {
   it('правка держится окно → healed: метка прежней версии, прежняя сборка, правка влита в main, случай закрыт', async () => {
     const r = repo()
@@ -316,6 +329,9 @@ describe('лечение до выкатки: deploying → observing → ито
     expect(last.type).toBe('deployed')
     expect(last.short).toContain(fixBranch(r))
     expect(last.short).toContain('запрос на слияние')
+    // Допуск записан при решении один раз: продолжение после перезапуска — не вторая попытка.
+    await second.close()
+    expect((await ledgerOf(r))?.autoDeploys).toHaveLength(1)
   }, 120_000)
 
   it('стало хуже → откат меньше чем за минуту по часам врача, случай rolled_back, main не тронута', async () => {
@@ -355,6 +371,9 @@ describe('лечение до выкатки: deploying → observing → ито
     const last = (await reports(doctor)).at(-1)!
     expect(last.type).toBe('rolled_back')
     expect(last.short).toContain('откатил')
+    // Откат помечен в учёте: дальше по этому отпечатку — только человек.
+    await doctor.close()
+    expect(await ledgerOf(r)).toMatchObject({ needsHuman: true, autoDeploys: [expect.objectContaining({ deploymentId: 1 })] })
   }, 90_000)
 
   it('стоп-кран нажат → правку не выкатывает: отчёт «правка готова», случай report_only', async () => {

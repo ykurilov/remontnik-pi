@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { decideDeploy } from '../deploy-gate/index.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
+import { openDoctorHarness } from '../service/harness.js'
 import {
   admitAutoDeployIn,
   readDeployAttempts,
@@ -45,6 +49,18 @@ describe('учёт попыток выкатки', () => {
     expect(gateCodes(facts)).toContain('attempts_exhausted')
     // Другой отпечаток не задет.
     expect(gateCodes(await attempts(store, 'fp-b', noon))).not.toContain('attempts_exhausted')
+  })
+
+  it('записи pi-durable: первая выкатка нового отпечатка сохраняется в учёте', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'remontnik-ledger-'))
+    const opened = await openDoctorHarness({ stateDir, onReport: () => {} })
+    try {
+      await deploy(opened.records, 'fp-a', 1, noon - HOUR)
+      expect((await attempts(opened.records, 'fp-a', noon)).autoDeploysForFingerprint).toBe(1)
+    } finally {
+      await opened.close()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
   })
 
   it('5 выкаток на приложение в сутки по всем отпечаткам', async () => {

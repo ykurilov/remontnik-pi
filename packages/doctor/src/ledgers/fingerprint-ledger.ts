@@ -39,9 +39,10 @@ function ledgerIn(tx: RecordTransaction): Promise<FingerprintLedger> {
   return tx.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger())
 }
 
+/** Запись отпечатка из черновика учёта: новый объект после вставки в черновик — уже не он, правки шли бы мимо. */
 function recordFor(ledger: FingerprintLedger, fingerprint: string): FingerprintRecord {
-  const found = Object.hasOwn(ledger.fingerprints, fingerprint) ? ledger.fingerprints[fingerprint] : undefined
-  return found ?? (ledger.fingerprints[fingerprint] = { autoDeploys: [], needsHuman: false })
+  if (!Object.hasOwn(ledger.fingerprints, fingerprint)) ledger.fingerprints[fingerprint] = { autoDeploys: [], needsHuman: false }
+  return ledger.fingerprints[fingerprint]!
 }
 
 /** Факты попыток для решения о выкатке (`DeployFacts.attempts`). */

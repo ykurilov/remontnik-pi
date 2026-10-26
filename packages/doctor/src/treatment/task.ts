@@ -20,7 +20,7 @@ import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
-import type { Deployer, DeployRequest, Deployment, DeployStep } from '../deployer/deploy-sequence.js'
+import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
 import { GitGuardError, slugify, type GitGuard, type GitGuardErrorCode } from '../git-guard/index.js'
 import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
 import { diagnoseMessage, fixMessage, resumeMessage } from '../model/case-messages.js'
@@ -43,8 +43,18 @@ import {
 import { durableTxOf, recordFamilyOf, recordTransactionOver, runDeploymentInTask } from '../service/harness.js'
 import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
-import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeployControls, type DeployControls, type FixInspection } from './gate.js'
-import { deployAttemptsOf, LEDGER, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
+import {
+  agentChatSdkPackage,
+  closingOf,
+  deployFactsOf,
+  fixCanBeChecked,
+  inspectFix,
+  noDeployControls,
+  type DeployControls,
+  type FixInspection,
+  type GateClosing,
+} from './gate.js'
+import { admitAutoDeployIn, deployAttemptsOf, emptyFingerprintLedger, LEDGER, recordRollbackIn, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
 import type { ModelBudget } from '../ledgers/model-budget.js'
 import {
   caseLimitUsdOf,
@@ -247,12 +257,15 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /** Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo. */
-  async function redactedReport(text: ReportText, baseRunning: boolean): Promise<ReportText> {
-    const knownSecrets = knownSecretsOf(await deps.loadConfig())
+  function redactedWith(knownSecrets: string[], text: ReportText, baseRunning: boolean): ReportText {
     return {
       short: redactSecrets(text.short, { knownSecrets }),
       full: redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets }),
     }
+  }
+
+  async function redactedReport(text: ReportText, baseRunning: boolean): Promise<ReportText> {
+    return redactedWith(knownSecretsOf(await deps.loadConfig()), text, baseRunning)
   }
 
   /** Отчёт и состояние случая внутри фиксации задачи. */
@@ -263,7 +276,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return report.reportId
   }
 
-  /** Отчёт, состояние случая и итог задачи — одной фиксацией. */
+  /** Отчёт, состояние случая и итог задачи — одной фиксацией; `alsoIn` — ещё записи в ту же фиксацию. */
   async function finish(
     runtime: Runtime,
     caseId: number,
@@ -273,10 +286,13 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     result: Omit<TreatmentResult, 'reportId'>,
     context: Context,
     baseRunning = true,
+    alsoIn?: (records: RecordTransaction) => Promise<void>,
   ): Promise<void> {
     const redacted = await redactedReport(text, baseRunning)
     await runtime.commit(async (tx) => {
-      const reportId = await reportIn(recordTransactionOver(tx), caseId, state, type, redacted)
+      const records = recordTransactionOver(tx)
+      if (alsoIn) await alsoIn(records)
+      const reportId = await reportIn(records, caseId, state, type, redacted)
       return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId } } }
     }, context)
     deps.onReport()
@@ -512,6 +528,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     const mainline = stays ? await settleMainline(runtime, checkpoint, context) : undefined
     const text = deploymentReport({ case: doc.case, deployment, branch: checkpoint.branch, ...(mainline ? { mainline } : {}) })
     const closing = deployClosing(deployment, text.type)
+    // Правку откатили (или откат не удался): по этому отпечатку дальше выкатывает только человек.
+    const rolledBack = deployment.outcome === 'rolled_back' || deployment.outcome === 'rollback_failed'
+    const markRollback = (records: RecordTransaction) =>
+      recordRollbackIn(records, { fingerprint: sick.fingerprint, deploymentId: deployment.deploymentId, at: deps.now() })
     await finish(
       runtime,
       caseId,
@@ -531,6 +551,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       },
       context,
       checkpoint.baseRunning,
+      rolledBack ? markRollback : undefined,
     )
   }
 
@@ -782,44 +803,67 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const sick = await readCase(runtime, caseId, context)
         const spendDay = (await runtime.snapshot(recordFamilyOf('spend'), spendDayKey(deps.now(), config.app.timeZone), context)) as unknown as SpendDay | undefined
         const controls = deps.deployControls ? await deps.deployControls.read({ caseId, fingerprint: sick.fingerprint, config }) : noDeployControls()
-        const ledger = (await runtime.snapshot(recordFamilyOf(LEDGER.collection), LEDGER.key, context)) as unknown as FingerprintLedger | undefined
-        const attempts = deployAttemptsOf(ledger, { fingerprint: sick.fingerprint, now: deps.now(), timeZone: config.app.timeZone, limits: config.limits })
-        const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
-        const closing = closingOf(gate, checks)
         const sdkPackage = agentChatSdkPackage(diagnosis, inspection)
         const result = {
           branch: checkpoint.branch,
           fixCommit: checkpoint.fixCommit,
           changedPaths: checkpoint.changedPaths,
           ...(checks ? { checks } : {}),
-          gate,
           ...(sdkPackage ? { sdkPackage } : {}),
         }
         const ready = { case: doc.case, diagnosis, fix, branch: checkpoint.branch, commit: checkpoint.fixCommit, pushed: checkpoint.pushed }
         const sdkTask = sdkPackage ? agentChatSdkTask({ case: doc.case, stack: doc.case.stack, diagnosis, packageName: sdkPackage }) : undefined
-        const close = (text: ReportText, outcome: Omit<TreatmentResult, 'reportId'>) =>
-          finish(runtime, caseId, closing.caseState, closing.report, text, { ...result, ...outcome }, context, checkpoint.baseRunning)
-        switch (closing.kind) {
-          case 'deploy':
-            if (!deps.deployer) return close(fixReadyReport({ ...ready, checks: checks! }), { outcome: 'fix_ready' })
-            // Решение — в чекпойнте: повтор фазы после перезапуска его уже не пересчитывает.
-            await runtime.commit(async (tx) => {
-              await setCaseStateIn(recordTransactionOver(tx), caseId, 'deploying')
-              return { status: 'running', checkpoint: { ...checkpoint, phase: 'deploying', gate } }
-            }, context)
-            return
-          case 'not_deployed':
-            return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate }), { outcome: 'fix_ready' })
-          case 'checks_red':
-            return close(causeFoundReport({ case: doc.case, diagnosis, reason: 'checks_red', branch: checkpoint.branch, checks: checks! }), { outcome: 'cause_found' })
-          case 'stand_broken':
-            return close(standBrokenReport({ case: doc.case, branch: checkpoint.branch, checks: checks! }), { outcome: 'stand_broken' })
-          case 'needs_human':
-            return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate, ...(sdkTask ? { sdkTask } : {}) }), {
-              outcome: 'needs_human',
-              why: sdkPackage ? 'agent_chat_sdk' : 'gate',
-            })
+        const knownSecrets = knownSecretsOf(config)
+        const closeWith = (kind: GateClosing['kind'], gate: GateDecision): { text: ReportText; outcome: Pick<TreatmentResult, 'outcome' | 'why'> } => {
+          switch (kind) {
+            case 'deploy':
+              return { text: fixReadyReport({ ...ready, checks: checks! }), outcome: { outcome: 'fix_ready' } }
+            case 'not_deployed':
+              return { text: gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate }), outcome: { outcome: 'fix_ready' } }
+            case 'checks_red':
+              return { text: causeFoundReport({ case: doc.case, diagnosis, reason: 'checks_red', branch: checkpoint.branch, checks: checks! }), outcome: { outcome: 'cause_found' } }
+            case 'stand_broken':
+              return { text: standBrokenReport({ case: doc.case, branch: checkpoint.branch, checks: checks! }), outcome: { outcome: 'stand_broken' } }
+            case 'needs_human':
+              return {
+                text: gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate, ...(sdkTask ? { sdkTask } : {}) }),
+                outcome: { outcome: 'needs_human', why: sdkPackage ? 'agent_chat_sdk' : 'gate' },
+              }
+          }
         }
+
+        // Учёт выкаток читается в той же фиксации, где решение и допуск: два случая разом не займут последнее место
+        // (отказ учёта — это решение «не выкатывать» с понятным отчётом), а продолжение после перезапуска решение
+        // не пересчитывает и второй попыткой не считается.
+        let reported = false
+        await runtime.commit(async (tx) => {
+          const records = recordTransactionOver(tx)
+          const now = deps.now()
+          const ledger = await records.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger())
+          const attempts = deployAttemptsOf(ledger, { fingerprint: sick.fingerprint, now, timeZone: config.app.timeZone, limits: config.limits })
+          const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
+          const closing = closingOf(gate, checks)
+          if (closing.kind === 'deploy' && deps.deployer) {
+            const deployment = await deploymentIdIn(records, { caseId, candidateVersion: checkpoint.fixCommit })
+            const admission = await admitAutoDeployIn(records, {
+              fingerprint: sick.fingerprint,
+              deploymentId: deployment.deploymentId,
+              at: now,
+              timeZone: config.app.timeZone,
+              limits: config.limits,
+            })
+            // Те же правила над тем же документом: решение «выкатывать» учёт не отклоняет.
+            if (!admission.admitted) throw new Error(`учёт выкаток не пустил разрешённую выкатку: ${admission.reasons.join(', ')}`)
+            deployment.reserve()
+            await setCaseStateIn(records, caseId, 'deploying')
+            return { status: 'running', checkpoint: { ...checkpoint, phase: 'deploying', gate } }
+          }
+          const { text, outcome } = closeWith(closing.kind, gate)
+          const reportId = await reportIn(records, caseId, closing.caseState, closing.report, redactedWith(knownSecrets, text, checkpoint.baseRunning))
+          reported = true
+          return { status: 'terminal', outcome: { status: 'completed', result: { ...result, gate, ...outcome, reportId } } }
+        }, context)
+        if (reported) deps.onReport()
       },
 
       deploying: async (task, runtime, context) => {
