@@ -1,0 +1,15 @@
+{
+  "name": "example-mini-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Образец приложения со сторожем Ремонтника: две страницы, сбой по переменной EXAMPLE_BUG=crash",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@ykurilov/remontnik-watch": "workspace:*"
+  }
+}
