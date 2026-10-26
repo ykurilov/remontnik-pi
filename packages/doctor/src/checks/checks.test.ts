@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { testRemontnikConfig } from '../testing/index.js'
+import type { EvalProxyRun, EvalProxyRunOptions, EvalSpend } from '../eval-proxy/index.js'
 import { SpoiledCopyError, type CommandRunner, type RunOptions, type RunResult } from '../workbench/index.js'
 import { createChecks, createMemoryEvalBaseCache, parseFailedTests, type EvalBaseCache } from './checks.js'
 
@@ -27,7 +28,8 @@ const config = testRemontnikConfig({
       resultFile: 'eval-result.json',
       repeat: 3,
       maxScenarios: 3,
-      env: ['PATIENT_BUG', 'EVAL_API_KEY'],
+      env: ['PATIENT_BUG'],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'EVAL_API_KEY', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 1, output: 2 } }],
     },
   },
   evalScope: [{ paths: ['src/bot/**'], scenarios: ['price-named-plan', 'greeting'] }],
@@ -51,10 +53,49 @@ interface FakeOptions {
   installOutput?: { exitCode: number; output: string }
   /** Тесты убить не удалось. */
   testsStillRunning?: boolean
+  /** Eval убить не удалось. */
+  evalStillRunning?: boolean
+  /** Расход, который eval пишет в свой файл итога: врач ему не верит. */
+  claimedCostUsd?: number
+}
+
+/** Подставной прокси модели: eval «тратит» через него, как через настоящий. */
+function fakeProxy() {
+  const runs: { options: EvalProxyRunOptions; spentUsd: number; closed: boolean; overBudget: AbortController }[] = []
+  return {
+    runs,
+    openRun(options: EvalProxyRunOptions): EvalProxyRun {
+      const run = { options, spentUsd: 0, closed: false, overBudget: new AbortController() }
+      runs.push(run)
+      const token = `run-token-${runs.length}`
+      const env: Record<string, string> = { [options.tokenEnv]: token }
+      for (const provider of options.providers) {
+        env[provider.baseUrlEnv] = `http://proxy.test/${token}/${provider.name}`
+        env[provider.keyEnv] = token
+      }
+      return {
+        token,
+        env,
+        overBudget: run.overBudget.signal,
+        spentUsd: () => run.spentUsd,
+        close: async () => {
+          run.closed = true
+        },
+      }
+    },
+    /** Eval потратил `usd` через прокси последнего прогона. */
+    spend(usd: number) {
+      const run = runs.at(-1)!
+      run.spentUsd += usd
+      run.options.onSpend?.({ spentUsd: run.spentUsd, pending: 0 })
+      if (run.spentUsd >= run.options.budgetUsd) run.overBudget.abort()
+    },
+  }
 }
 
 function fakeRunner(options: FakeOptions) {
   const calls: { command: string; options: RunOptions }[] = []
+  const proxy = fakeProxy()
   const tests = [...(options.tests ?? [{ exitCode: 0 }])]
   const runner: CommandRunner = {
     isolation: 'none',
@@ -73,11 +114,16 @@ function fakeRunner(options: FakeOptions) {
         const outDir = args[args.indexOf('--out') + 1]!
         const repeats = Number(args[args.indexOf('--repeat') + 1])
         mkdirSync(outDir, { recursive: true })
+        if (options.evalStillRunning) return { exitCode: null, timedOut: true, aborted: false, output: '', stillRunning: true }
         if (options.evalHangsAtCostUsd !== undefined) {
-          writeFileSync(join(outDir, 'eval-result.json'), JSON.stringify({ scenarios: [], costUsd: options.evalHangsAtCostUsd }))
-          await new Promise<void>((resolve) => runOptions.signal?.addEventListener('abort', () => resolve(), { once: true }))
+          proxy.spend(options.evalHangsAtCostUsd)
+          await new Promise<void>((resolve) => {
+            if (runOptions.signal?.aborted) resolve()
+            runOptions.signal?.addEventListener('abort', () => resolve(), { once: true })
+          })
           return { exitCode: null, timedOut: false, aborted: true, output: '' }
         }
+        proxy.spend(options.evalCostUsd ?? 0.1)
         writeFileSync(
           join(outDir, 'eval-result.json'),
           JSON.stringify({
@@ -92,7 +138,7 @@ function fakeRunner(options: FakeOptions) {
                 personaBroken: outcome.personaBroken ?? 0,
               }
             }),
-            costUsd: options.evalCostUsd ?? 0.1,
+            costUsd: options.claimedCostUsd ?? 0,
           }),
         )
         return { exitCode: 0, timedOut: false, aborted: false, output: '' }
@@ -101,7 +147,7 @@ function fakeRunner(options: FakeOptions) {
       return { exitCode: 0, timedOut: false, aborted: false, output: '' }
     },
   }
-  return { runner, calls }
+  return { runner, calls, proxy }
 }
 
 const EVAL_KEY = 'eval-key-example-0000'
@@ -111,10 +157,10 @@ function checksWith(fake: ReturnType<typeof fakeRunner>, baseCache: EvalBaseCach
     runner: fake.runner,
     config,
     evalEnv: { PATIENT_BUG: 'worsening_fix', EVAL_API_KEY: EVAL_KEY, DEEPSEEK_API_KEY: 'test-not-passed' },
+    evalProxy: fake.proxy,
     baseCache,
     workDir,
     timeoutSeconds: 60,
-    costPollMs: 5,
   })
 }
 
@@ -251,17 +297,68 @@ describe('проверки', () => {
     expect(broke.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
   })
 
-  it('eval получает только переменные из настройки', async () => {
+  it('eval получает переменные из настройки, адрес прокси и токен прогона, но не ключ', async () => {
     const fake = fakeRunner({})
     await checksWith(fake).run(runInput())
     const evalRun = fake.calls.find((call) => call.command.startsWith('node eval'))
-    expect(evalRun?.options.env).toEqual({ PATIENT_BUG: 'worsening_fix', EVAL_API_KEY: EVAL_KEY })
+    expect(evalRun?.options.env).toEqual({
+      PATIENT_BUG: 'worsening_fix',
+      CHAT_BASE_URL: 'http://proxy.test/run-token-1/chat',
+      EVAL_API_KEY: 'run-token-1',
+      REMONTNIK_EVAL_TOKEN: 'run-token-1',
+    })
+    expect(JSON.stringify(fake.calls.map((call) => call.options.env))).not.toContain(EVAL_KEY)
+    // Настоящий ключ — только у прокси, по имени из настройки.
+    expect(fake.proxy.runs[0]?.options.providers[0]).toMatchObject({ name: 'chat', key: EVAL_KEY, upstream: 'https://api.example.com/v1' })
+    expect(fake.proxy.runs.every((run) => run.closed)).toBe(true)
   })
 
-  it('стоимость eval складывается', async () => {
-    const fake = fakeRunner({ evalCostUsd: 0.2 })
-    const result = await checksWith(fake).run(runInput())
+  it('расход eval — по прокси, а не по файлу итога; складывается и сообщается по ходу', async () => {
+    const fake = fakeRunner({ evalCostUsd: 0.2, claimedCostUsd: 0.001 })
+    const spends: EvalSpend[] = []
+    const result = await checksWith(fake).run(runInput({ onEvalSpend: (spend: EvalSpend) => spends.push(spend) }))
     expect(result.eval.costUsd).toBeCloseTo(0.4)
+    expect(spends.at(-1)?.spentUsd).toBeCloseTo(0.4)
+    expect(spends.at(-1)?.pending).toBe(0)
+  })
+
+  it('провайдеры есть, а прокси нет → eval не запускается', async () => {
+    const fake = fakeRunner({})
+    const checks = createChecks({ runner: fake.runner, config, evalEnv: { EVAL_API_KEY: EVAL_KEY }, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60 })
+    const result = await checks.run(runInput())
+    expect(result.eval.status).toBe('not_run')
+    expect(result.eval.note).toContain('прокси')
+    expect(fake.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
+  })
+
+  it('ключа провайдера нет у врача → eval не запускается', async () => {
+    const fake = fakeRunner({})
+    const checks = createChecks({ runner: fake.runner, config, evalEnv: {}, evalProxy: fake.proxy, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60 })
+    const result = await checks.run(runInput())
+    expect(result.eval.status).toBe('not_run')
+    expect(result.eval.note).toContain('EVAL_API_KEY')
+  })
+
+  it('правка задела файлы eval или настройки тестов → eval не запускается: скрипты eval только из основы', async () => {
+    const fake = fakeRunner({})
+    const result = await checksWith(fake).run(runInput({ changedPaths: ['src/bot/bot.ts', 'eval/run-eval.ts'] }))
+    expect(result.eval.status).toBe('not_run')
+    expect(result.eval.note).toContain('eval/run-eval.ts')
+    expect(fake.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
+  })
+
+  it('тесты, проверка типов и eval — во внутренней сети; установка — во внешней', async () => {
+    const fake = fakeRunner({})
+    await checksWith(fake).run(runInput())
+    for (const call of fake.calls) {
+      expect(call.options.network).toBe(call.command === 'pnpm install' ? undefined : 'internal')
+    }
+  })
+
+  it('eval не удалось убить → ошибка копии, прогон прокси закрыт', async () => {
+    const fake = fakeRunner({ evalStillRunning: true })
+    await expect(checksWith(fake).run(runInput())).rejects.toBeInstanceOf(SpoiledCopyError)
+    expect(fake.proxy.runs.every((run) => run.closed)).toBe(true)
   })
 
   it('итог eval пишется в папку вне копии, и писать туда может только eval', async () => {
@@ -290,12 +387,13 @@ describe('проверки', () => {
     expect(result.tests.outputTail).not.toContain(EVAL_KEY)
   })
 
-  it('eval потратил свою долю бюджета → врач его прерывает, расход учтён', async () => {
+  it('eval потратил свою долю бюджета → прокси его прерывает, расход учтён', async () => {
     const fake = fakeRunner({ evalHangsAtCostUsd: 0.7 })
     const result = await checksWith(fake).run(runInput({ budgetUsd: 0.6 }))
     expect(result.eval.status).toBe('not_run')
     expect(result.eval.note).toContain('бюджет')
     expect(result.eval.costUsd).toBeCloseTo(0.7)
+    expect(fake.proxy.runs[0]?.options.budgetUsd).toBeCloseTo(0.6)
     expect(fake.calls.find((call) => call.command.startsWith('node eval'))?.options.signal?.aborted).toBe(true)
   })
 })

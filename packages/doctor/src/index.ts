@@ -18,4 +18,5 @@ export {
   type TreatmentResult,
 } from './treatment/index.js'
 export { createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
+export { createEvalProxy, type EvalProxy, type EvalProxyOptions } from './eval-proxy/index.js'
 export { runDoctorCommand, type DoctorCommandIo } from './cli/run-doctor-command.js'

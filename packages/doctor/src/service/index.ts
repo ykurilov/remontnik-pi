@@ -6,6 +6,7 @@ import type { Models } from '@earendil-works/pi-ai'
 import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
+import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '../intake/private-address.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
@@ -54,8 +55,13 @@ export interface DoctorTreatmentOptions {
   allowUnisolatedRunner?: boolean
   /** Коммит рабочей версии; по умолчанию — команда `deploy.commands.current` в основной копии репозитория. */
   currentVersion?: (config: RemontnikConfig) => Promise<string | undefined>
-  /** Окружение, из которого eval берёт свои переменные; по умолчанию — окружение врача. */
+  /** Окружение, из которого eval берёт свои переменные, а прокси — ключи модели; по умолчанию — окружение врача. */
   evalEnv?: Readonly<Record<string, string | undefined>>
+  /**
+   * Прокси модели для eval (`eval-proxy`): слушает там, где его видит внутренняя сеть проверок, `publicUrl` — его адрес
+   * из контейнера. Не задан — eval с провайдерами (`checks.eval.providers`) не запускается.
+   */
+  evalProxy?: { listen: { host: string; port: number }; publicUrl?: string }
   appDescription?: string
   budgetPollMs?: number
 }
@@ -167,6 +173,16 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   })
   reportsRef = reports
 
+  let evalProxy: EvalProxy | undefined
+  if (treatmentOptions?.evalProxy) {
+    try {
+      evalProxy = await createEvalProxy(treatmentOptions.evalProxy)
+    } catch (error) {
+      await opened.close().catch(() => {})
+      throw error
+    }
+  }
+
   let treatment: Treatment | undefined
   if (treatmentOptions && runners) {
     treatment = createTreatment({
@@ -180,6 +196,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       worktreesDir: treatmentOptions.worktreesDir,
       checksDir: join(options.stateDir, 'checks'),
       evalEnv: treatmentOptions.evalEnv ?? process.env,
+      ...(evalProxy ? { evalProxy } : {}),
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
@@ -237,6 +254,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       onError: (error) => log(`[врач] сбой приёма событий: ${describeError(error)}`),
     })
   } catch (error) {
+    await evalProxy?.close()
     await opened.close().catch(() => {})
     throw error
   }
@@ -252,6 +270,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       })
     } catch (error) {
       await intake.close()
+      await evalProxy?.close()
       await opened.close().catch(() => {})
       throw error
     }
@@ -274,6 +293,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       await intake.close()
       await bridgeIntake?.close()
       if (harnessState === 'open') await opened.close().catch((error: unknown) => log(`[врач] Harness не закрылся: ${describeError(error)}`))
+      await evalProxy?.close()
     },
   }
 }

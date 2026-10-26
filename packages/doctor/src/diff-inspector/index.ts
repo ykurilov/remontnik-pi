@@ -17,6 +17,10 @@ export type SuspiciousSignal =
   | 'outside_project'
   | 'special_file_mode'
   | 'patch_unavailable'
+  /** Запись, удаление, переименование файлов: правка могла бы подделать итог проверки. */
+  | 'file_write'
+  /** Переменные `REMONTNIK*`, папка итога eval (`outDir`) или сам файл итога. */
+  | 'remontnik_access'
 
 export interface SuspiciousFinding {
   path: string
@@ -46,6 +50,8 @@ export interface DiffLimits {
 export interface InspectDiffOptions {
   /** Хосты или полные адреса, которые приложению уже известны (например, `browser.allowedOrigins`): новыми не считаются. */
   knownHosts?: readonly string[]
+  /** Имя файла итога eval (`checks.eval.resultFile`): упоминание в правке — обращение к итогу eval. */
+  evalResultFile?: string
 }
 
 // Настройки запуска тестов и eval: их нельзя ни менять, ни добавлять заново.
@@ -105,6 +111,9 @@ const HOME_DIRECTORY = /\bhomedir\s*\(/
 const FILE_CALL_WITH_PARENT_PATH =
   /\b(?:readFile|writeFile|appendFile|readdir|readFileSync|writeFileSync|appendFileSync|readdirSync|createReadStream|createWriteStream|unlink|unlinkSync|rm|rmSync|rmdir|copyFile|rename|mkdir|mkdirSync|open|openSync|stat|existsSync)\s*\(\s*['"`]\.\.[/\\]/
 const SUBMODULE_IN_PATCH = /^Subproject commit\b/
+const FILE_WRITE =
+  /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|rename|renameSync|copyFile|copyFileSync|cpSync|writeSync|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|symlink|symlinkSync|chmod|chmodSync)\s*\(|\bBun\.write\s*\(|\bfs\.write\s*\(|\bopen(?:Sync)?\s*\([^)]*,\s*['"`](?:[wa]|r\+)/
+const REMONTNIK_ACCESS = /\bREMONTNIK\w*|\boutDir\b|eval-result/
 
 const LINK_AND_SUBMODULE_MODES = new Set(['120000', '160000'])
 const EXECUTABLE_MODE = '100755'
@@ -174,7 +183,7 @@ function hostsAlreadyInFile(patch: string): Set<string> {
   return known
 }
 
-function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: ReadonlySet<string>): SuspiciousFinding[] {
+function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: ReadonlySet<string>, evalResultFile: string | undefined): SuspiciousFinding[] {
   const findings: SuspiciousFinding[] = []
   const hostsInFile = hostsAlreadyInFile(patch)
   const report = (signal: SuspiciousSignal, line: string) => findings.push({ path: file.path, signal, line })
@@ -192,6 +201,8 @@ function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: Read
       (host) => !isLocalHost(host) && !knownHosts.has(host) && !hostsInFile.has(host),
     )
     if (isNewExternal) report('new_external_address', line)
+    if (FILE_WRITE.test(line)) report('file_write', line)
+    if (REMONTNIK_ACCESS.test(line) || (evalResultFile && line.includes(evalResultFile))) report('remontnik_access', line)
   }
   return findings
 }
@@ -207,7 +218,7 @@ function isPureRename(file: ChangedFile): boolean {
   return file.status === 'renamed' && file.added === 0 && file.removed === 0
 }
 
-function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySet<string>): SuspiciousFinding[] {
+function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySet<string>, evalResultFile: string | undefined): SuspiciousFinding[] {
   const findings: SuspiciousFinding[] = []
   for (const file of files) {
     if (isOutsideProject(file.path) || (file.previousPath && isOutsideProject(file.previousPath))) {
@@ -223,7 +234,7 @@ function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySe
       if (file.status !== 'deleted' && !isPureRename(file)) findings.push({ path: file.path, signal: 'patch_unavailable', line: '' })
       continue
     }
-    findings.push(...findingsInAddedLines(file, file.patch, knownHosts))
+    findings.push(...findingsInAddedLines(file, file.patch, knownHosts, evalResultFile))
   }
   return findings
 }
@@ -258,7 +269,7 @@ export function inspectDiff(files: readonly ChangedFile[], limits: DiffLimits, o
   const knownHosts = new Set((options.knownHosts ?? []).map(hostOf))
   return {
     existingTestChanges: inspectExistingTests(files),
-    suspicious: inspectSuspicious(files, knownHosts),
+    suspicious: inspectSuspicious(files, knownHosts, options.evalResultFile),
     size: inspectSize(files, limits),
   }
 }

@@ -297,6 +297,26 @@ describe('исполнитель в контейнере', () => {
     expect(mountSources(args!)).toEqual([b.workbench.path, expect.stringContaining(join(b.root, 'homes')), outDir])
   })
 
+  it('проверки во внутренней сети: видно только прокси модели; установка — во внешней', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, network: 'remontnik-install', internalNetwork: 'remontnik-eval' })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    const creates = fake.calls().filter((call) => call[0] === 'create')
+    expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['remontnik-install', 'remontnik-eval'])
+  })
+
+  it('внутренняя сеть не задана → команда для неё не запускается', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    const result = await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    expect(result.exitCode).toBeNull()
+    expect(result.spawnError).toContain('внутренн')
+    expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
+  })
+
   it('по умолчанию лимиты тоже есть', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)

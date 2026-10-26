@@ -67,13 +67,39 @@ const timeZone = z.string().refine((value) => {
   }
 }, 'неизвестный часовой пояс')
 
-const evalSchema = z.strictObject({
-  run: command,
-  resultFile: z.string().min(1),
-  repeat: positiveInt.default(3),
-  maxScenarios: positiveInt.default(3),
-  env: z.array(envName),
+// Ключи провайдеров модели остаются у врача: eval ходит к модели через его прокси (адрес в `baseUrlEnv`,
+// токен прогона вместо ключа в `keyEnv`). Поэтому в `env` — только несекретные переменные.
+const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|PRIVATE/
+
+const evalProviderSchema = z.strictObject({
+  name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'строчные латинские буквы, цифры и дефис: имя идёт в адрес прокси'),
+  baseUrlEnv: envName,
+  keyEnv: envName,
+  upstream: z.url(),
+  authHeader: z.enum(['authorization', 'x-api-key']).default('authorization'),
+  priceUsdPerMTok: z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() }),
 })
+
+const evalSchema = z
+  .strictObject({
+    run: command,
+    resultFile: z.string().min(1),
+    repeat: positiveInt.default(3),
+    maxScenarios: positiveInt.default(3),
+    env: z.array(envName),
+    providers: z.array(evalProviderSchema).default([]),
+    tokenEnv: envName.default('REMONTNIK_EVAL_TOKEN'),
+  })
+  .superRefine((evalConfig, context) => {
+    const proxyNames = new Set([evalConfig.tokenEnv, ...evalConfig.providers.flatMap((provider) => [provider.keyEnv, provider.baseUrlEnv])])
+    evalConfig.env.forEach((name, index) => {
+      if (SECRET_LIKE_ENV.test(name) || proxyNames.has(name)) {
+        context.addIssue({ code: 'custom', path: ['env', index], message: 'секрет в eval не передаётся: ключи модели — через providers и прокси врача' })
+      }
+    })
+    const names = evalConfig.providers.map((provider) => provider.name)
+    if (new Set(names).size !== names.length) context.addIssue({ code: 'custom', path: ['providers'], message: 'имена провайдеров повторяются' })
+  })
 
 const paseoSchema = z.strictObject({
   bridgeUrlEnv: envName,
@@ -165,6 +191,8 @@ export const remontnikConfigSchema = z.strictObject({
     .strictObject({
       modelUsdPerDay: z.number().nonnegative().default(5),
       evalUsdPerDay: z.number().nonnegative().default(5),
+      /** Доля дневного бюджета eval на один случай: столько бронирует проверка правки. */
+      evalUsdPerCase: z.number().nonnegative().default(1),
       autoDeploysPerFingerprintPerDay: z.number().int().nonnegative().default(2),
       autoDeploysPerDay: z.number().int().nonnegative().default(5),
       maxDiffLines: positiveInt.default(300),

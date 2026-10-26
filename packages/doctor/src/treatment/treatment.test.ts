@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -8,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { CaseState } from '../case-book/index.js'
 import { createGitGuard, type GitGuard } from '../git-guard/index.js'
 import { startDoctorService, type DoctorService, type DoctorTreatmentOptions } from '../service/index.js'
+import type { RemontnikConfigInput } from '@ykurilov/remontnik-core/config'
 import { testRemontnikConfig } from '../testing/config.js'
 import { callTool, callTools, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
 import { createLocalRunner, type CommandRunner } from '../workbench/index.js'
@@ -32,6 +35,21 @@ test('цена тарифа по умолчанию', () => assert.equal(price()
 const SECRET_TEXT = 'closed-secret-value'
 // Похоже на ключ модели; собрано по частям, чтобы проверка публичности не приняла тест за утечку.
 const LEAKED_KEY = ['sk', 'example0000000000000000'].join('-')
+// Eval приложения: один запрос к модели по адресу и ключу из окружения, итог — в {outDir}.
+const EVAL_SCRIPT = `import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+const [scenarios, maxCost, outDir] = process.argv.slice(2)
+const key = process.env.CHAT_API_KEY ?? ''
+const response = await fetch(process.env.CHAT_BASE_URL + '/chat/completions', {
+  method: 'POST',
+  headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' },
+  body: JSON.stringify({ maxCost, key }),
+})
+await response.text()
+const results = scenarios.split(',').map((id) => ({ id, repeats: 1, pass: 1, fail: 0, standBroken: 0, personaBroken: 0 }))
+writeFileSync(join(outDir, 'result.json'), JSON.stringify({ costUsd: 0, scenarios: results }))
+`
+const MODEL_KEY = ['model', 'key', 'example', '0000', '0000'].join('-')
 const FINAL_STATES: CaseState[] = ['report_only', 'no_cause_found', 'stand_broken', 'needs_human']
 
 const dirs: string[] = []
@@ -73,7 +91,10 @@ function repo() {
 type Repo = ReturnType<typeof repo>
 
 interface DoctorOptions {
-  limits?: { diagnoseUsdPerCase?: number; modelUsdPerDay?: number }
+  limits?: { diagnoseUsdPerCase?: number; modelUsdPerDay?: number; evalUsdPerDay?: number; evalUsdPerCase?: number }
+  /** Проверки и карта eval приложения. */
+  checks?: RemontnikConfigInput['checks']
+  evalScope?: RemontnikConfigInput['evalScope']
   /** Команда `deploy.commands.current`; по умолчанию её скрипта нет, и рабочая версия неизвестна. */
   current?: string
   wrapGuard?: (guard: GitGuard) => GitGuard
@@ -95,7 +116,8 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
   const base = testRemontnikConfig()
   const config = testRemontnikConfig({
     workbench: { image: 'node:22', install: 'true', bashTimeoutMs: 30_000 },
-    checks: { test: 'node --test test/*.test.mjs' },
+    checks: options.checks ?? { test: 'node --test test/*.test.mjs' },
+    evalScope: options.evalScope ?? [],
     closedPaths: ['secret/**'],
     limits: { diagnoseUsdPerCase: 1, ...options.limits },
     deploy: { ...base.deploy, commands: { ...base.deploy.commands, ...(options.current ? { current: options.current } : {}) } },
@@ -120,6 +142,23 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
       ...options.treatment,
     } as DoctorTreatmentOptions,
   }
+}
+
+/** Подставной провайдер модели: запоминает ключ и тело, отвечает расходом 100 000 токенов входа. */
+async function startModelUpstream() {
+  const seen: { authorization: string | undefined; body: Record<string, string> }[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      seen.push({ authorization: request.headers.authorization, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, string> })
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ choices: [], usage: { prompt_tokens: 100_000, completion_tokens: 0 } }))
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, seen }
 }
 
 async function startDoctor(r: Repo, model: ScriptedModel, options: DoctorOptions = {}): Promise<DoctorService> {
@@ -374,6 +413,30 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(report?.full).toContain('test/price.test.mjs')
   }, 60_000)
 
+  it('правка пишет в файлы или читает окружение → не проверяется и не отправляется, нужен человек', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    const sneaky = `${FIXED}import { writeFileSync } from 'node:fs'\nwriteFileSync('verdict.json', JSON.stringify({ pass: 3, token: process.env.REMONTNIK_EVAL_TOKEN }))\n`
+    model.script(
+      ...diagnosisSteps(),
+      callTool('write', { path: 'src/price.mjs', content: sneaky }),
+      callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: [] }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('report_only')
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*')).toBe('')
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('needs_human')
+    expect(report?.short).toContain('подозрительн')
+    expect(report?.full).toContain('file_write')
+    expect(report?.full).toContain('remontnik_access')
+    expect(report?.full).toContain('environment_access')
+  }, 60_000)
+
   it('модель подменила .git в копии → случай остановлен, отчёт о попытке выхода', async () => {
     const r = repo()
     const model = createScriptedModel()
@@ -473,5 +536,45 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(second.requests).toHaveLength(0)
     const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
     expect(report?.short).toContain('дневной бюджет')
+  }, 60_000)
+  it('eval ходит к модели через прокси врача: ключа в eval нет, бронь — доля случая, расход — по прокси', async () => {
+    const r = repo()
+    writeFiles(r.repoDir, { 'eval/run.mjs': EVAL_SCRIPT })
+    git(r.repoDir, 'add', '-A')
+    git(r.repoDir, 'commit', '-m', 'eval')
+    git(r.repoDir, 'push', 'origin', 'main')
+    const upstream = await startModelUpstream()
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model, {
+      limits: { diagnoseUsdPerCase: 1, evalUsdPerDay: 5, evalUsdPerCase: 0.5 },
+      checks: {
+        test: 'node --test test/*.test.mjs',
+        eval: {
+          run: 'node eval/run.mjs {scenarios} {maxCostUsd} {outDir}',
+          resultFile: 'result.json',
+          env: [],
+          providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: upstream.url, priceUsdPerMTok: { input: 1, output: 1 } }],
+        },
+      },
+      evalScope: [{ paths: ['src/**'], scenarios: ['price'] }],
+      treatment: { evalEnv: { CHAT_API_KEY: MODEL_KEY }, evalProxy: { listen: { host: '127.0.0.1', port: 0 } } },
+    })
+
+    await doctor.receiveEvents([priceCrash()])
+    await settledCase(doctor)
+
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('fix_ready')
+    // Кандидат и основа: каждый — один запрос к модели по $0.1.
+    expect(upstream.seen).toHaveLength(2)
+    for (const seen of upstream.seen) {
+      expect(seen.authorization).toBe(`Bearer ${MODEL_KEY}`)
+      expect(seen.body.key).not.toBe(MODEL_KEY)
+      expect(seen.body.key).not.toBe('')
+    }
+    expect(upstream.seen.map((seen) => seen.body.maxCost)).toEqual(['0.5', '0.4'])
+    expect(report?.full).toContain('расход $0.2')
+    expect(report?.full).not.toContain(MODEL_KEY)
   }, 60_000)
 })

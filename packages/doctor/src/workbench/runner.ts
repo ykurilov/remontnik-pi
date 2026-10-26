@@ -21,6 +21,8 @@ export interface RunOptions {
   timeoutSeconds: number
   onOutput?: (text: string, stream: 'stdout' | 'stderr') => void
   signal?: AbortSignal
+  /** `internal` — внутренняя сеть проверок, где видно только прокси модели и службы тестов. По умолчанию — внешняя. */
+  network?: 'internal'
 }
 
 export interface RunResult {
@@ -223,6 +225,11 @@ export interface DockerRunnerOptions {
   homesDir: string
   /** Сеть контейнера: нужна для установки пакетов, но не внутренняя сеть приложения. По умолчанию `bridge`. */
   network?: string
+  /**
+   * Внутренняя сеть Docker (`internal: true`) для тестов, проверки типов и eval: выхода наружу нет, видны только
+   * прокси модели и службы тестов приложения. Не задана — такие команды не запускаются.
+   */
+  internalNetwork?: string
   /** Пользователь в контейнере; по умолчанию — тот же, что у врача, чтобы файлы копии оставались его. */
   user?: string
   /** Лимит памяти контейнера (без подкачки). По умолчанию `4g`. */
@@ -271,6 +278,7 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
       const inCopy = relative(copyDir, resolve(runOptions.cwd))
       if (inCopy.startsWith('..') || isAbsolute(inCopy)) return failed(`папка ${runOptions.cwd} вне копии ${copyDir}`)
       if (existsSync(spoiledMark(copyDir))) return failed(new SpoiledCopyError(copyDir).message)
+      if (runOptions.network === 'internal' && !options.internalNetwork) return failed('внутренняя сеть проверок не задана (internalNetwork)')
       const name = `remontnik-${randomBytes(6).toString('hex')}`
       const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
       const envFile = join(envDir, 'env')
@@ -284,7 +292,7 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
           home: homeOf(options.homesDir, copyDir),
           workdir: resolve(runOptions.cwd),
           writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
-          network: options.network ?? 'bridge',
+          network: runOptions.network === 'internal' ? options.internalNetwork! : (options.network ?? 'bridge'),
           ...(user ? { user } : {}),
           envFile,
           memory: options.memory ?? '4g',

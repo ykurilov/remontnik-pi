@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
+import { isRunnerConfigOrEvalPath } from '../diff-inspector/index.js'
+import type { EvalProxy, EvalProxyProvider, EvalSpend } from '../eval-proxy/index.js'
 import { SpoiledCopyError, type CommandRunner, type RunResult } from '../workbench/index.js'
 import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 
@@ -10,9 +12,11 @@ import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 // Упавшие тесты повторяются один раз: разный итог = flaky. Eval сравнивается с основой по каждому сценарию,
 // итог основы кэшируется по паре (коммит, сценарий).
 //
-// Ключи eval получает только процесс eval. Итог eval лежит вне копий, и писать туда может только он.
-// Расход eval сверяется с его долей бюджета, пока он идёт: превысил — прогон прерывается.
-// Хвосты вывода и заметки вычищаются от ключей до того, как попадут в отчёт.
+// Ключи модели в контейнер eval не попадают: eval ходит к модели через прокси врача (`eval-proxy`) с токеном
+// прогона. Прокси сам считает расход и прерывает eval, когда его доля бюджета кончилась; `costUsd` из файла
+// итога не читается — его пишет код правки. Скрипты eval — только из основы: правка, задевшая их, eval не
+// запускает. Тесты, проверка типов и eval идут во внутренней сети (видно только прокси); установка — во внешней.
+// Итог eval лежит вне копий, и писать туда может только он. Хвосты вывода и заметки вычищаются от ключей.
 
 export interface EvalScenarioResult {
   id: string
@@ -71,15 +75,15 @@ export function createMemoryEvalBaseCache(): EvalBaseCache {
 export interface ChecksOptions {
   runner: CommandRunner
   config: RemontnikConfig
-  /** Окружение врача, из которого eval получает только переменные `checks.eval.env`. */
+  /** Окружение врача: eval получает из него переменные `checks.eval.env`, прокси — ключи `providers[].keyEnv`. */
   evalEnv: Readonly<Record<string, string | undefined>>
+  /** Прокси модели; без него eval с провайдерами не запускается. */
+  evalProxy?: Pick<EvalProxy, 'openRun'>
   baseCache: EvalBaseCache
   /** Папка для итогов eval (`{outDir}`), вне копий: команды правки до неё не дотягиваются. */
   workDir: string
   /** Тайм-аут одной команды. */
   timeoutSeconds: number
-  /** Как часто сверять расход идущего eval с его бюджетом. */
-  costPollMs?: number
   now?: () => number
 }
 
@@ -92,12 +96,13 @@ export interface ChecksInput {
   changedPaths: readonly string[]
   /** Сколько денег можно потратить на eval в этом прогоне. */
   budgetUsd: number
+  /** Расход eval по прокси за все прогоны этой проверки — по ходу, для дневного учёта. */
+  onEvalSpend?: (spend: EvalSpend) => void
 }
 
 const FAILED_LINE = /^REMONTNIK_FAILED=(.*)$/m
 const TESTCASE = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g
 const OUTPUT_TAIL_CHARS = 4_000
-const COST_POLL_MS = 2_000
 
 function xmlAttribute(attributes: string, name: string): string | undefined {
   const match = attributes.match(new RegExp(`\\b${name}="([^"]*)"`))
@@ -155,26 +160,31 @@ interface EvalRun {
 export function createChecks(options: ChecksOptions) {
   const now = options.now ?? Date.now
   const { config } = options
-  const evalSecrets = Object.values(evalEnv()).filter((value) => value.length >= 8)
+  const evalSecrets = [...Object.values(evalEnv()), ...(config.checks.eval?.providers ?? []).flatMap((provider) => options.evalEnv[provider.keyEnv] ?? [])].filter(
+    (value) => value.length >= 8,
+  )
 
   function tail(output: string): string {
     return redactSecrets(output, { knownSecrets: evalSecrets }).slice(-OUTPUT_TAIL_CHARS)
   }
 
   /** Команда в копии `cwd`; писать вне копии можно только в `writableDirs`. Неубитая команда — копии и итогам не верим. */
-  async function run(command: string, cwd: string, extra: { env?: Record<string, string>; writableDirs?: string[]; signal?: AbortSignal } = {}): Promise<RunResult> {
-    const result = await options.runner.run(command, { cwd, copyDir: cwd, env: extra.env ?? {}, timeoutSeconds: options.timeoutSeconds, ...(extra.writableDirs ? { writableDirs: extra.writableDirs } : {}), ...(extra.signal ? { signal: extra.signal } : {}) })
+  async function run(
+    command: string,
+    cwd: string,
+    extra: { env?: Record<string, string>; writableDirs?: string[]; signal?: AbortSignal; network?: 'internal' } = {},
+  ): Promise<RunResult> {
+    const result = await options.runner.run(command, {
+      cwd,
+      copyDir: cwd,
+      env: extra.env ?? {},
+      timeoutSeconds: options.timeoutSeconds,
+      ...(extra.writableDirs ? { writableDirs: extra.writableDirs } : {}),
+      ...(extra.signal ? { signal: extra.signal } : {}),
+      ...(extra.network ? { network: extra.network } : {}),
+    })
     if (result.stillRunning) throw new SpoiledCopyError(cwd)
     return result
-  }
-
-  function readCostUsd(file: string): number | undefined {
-    try {
-      const record = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
-      return typeof record.costUsd === 'number' && record.costUsd >= 0 ? record.costUsd : undefined
-    } catch {
-      return undefined
-    }
   }
 
   function failedStep(name: string, result: RunResult, startedAt: number): TestsOutcome {
@@ -187,13 +197,13 @@ export function createChecks(options: ChecksOptions) {
     const install = await run(config.workbench.install, dir)
     if (install.exitCode !== 0) return failedStep('install', install, startedAt)
     if (config.checks.typecheck) {
-      const typecheck = await run(config.checks.typecheck, dir)
+      const typecheck = await run(config.checks.typecheck, dir, { network: 'internal' })
       if (typecheck.exitCode !== 0) return failedStep('typecheck', typecheck, startedAt)
     }
-    const first = await run(config.checks.test, dir)
+    const first = await run(config.checks.test, dir, { network: 'internal' })
     if (first.exitCode === 0) return { status: 'green', failed: [], durationMs: now() - startedAt }
     const firstFailed = parseFailedTests(first.output)
-    const second = await run(config.checks.test, dir)
+    const second = await run(config.checks.test, dir, { network: 'internal' })
     if (second.exitCode === 0) return { status: 'flaky', failed: firstFailed, durationMs: now() - startedAt }
     const failed = parseFailedTests(second.output)
     const names = failed.length > 0 ? failed : firstFailed
@@ -214,7 +224,25 @@ export function createChecks(options: ChecksOptions) {
     return env
   }
 
-  async function runEval(dir: string, label: string, scenarios: readonly string[], maxCostUsd: number): Promise<EvalRun> {
+  /** Провайдеры с ключами из окружения врача; ключа нет — имя переменной для заметки. */
+  function evalProviders(): { providers: EvalProxyProvider[]; missing?: string } {
+    const providers: EvalProxyProvider[] = []
+    for (const provider of config.checks.eval?.providers ?? []) {
+      const key = options.evalEnv[provider.keyEnv]
+      if (!key) return { providers, missing: provider.keyEnv }
+      providers.push({ ...provider, key })
+    }
+    return { providers }
+  }
+
+  async function runEval(
+    dir: string,
+    label: string,
+    scenarios: readonly string[],
+    maxCostUsd: number,
+    providers: EvalProxyProvider[],
+    onSpend: (spentUsd: EvalSpend) => void,
+  ): Promise<EvalRun> {
     const evalConfig = config.checks.eval!
     mkdirSync(options.workDir, { recursive: true })
     const outDir = mkdtempSync(join(options.workDir, `eval-${label}-`))
@@ -223,28 +251,29 @@ export function createChecks(options: ChecksOptions) {
       .replaceAll('{repeat}', String(evalConfig.repeat))
       .replaceAll('{maxCostUsd}', formatUsd(maxCostUsd))
       .replaceAll('{outDir}', shellWord(outDir))
-    const resultFile = join(outDir, evalConfig.resultFile)
-    const cutoff = new AbortController()
-    const watcher = setInterval(() => {
-      if ((readCostUsd(resultFile) ?? 0) >= maxCostUsd) cutoff.abort()
-    }, options.costPollMs ?? COST_POLL_MS)
+    const proxyRun = providers.length > 0 ? options.evalProxy!.openRun({ providers, tokenEnv: evalConfig.tokenEnv, budgetUsd: maxCostUsd, onSpend }) : undefined
     let result: RunResult
     try {
-      result = await run(command, dir, { env: evalEnv(), writableDirs: [outDir], signal: cutoff.signal })
+      result = await run(command, dir, {
+        env: { ...evalEnv(), ...proxyRun?.env },
+        writableDirs: [outDir],
+        network: 'internal',
+        ...(proxyRun ? { signal: proxyRun.overBudget } : {}),
+      })
     } finally {
-      clearInterval(watcher)
+      await proxyRun?.close()
     }
-    if (cutoff.signal.aborted) {
-      return { ok: false, overBudget: true, scenarios: [], costUsd: readCostUsd(resultFile) ?? maxCostUsd, note: `eval (${label}) прерван: потратил свой бюджет $${formatUsd(maxCostUsd)}` }
+    const costUsd = proxyRun?.spentUsd() ?? 0
+    if (proxyRun?.overBudget.aborted) {
+      return { ok: false, overBudget: true, scenarios: [], costUsd, note: `eval (${label}) прерван: потратил свой бюджет $${formatUsd(maxCostUsd)}` }
     }
     let parsed: unknown
     try {
-      parsed = JSON.parse(readFileSync(resultFile, 'utf8'))
+      parsed = JSON.parse(readFileSync(join(outDir, evalConfig.resultFile), 'utf8'))
     } catch {
-      return { ok: false, scenarios: [], costUsd: 0, note: `eval (${label}) не оставил итог: код ${result.exitCode ?? '—'}\n${tail(result.output)}` }
+      return { ok: false, scenarios: [], costUsd, note: `eval (${label}) не оставил итог: код ${result.exitCode ?? '—'}\n${tail(result.output)}` }
     }
     const record = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>
-    const costUsd = typeof record.costUsd === 'number' && record.costUsd >= 0 ? record.costUsd : 0
     if (!Array.isArray(record.scenarios) || !record.scenarios.every(isScenarioResult)) {
       return { ok: false, scenarios: [], costUsd, note: `итог eval (${label}) не по контракту` }
     }
@@ -262,8 +291,17 @@ export function createChecks(options: ChecksOptions) {
     const truncated = selection.truncated ? { truncated: true } : {}
     if (tests.status !== 'green') return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'тесты не зелёные' }
     if (input.budgetUsd <= 0) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'на eval не осталось денег' }
+    const touched = input.changedPaths.filter((path) => isRunnerConfigOrEvalPath(path))
+    if (touched.length > 0) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: `правка задела eval или настройку тестов: ${touched.join(', ')}` }
+    const { providers, missing } = evalProviders()
+    if (missing) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: `у врача нет ключа модели для eval (${missing})` }
+    if (providers.length > 0 && !options.evalProxy) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'прокси модели для eval не включён' }
 
-    const candidate = await runEval(input.candidateDir, 'candidate', selection.scenarios, input.budgetUsd)
+    // Расход прошлых прогонов этой проверки + текущего: дневной учёт видит итог по ходу.
+    let settledUsd = 0
+    const onSpend = (spend: EvalSpend) => input.onEvalSpend?.({ spentUsd: settledUsd + spend.spentUsd, pending: spend.pending })
+    const candidate = await runEval(input.candidateDir, 'candidate', selection.scenarios, input.budgetUsd, providers, onSpend)
+    settledUsd = candidate.costUsd
     let costUsd = candidate.costUsd
     if (candidate.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: candidate.note! }
     if (!candidate.ok) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, ...(candidate.note ? { note: candidate.note } : {}) }
@@ -278,13 +316,13 @@ export function createChecks(options: ChecksOptions) {
         if (cached) base.set(id, cached)
       }
     }
-    const missing = runAll ? [ALL_SCENARIOS] : ids.filter((id) => !base.has(id))
-    if (missing.length > 0) {
+    const missingScenarios = runAll ? [ALL_SCENARIOS] : ids.filter((id) => !base.has(id))
+    if (missingScenarios.length > 0) {
       const remaining = input.budgetUsd - costUsd
       if (remaining <= 0) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: 'на eval основы не осталось денег' }
       const baseInstall = await run(config.workbench.install, input.baseDir)
       if (baseInstall.exitCode !== 0) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `установка зависимостей основы: код ${baseInstall.exitCode ?? '—'}` }
-      const baseRun = await runEval(input.baseDir, 'base', missing, remaining)
+      const baseRun = await runEval(input.baseDir, 'base', missingScenarios, remaining, providers, onSpend)
       costUsd += baseRun.costUsd
       if (baseRun.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: baseRun.note! }
       if (!baseRun.ok) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, ...(baseRun.note ? { note: baseRun.note } : {}) }

@@ -1,6 +1,7 @@
 import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
+import type { SuspiciousFinding } from '../diff-inspector/index.js'
 import type { ProtectedChange } from '../treatment/protected-changes.js'
 
 // Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
@@ -146,6 +147,7 @@ export type NeedsHumanReason =
   | { kind: 'protected_paths'; changes: readonly ProtectedChange[]; branch: string }
   | { kind: 'escape'; detail: string }
   | { kind: 'spoiled'; detail: string }
+  | { kind: 'suspicious'; findings: readonly SuspiciousFinding[]; branch: string }
   | { kind: 'eval_worse'; branch: string; checks: ChecksResult }
 
 /** Врач остановился и ничего не выкатит: правку должен посмотреть человек. */
@@ -159,6 +161,8 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
         return 'модель пыталась выбраться из верстака: копия подменена, лечение остановлено'
       case 'spoiled':
         return 'команда в копии не остановлена, копия испорчена: я ничего не коммитил, лечение остановлено'
+      case 'suspicious':
+        return `в правке подозрительный код (${[...new Set(reason.findings.map((finding) => finding.path))].join(', ')}): я её не проверял и не отправлял`
       case 'eval_worse':
         return `правка в ветке ${reason.branch} проходит тесты, но ${evalShort(reason.checks.eval)}`
     }
@@ -172,6 +176,9 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
     ...(input.fix ? [`Правка: ${input.fix.summary}`] : []),
     ...(reason.kind === 'protected_paths' ? ['Защищённые пути:', ...reason.changes.map((change) => `- ${change.path}: ${change.why}`), `Ветка (только у врача): ${reason.branch}`] : []),
     ...(reason.kind === 'escape' ? [`Что нашёл git-замок: ${reason.detail}`] : []),
+    ...(reason.kind === 'suspicious'
+      ? ['Подозрительное:', ...reason.findings.map((finding) => `- ${finding.path}: ${finding.signal}${finding.line ? ` — ${finding.line.trim().slice(0, 200)}` : ''}`), `Ветка (только у врача): ${reason.branch}`]
+      : []),
     ...(reason.kind === 'spoiled' ? [`Что случилось: ${reason.detail}. Контейнер надо остановить вручную, копию — удалить.`] : []),
     ...(reason.kind === 'eval_worse' ? checksLines(reason.checks) : []),
   ].join('\n')

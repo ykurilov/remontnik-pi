@@ -15,6 +15,8 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { Case, CaseState } from '../case-book/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
+import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
+import { inspectDiff } from '../diff-inspector/index.js'
 import { GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
@@ -26,7 +28,18 @@ import { durableTxOf, recordFamilyOf, recordTransactionOver } from '../service/h
 import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
 import { findProtectedChanges } from './protected-changes.js'
-import { emptySpendDay, evalSpentUsd, modelSpentUsd, spendDayKey, type CaseSpend, type SpendDay } from './spend.js'
+import {
+  closeInterruptedEval,
+  emptySpendDay,
+  evalCaseBudgetUsd,
+  modelSpentUsd,
+  recordEvalObserved,
+  settleEvalWithProxyFact,
+  spendDayKey,
+  type CaseSpend,
+  type EvalReservation,
+  type SpendDay,
+} from './spend.js'
 import { doctorToolGuard, doctorTools } from './tools.js'
 
 // Задача лечения `remontnik.treatment` (R1). Фазы — чекпойнты pi-durable: перезапуск врача продолжает
@@ -67,7 +80,7 @@ export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
   /** Почему нужен человек. */
-  why?: 'protected_paths' | 'escape' | 'spoiled' | 'eval_worse'
+  why?: 'protected_paths' | 'suspicious' | 'escape' | 'spoiled' | 'eval_worse'
   reportId: number
   branch?: string
   fixCommit?: string
@@ -90,7 +103,10 @@ export interface TreatmentDeps {
   worktreesDir: string
   /** Папка для итогов eval. */
   checksDir: string
+  /** Окружение врача: несекретные переменные eval и ключи провайдеров модели (их видит только прокси). */
   evalEnv: Readonly<Record<string, string | undefined>>
+  /** Прокси модели для eval; без него eval с провайдерами не запускается. */
+  evalProxy?: Pick<EvalProxy, 'openRun'>
   evalBaseCache: EvalBaseCache
   appDescription?: string
   /** Как часто сверять расход модели с потолком. */
@@ -159,7 +175,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   ): Promise<void> {
     // Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo.
     const config = await deps.loadConfig()
-    const knownSecrets = (config.checks.eval?.env ?? []).flatMap((name) => deps.evalEnv[name] ?? [])
+    const evalNames = [...(config.checks.eval?.env ?? []), ...(config.checks.eval?.providers ?? []).map((provider) => provider.keyEnv)]
+    const knownSecrets = evalNames.flatMap((name) => deps.evalEnv[name] ?? [])
     const short = redactSecrets(text.short, { knownSecrets })
     const full = redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets })
     await runtime.commit(async (tx) => {
@@ -255,7 +272,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return { commit: await deps.guard.resolve(`origin/${config.repo.mainBranch}`), running: false }
   }
 
-  /** Бронь eval на остаток дневного бюджета. Незакрытая бронь от прерванного прогона считается потраченной целиком. */
+  /** Бронь eval: доля случая, не больше остатка дня. Брони прогонов, прерванных перезапуском, закрываются фактом прокси. */
   async function reserveEval(runtime: Runtime, caseId: number, config: RemontnikConfig, context: Context): Promise<{ day: string; id: string; budgetUsd: number }> {
     const dayKey = spendDayKey(deps.now(), config.app.timeZone)
     let reservation = { day: dayKey, id: '', budgetUsd: 0 }
@@ -263,12 +280,11 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       const day = await recordTransactionOver(tx).doc<SpendDay>('spend', dayKey, emptySpendDay())
       let attempt = 0
       while (day.eval[`case-${caseId}-${attempt}`]) {
-        const earlier = day.eval[`case-${caseId}-${attempt}`]!
-        earlier.actualUsd ??= earlier.reservedUsd
+        closeInterruptedEval(day.eval[`case-${caseId}-${attempt}`]!)
         attempt += 1
       }
       const id = `case-${caseId}-${attempt}`
-      const budgetUsd = Math.max(0, config.limits.evalUsdPerDay - evalSpentUsd(day))
+      const budgetUsd = evalCaseBudgetUsd(day, config.limits)
       day.eval[id] = { reservedUsd: budgetUsd }
       reservation = { day: dayKey, id, budgetUsd }
       return undefined
@@ -276,13 +292,34 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return reservation
   }
 
-  async function settleEval(runtime: Runtime, reservation: { day: string; id: string }, actualUsd: number, context: Context): Promise<void> {
+  async function updateReservation(runtime: Runtime, reservation: { day: string; id: string }, context: Context, change: (item: EvalReservation) => void): Promise<void> {
     await runtime.commit(async (tx) => {
-      const day = await recordTransactionOver(tx).doc<SpendDay>('spend', reservation.day, emptySpendDay())
-      const item = day.eval[reservation.id]
-      if (item) item.actualUsd = actualUsd
+      const item = (await recordTransactionOver(tx).doc<SpendDay>('spend', reservation.day, emptySpendDay())).eval[reservation.id]
+      if (item) change(item)
       return undefined
     }, context)
+  }
+
+  /** Расход eval по прокси — в бронь по ходу, по одной записи за раз; последняя запись важнее промежуточных. */
+  function evalSpendRecorder(runtime: Runtime, reservation: { day: string; id: string }, context: Context) {
+    let latest: EvalSpend | undefined
+    let unwritten: EvalSpend | undefined
+    let chain = Promise.resolve()
+    return {
+      latest: () => latest,
+      record(spend: EvalSpend) {
+        latest = spend
+        unwritten = spend
+        chain = chain
+          .then(async () => {
+            const next = unwritten
+            unwritten = undefined
+            if (next) await updateReservation(runtime, reservation, context, (item) => recordEvalObserved(item, next))
+          })
+          .catch((error: unknown) => runtime.report(error))
+      },
+      flush: () => chain,
+    }
   }
 
   /**
@@ -425,10 +462,22 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           }
           const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
           const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
-          const protectedChanges = findProtectedChanges(await deps.loadConfig(), files)
+          const config = await deps.loadConfig()
+          const protectedChanges = findProtectedChanges(config, files)
           if (protectedChanges.length > 0) {
             const text = needsHumanReport({ case: doc.case, diagnosis, fix, reason: { kind: 'protected_paths', changes: protectedChanges, branch: treating.branch } })
             const result = { outcome: 'needs_human', why: 'protected_paths', branch: treating.branch, fixCommit, changedPaths } as const
+            await finish(runtime, caseId, 'report_only', 'needs_human', text, result, context, treating.baseRunning)
+            return
+          }
+          // Запись в файлы, окружение, новые адреса, Ремонтник и итог eval: правка могла бы подделать проверку.
+          const suspicious = inspectDiff(files, config.limits, {
+            knownHosts: config.browser?.allowedOrigins ?? [],
+            ...(config.checks.eval ? { evalResultFile: config.checks.eval.resultFile } : {}),
+          }).suspicious
+          if (suspicious.length > 0) {
+            const text = needsHumanReport({ case: doc.case, diagnosis, fix, reason: { kind: 'suspicious', findings: suspicious, branch: treating.branch } })
+            const result = { outcome: 'needs_human', why: 'suspicious', branch: treating.branch, fixCommit, changedPaths } as const
             await finish(runtime, caseId, 'report_only', 'needs_human', text, result, context, treating.baseRunning)
             return
           }
@@ -447,7 +496,6 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
         let checks = (await runtime.memo<JsonValue>('checks', context)) as ChecksResult | undefined
         if (!checks) await stopOnBrokenWorkbench(runtime, caseId, checkpoint, context, async () => {
-          const reservation = await reserveEval(runtime, caseId, config, context)
           // Проверки идут в своих копиях на закоммиченной правке и на основе: мусор модели в верстаке им не мешает.
           const closed = (await deps.guard.listFiles(checkpoint.baseCommit)).filter((file) => matchesAnyMask(config.closedPaths, file))
           const candidateDir = join(deps.worktreesDir, `case-${caseId}-candidate`)
@@ -455,11 +503,16 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           // Копии проверок всегда заново: после сбоя в старых мог остаться мусор прошлого прогона.
           await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed, fresh: true })
           await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed, fresh: true })
+          // Бронь — прямо перед проверками: открытая бронь всегда закрывается в finally или после перезапуска.
+          const reservation = await reserveEval(runtime, caseId, config, context)
+          const evalSpend = evalSpendRecorder(runtime, reservation, context)
+          let settled = false
           try {
             const result = await createChecks({
               runner: deps.checksRunner,
               config,
               evalEnv: deps.evalEnv,
+              ...(deps.evalProxy ? { evalProxy: deps.evalProxy } : {}),
               baseCache: deps.evalBaseCache,
               workDir: deps.checksDir,
               timeoutSeconds: Math.max(1, Math.ceil(config.workbench.bashTimeoutMs / 1000)),
@@ -469,10 +522,18 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               baseCommit: checkpoint.baseCommit,
               changedPaths: checkpoint.changedPaths,
               budgetUsd: reservation.budgetUsd,
+              onEvalSpend: evalSpend.record,
             })
-            await settleEval(runtime, reservation, result.eval.costUsd, context)
+            await evalSpend.flush()
+            await updateReservation(runtime, reservation, context, (item) => (item.actualUsd = result.eval.costUsd))
+            settled = true
             checks = (await runtime.memo('checks', result as unknown as JsonValue, context)) as unknown as ChecksResult
           } finally {
+            // Проверка упала: бронь закрывается тем, что досчитал прокси, а не сгорает целиком.
+            if (!settled) {
+              await evalSpend.flush()
+              await updateReservation(runtime, reservation, context, (item) => settleEvalWithProxyFact(item, evalSpend.latest())).catch((error: unknown) => runtime.report(error))
+            }
             await deps.guard.removeWorktree(candidateDir).catch(() => {})
             await deps.guard.removeWorktree(baseDir).catch(() => {})
           }

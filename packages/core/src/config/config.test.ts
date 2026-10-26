@@ -80,7 +80,7 @@ describe('defineRemontnikConfig', () => {
 
   it('подставляет значения по умолчанию для eval, review и Paseo', () => {
     const input = minimalConfig()
-    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: ['EVAL_KEY'] }
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: ['EVAL_MODE'] }
     input.review = { botDescription: 'бот помогает с тарифами' }
     input.handoff = {
       mode: 'paseo-first',
@@ -89,9 +89,35 @@ describe('defineRemontnikConfig', () => {
 
     const config = defineRemontnikConfig(input)
 
-    expect(config.checks.eval).toMatchObject({ repeat: 3, maxScenarios: 3 })
+    expect(config.checks.eval).toMatchObject({ repeat: 3, maxScenarios: 3, providers: [], tokenEnv: 'REMONTNIK_EVAL_TOKEN' })
+    expect(config.limits.evalUsdPerCase).toBe(1)
     expect(config.review?.minConfidence).toBe(0.7)
     expect(config.handoff.paseo).toMatchObject({ acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 })
+  })
+
+  it('провайдеры модели для eval: ключ — имя переменной у врача, в контейнер идут адрес прокси и токен', () => {
+    const input = minimalConfig()
+    input.checks.eval = {
+      run: 'eval {scenarios}',
+      resultFile: 'result.json',
+      env: ['EVAL_MODE'],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 0.5, output: 2 } }],
+    }
+    const config = defineRemontnikConfig(input)
+    expect(config.checks.eval?.providers[0]).toMatchObject({ name: 'chat', authHeader: 'authorization' })
+  })
+
+  it.each([
+    ['ключ в eval.env', { env: ['EVAL_API_KEY'] }],
+    ['токен в eval.env', { env: ['BOT_TOKEN'] }],
+    ['пароль в eval.env', { env: ['DB_PASSWORD'] }],
+    ['секрет в eval.env', { env: ['APP_SECRET'] }],
+    ['переменная ключа провайдера в eval.env', { env: ['CHAT_KEY_NAME'], providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_KEY_NAME', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 1, output: 1 } }] }],
+    ['имя провайдера не для адреса', { env: [], providers: [{ name: 'Chat/../x', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 1, output: 1 } }] }],
+  ])('отклоняет %s: секреты eval идут только через прокси', (_what, extra) => {
+    const input = minimalConfig()
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', ...extra } as NonNullable<RemontnikConfigInput['checks']['eval']>
+    expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval'))).toBe(true)
   })
 
   it('принимает все разделы контракта, включая браузер с живым экраном', () => {
