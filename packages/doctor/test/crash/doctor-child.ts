@@ -181,10 +181,12 @@ function crashingBridge(client: PaseoBridgeClient): PaseoBridgeClient {
   let silentAnswers = 0
   return {
     async health() {
-      if ((await doctor?.caseBook.getCase(1))?.state === 'paseo_working') crash('paseo_working')
+      const working = (await doctor?.caseBook.getCase(1))?.state === 'paseo_working'
+      if (working) crash('paseo_working')
       const up = await client.health()
-      // Второй немой ответ: начало молчания записано при первом.
-      if (!up && (silentAnswers += 1) === 2) crash('bridge_silent')
+      // Второй немой ответ, пока агент работает: начало молчания записано при первом. Немой ответ ещё до «взял» не в счёт:
+      // принятие задачи пришло через мост, и отсчёт молчания в `paseo_working` начинается заново.
+      if (!up && working && (silentAnswers += 1) === 2) crash('bridge_silent')
       return up
     },
     async sendTask(task) {

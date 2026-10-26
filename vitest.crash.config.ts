@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
+const setupFile = fileURLToPath(new URL('./vitest.setup.ts', import.meta.url))
 const root = fileURLToPath(new URL('./', import.meta.url))
 const packagesDirectory = fileURLToPath(new URL('./packages/', import.meta.url))
 
@@ -16,6 +17,7 @@ export default defineConfig({
   },
   test: {
     include: ['packages/*/test/crash/**/*.test.ts'],
+    setupFiles: [setupFile],
     testTimeout: 180_000,
     maxConcurrency: 4,
   },
