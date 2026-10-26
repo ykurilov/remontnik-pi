@@ -165,9 +165,9 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T067 [P] [US3] Запуск команд приложения и файл-замок в `packages/doctor/src/deployer/`
 - [X] T068 [US3] Наблюдение с `runtime.sleepUntil` и уровнем ошибок до выкатки из книги случаев в `packages/doctor/src/deployer/observer.ts`
 - [X] T069 [US3] Стоп-кран: документ `remontnik.controls`, `POST /v1/control/deploys`, команды `deploys stop|resume` в `packages/doctor/src/ledgers/controls.ts`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
-- [ ] T070 [US3] Фазы `deploying` → `observing` → `healed` | `rolled_back` | `not_helped`; после окна — слияние в основную ветку или запрос на слияние по `repo.mainline` через git-замок, в `packages/doctor/src/treatment/`
+- [X] T070 [US3] Фазы `deploying` → `observing` → `healed` | `rolled_back` | `not_helped`; после окна — слияние в основную ветку или запрос на слияние по `repo.mainline` через git-замок, в `packages/doctor/src/treatment/`
 - [X] T071 [US3] Отчёты `deployed`, `rolled_back`, `not_helped` (поле снимков экрана) в `packages/doctor/src/reports/texts.ts`
-- [ ] T072 [US3] Интеграционный тест `apps/patient/test/cycle/us3-deploy.test.ts`: crash до `healed` с меткой и прежней сборкой; worse → откат меньше чем за минуту; no-git; stop
+- [X] T072 [US3] Интеграционный тест `apps/patient/test/cycle/us3-deploy.test.ts`: crash до `healed` с меткой и прежней сборкой; worse → откат меньше чем за минуту; no-git; stop
 
 **Контрольная точка**: P1 закрыт — самолечение работает целиком на «Пациенте».
 

@@ -107,7 +107,7 @@ describe('тексты отчётов выкатки', () => {
     observeUntil: '2026-10-26T12:31:00.000Z',
     lastTick: { at: '2026-10-26T12:31:00.000Z', errors: 0, errorsPerHour: 0, newFingerprints: [], caseFingerprintSeen: false },
   }
-  const report = (deployment: Partial<Deployment>, extra: { branch?: string; screenshots?: string[] } = {}) =>
+  const report = (deployment: Partial<Deployment>, extra: Omit<Parameters<typeof deploymentReport>[0], 'case' | 'deployment'> = {}) =>
     deploymentReport({ case: sick, deployment: { ...base, ...deployment }, ...extra })
 
   it('держится: deployed с версией, меткой прежней и снимками экрана', () => {
@@ -118,6 +118,18 @@ describe('тексты отчётов выкатки', () => {
     expect(text.full).toContain('remontnik/pre-deploy/2026-10-26-7-2')
     expect(text.full).toContain(PREV.slice(0, 12))
     expect(text.screenshots).toEqual(['/state/shots/7-1.png'])
+  })
+
+  it('оставленная правка: влита в основную ветку или ждёт запроса на слияние', () => {
+    expect(report({}, { mainline: { kind: 'merged', into: 'main' } }).short).toContain('влил в основную ветку main')
+    const waiting = report({ outcome: 'not_helped' }, { mainline: { kind: 'pull_request', branch: 'remontnik/7-fix' } })
+    expect(waiting.type).toBe('not_helped')
+    expect(waiting.short).toContain('remontnik/7-fix')
+    expect(waiting.short).toContain('запрос на слияние')
+    expect(waiting.short).toContain('сотрёт правку')
+    const failed = report({}, { mainline: { kind: 'merge_failed', branch: 'remontnik/7-fix', reason: 'основная ветка ушла вперёд' } })
+    expect(failed.short).toContain('основная ветка ушла вперёд')
+    expect(failed.short).toContain('запрос на слияние')
   })
 
   it('выкатка в окне наблюдения: deployed «наблюдаю до»', () => {

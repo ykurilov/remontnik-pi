@@ -219,11 +219,28 @@ function deploymentLines(deployment: Deployment): string[] {
   ]
 }
 
+/** Что стало с веткой правки, которая осталась работать: влита в основную ветку или ждёт запроса на слияние. */
+export type MainlineResult = { kind: 'merged'; into: string } | { kind: 'pull_request'; branch: string } | { kind: 'merge_failed'; branch: string; reason: string }
+
+function mainlineLine(mainline: MainlineResult | undefined): string {
+  if (!mainline) return ''
+  if (mainline.kind === 'merged') return ` Правку влил в основную ветку ${mainline.into}.`
+  const unmerged = 'Пока она не влита, ручная выкатка из основной ветки сотрёт правку.'
+  if (mainline.kind === 'pull_request') return ` Ветка ${mainline.branch} ждёт слияния: откройте запрос на слияние в основную ветку. ${unmerged}`
+  return ` Влить ветку ${mainline.branch} в основную не смог (${mainline.reason}): откройте запрос на слияние. ${unmerged}`
+}
+
 /**
  * Отчёт о выкатке по её записи: тип и текст. `branch` — ветка правки, если выкатку не начинали (стоп-кран),
- * `screenshots` — снимки экрана после выкатки.
+ * `mainline` — что стало с веткой оставленной правки, `screenshots` — снимки экрана после выкатки.
  */
-export function deploymentReport(input: { case: ReportCase; deployment: Deployment; branch?: string; screenshots?: string[] }): ReportText & { type: ReportType } {
+export function deploymentReport(input: {
+  case: ReportCase
+  deployment: Deployment
+  branch?: string
+  mainline?: MainlineResult
+  screenshots?: string[]
+}): ReportText & { type: ReportType } {
   const { deployment } = input
   const candidate = version(deployment.candidateVersion)
   const previous = version(deployment.previousVersion)
@@ -232,9 +249,12 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
       case 'in_progress':
         return ['deployed', `${head(input.case)}: выкатил правку (версия ${candidate}), наблюдаю до ${clock(deployment.observeUntil)}.`]
       case 'holding':
-        return ['deployed', `${head(input.case)}: правка выкачена (версия ${candidate}) и держится: окно наблюдения прошло без ухудшения.`]
+        return ['deployed', `${head(input.case)}: правка выкачена (версия ${candidate}) и держится: окно наблюдения прошло без ухудшения.${mainlineLine(input.mainline)}`]
       case 'not_helped':
-        return ['not_helped', `${head(input.case)}: правка (версия ${candidate}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.`]
+        return [
+          'not_helped',
+          `${head(input.case)}: правка (версия ${candidate}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.${mainlineLine(input.mainline)}`,
+        ]
       case 'rolled_back': {
         const why = deployment.rollbackReason ?? (deployment.rollbackCause ? ROLLBACK_CAUSES[deployment.rollbackCause] : 'стало хуже')
         const rolled = `${head(input.case)}: откатил правку на прежнюю версию ${previous} — ${why}.`

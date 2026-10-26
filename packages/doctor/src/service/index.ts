@@ -3,13 +3,13 @@ import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { Models } from '@earendil-works/pi-ai'
-import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
+import type { ReportInfo, Storage, Wake } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
-import { confirmAbandonedVersion } from '../deployer/index.js'
+import { confirmAbandonedVersion, type Deployer } from '../deployer/index.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls } from '../ledgers/controls.js'
@@ -41,6 +41,8 @@ export interface DoctorServiceOptions {
   /** Для проверок: подменить хранилище. */
   wrapStorage?: (storage: Storage) => Storage
   now?: () => number
+  /** Для проверок с подменёнными часами: будить спящие задачи самим (`resume`), а не таймером. */
+  onWake?: (wake: Wake, resume: () => void) => void
   /** Лечение случаев; без него врач только принимает случаи и сообщает о них. */
   treatment?: DoctorTreatmentOptions
 }
@@ -69,6 +71,8 @@ export interface DoctorTreatmentOptions {
   evalProxy?: { listen: { host: string; port: number }; publicUrl?: string }
   appDescription?: string
   budgetPollMs?: number
+  /** Выкатчик приложения (`createServerDeployer`). Не задан — врач правку не выкатывает, а сообщает «правка готова». */
+  deployer?: Deployer
 }
 
 export interface DoctorService {
@@ -164,11 +168,13 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
 
   const treatmentOptions = options.treatment
   const runners = treatmentOptions ? isolatedRunners(treatmentOptions) : undefined
+  const onWake = options.onWake
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
+    ...(onWake ? { onWake: (wake: Wake) => onWake(wake, () => harnessState === 'open' && opened.harness.resume()) } : {}),
     ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
@@ -207,6 +213,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       ...(evalProxy ? { evalProxy } : {}),
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
+      ...(treatmentOptions.deployer ? { deployer: treatmentOptions.deployer } : {}),
       budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
       onReport: pump,
       now,

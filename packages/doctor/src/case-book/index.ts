@@ -95,19 +95,31 @@ export interface CaseBookOptions {
   now?: () => number
 }
 
+/** Состояние случая внутри чужой транзакции (например, фиксации задачи лечения); закрытый случай уходит из открытых. */
+export async function setCaseStateIn(tx: RecordTransaction, caseId: number, state: CaseState): Promise<Case> {
+  const opened = await tx.doc<Case>('case', String(caseId), {} as Case)
+  if (opened.caseId !== caseId) throw new Error(`случая ${caseId} нет`)
+  opened.state = state
+  if (CLOSED_CASE_STATES.includes(state)) {
+    const index = await tx.doc<CaseIndex>(INDEX.collection, INDEX.key, emptyIndex())
+    const key = openKey(opened.appName, opened.fingerprint)
+    if (index.open[key] === caseId) delete index.open[key]
+  }
+  return opened
+}
+
 export function createCaseBook(store: RecordStore, options: CaseBookOptions = {}): CaseBook {
   const now = options.now ?? Date.now
   const caseKey = (caseId: number) => String(caseId)
   /** Приложения, чьи старые часы ошибок уже внесены в список (`seedErrorHourIndex`). */
   const seededApps = new Set<string>()
 
-  async function updateCase(caseId: number, change: (opened: Case) => void, onIndex?: (index: CaseIndex, opened: Case) => void) {
+  async function updateCase(caseId: number, change: (opened: Case) => void) {
     return store.transaction(async (tx) => {
       // Читать внутри транзакции можно только через tx: пустой документ значит «случая нет», и откат его уберёт.
       const opened = await tx.doc<Case>('case', caseKey(caseId), {} as Case)
       if (opened.caseId !== caseId) throw new Error(`случая ${caseId} нет`)
       change(opened)
-      if (onIndex) onIndex(await tx.doc<CaseIndex>(INDEX.collection, INDEX.key, emptyIndex()), opened)
       return copyRecord(opened)
     })
   }
@@ -189,17 +201,7 @@ export function createCaseBook(store: RecordStore, options: CaseBookOptions = {}
       return caseId === undefined ? undefined : store.read<Case>('case', caseKey(caseId))
     },
 
-    setState: (caseId, state) =>
-      updateCase(
-        caseId,
-        (opened) => {
-          opened.state = state
-        },
-        (index, opened) => {
-          const key = openKey(opened.appName, opened.fingerprint)
-          if (CLOSED_CASE_STATES.includes(state) && index.open[key] === caseId) delete index.open[key]
-        },
-      ),
+    setState: (caseId, state) => store.transaction(async (tx) => copyRecord(await setCaseStateIn(tx, caseId, state))),
 
     async linkReport(caseId, reportId) {
       await updateCase(caseId, (opened) => {

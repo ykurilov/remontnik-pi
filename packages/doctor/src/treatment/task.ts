@@ -13,10 +13,11 @@ import {
 } from '@earendil-works/pi-durable'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
-import type { Case, CaseState } from '../case-book/index.js'
+import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
+import type { Deployer, DeployRequest, Deployment, DeployStep } from '../deployer/deploy-sequence.js'
 import { GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
@@ -24,8 +25,17 @@ import { matchesAnyMask } from '../path-mask/index.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 import type { ReportType, Reports } from '../reports/index.js'
 import { agentChatSdkReport, agentChatSdkTask, gateReport } from '../reports/gate-texts.js'
-import { causeFoundReport, fixReadyReport, needsHumanReport, noCauseFoundReport, standBrokenReport, type ReportText } from '../reports/texts.js'
-import { durableTxOf, recordFamilyOf, recordTransactionOver } from '../service/harness.js'
+import {
+  causeFoundReport,
+  deploymentReport,
+  fixReadyReport,
+  needsHumanReport,
+  noCauseFoundReport,
+  standBrokenReport,
+  type MainlineResult,
+  type ReportText,
+} from '../reports/texts.js'
+import { durableTxOf, recordFamilyOf, recordTransactionOver, runDeploymentInTask } from '../service/harness.js'
 import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
 import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeploysYet, type DeployControls, type FixInspection } from './gate.js'
@@ -47,7 +57,13 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // с последней сохранённой фазы, а фаза после перезапуска выполняется заново с начала, поэтому каждая
 // идемпотентна: копия переиспользуется, запрос модели находится по `requestId`, итог модели лежит в документе.
 //
-//   triage → diagnosing → fixing → verifying → gated → (этап 6: выкатка)
+//   triage → diagnosing → fixing → verifying → gated → deploying → observing → healed | rolled_back | not_helped
+//
+// Решение `gated` о выкатке фиксируется в чекпойнте `deploying`: после перезапуска оно не считается заново.
+// Выкатку ведёт выкатчик (`runDeploymentInTask`), его отчёты (долгий замок, `.stale-*`, брошенная выкатка)
+// отправляются после каждого шага. Правка, оставшаяся работать после окна наблюдения, сливается в основную ветку
+// через git-замок (`repo.mainline: merge`, только вперёд) или ждёт запроса на слияние (`pull-request`).
+// Без выкатчика решение `deploy` закрывается отчётом «правка готова».
 //
 // Основа — рабочая версия (`deploy.commands.current`); неизвестна — последний коммит основной ветки, и отчёт это говорит.
 // Выкатывать или нет, решает только фаза `gated` (`decideDeploy` по фактам из `gate.ts`). Правка, которая задевает
@@ -79,17 +95,21 @@ export type TreatmentState =
   | ({ phase: 'diagnosing' } & Treating)
   | ({ phase: 'fixing'; diagnosis: Diagnosis } & Treating)
   | ({ phase: 'verifying' } & Fixed & Treating)
-  | ({ phase: 'gated'; checks?: ChecksResult; pushed: boolean } & Fixed & Treating)
+  | ({ phase: 'gated' } & Gated)
+  | ({ phase: 'deploying'; gate: GateDecision } & Gated)
+  | ({ phase: 'observing'; gate: GateDecision } & Gated)
 
 /** Закоммиченная правка и осмотр её диффа. */
 type Fixed = { diagnosis: Diagnosis; fix: FixSummary; fixCommit: string; changedPaths: string[]; inspection: FixInspection }
+/** Правка проверена (или проверять её нельзя) и, может быть, отправлена в origin. */
+type Gated = { checks?: ChecksResult; pushed: boolean } & Fixed & Treating
 
-export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken' | 'needs_human'
+export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken' | 'needs_human' | 'healed' | 'rolled_back' | 'not_helped'
 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
   /** Почему нужен человек. */
-  why?: 'escape' | 'spoiled' | 'agent_chat_sdk' | 'gate'
+  why?: 'escape' | 'spoiled' | 'agent_chat_sdk' | 'gate' | 'deploy'
   reportId: number
   /** Решение фазы `gated`. */
   gate?: GateDecision
@@ -99,6 +119,9 @@ export type TreatmentResult = {
   fixCommit?: string
   changedPaths?: string[]
   checks?: ChecksResult
+  deploymentId?: number
+  /** Что стало с веткой правки, которая осталась работать. */
+  mainline?: MainlineResult
 }
 
 export interface TreatmentDeps {
@@ -123,6 +146,8 @@ export interface TreatmentDeps {
   evalBaseCache: EvalBaseCache
   /** Стоп-кран, учёт выкаток, перенос на свежий main. Нет — выкаток ещё не было (`noDeploysYet`). */
   deployControls?: DeployControls
+  /** Выкатчик приложения. Нет — решение `deploy` закрывается отчётом «правка готова». */
+  deployer?: Deployer
   appDescription?: string
   /** Как часто сверять расход модели с потолком. */
   budgetPollMs: number
@@ -140,6 +165,8 @@ export interface Treatment {
 type Runtime = TaskRuntime<TreatmentInput, TreatmentState, TreatmentResult, object>
 type ConverseStatus = 'answered' | 'failed' | 'budget' | 'day_budget'
 type Base = { commit: string; running: boolean }
+type DeployPhase = Extract<TreatmentState, { phase: 'deploying' | 'observing' }>
+type DeploySleep = Extract<DeployStep, { kind: 'sleep' }>
 
 const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
@@ -183,6 +210,23 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return evalNames.flatMap((name) => deps.evalEnv[name] ?? [])
   }
 
+  /** Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo. */
+  async function redactedReport(text: ReportText, baseRunning: boolean): Promise<{ short: string; full: string }> {
+    const knownSecrets = knownSecretsOf(await deps.loadConfig())
+    return {
+      short: redactSecrets(text.short, { knownSecrets }),
+      full: redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets }),
+    }
+  }
+
+  /** Отчёт и состояние случая внутри фиксации задачи. */
+  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: { short: string; full: string }): Promise<number> {
+    const opened = await setCaseStateIn(records, caseId, state)
+    const report = await deps.reports.addIn(records, { type, caseId, ...text, telegram: 'pending' })
+    opened.reportIds.push(report.reportId)
+    return report.reportId
+  }
+
   /** Отчёт, состояние случая и итог задачи — одной фиксацией. */
   async function finish(
     runtime: Runtime,
@@ -194,17 +238,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     context: Context,
     baseRunning = true,
   ): Promise<void> {
-    // Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo.
-    const knownSecrets = knownSecretsOf(await deps.loadConfig())
-    const short = redactSecrets(text.short, { knownSecrets })
-    const full = redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets })
+    const redacted = await redactedReport(text, baseRunning)
     await runtime.commit(async (tx) => {
-      const records = recordTransactionOver(tx)
-      const opened = await caseIn(records, caseId)
-      opened.state = state
-      const report = await deps.reports.addIn(records, { type, caseId, short, full, telegram: 'pending' })
-      opened.reportIds.push(report.reportId)
-      return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId: report.reportId } } }
+      const reportId = await reportIn(recordTransactionOver(tx), caseId, state, type, redacted)
+      return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId } } }
     }, context)
     deps.onReport()
   }
@@ -361,6 +398,106 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
   function assertWorkbenchIntact(treating: Treating): void {
     if (deps.workbenchRunner.spoiled(treating.worktreePath)) throw new SpoiledCopyError(treating.worktreePath)
+  }
+
+  /**
+   * Правка осталась работать — ветка уходит в основную: `merge` — git-замком, только вперёд, `pull-request` — ждёт
+   * запроса на слияние. Повтор безопасен: влитая ветка вливается ещё раз без изменений.
+   */
+  async function settleMainline(runtime: Runtime, checkpoint: DeployPhase): Promise<MainlineResult> {
+    const config = await deps.loadConfig()
+    const { branch } = checkpoint
+    try {
+      if (!checkpoint.pushed) await deps.guard.push(branch)
+      if (config.repo.mainline !== 'merge') return { kind: 'pull_request', branch }
+      await deps.guard.mergeIntoMain(branch)
+      return { kind: 'merged', into: config.repo.mainBranch }
+    } catch (error) {
+      if (!(error instanceof GitGuardError)) throw error
+      runtime.report(error)
+      return { kind: 'merge_failed', branch, reason: error.message.split('\n')[0]!.slice(0, 200) }
+    }
+  }
+
+  /** Итог выкатки: состояние случая и итог задачи по записи выкатки и типу её отчёта. */
+  function deployClosing(deployment: Deployment, report: ReportType): { state: CaseState; outcome: TreatmentOutcome; why?: 'deploy' } {
+    if (report === 'needs_human') return { state: 'needs_human', outcome: 'needs_human', why: 'deploy' }
+    switch (deployment.outcome) {
+      case 'holding':
+        return { state: 'healed', outcome: 'healed' }
+      case 'not_helped':
+        return { state: 'not_helped', outcome: 'not_helped' }
+      case 'rolled_back':
+        return { state: 'rolled_back', outcome: 'rolled_back' }
+      case 'refused':
+        // Стоп-кран: правка готова, выкатит её человек.
+        return { state: 'report_only', outcome: 'fix_ready' }
+      default:
+        return { state: 'needs_human', outcome: 'needs_human', why: 'deploy' }
+    }
+  }
+
+  /**
+   * Фазы `deploying` и `observing`: шаг выкатки. Пока выкатка ждёт замок, задача спит в `deploying`; когда правка
+   * выкачена, одной фиксацией — случай `observing`, отчёт «выкатил, наблюдаю» и чекпойнт `observing`.
+   * Конец выкатки закрывает случай её отчётом.
+   */
+  async function deployStep(runtime: Runtime, caseId: number, checkpoint: DeployPhase, deployer: Deployer, context: Context): Promise<void> {
+    const sick = await readCase(runtime, caseId, context)
+    const candidateDir = join(deps.worktreesDir, `case-${caseId}-deploy`)
+    // Копия правки нужна только для сборки: в наблюдении её уже нет.
+    if (checkpoint.phase === 'deploying') await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit })
+    const request: DeployRequest = { caseId, appName: sick.appName, fingerprint: sick.fingerprint, candidateVersion: checkpoint.fixCommit, candidateDir }
+    const sleepsHere = (step: DeploySleep) => (checkpoint.phase === 'observing' || step.stage === 'waiting_lock' ? checkpoint : undefined)
+    let step: DeployStep
+    try {
+      step = await runDeploymentInTask(runtime, deployer, request, sleepsHere, context)
+    } finally {
+      // Отчёты выкатчика (долгий замок, `.stale-*`, брошенная чужая выкатка) записаны его фиксациями.
+      deps.onReport()
+    }
+    if (step.kind === 'sleep' && sleepsHere(step)) return
+
+    const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
+    const { deployment } = step
+    if (step.kind === 'sleep') {
+      await deps.guard.removeWorktree(candidateDir).catch(() => {})
+      const deployed = step.stage === 'observing' ? await redactedReport(deploymentReport({ case: doc.case, deployment }), checkpoint.baseRunning) : undefined
+      await runtime.commit(async (tx) => {
+        const records = recordTransactionOver(tx)
+        if (deployed) await reportIn(records, caseId, 'observing', 'deployed', deployed)
+        else await setCaseStateIn(records, caseId, 'observing')
+        return { status: 'running', checkpoint: { ...checkpoint, phase: 'observing' } }
+      }, context)
+      if (deployed) deps.onReport()
+      return
+    }
+
+    await deps.guard.removeWorktree(candidateDir).catch(() => {})
+    const stays = deployment.outcome === 'holding' || deployment.outcome === 'not_helped'
+    const mainline = stays ? await settleMainline(runtime, checkpoint) : undefined
+    const text = deploymentReport({ case: doc.case, deployment, branch: checkpoint.branch, ...(mainline ? { mainline } : {}) })
+    const closing = deployClosing(deployment, text.type)
+    await finish(
+      runtime,
+      caseId,
+      closing.state,
+      text.type,
+      text,
+      {
+        outcome: closing.outcome,
+        ...(closing.why ? { why: closing.why } : {}),
+        branch: checkpoint.branch,
+        fixCommit: checkpoint.fixCommit,
+        changedPaths: checkpoint.changedPaths,
+        ...(checkpoint.checks ? { checks: checkpoint.checks } : {}),
+        gate: checkpoint.gate,
+        deploymentId: deployment.deploymentId,
+        ...(mainline ? { mainline } : {}),
+      },
+      context,
+      checkpoint.baseRunning,
+    )
   }
 
   const task = defineTask<TreatmentInput, TreatmentState, TreatmentResult>({
@@ -599,9 +736,13 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           finish(runtime, caseId, closing.caseState, closing.report, text, { ...result, ...outcome }, context, checkpoint.baseRunning)
         switch (closing.kind) {
           case 'deploy':
-            // Этап 6 подключает здесь выкатку; пока решение `deploy` закрывается отчётом «правка готова».
-            // Перед выкаткой решение надо зафиксировать в чекпойнте: при повторе фазы оно сейчас считается заново.
-            return close(fixReadyReport({ ...ready, checks: checks! }), { outcome: 'fix_ready' })
+            if (!deps.deployer) return close(fixReadyReport({ ...ready, checks: checks! }), { outcome: 'fix_ready' })
+            // Решение — в чекпойнте: повтор фазы после перезапуска его уже не пересчитывает.
+            await runtime.commit(async (tx) => {
+              await setCaseStateIn(recordTransactionOver(tx), caseId, 'deploying')
+              return { status: 'running', checkpoint: { ...checkpoint, phase: 'deploying', gate } }
+            }, context)
+            return
           case 'not_deployed':
             return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate }), { outcome: 'fix_ready' })
           case 'checks_red':
@@ -614,6 +755,16 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               why: sdkPackage ? 'agent_chat_sdk' : 'gate',
             })
         }
+      },
+
+      deploying: async (task, runtime, context) => {
+        if (!deps.deployer) throw new Error('выкатка начата, а выкатчика у врача нет')
+        await deployStep(runtime, task.input.caseId, task.state.checkpoint, deps.deployer, context)
+      },
+
+      observing: async (task, runtime, context) => {
+        if (!deps.deployer) throw new Error('выкатка начата, а выкатчика у врача нет')
+        await deployStep(runtime, task.input.caseId, task.state.checkpoint, deps.deployer, context)
       },
     },
     abort: (_task, runtime, context) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),

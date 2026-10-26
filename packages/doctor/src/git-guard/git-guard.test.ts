@@ -122,7 +122,7 @@ describe('git-замок', () => {
     expect((await rejection(guard.mergeIntoMain('remontnik/1-x'))).code).toBe('forbidden')
   })
 
-  it('при mainline "merge" вливает ветку врача в основную без --force', async () => {
+  it('при mainline "merge" вливает ветку врача в основную origin вперёд; рабочую копию основной ветки не трогает', async () => {
     const r = repo()
     const guard = guardFor(r, { mainline: 'merge' })
     const base = await guard.resolve('HEAD')
@@ -132,9 +132,32 @@ describe('git-замок', () => {
     writeFileSync(join(path, 'app.ts'), 'export const answer = 3\n')
     const commit = await guard.commitAll(path, 'Ремонтник: случай 3')
     await guard.mergeIntoMain(branch)
-    await guard.push('main')
     expect(git(r.origin, 'rev-parse', 'main')).toBe(commit)
+    // Копию основной ветки держат выкатки: её смена посреди чужой выкатки была бы «копию изменили».
+    expect(git(r.repoDir, 'rev-parse', 'HEAD')).toBe(base)
+    expect(readFileSync(join(r.repoDir, 'app.ts'), 'utf8')).toBe('export const answer = 1\n')
+    // Повтор после перезапуска врача безопасен.
+    await guard.mergeIntoMain(branch)
     expect((await rejection(guard.run(['push', '--force', 'origin', 'main']))).code).toBe('forbidden')
+    expect((await rejection(guard.mergeIntoMain('main'))).code).toBe('forbidden')
+  })
+
+  it('основная ветка в origin ушла вперёд → слияние отказано, ничего не перезаписано', async () => {
+    const r = repo()
+    const guard = guardFor(r, { mainline: 'merge' })
+    const base = await guard.resolve('HEAD')
+    const branch = treatmentBranch(4, 'late')
+    const path = join(r.worktreesDir, '4')
+    await guard.addWorktree({ path, branch, base })
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 4\n')
+    await guard.commitAll(path, 'Ремонтник: случай 4')
+    writeFileSync(join(r.repoDir, 'other.ts'), 'export const other = 1\n')
+    git(r.repoDir, 'add', '-A')
+    git(r.repoDir, 'commit', '-m', 'человек')
+    git(r.repoDir, 'push', 'origin', 'main')
+    const human = git(r.origin, 'rev-parse', 'main')
+    expect((await rejection(guard.mergeIntoMain(branch))).code).toBe('failed')
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(human)
   })
 
   it('команды вне своих папок отклонены', async () => {

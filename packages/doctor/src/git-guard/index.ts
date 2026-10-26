@@ -82,7 +82,10 @@ export interface GitGuard {
    * Повтор с тем же коммитом безопасен (перезапуск врача); та же метка на другом коммите — отказ.
    */
   tagPreDeploy(name: string, commit: string): Promise<void>
-  /** Влить ветку врача в основную вперёд (`--ff-only`). Только при `mainline: "merge"`. */
+  /**
+   * Влить ветку врача в основную ветку origin, только вперёд и без `--force`. Только при `mainline: "merge"`.
+   * Рабочую копию основной ветки не трогает: её держат выкатки, и смена копии посреди чужой выкатки — её отказ.
+   */
   mergeIntoMain(branch: string): Promise<void>
 }
 
@@ -539,7 +542,9 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
 
     async mergeIntoMain(branch) {
       if (options.mainline !== 'merge') throw new GitGuardError('forbidden', 'git-замок: вливать в основную ветку можно только при mainline: "merge"')
-      await run(['merge', '--ff-only', branch])
+      if (!isTreatmentRef(branch) || branch.startsWith('refs/')) throw new GitGuardError('forbidden', 'git-замок: вливать можно только свою ветку remontnik/…')
+      // Обычный push без `+`: origin примет его, только если основная ветка — предок правки.
+      await run(['push', remote, `refs/heads/${branch}:refs/heads/${options.mainBranch}`])
     },
   }
 }
