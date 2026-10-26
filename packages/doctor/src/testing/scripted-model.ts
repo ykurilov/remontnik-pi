@@ -27,14 +27,17 @@ export interface ScriptedModelOptions {
   /** Сколько долларов записывать на каждый ответ. По умолчанию 0. */
   costPerResponseUsd?: number
   /**
-   * Наибольшая цена ответа по цене модели — столько врач бронирует перед запросом. По умолчанию `costPerResponseUsd`.
-   * Вход бесплатный, поэтому бронь от длины разговора не зависит.
+   * Наибольшая цена ответа по цене модели — столько врач бронирует перед запросом. По умолчанию `costPerResponseUsd`,
+   * а при бесплатных ответах — доля цента: модель без цены врач не зовёт. Вход бесплатный, поэтому бронь от длины
+   * разговора не зависит.
    */
   maxResponseUsd?: number
 }
 
 /** Предел длины ответа модели по сценарию: из него и цены выхода складывается наибольшая цена ответа. */
 const SCRIPTED_MAX_TOKENS = 1_000
+/** Наибольшая цена ответа, когда ответы бесплатны. */
+const SCRIPTED_FREE_MAX_RESPONSE_USD = 0.000_1
 
 export interface ScriptedModel {
   models: MutableModels
@@ -73,7 +76,8 @@ export const hang: ScriptStep = (_context, signal) =>
 
 export function createScriptedModel(options: ScriptedModelOptions = {}): ScriptedModel {
   const cost = options.costPerResponseUsd ?? 0
-  const outputUsdPerMtok = ((options.maxResponseUsd ?? cost) * 1_000_000) / SCRIPTED_MAX_TOKENS
+  const maxResponseUsd = options.maxResponseUsd ?? (cost || SCRIPTED_FREE_MAX_RESPONSE_USD)
+  const outputUsdPerMtok = (maxResponseUsd * 1_000_000) / SCRIPTED_MAX_TOKENS
   const faux = fauxProvider({
     provider: SCRIPTED_PROVIDER,
     models: [{ id: SCRIPTED_MODEL, contextWindow: 200_000, maxTokens: SCRIPTED_MAX_TOKENS, cost: { input: 0, output: outputUsdPerMtok, cacheRead: 0, cacheWrite: 0 } }],

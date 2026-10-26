@@ -9,6 +9,7 @@ import {
 } from '@earendil-works/pi-ai'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { RecordStore } from '../records/index.js'
+import { maxRequestUsd, unknownPriceOf } from '../model/request-price.js'
 import { caseLimitUsdOf, holdModelIn, settleModelHoldIn, spendDayKey, type ModelBlock } from './spend-ledger.js'
 
 // Жёсткий потолок модели врача (FR-030), так же, как у прокси eval: перед каждым запросом к поставщику — бронь
@@ -16,12 +17,15 @@ import { caseLimitUsdOf, holdModelIn, settleModelHoldIn, spendDayKey, type Model
 // не уходит, а разговор получает ошибку «out of budget»: pi-ai считает её неповторяемой, и ход разговора кончается.
 // Хук pi-durable отказать в запросе не может (его ошибки только сообщаются), поэтому отказ — здесь, в моделях врача.
 //
+// Через бронь идёт любой путь к модели: `streamSimple` и `completeSimple` (генерация и сжатие разговора pi-durable),
+// `stream` и `complete`. Отложенные ответы (`streamDeferred`, `fetchDeferred`) врач не использует: в них отказ.
 // Запрос привязывается к случаю через сигнал исполнения: хук `beforeRequest` получает исполнение генерации с тем же
-// `signal`, который затем уходит в `streamSimple`. Запрос без привязки (сжатие разговора) считается только в день.
-// Обёрнут только `streamSimple`: его зовёт генерация pi-durable; другие пути к модели врач не использует.
+// `signal`, который затем уходит в запрос. Запрос без привязки (сжатие разговора) считается только в день.
 
-const RESERVE_BYTES_PER_TOKEN = 3
-const TOKENS_PER_MTOK = 1_000_000
+export { maxRequestUsd } from '../model/request-price.js'
+
+type ChatContext = Parameters<Models['streamSimple']>[1]
+type ChatOptions = { signal?: AbortSignal; maxTokens?: number }
 
 export interface ModelBudget {
   /** Модели врача: каждый запрос сначала бронирует наибольшую цену. */
@@ -30,18 +34,6 @@ export interface ModelBudget {
   bind(signal: AbortSignal, caseId: number): void
   /** Подключить учёт, когда записи врача открыты. До этого запросы не уходят. */
   attach(ledger: { records: RecordStore; loadConfig(): Promise<RemontnikConfig> }): void
-}
-
-/**
- * Наибольшая цена запроса: вход — по байтам разговора (не меньше 1 токена на 3 байта) по самой дорогой ставке входа,
- * выход — предел длины ответа по самой дорогой ставке выхода, с учётом ступеней цены.
- */
-export function maxRequestUsd(model: Model<Api>, context: unknown, maxTokens: number | undefined): number {
-  const rates = [model.cost, ...(model.cost.tiers ?? [])]
-  const inputRate = Math.max(...rates.map((rate) => Math.max(rate.input, rate.cacheWrite, rate.cacheRead)))
-  const outputRate = Math.max(...rates.map((rate) => rate.output))
-  const inputTokens = Buffer.byteLength(JSON.stringify(context)) / RESERVE_BYTES_PER_TOKEN
-  return (inputTokens * inputRate + (maxTokens ?? model.maxTokens) * outputRate) / TOKENS_PER_MTOK
 }
 
 function refusal(model: Model<Api>, why: string): AssistantMessage {
@@ -58,10 +50,13 @@ function refusal(model: Model<Api>, why: string): AssistantMessage {
   }
 }
 
-/** Настоящая цена: что насчитал поставщик; ответ оборвался без счёта, но уже шёл — вся бронь; не начался — ноль. */
-function actualUsdOf(message: AssistantMessage | undefined, started: boolean, maxUsd: number): number {
-  if (message && (message.usage.totalTokens > 0 || message.usage.cost.total > 0)) return message.usage.cost.total
-  return started ? maxUsd : 0
+/**
+ * Настоящая цена ушедшего запроса: ответ пришёл — счёт поставщика. Оборвался — частичный счёт занижен (поставщик
+ * мог насчитать больше, чем успел сообщить), поэтому в учёт идёт вся бронь.
+ */
+function actualUsdOf(answer: AssistantMessage | undefined, maxUsd: number): number {
+  if (answer && answer.stopReason !== 'error' && answer.stopReason !== 'aborted') return answer.usage.cost.total
+  return Math.max(answer?.usage.cost.total ?? 0, maxUsd)
 }
 
 export function createModelBudget(options: { models: Models; boot: string; now(): number; report?(error: unknown): void; log?(line: string): void }): ModelBudget {
@@ -90,11 +85,27 @@ export function createModelBudget(options: { models: Models; boot: string; now()
     return answer.held ? { held: true, dayKey, holdId } : { held: false, why: BLOCK_TEXT[answer.block] }
   }
 
-  function guarded(inner: Models, model: Model<Api>, context: Parameters<Models['streamSimple']>[1], streamOptions?: Parameters<Models['streamSimple']>[2]) {
-    const out: AssistantMessageEventStream = createAssistantMessageEventStream()
+  /** Поток-отказ: запрос к поставщику не уходит, разговор получает ошибку с причиной. */
+  function refused(model: Model<Api>, why: string, caseId?: number): AssistantMessageEventStream {
+    log(`запрос к модели не отправлен${caseId === undefined ? '' : ` (случай ${caseId})`}: ${why}`)
+    const out = createAssistantMessageEventStream()
+    const message = refusal(model, why)
+    out.push({ type: 'error', reason: 'error', error: message })
+    out.end(message)
+    return out
+  }
+
+  function guarded(model: Model<Api>, context: ChatContext, streamOptions: ChatOptions | undefined, send: () => AssistantMessageEventStream): AssistantMessageEventStream {
+    const signal = streamOptions?.signal
+    const caseId = signal ? cases.get(signal) : undefined
+    const unknownPrice = unknownPriceOf(model)
+    if (unknownPrice) return refused(model, unknownPrice, caseId)
+    const out = createAssistantMessageEventStream()
+    const fail = (message: AssistantMessage) => {
+      out.push({ type: 'error', reason: 'error', error: message })
+      out.end(message)
+    }
     void (async () => {
-      const signal = streamOptions?.signal
-      const caseId = signal ? cases.get(signal) : undefined
       const maxUsd = maxRequestUsd(model, context, streamOptions?.maxTokens)
       const held = await hold(caseId, maxUsd).catch((error: unknown) => {
         report(error)
@@ -102,18 +113,16 @@ export function createModelBudget(options: { models: Models; boot: string; now()
       })
       if (!held.held) {
         log(`запрос к модели не отправлен${caseId === undefined ? '' : ` (случай ${caseId})`}: ${held.why}`)
-        const message = refusal(model, held.why)
-        out.push({ type: 'error', reason: 'error', error: message })
-        out.end(message)
+        fail(refusal(model, held.why))
         return
       }
-      let started = false
-      const settle = (message: AssistantMessage | undefined) =>
+      const settle = (answer: AssistantMessage | undefined) =>
         ledger!.records
-          .transaction((tx) => settleModelHoldIn(tx, { dayKey: held.dayKey, holdId: held.holdId, actualUsd: actualUsdOf(message, started, maxUsd) }))
+          .transaction((tx) => settleModelHoldIn(tx, { dayKey: held.dayKey, holdId: held.holdId, actualUsd: actualUsdOf(answer, maxUsd) }))
+          // Итог не записался — бронь остаётся и закрывается целиком по возрасту (`holdModelIn`).
           .catch((error: unknown) => report(error))
       try {
-        for await (const event of inner.streamSimple(model, context, streamOptions)) {
+        for await (const event of send()) {
           if (event.type === 'done' || event.type === 'error') {
             // Итог в учёт — раньше, чем разговор узнает об ответе: следующий запрос видит уже настоящую цену.
             await settle(event.type === 'done' ? event.message : event.error)
@@ -121,26 +130,37 @@ export function createModelBudget(options: { models: Models; boot: string; now()
             out.end()
             return
           }
-          if (event.type !== 'start') started = true
           out.push(event)
         }
         await settle(undefined)
         out.end()
       } catch (error) {
         await settle(undefined)
-        const message = { ...refusal(model, 'поставщик оборвал поток'), errorMessage: error instanceof Error ? error.message : String(error) }
-        out.push({ type: 'error', reason: 'error', error: message })
-        out.end(message)
+        fail({ ...refusal(model, 'поставщик оборвал поток'), errorMessage: error instanceof Error ? error.message : String(error) })
       }
-    })()
+    })().catch((error: unknown) => {
+      // Сбой самой обёртки: поток всё равно закрывается ошибкой, а не виснет.
+      report(error)
+      fail({ ...refusal(model, 'сбой учёта расходов'), errorMessage: `Ремонтник: out of budget — сбой учёта расходов: ${error instanceof Error ? error.message : String(error)}` })
+    })
     return out
   }
 
-  const models = new Proxy(options.models, {
-    get(target, property) {
-      if (property === 'streamSimple') return (model: Model<Api>, context: Parameters<Models['streamSimple']>[1], streamOptions?: Parameters<Models['streamSimple']>[2]) => guarded(target, model, context, streamOptions)
-      const value: unknown = Reflect.get(target, property, target)
-      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
+  const target = options.models
+  const deferredRefusal = 'отложенные ответы врач не использует'
+  const chat: Pick<Models, 'streamSimple' | 'completeSimple' | 'stream' | 'complete' | 'streamDeferred' | 'fetchDeferred'> = {
+    streamSimple: (model, context, streamOptions) => guarded(model, context, streamOptions, () => target.streamSimple(model, context, streamOptions)),
+    completeSimple: async (model, context, streamOptions) => chat.streamSimple(model, context, streamOptions).result(),
+    stream: (model, context, streamOptions) => guarded(model, context, streamOptions, () => target.stream(model, context, streamOptions)),
+    complete: async (model, context, streamOptions) => chat.stream(model, context, streamOptions).result(),
+    streamDeferred: (model) => refused(model, deferredRefusal),
+    fetchDeferred: async (model) => refused(model, deferredRefusal).result(),
+  }
+  const models = new Proxy(target, {
+    get(inner, property) {
+      if (Object.hasOwn(chat, property)) return chat[property as keyof typeof chat]
+      const value: unknown = Reflect.get(inner, property, inner)
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(inner) : value
     },
   })
 

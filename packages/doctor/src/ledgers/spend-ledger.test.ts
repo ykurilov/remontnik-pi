@@ -7,6 +7,7 @@ import {
   evalSpentUsd,
   closeCaseEvalIn,
   holdModelIn,
+  MODEL_HOLD_STALE_MS,
   modelSpentUsd,
   settleModelHoldIn,
   nextDayStartMs,
@@ -69,9 +70,9 @@ describe('бронь запроса к модели: потолок до зап�
   const dayKey = '2026-11-02'
   const now = Date.UTC(2026, 10, 2, 12)
 
-  function hold(store: RecordStore, input: { caseKey?: string; holdId: string; maxUsd: number; boot?: string; caseLimitUsd?: number }) {
+  function hold(store: RecordStore, input: { caseKey?: string; holdId: string; maxUsd: number; boot?: string; caseLimitUsd?: number; at?: number }) {
     return store.transaction((tx) =>
-      holdModelIn(tx, { dayKey, holdId: input.holdId, maxUsd: input.maxUsd, boot: input.boot ?? 'boot-a', now, limits, caseLimitUsd: input.caseLimitUsd ?? 5, ...(input.caseKey ? { caseKey: input.caseKey } : {}) }),
+      holdModelIn(tx, { dayKey, holdId: input.holdId, maxUsd: input.maxUsd, boot: input.boot ?? 'boot-a', now: input.at ?? now, limits, caseLimitUsd: input.caseLimitUsd ?? 5, ...(input.caseKey ? { caseKey: input.caseKey } : {}) }),
     )
   }
 
@@ -125,6 +126,19 @@ describe('бронь запроса к модели: потолок до зап�
     expect(modelSpentUsd(day)).toBeCloseTo(0.5)
     expect(Object.keys(day?.modelHolds ?? {})).toEqual(['h2'])
     expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.4)
+  })
+
+  it('бронь этого же запуска старше часа (итог потерялся) тоже списывается целиком, свежая — держится', async () => {
+    const store = createMemoryRecordStore()
+    await hold(store, { caseKey: '1', holdId: 'h-old', maxUsd: 0.3, at: now - MODEL_HOLD_STALE_MS - 1 })
+    await hold(store, { caseKey: '1', holdId: 'h-fresh', maxUsd: 0.2, at: now - 60_000 })
+    expect(await hold(store, { caseKey: '2', holdId: 'h2', maxUsd: 0.1 })).toEqual({ held: true })
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect(day?.model).toEqual({ '1': 0.3 })
+    expect(Object.keys(day?.modelHolds ?? {}).sort()).toEqual(['h-fresh', 'h2'])
+    // Поздний итог списанной брони второй раз не считается.
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h-old', actualUsd: 0.05 }))
+    expect((await store.read<SpendDay>('spend', dayKey))?.model).toEqual({ '1': 0.3 })
   })
 })
 
