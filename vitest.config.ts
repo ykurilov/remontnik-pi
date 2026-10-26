@@ -19,6 +19,7 @@ export default defineConfig({
       'apps/*/test/**/*.test.ts',
       'apps/*/deploy/**/*.test.ts',
     ],
-    exclude: ['**/node_modules/**', '**/dist/**', '**/*.live.test.ts'],
+    // Падения врача — своя группа: `vitest.crash.config.ts`.
+    exclude: ['**/node_modules/**', '**/dist/**', '**/*.live.test.ts', 'packages/*/test/crash/**'],
   },
 })
