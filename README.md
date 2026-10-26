@@ -4,7 +4,24 @@
 
 Работает на сервере рядом с приложением, без Paseo. Построен на [@earendil-works/pi-durable](https://github.com/earendil-works/pi/tree/main/packages/durable).
 
-Подключается к приложению как набор пакетов `@ykurilov/remontnik-*`.
+## Из чего состоит
+
+| Пакет | Где работает | Что делает |
+|---|---|---|
+| `@ykurilov/remontnik-watch` | в каждом процессе приложения | сторож: ловит сбои и плохие ответы бота, шлёт врачу и в Telegram |
+| `@ykurilov/remontnik-core` | везде | настройка `remontnik.config.ts`, подписи запросов, вычистка секретов |
+| `@ykurilov/remontnik-doctor` | контейнер на сервере | врач: лечение, проверки, выкатка, откат, отчёты |
+| `@ykurilov/remontnik-browser` | контейнер на сервере, по желанию | браузер врача с сохранёнными входами |
+| `@ykurilov/remontnik-paseo-bridge` | компьютер владельца, по желанию | мост для режима «сначала Paseo» |
+
+## Документация
+
+- [Подключение к приложению](./docs/getting-started.md) — пошагово, для агента приложения.
+- [Настройка](./docs/configuration.md) — все поля `remontnik.config.ts`, окружение, команды.
+- [Безопасность](./docs/security.md) — что врачу можно и нельзя, сети случая, деньги, пароли, остаток риска.
+- Договоры между частями — [specs/001-self-healing-kit/contracts](./specs/001-self-healing-kit/contracts).
+
+Перед стартом врача: `remontnik-doctor check-config` — проверка настройки, окружения, Docker и правил GitHub.
 
 ## Разработка
 

@@ -300,9 +300,9 @@ description: "Задачи реализации Ремонтника Pi"
 **Независимая проверка**: свежий агент по `docs/getting-started.md` подключает набор к копии «Пациента», первый случай проходит весь цикл.
 
 - [X] T129 [P] [US10] Шаблон `deploy/compose.remontnik.yml` и `deploy/doctor.Dockerfile`: врач с сокетом Docker, верстак без сокета, без секретов и без сети приложения, тома состояния
-- [ ] T130 [P] [US10] `docs/getting-started.md` по contracts/app-integration.md: пакеты, сторож, настройка, команды, окружение через `secret-handoff`, по желанию — режим «сначала Paseo», правила GitHub через `gh api`, вход браузера через `logins add --password-stdin`
-- [ ] T131 [P] [US10] `docs/configuration.md`, `docs/security.md` (модель паролей и остаток риска, верстак, ключи eval), обновить `README.md`
-- [x] T132 [US10] Команда `remontnik-doctor check-config` с тестом в `packages/doctor/src/cli/check-config.ts`
+- [X] T130 [P] [US10] `docs/getting-started.md` по contracts/app-integration.md: пакеты, сторож, настройка, команды, окружение через `secret-handoff`, по желанию — режим «сначала Paseo», правила GitHub через `gh api`, вход браузера через `logins add --password-stdin`
+- [X] T131 [P] [US10] `docs/configuration.md`, `docs/security.md` (модель паролей и остаток риска, верстак, ключи eval), обновить `README.md`
+- [X] T132 [US10] Команда `remontnik-doctor check-config` с тестом в `packages/doctor/src/cli/check-config.ts`
 - [ ] T133 [US10] Проверка подключения свежим агентом (SC-012) на копии «Пациента»; итог записать в `specs/001-self-healing-kit/checklists/install-run.md`
 - [ ] T134 [US10] Первая запись changeset и раздел 0.1.0 «Как подключить» в `CHANGES.md`
 - [ ] T135 [US10] Вне репозитория: передать агенту первого приложения задачу подключения из частной папки `.private/` через `send_agent_prompt` — после выпуска 0.1.0

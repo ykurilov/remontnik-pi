@@ -1,0 +1,280 @@
+# Настройка Ремонтника
+
+Два источника настроек:
+
+- **`remontnik.config.ts`** в корне репозитория приложения — что лечить и как выкатывать. Секретов в нём нет: только имена переменных окружения.
+- **Окружение сервера** — где лежат секреты и как врач подключён к Docker.
+
+Проверить всё сразу: `remontnik-doctor check-config` (см. [getting-started.md](./getting-started.md#8-проверка-настройки)).
+
+## `remontnik.config.ts`
+
+Файл описывается функцией `defineRemontnikConfig` из `@ykurilov/remontnik-core/config`. Подходят и `remontnik.config.mts`, `.js`, `.mjs`, `.json`: файл должен быть ровно один.
+
+Врач читает настройку только из рабочей копии основной ветки на сервере. Копия на другой ветке или без ветки — отказ, файл не выполняется. Ошибка в настройке — врач не стартует и пишет каждое плохое поле отдельно. Неизвестные поля — тоже ошибка.
+
+В таблицах: `?` — поле необязательное, в скобках — значение по умолчанию.
+
+### `app`
+
+| Поле | Что это |
+|---|---|
+| `name` | короткое имя приложения для отчётов; то же, что `appName` у сторожа |
+| `timeZone?` (`"UTC"`) | пояс, по которому считаются сутки для дневных пределов |
+
+### `repo`
+
+| Поле | Что это |
+|---|---|
+| `mainBranch` | основная ветка; должна совпадать с `REMONTNIK_MAIN_BRANCH` врача (по умолчанию `main`) |
+| `mainline?` (`"merge"`) | как правка попадает в основную ветку после окна наблюдения: `"merge"` — врач отправляет её сам, только вперёд, без merge-коммита; `"pull-request"` — правка ждёт в своей ветке запроса на слияние |
+
+### `workbench` — где работает модель
+
+| Поле | Что это |
+|---|---|
+| `image` | образ разработки приложения (Node, pnpm): в нём идут команды модели, установка и проверки |
+| `install` | команда установки зависимостей. Врач добавляет `npm_config_frozen_lockfile=true`: pnpm ставит строго по файлу-замку. Для npm пишите `npm ci` |
+| `bashTimeoutMs?` (600 000) | предел одной команды модели, мс |
+
+### `checks` — проверки правки
+
+| Поле | Что это |
+|---|---|
+| `test` | команда тестов; код 0 — зелёные. Список упавших — JUnit XML или строка `REMONTNIK_FAILED=<имя>;<имя>` |
+| `typecheck?` | проверка типов |
+| `services?` | путь к файлу служб для тестов, см. ниже |
+| `eval?` | прогон сценариев с настоящей моделью, см. ниже |
+
+#### `checks.eval`
+
+| Поле | Что это |
+|---|---|
+| `run` | шаблон команды; подставляются `{scenarios}` (через запятую), `{repeat}`, `{maxCostUsd}`, `{outDir}` |
+| `resultFile` | путь к итогу внутри `{outDir}`. Формат — [deploy-commands.md](../specs/001-self-healing-kit/contracts/deploy-commands.md#итог-eval-outdirresultfile) |
+| `repeat?` (3) | сколько раз гонять сценарий |
+| `maxScenarios?` (3) | сколько сценариев в одном прогоне |
+| `env` | имена несекретных переменных окружения врача, которые получает eval. Имена с `KEY`, `TOKEN`, `SECRET`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `URL`, `DSN`, `COOKIE`, `SESSION` — ошибка: ключи идут только через `providers` |
+| `providers?` (`[]`) | модели, к которым eval ходит через прокси врача, см. ниже |
+| `tokenEnv?` (`REMONTNIK_EVAL_TOKEN`) | переменная, в которой eval получает разовый пропуск прогона |
+| `proxy?` | пределы прокси на прогон, см. ниже |
+
+Поставщик в `providers`:
+
+| Поле | Что это |
+|---|---|
+| `name` | строчные латинские буквы, цифры, дефис; без повторов |
+| `baseUrlEnv` | переменная, в которой eval получит адрес прокси |
+| `keyEnv` | переменная с настоящим ключом в окружении врача. Eval в ней же получает разовый пропуск, а не ключ |
+| `upstream` | настоящий адрес API модели |
+| `authHeader?` (`"authorization"`) | `"authorization"` или `"x-api-key"` |
+| `models` | белый список моделей с ценой за 1 млн токенов, $: `{ "<модель>": { input, output } }`. Не пустой. Модели нет в списке — прокси отвечает `403` |
+
+`proxy`:
+
+| Поле | По умолчанию | Что это |
+|---|---|---|
+| `maxRequestBytes` | 2 МБ | больше — `413` |
+| `maxResponseBytes` | 8 МБ | ответ читается потоком и обрывается на пределе |
+| `maxConcurrentRequests` | 4 | лишние запросы — `429` |
+| `maxOutputTokens` | 4096 | вставляется в запрос без предела ответа |
+
+#### Службы для тестов
+
+`checks.services` — файл compose (YAML или JSON) в репозитории: например, временная база для тестов. Врач поднимает службы сам, в закрытой сети проверок своего случая, и убирает после проверок. Тесты ходят к службе по её имени.
+
+- Файл берётся из основной ветки. Путь не должен попадать в `fixablePaths`, иначе врач не стартует.
+- Разделы: только `services` (и `name`, `version`, заготовки `x-…`).
+- Поля службы: `image`, `command`, `entrypoint`, `environment`, `healthcheck`, `tmpfs`, `working_dir`, `user`, `shm_size`, `depends_on`. Любое другое поле — отказ с его именем: портов, томов, сетей, `env_file`, сборки и прав у служб нет.
+- `image` — только закреплённый по отпечатку: `имя@sha256:<64 знака>`. Отпечаток: `docker buildx imagetools inspect <образ>`.
+- Подстановки переменных нет. Одиночный `$` — отказ; `$$` в контейнере становится `$`.
+- Базе нужна `healthcheck`: врач ждёт готовности.
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine@sha256:<64 знака>
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 1s
+      retries: 60
+```
+
+### `evalScope`
+
+Какие сценарии eval гонять при правке каких путей: `[{ paths: ["src/bot/**"], scenarios: "all" }, { paths: [...], scenarios: ["greeting"] }]`. Карта не даёт сценариев для правки плохого ответа бота — eval «не запускался», и такую правку врач не выкатывает: она уходит человеку.
+
+### Пути
+
+| Поле | Что это |
+|---|---|
+| `closedPaths` | маски путей, которые не попадают в рабочую копию врача и не запускаются |
+| `fixablePaths?` (`["src/**"]`) | белый список правки: только здесь врач может менять код. Новые файлы тестов можно добавлять и вне его |
+
+Маски различают регистр; путь с `\` не проходит; непонятная маска — ошибка при загрузке. Даже внутри `fixablePaths` защищены: существующие тесты, обвязка тестов (`setupTests.*`, `test-utils.*`, `mocks/**`, `testing/**`, `globalSetup.*`), конфиги сборки (`next.config.*`, `webpack.*`, `rollup.*`, `tsup.*`, `vite.*`, `.swcrc`, `.babelrc*`), `package.json`, файлы-замки, `.npmrc`, `pnpm-workspace.yaml`, `tsconfig*`, `.env*`. Правка такого файла уходит человеку.
+
+### `forbidden` — куда врачу нельзя
+
+| Поле | Что это |
+|---|---|
+| `schema` | маски файлов схемы базы и миграций |
+| `money` | деньги: оплата, счета, цены |
+| `access` | доступы: вход, права, ключи |
+| `extra?` | свои запреты приложения |
+| `allowDependencyChanges?` (`false`) | разрешить менять зависимости и файлы-замки |
+| `allowBuildAndDeployChanges?` (`false`) | разрешить менять сборку и выкатку |
+
+`schema`, `money`, `access` пустыми быть не могут. Зоны нет — `["<нет>"]` с комментарием.
+
+Встроенные запреты действуют всегда, убрать их нельзя:
+
+- файлы `.env*`, `*secret*`, `*credential*`, `*.pem`, `*.key`;
+- сам Ремонтник (`remontnik.config.*`, `.remontnik*`) и код Agent Chat SDK;
+- версии и патчи пакетов `@ykurilov/agent-chat-*` и `@ykurilov/remontnik-*`;
+- `CREATE TABLE`, `ALTER TABLE`, `DROP` в файлах `*.sql`.
+
+Без `allowBuildAndDeployChanges` закрыты `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `compose*.yml`, `docker-compose*.yml`, `.github/**`, `deploy/**`, `Makefile`, `tsconfig*.json` и поле `scripts` любого `package.json`. `.npmrc` закрыт всегда.
+
+### `deploy` — выкатка
+
+| Поле | Что это |
+|---|---|
+| `commands.build` | собрать кандидата из рабочей копии правки; 30 минут |
+| `commands.promote` | сохранить текущую сборку как прежнюю и запустить кандидата; 5 минут |
+| `commands.confirm` | снять отметку «выкатка не подтверждена»; 5 минут |
+| `commands.rollback` | вернуть прежнюю сборку, без git и без сети; 5 минут |
+| `commands.current` | JSON `{"version":"<полный sha>","previous":"<sha>"\|null}`; 30 секунд |
+| `commands.health` | код 0 — здоров; 30 секунд |
+| `lockFile` | замок выкатки, общий с ручной выкаткой: от корня рабочей копии или абсолютный путь |
+| `buildEnv?` (`[]`) | имена переменных окружения, которые видит `build`, кроме `PATH`, пустого `HOME` и `REMONTNIK_VERSION`. Имена `REMONTNIK_*` — ошибка |
+| `lockWaitReportMinutes?` (30) | сколько ждать занятый замок, прежде чем позвать человека. Ждать врач продолжает |
+
+Договор на каждую команду — [deploy-commands.md](../specs/001-self-healing-kit/contracts/deploy-commands.md).
+
+### `observe?` — окно наблюдения после выкатки
+
+| Поле | По умолчанию | Что это |
+|---|---|---|
+| `windowMinutes` | 30 | сколько наблюдать |
+| `healthFailuresToRollback` | 3 | столько сбоев `health` подряд или среди последних `healthWindowTicks` проверок — откат |
+| `healthWindowTicks` | 5 | окно не закрывается раньше этого числа проверок |
+| `errorRateFactor` | 3 | ошибок стало во столько раз больше, чем до выкатки, — откат |
+| `minErrorsToRollback` | 5 | меньше ошибок за окно рост не считается |
+| `newFingerprintsToRollback` | 3 | столько новых видов сбоев — откат |
+
+### `limits?` — пределы
+
+| Поле | По умолчанию | Что это |
+|---|---|---|
+| `watchModelUsdPerDay` | $1 | потолок модели сторожа (чтение разговоров) в сутки |
+| `doctorModelUsdPerDay` | $4 | потолок модели врача в сутки. Со сторожем у него раздельные счётчики |
+| `diagnoseUsdPerCase?` | — | потолок модели на одно лечение |
+| `evalUsdPerDay` | $5 | потолок eval в сутки |
+| `evalUsdPerCase` | $1 | доля eval на один случай; больше прокси не пропустит |
+| `autoDeploysPerFingerprintPerDay` | 2 | автовыкаток на один вид сбоя в сутки |
+| `autoDeploysPerDay` | 5 | автовыкаток на приложение в сутки |
+| `maxDiffLines` | 300 | правка больше — человеку |
+| `maxDiffFiles` | 15 | правка шире — человеку |
+
+Пока этап 10 не влит в основную ветку, вместо `watchModelUsdPerDay` и `doctorModelUsdPerDay` действует общий `modelUsdPerDay` ($5), а потолок сторожа задаётся в `review.usdPerDay`.
+
+### `reports` — куда слать отчёты
+
+| Поле | Что это |
+|---|---|
+| `telegram.botTokenEnv` | имя переменной с токеном бота тревог |
+| `telegram.chatIdEnv?` | имя переменной с чатом. Врачу чат нужен: без этого поля он не стартует |
+| `telegram.apiBaseUrlEnv?` | имя переменной с адресом своего прокси Telegram |
+| `telegram.proxyTokenEnv?` | имя переменной с ключом этого прокси |
+
+### `handoff?` — кто лечит первым
+
+| Поле | Что это |
+|---|---|
+| `mode` (`"self"`) | `"self"` — лечит врач; `"paseo-first"` — сначала агент приложения в Paseo |
+| `paseo.bridgeUrlEnv` | имя переменной с адресом моста в частной сети |
+| `paseo.bridgeSecretEnv` | имя переменной с секретом моста |
+| `paseo.listenEnv` | имя переменной с адресом частной сети, где врач слушает мост |
+| `paseo.acceptTimeoutMs?` (300 000) | сколько ждать, что агент взял случай |
+| `paseo.workTimeoutMs?` (3 600 000) | сколько ждать итога |
+
+`paseo` обязателен при `"paseo-first"`. Договор — [paseo-bridge.md](../specs/001-self-healing-kit/contracts/paseo-bridge.md).
+
+### `review?` — чтение разговоров сторожем
+
+| Поле | Что это |
+|---|---|
+| `botDescription` | что бот должен делать и чего не должен: по нему модель судит ответы |
+| `minConfidence?` (0.7) | отметки с меньшей уверенностью случаями не становятся |
+
+### `browser?` — браузер врача
+
+| Поле | Что это |
+|---|---|
+| `enabled` | включён ли |
+| `profile` | профиль браузера |
+| `allowedOrigins` | куда можно ходить; в примерах — только `https://app.example.com` |
+| `allowedMutations` | какие изменяющие запросы пропускать: `{ method, pathPattern }`; `*` — кусок пути, `**` — остаток. Держите узкими |
+| `pagesToCheck` | страницы для проверки после правки: `{ url, expectText? }` |
+| `loginEntryId?` | номер сохранённого входа (`logins list`) |
+| `live?` | живой экран владельца: `{ enabled, linkEnv }`, `linkEnv` — имя переменной с его адресом в частной сети |
+
+## Окружение врача
+
+Секреты — в файле окружения врача (`REMONTNIK_ENV_FILE`), который кладёт на сервер `secret-handoff`. Остальное задаёт шаблон [`deploy/compose.remontnik.yml`](../deploy/compose.remontnik.yml).
+
+| Переменная | Нужна | Что это |
+|---|---|---|
+| `REMONTNIK_CONFIG_REPO_DIR` | да | рабочая копия основной ветки приложения |
+| `REMONTNIK_STATE_DIR` | да | состояние врача: хранилище, копии случаев |
+| `REMONTNIK_WORKTREES_DIR` | нет | копии случаев; по умолчанию `<состояние>/worktrees` |
+| `REMONTNIK_MAIN_BRANCH` | нет | основная ветка (`main`) |
+| `REMONTNIK_SHARED_SECRET` | да | общий секрет сторожа и врача |
+| `REMONTNIK_CONTROL_SECRET` | желательно | секрет владельца: снова пускает выкатки, подтверждает версию брошенной выкатки, снимает «нужен человек». Совпадает с общим — врач не стартует |
+| `REMONTNIK_GATEWAY_CONTAINER` | да | имя контейнера врача: он подключает себя к сетям случая |
+| `REMONTNIK_LISTEN_NETWORK` | да* | сеть Docker приложения: врач слушает приём событий только на своём адресе в ней |
+| `REMONTNIK_LISTEN` | да* | вместо сети — явный адрес `host:port`; все адреса (`0.0.0.0`, `::`) — отказ |
+| `REMONTNIK_LISTEN_PORT` | нет | порт приёма (7800) |
+| `REMONTNIK_CASE_SUBNETS` | нет | пул подсетей сетей случая (`10.213.0.0/16`); не должен пересекаться с сетями сервера |
+| `REMONTNIK_GIT_TOKEN` | желательно | ключ git врача: только этот репозиторий |
+| `REMONTNIK_GIT_AUTHOR_NAME`, `REMONTNIK_GIT_AUTHOR_EMAIL` | нет | автор коммитов врача |
+| `REMONTNIK_WORKBENCH_MEMORY`, `REMONTNIK_WORKBENCH_CPUS` | нет | пределы контейнера верстака |
+| `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | да | ключи модели врача |
+| `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL`, `PROXY_TOKEN` | нет | свой прокси до моделей |
+| переменные из `reports.telegram.*Env` | да | бот и чат тревог |
+| переменные из `checks.eval.providers[].keyEnv` | да, если есть eval | настоящие ключи моделей для eval |
+| переменные из `checks.eval.env` | нет | несекретные переменные для eval |
+| переменные из `handoff.paseo.*Env` | да, при `"paseo-first"` | адрес моста, секрет моста, адрес приёма |
+| `REMONTNIK_REPORTS_TOKEN` | нет | забор отчётов `reports pull` без моста |
+| `REMONTNIK_BROWSER_URL`, `REMONTNIK_BROWSER_TOKEN` | при браузере | адрес и ключ браузера врача |
+| `REMONTNIK_DOCTOR_URL` | для команд | адрес врача для консольных команд (`deploys`, `reports`) |
+
+\* Одна из двух.
+
+Переменные compose (не секреты, в `.env` рядом с шаблоном): `REMONTNIK_APP_DIR`, `REMONTNIK_STATE_DIR`, `REMONTNIK_ENV_FILE`, `REMONTNIK_APP_NETWORK`, `DOCKER_GID`, `REMONTNIK_UID`, `REMONTNIK_GID`, `REMONTNIK_DOCTOR_MEMORY` (2g), `REMONTNIK_CASE_SUBNETS`, `REMONTNIK_IMAGE_TAG`; для браузера — `REMONTNIK_BROWSER_ENV_FILE`, `REMONTNIK_BROWSER_POLICY`.
+
+## Окружение браузера
+
+| Переменная | Что это |
+|---|---|
+| `REMONTNIK_BROWSER_TOKEN` | ключ врача, не короче 16 знаков |
+| `REMONTNIK_BROWSER_VAULT_KEY` | ключ хранилища входов: 32 байта в base64. Есть только в контейнере браузера |
+| `REMONTNIK_BROWSER_DATA_DIR` | профили, входы, снимки экрана |
+| `REMONTNIK_BROWSER_POLICY` | путь к политике: `allowedOrigins`, `allowedMutations`, `profiles` |
+| `REMONTNIK_BROWSER_LISTEN` | адрес службы (`127.0.0.1:7700`) |
+| `REMONTNIK_BROWSER_LIVE_LISTEN`, `REMONTNIK_BROWSER_OWNER_TOKEN` | живой экран: адрес в частной сети и ключ владельца |
+
+## Консольные команды врача
+
+| Команда | Что делает |
+|---|---|
+| `remontnik-doctor start` | служба врача; всё — из окружения |
+| `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы и правила GitHub до старта; код 1 — есть ошибки |
+| `remontnik-doctor deploys stop` / `resume` | стоп-кран; `resume` — только секретом владельца |
+| `remontnik-doctor deploys confirm <версия>` | подтвердить версию брошенной выкатки; только секретом владельца |
+| `remontnik-doctor fingerprint <отпечаток> release` | снять «нужен человек» после отката; только секретом владельца (этап 10) |
+| `remontnik-doctor reports pull` / `ack <номер>` | забор отчётов по `REMONTNIK_REPORTS_TOKEN` |
