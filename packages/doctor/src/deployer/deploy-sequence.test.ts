@@ -10,7 +10,7 @@ import { createReports } from '../reports/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
 import type { AppCommands } from './app-commands.js'
-import { confirmAbandonedVersion, createDeployer, LOCK_RETRY_MS, readDeployment, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
+import { confirmAbandonedVersion, createDeployer, DEPLOYMENT_INDEX_COLLECTION, LOCK_RETRY_MS, readDeployment, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
 import { createDeployLock, type DeployLock } from './lock.js'
 
 // Порядок выкатки (contracts/deploy-commands.md) и её доведение до конца после падения врача на любом шаге.
@@ -785,4 +785,60 @@ describe('падение врача посреди выкатки', () => {
       // Полная выкатка заново после каждого из десятков шагов: на занятой машине дольше обычных 5 с.
     }, 60_000)
   }
+})
+
+describe('чужая выкатка (adopt): врач наблюдает выкатку агента Paseo', () => {
+  // Агент уже выкатил кандидата по правилам приложения: работает он, прежняя — на месте для отката.
+  const adoptApp = () => createFakeDeployApp({ running: CAND, previous: PREV })
+  const adopted = (adopt: NonNullable<DeployRequest['adopt']> = { since: START }): DeployRequest => ({ ...request, candidateDir: '', adopt })
+
+  it('стоп-кран нажат — чужую выкатку врач всё равно наблюдает и откатывает, если стало хуже', async () => {
+    const app = adoptApp()
+    sickAfterPromote(app)
+    const r = rig({ app, request: adopted() })
+    await createControls(r.records).set('stop', 'telegram:admin')
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'health', previousVersion: PREV })
+    expect(app.running).toBe(PREV)
+    expect(count(app.calls, 'promote')).toBe(0)
+    expect(app.calls.some((call) => call.startsWith('build'))).toBe(false)
+  })
+
+  it('работает не та версия, о которой сообщил агент, — отказ claimed_version_not_running, приложение не трогаем', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({ app, request: adopted() })
+    expect(await r.drive()).toMatchObject({ outcome: 'refused', refusal: 'claimed_version_not_running' })
+    expect(app.running).toBe(PREV)
+    expect(count(app.calls, 'rollback')).toBe(0)
+    expect(count(app.calls, 'confirm')).toBe(0)
+    expect(r.tags).toEqual([])
+  })
+
+  it('прежняя версия — кандидат брошенной выкатки — отказ unconfirmed_version: откатываться на неё нельзя', async () => {
+    const app = adoptApp()
+    const r = rig({ app, request: adopted() })
+    await r.records.transaction(async (tx) => {
+      const index = await tx.doc<{ abandonedVersions?: string[] }>(DEPLOYMENT_INDEX_COLLECTION, 'main', { nextId: 1, byRequest: {} } as { abandonedVersions?: string[] })
+      index.abandonedVersions = [PREV]
+    })
+    expect(await r.drive()).toMatchObject({ outcome: 'refused', refusal: 'unconfirmed_version' })
+    expect(app.running).toBe(CAND)
+    expect(count(app.calls, 'rollback')).toBe(0)
+    expect(r.tags).toEqual([])
+  })
+
+  it('сбой случая до отчёта агента — это ещё прежняя версия: не «не помогло»; после отчёта — «не помогло»', async () => {
+    const caseEvent = (at: number) => createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/case.ts', message: 'сбой случая', occurredAt: new Date(at) })
+    const fingerprint = caseEvent(START).fingerprint
+    // Окно ошибок — с запасом до отчёта агента; сбой случая — только с самого отчёта.
+    const adopt = { since: START - 5 * MINUTE, caseSince: START }
+
+    const before = rig({ app: adoptApp(), request: { ...adopted(adopt), fingerprint } })
+    await createCaseBook(before.records).recordEvents([caseEvent(START - 2 * MINUTE)])
+    expect((await before.drive()).outcome).toBe('holding')
+
+    const after = rig({ app: adoptApp(), request: { ...adopted(adopt), fingerprint } })
+    await createCaseBook(after.records).recordEvents([caseEvent(START + MINUTE)])
+    expect((await after.drive()).outcome).toBe('not_helped')
+  })
 })

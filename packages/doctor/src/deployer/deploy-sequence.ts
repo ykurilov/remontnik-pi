@@ -98,6 +98,8 @@ export interface Deployment {
   promoteLaunched?: boolean
   /** Когда `promote` вернулся: с этой минуты считаются ошибки кандидата. */
   promoteReturnedAt?: string
+  /** Чужая выкатка: с этой минуты повтор сбоя случая — «не помогло»; нет — с `promoteReturnedAt`. */
+  caseErrorsFrom?: string
   /** Когда `current` подтвердил кандидата: от него окно наблюдения. */
   promotedAt?: string
   observeUntil?: string
@@ -140,10 +142,11 @@ export interface DeployRequest {
   candidateDir: string
   /**
    * Выкатку уже сделал другой (агент Paseo по правилам выкатки приложения): врач берёт замок, метит прежнюю версию,
-   * без `build` и `promote` наблюдает окно и откатывает, если стало хуже. `since` — когда она закончилась:
-   * с этой минуты считаются ошибки новой версии. Рабочая копия берётся как есть — выкатка могла её изменить.
+   * без `build` и `promote` наблюдает окно и откатывает, если стало хуже. `since` — не позже начала её выкатки:
+   * с этой минуты считаются ошибки новой версии. `caseSince` — с какой минуты повтор сбоя случая значит «не помогло»:
+   * раньше мог работать прежний код. Рабочая копия берётся как есть — выкатка могла её изменить.
    */
-  adopt?: { since: number }
+  adopt?: { since: number; caseSince?: number }
 }
 
 export interface DeployIo {
@@ -468,12 +471,14 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             if (!current.ok) return refuse('current_unavailable', current.reason)
             if (current.version === null) return refuse('no_previous_build')
             let previousVersion = current.version
+            const abandoned = (await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY))?.abandonedVersions ?? []
             if (request.adopt) {
               if (current.version !== request.candidateVersion) return refuse('claimed_version_not_running', `работает ${current.version}, а не ${request.candidateVersion}`)
               if (current.previous === null) return refuse('no_previous_build')
+              // Откат вернул бы кандидата брошенной выкатки, которого владелец не подтвердил.
+              if (abandoned.includes(current.previous)) return refuse('unconfirmed_version', `прежняя ${current.previous} — кандидат брошенной выкатки`)
               previousVersion = current.previous
             } else {
-              const abandoned = (await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY))?.abandonedVersions ?? []
               if (abandoned.includes(current.version)) return refuse('unconfirmed_version', `работает ${current.version} — кандидат брошенной выкатки`)
               if (current.version === request.candidateVersion) return refuse('already_running')
             }
@@ -499,7 +504,8 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           case 'building': {
             if (!(await holdsLock())) break
             if (request.adopt) {
-              // Чужая выкатка уже прошла: окно наблюдения — от этой минуты, ошибки новой версии — с её конца.
+              // Чужая выкатка уже прошла: окно наблюдения — от этой минуты, ошибки новой версии — с её начала.
+              const { caseSince } = request.adopt
               const since = new Date(request.adopt.since)
               const baseline = await readErrorBaseline(store, request.appName, since)
               await save((draft) => {
@@ -507,6 +513,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
                 draft.promoteRequested = true
                 draft.promoteLaunched = true
                 draft.promoteReturnedAt = since.toISOString()
+                if (caseSince !== undefined) draft.caseErrorsFrom = new Date(caseSince).toISOString()
                 draft.stage = 'observing'
                 draft.promotedAt = now().toISOString()
                 draft.observeUntil = new Date(io.now() + windowMs).toISOString()
@@ -617,6 +624,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               appName: request.appName,
               at: now(),
               errorsFrom: new Date(deployment.promoteReturnedAt ?? deployment.promotedAt!),
+              ...(deployment.caseErrorsFrom ? { caseErrorsFrom: new Date(deployment.caseErrorsFrom) } : {}),
               baseline: deployment.baseline!,
               caseFingerprint: request.fingerprint,
             })
