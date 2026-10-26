@@ -98,6 +98,19 @@ describe('бронь запроса к модели: потолок до зап�
     expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.1)
   })
 
+  it('расход случая разложен по поставщикам, которые ответили: видно, ушёл ли случай на запасной путь', async () => {
+    const store = createMemoryRecordStore()
+    await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.2 })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.1, provider: 'deepseek' }))
+    await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.2 })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h2', actualUsd: 0.05, provider: 'deepseek' }))
+    await hold(store, { caseKey: '1', holdId: 'h3', maxUsd: 0.2 })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h3', actualUsd: 0.2 }))
+    const spend = await store.read<CaseSpend>('spend-case', '1')
+    expect(spend?.modelUsd).toBeCloseTo(0.35)
+    expect(spend?.byProvider).toEqual({ deepseek: expect.closeTo(0.15) })
+  })
+
   it('денег на бронь нет → отказ; день исчерпан → отказ даже бесплатному запросу; нулевой потолок — модель не зовётся', async () => {
     const store = createMemoryRecordStore()
     await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.9 })

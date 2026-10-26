@@ -42,6 +42,12 @@ function current() {
   return JSON.parse(result.stdout) as { version: string | null; previous: string | null }
 }
 
+/** Настройки выкатки лежат файлом в папке выкаток: врач не передаёт командам переменные с адресами. */
+function writeSettings(settings: Record<string, unknown>) {
+  mkdirSync(deployRoot, { recursive: true })
+  writeFileSync(join(deployRoot, 'settings.json'), JSON.stringify(settings))
+}
+
 function buildAndPromote(version: string, content: string) {
   writeFileSync(join(workCopy, 'app.txt'), content)
   expect(run('build', { REMONTNIK_VERSION: version }).code).toBe(0)
@@ -157,12 +163,84 @@ describe('выкатка «Пациента» на папках', () => {
       buildAndPromote('v1', 'one')
       const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/health`
 
+      writeSettings({ healthUrl: url })
+
       status = 200
-      expect((await runAsync('health', { PATIENT_HEALTH_URL: url })).code).toBe(0)
+      expect((await runAsync('health')).code).toBe(0)
       status = 500
-      const unhealthy = await runAsync('health', { PATIENT_HEALTH_URL: url })
+      const unhealthy = await runAsync('health')
       expect(unhealthy.code).not.toBe(0)
       expect(unhealthy.stdout).toContain('500')
+    })
+  })
+
+  describe('promote и rollback ждут, пока перезапущенное приложение ответит своей версией', () => {
+    let server: Server
+    /** Какую версию отдаёт «приложение»: присмотр перезапускает его не сразу после смены ссылки. */
+    let answers: string[] = []
+    let versionUrl: string
+
+    beforeEach(async () => {
+      answers = []
+      server = createServer((_request, response) => {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ version: answers.length > 1 ? answers.shift() : answers[0] }))
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      versionUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/version`
+    })
+
+    afterEach(async () => {
+      await new Promise((resolve) => server.close(resolve))
+    })
+
+    it('promote возвращается, когда приложение отвечает версией кандидата', async () => {
+      buildAndPromote('v1', 'one')
+      writeFileSync(join(workCopy, 'app.txt'), 'two')
+      expect(run('build', { REMONTNIK_VERSION: 'v2' }).code).toBe(0)
+      answers = ['v1', 'v1', 'v1', 'v2']
+      writeSettings({ versionUrl })
+
+      const promoted = await runAsync('promote')
+
+      expect(promoted).toMatchObject({ code: 0 })
+      expect(answers).toEqual(['v2'])
+    })
+
+    it('приложение так и не ответило версией кандидата — promote с ошибкой, ссылка уже переставлена', async () => {
+      buildAndPromote('v1', 'one')
+      writeFileSync(join(workCopy, 'app.txt'), 'two')
+      expect(run('build', { REMONTNIK_VERSION: 'v2' }).code).toBe(0)
+      answers = ['v1']
+      writeSettings({ versionUrl, startTimeoutSeconds: 1 })
+
+      const promoted = await runAsync('promote')
+
+      expect(promoted.code).not.toBe(0)
+      expect(promoted.stdout).toContain('v2')
+      expect(current().version).toBe('v2')
+    })
+
+    it.each([[0], [-5], ['10'], [null]])('startTimeoutSeconds %j — не положительное число: ждёт по умолчанию, а не сдаётся сразу', async (startTimeoutSeconds) => {
+      buildAndPromote('v1', 'one')
+      writeFileSync(join(workCopy, 'app.txt'), 'two')
+      expect(run('build', { REMONTNIK_VERSION: 'v2' }).code).toBe(0)
+      answers = ['v1', 'v1', 'v1', 'v2']
+      writeSettings({ versionUrl, startTimeoutSeconds })
+
+      expect(await runAsync('promote')).toMatchObject({ code: 0 })
+    })
+
+    it('rollback возвращается, когда приложение отвечает прежней версией', async () => {
+      buildAndPromote('v1', 'one')
+      buildAndPromote('v2', 'two')
+      answers = ['v2', 'v2', 'v1']
+      writeSettings({ versionUrl })
+
+      const rolledBack = await runAsync('rollback')
+
+      expect(rolledBack).toMatchObject({ code: 0 })
+      expect(answers).toEqual(['v1'])
     })
   })
 

@@ -94,7 +94,7 @@ function paseoBridgeOf(env: DoctorEnv, config: RemontnikConfig): Pick<DoctorServ
  * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
  * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
-export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): DoctorStartPlan {
+export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options: { log?: (line: string) => void } = {}): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
   const worktreesDir = env.REMONTNIK_WORKTREES_DIR?.trim() || join(stateDir, 'worktrees')
@@ -108,7 +108,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   if (!chatIdEnv) throw new Error('врачу нужен чат тревог: reports.telegram.chatIdEnv в настройке')
   const apiBaseUrl = telegram.apiBaseUrlEnv ? env[telegram.apiBaseUrlEnv]?.trim() : undefined
   const proxyToken = telegram.proxyTokenEnv ? env[telegram.proxyTokenEnv]?.trim() : undefined
-  const model = createDoctorModels(env)
+  // Переход модели на запасной путь и обратно — в журнал врача.
+  const model = createDoctorModels(env, options.log ? { log: options.log } : {})
   const browserClient = browserClientFromEnv(env)
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
   const { bridge, paseoBridge } = paseoBridgeOf(env, config)
@@ -214,7 +215,7 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
   const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
-  const plan = doctorStartPlan(env, config)
+  const plan = doctorStartPlan(env, config, options.log ? { log: options.log } : {})
   const listen = 'network' in plan.listen
     ? { host: await containerAddress(plan.gateway.container, plan.listen.network, options.docker), port: plan.listen.port }
     : plan.listen

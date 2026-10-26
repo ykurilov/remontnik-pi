@@ -13,6 +13,7 @@ import {
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek'
 import { openrouterProvider } from '@earendil-works/pi-ai/providers/openrouter'
 import { DEFAULT_RETRY_PRIMARY_AFTER_MS, FALLBACK_MODEL, PRIMARY_MODEL } from '@ykurilov/remontnik-core/model-route'
+import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { mayHaveBeenPaid, maxRequestUsd, statusFromMessage, unknownPriceOf } from './request-price.js'
 
 // Модель врача для pi-durable: один поставщик pi-ai поверх двух путей (R2).
@@ -228,12 +229,21 @@ function proxyHeaders(baseUrl: string | undefined, proxyToken: string | undefine
   return baseUrl && proxyToken ? { 'X-Proxy-Token': proxyToken } : undefined
 }
 
+/** Строка журнала врача о смене пути модели. Причина — текст ошибки поставщика, ключи из неё вычищены. */
+function routeSwitchLine(event: { to: RouteName; reason: string }, env: DoctorModelEnv): string {
+  if (event.to === 'primary') return 'модель: снова основной путь (DeepSeek)'
+  const knownSecrets = [env.DEEPSEEK_API_KEY, env.OPENROUTER_API_KEY, env.PROXY_TOKEN].filter((secret): secret is string => Boolean(secret))
+  const minutes = Math.round(DEFAULT_RETRY_PRIMARY_AFTER_MS / 60_000)
+  return `модель: основной путь (DeepSeek) не ответил — запасной путь (OpenRouter) на ${minutes} мин: ${redactSecrets(event.reason, { knownSecrets }).slice(0, 300)}`
+}
+
 export function createDoctorModels(
   env: DoctorModelEnv,
-  options: Pick<FallbackProviderOptions, 'now' | 'onSwitch' | 'retryPrimaryAfterMs'> = {},
+  options: Pick<FallbackProviderOptions, 'now' | 'onSwitch' | 'retryPrimaryAfterMs'> & { log?: (line: string) => void } = {},
 ): { models: MutableModels; model: { provider: string; modelId: string }; provider: FallbackProvider } {
   if (!env.DEEPSEEK_API_KEY) throw new Error('врачу нужен ключ DEEPSEEK_API_KEY')
   if (!env.OPENROUTER_API_KEY) throw new Error('врачу нужен ключ OPENROUTER_API_KEY')
+  const { log, ...routeOptions } = options
   const primaryHeaders = proxyHeaders(env.DEEPSEEK_BASE_URL, env.PROXY_TOKEN)
   const fallbackHeaders = proxyHeaders(env.OPENROUTER_BASE_URL, env.PROXY_TOKEN)
   const provider = createFallbackProvider({
@@ -251,7 +261,11 @@ export function createDoctorModels(
       ...(env.OPENROUTER_BASE_URL ? { baseUrl: env.OPENROUTER_BASE_URL } : {}),
       ...(fallbackHeaders ? { headers: fallbackHeaders } : {}),
     },
-    ...options,
+    ...routeOptions,
+    onSwitch: (event) => {
+      log?.(routeSwitchLine(event, env))
+      routeOptions.onSwitch?.(event)
+    },
   })
   const models = createModels()
   models.setProvider(provider)
