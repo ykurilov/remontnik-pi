@@ -19,7 +19,7 @@ import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js
 import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
-import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
+import { ATTEMPT_REFUSALS, decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
 import { GIT_GUARD_REASONS, GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
@@ -54,7 +54,7 @@ import {
   type FixInspection,
   type GateClosing,
 } from './gate.js'
-import { admitAutoDeployIn, deployAttemptsOf, emptyFingerprintLedger, LEDGER, recordRollbackIn, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
+import { admitAutoDeployIn, deployAttemptsOf, emptyFingerprintLedger, LEDGER, recordRollbackIn, refundAutoDeployIn, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
 import type { ModelBudget } from '../ledgers/model-budget.js'
 import {
   caseLimitUsdOf,
@@ -521,10 +521,14 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     const mainline = stays ? await settleMainline(runtime, checkpoint, context) : undefined
     const text = deploymentReport({ case: doc.case, deployment, branch: checkpoint.branch, ...(mainline ? { mainline } : {}) })
     const closing = deployClosing(deployment, text.type)
-    // Правку откатили (или откат не удался): по этому отпечатку дальше выкатывает только человек.
-    const rolledBack = deployment.outcome === 'rolled_back' || deployment.outcome === 'rollback_failed'
-    const markRollback = (records: RecordTransaction) =>
-      recordRollbackIn(records, { fingerprint: sick.fingerprint, deploymentId: deployment.deploymentId, at: deps.now() })
+    // Учёт выкаток — той же фиксацией, что итог. Правку откатили (или откат не удался): по этому отпечатку дальше
+    // выкатывает только человек. Выкатка не началась: допуск возвращается, попытка не потрачена.
+    const { timeZone } = (await deps.loadConfig()).app
+    const ledgerIn = async (records: RecordTransaction) => {
+      const input = { fingerprint: sick.fingerprint, deploymentId: deployment.deploymentId }
+      if (deployment.outcome === 'rolled_back' || deployment.outcome === 'rollback_failed') await recordRollbackIn(records, { ...input, at: deps.now() })
+      if (deployment.outcome === 'refused') await refundAutoDeployIn(records, { ...input, timeZone })
+    }
     await finish(
       runtime,
       caseId,
@@ -544,7 +548,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       },
       context,
       checkpoint.baseRunning,
-      rolledBack ? markRollback : undefined,
+      ledgerIn,
     )
   }
 
@@ -834,8 +838,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           const now = deps.now()
           const ledger = await records.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger())
           const attempts = deployAttemptsOf(ledger, { fingerprint: sick.fingerprint, now, timeZone: config.app.timeZone, limits: config.limits })
-          const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
-          const closing = closingOf(gate, checks)
+          let gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
+          let closing = closingOf(gate, checks)
           if (closing.kind === 'deploy' && deps.deployer) {
             const deployment = await deploymentIdIn(records, { caseId, candidateVersion: checkpoint.fixCommit })
             const admission = await admitAutoDeployIn(records, {
@@ -845,11 +849,15 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               timeZone: config.app.timeZone,
               limits: config.limits,
             })
-            // Те же правила над тем же документом: решение «выкатывать» учёт не отклоняет.
-            if (!admission.admitted) throw new Error(`учёт выкаток не пустил разрешённую выкатку: ${admission.reasons.join(', ')}`)
-            deployment.reserve()
-            await setCaseStateIn(records, caseId, 'deploying')
-            return { status: 'running', checkpoint: { ...checkpoint, phase: 'deploying', gate } }
+            if (admission.admitted) {
+              deployment.reserve()
+              await setCaseStateIn(records, caseId, 'deploying')
+              return { status: 'running', checkpoint: { ...checkpoint, phase: 'deploying', gate } }
+            }
+            // Те же правила над тем же документом, так что отказа здесь быть не должно. Если он всё же есть — это
+            // решение «не выкатывать»: случай закрывается отчётом, а фаза не падает по кругу.
+            gate = { verdict: 'report_only', reasons: admission.reasons.map((code) => ({ code, message: ATTEMPT_REFUSALS[code] })) }
+            closing = closingOf(gate, checks)
           }
           const { text, outcome } = closeWith(closing.kind, gate)
           const reportId = await reportIn(records, caseId, closing.caseState, closing.report, redactedWith(knownSecrets, text, checkpoint.baseRunning))

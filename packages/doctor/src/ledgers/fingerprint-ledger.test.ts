@@ -9,6 +9,7 @@ import {
   admitAutoDeployIn,
   readDeployAttempts,
   recordRollbackIn,
+  refundAutoDeployIn,
   releaseFingerprint,
   type DeployAttemptLimits,
 } from './fingerprint-ledger.js'
@@ -150,6 +151,22 @@ describe('допуск автовыкатки: проверить и запис�
     await store.transaction((tx) => recordRollbackIn(tx, { fingerprint: 'fp-a', deploymentId: 2, at: noon }))
     expect(await admit('fp-a', 3)).toEqual({ admitted: false, reasons: ['attempts_exhausted', 'needs_human_after_rollback'] })
     expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 2, autoDeploysToday: 2 })
+  })
+
+  it('выкатка не началась → допуск возвращается: попытка и место дня свободны; повторный возврат ничего не меняет', async () => {
+    const store = createMemoryRecordStore()
+    await deploy(store, 'fp-a', 1, noon - HOUR)
+    await deploy(store, 'fp-a', 2, noon - HOUR)
+    await deploy(store, 'fp-b', 3, noon - HOUR)
+    const refund = () => store.transaction((tx) => refundAutoDeployIn(tx, { fingerprint: 'fp-a', deploymentId: 2, timeZone: 'UTC' }))
+    await refund()
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    await refund()
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    // Незнакомая выкатка или отпечаток — ничего не меняется и не создаётся.
+    await store.transaction((tx) => refundAutoDeployIn(tx, { fingerprint: 'fp-x', deploymentId: 9, timeZone: 'UTC' }))
+    expect(await attempts(store, 'fp-b', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    await deploy(store, 'fp-a', 4, noon)
   })
 
   it('повтор той же выкатки после перезапуска пропускается, даже когда предел уже выбран', async () => {

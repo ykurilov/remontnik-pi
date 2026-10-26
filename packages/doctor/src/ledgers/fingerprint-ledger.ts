@@ -7,7 +7,8 @@ import { spendDayKey } from './spend-ledger.js'
 // «нужен человек»: автоматических выкаток по нему нет, пока владелец не снимет пометку командой `fingerprint <fp> release`.
 // Выкатка спрашивает допуск `admitAutoDeployIn`: проверка пределов и запись попытки — одной транзакцией, поэтому два
 // случая разом не проходят оба на последнем свободном месте. `recordRollbackIn` — после отката. Повтор той же выкатки
-// (фаза после перезапуска) допускается и не считается второй попыткой.
+// (фаза после перезапуска) допускается и не считается второй попыткой. Выкатка не началась — `refundAutoDeployIn`
+// возвращает допуск.
 
 export const LEDGER = { collection: 'ledger', key: 'main' } as const
 
@@ -94,6 +95,21 @@ export async function admitAutoDeployIn(
   const day = spendDayKey(input.at, input.timeZone)
   ledger.deploysToday = ledger.deploysToday.day === day ? { day, count: ledger.deploysToday.count + 1 } : { day, count: 1 }
   return { admitted: true }
+}
+
+/**
+ * Выкатка не началась (`refused`: рабочая версия не тронута) — допуск возвращается: попытка по отпечатку и место дня
+ * снова свободны. Возврат уже возвращённой выкатки ничего не меняет, поэтому повтор фиксации после перезапуска безопасен.
+ */
+export async function refundAutoDeployIn(tx: RecordTransaction, input: { fingerprint: string; deploymentId: number; timeZone: string }): Promise<void> {
+  const ledger = await ledgerIn(tx)
+  if (!Object.hasOwn(ledger.fingerprints, input.fingerprint)) return
+  const record = ledger.fingerprints[input.fingerprint]!
+  const admitted = record.autoDeploys.find((deploy) => deploy.deploymentId === input.deploymentId)
+  if (!admitted) return
+  record.autoDeploys = record.autoDeploys.filter((deploy) => deploy.deploymentId !== input.deploymentId)
+  const day = spendDayKey(Date.parse(admitted.at), input.timeZone)
+  if (ledger.deploysToday.day === day && ledger.deploysToday.count > 0) ledger.deploysToday = { day, count: ledger.deploysToday.count - 1 }
 }
 
 /** Правку по отпечатку откатили: дальше по нему только отчёты, пока человек не снимет пометку. */

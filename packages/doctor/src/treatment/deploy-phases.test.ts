@@ -7,18 +7,24 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CaseState } from '../case-book/index.js'
 import { createDeployer, createDeployLock } from '../deployer/index.js'
 import { createGitGuard, GitGuardError, type GitGuard } from '../git-guard/index.js'
 import { startDoctorService, type DoctorService } from '../service/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
-import { callTool, createScriptedModel, type ScriptedModel } from '../testing/scripted-model.js'
+import { callTool, createScriptedModel, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
 import { createLocalRunner } from '../workbench/index.js'
-import { emptyFingerprintLedger, LEDGER, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
+import { admitAutoDeployIn, emptyFingerprintLedger, LEDGER, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
 import { copyRecord } from '../records/index.js'
 import { seedDoctorRecords } from '../testing/doctor-records.js'
+
+// Допуск учёта — настоящий; отдельный тест подменяет его ответ, чтобы проверить отказ после решения «выкатывать».
+vi.mock('../ledgers/fingerprint-ledger.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../ledgers/fingerprint-ledger.js')>()
+  return { ...original, admitAutoDeployIn: vi.fn(original.admitAutoDeployIn) }
+})
 
 // Лечение до выкатки (T070): решение `gated` о выкатке — в чекпойнте, дальше `deploying` → `observing` →
 // `healed` | `rolled_back` | `not_helped`. Приложение подставное (сборки в памяти), git настоящий, часы врача
@@ -157,7 +163,6 @@ async function startDoctor(r: Repo, model: ScriptedModel, app: FakeDeployApp, cl
       worktreesDir: r.worktreesDir,
       models: model.models,
       model: model.model,
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
       deployer,
@@ -167,9 +172,9 @@ async function startDoctor(r: Repo, model: ScriptedModel, app: FakeDeployApp, cl
   return service
 }
 
-function priceCrash() {
+function priceCrash(appName = 'test-app') {
   return createIncidentEvent({
-    appName: 'test-app',
+    appName,
     kind: 'crash',
     where: 'src/price.mjs:5:35',
     message: 'нет тарифа starter',
@@ -179,12 +184,12 @@ function priceCrash() {
   })
 }
 
-async function settledCase(service: DoctorService, states: CaseState[] = FINAL_STATES, timeoutMs = 60_000) {
+async function settledCase(service: DoctorService, states: CaseState[] = FINAL_STATES, timeoutMs = 60_000, caseId = 1) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const found = await service.caseBook.getCase(1)
+    const found = await service.caseBook.getCase(caseId)
     if (found && states.includes(found.state)) return found
-    if (Date.now() > deadline) throw new Error(`случай 1 не дошёл до ${states.join('/')}: ${found?.state}`)
+    if (Date.now() > deadline) throw new Error(`случай ${caseId} не дошёл до ${states.join('/')}: ${found?.state}`)
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
 }
@@ -197,14 +202,18 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
   }
 }
 
-function scriptCure(model: ScriptedModel): void {
-  model.script(
+function cureSteps(): ScriptStep[] {
+  return [
     callTool('read', { path: 'src/price.mjs' }),
     callTool('finish_diagnosis', { found: true, cause: 'Тариф по умолчанию starter не существует', evidence: ["src/price.mjs: DEFAULT_PLAN = 'starter'"], confidence: 'high' }),
     callTool('write', { path: 'src/price.mjs', content: FIXED }),
     callTool('write', { path: 'test/default-plan.test.mjs', content: NEW_TEST }),
     callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: ['test/default-plan.test.mjs'] }),
-  )
+  ]
+}
+
+function scriptCure(model: ScriptedModel): void {
+  model.script(...cureSteps())
 }
 
 function fixBranch(r: Repo): string {
@@ -248,14 +257,18 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-/** Учёт выкаток по отпечатку сбоя случая — из записей врача (врач уже закрыт). */
-async function ledgerOf(r: Repo): Promise<FingerprintLedger['fingerprints'][string] | undefined> {
-  let found: FingerprintLedger['fingerprints'][string] | undefined
+/** Учёт выкаток — из записей врача (врач уже закрыт). */
+async function wholeLedgerOf(r: Repo): Promise<FingerprintLedger> {
+  let found = emptyFingerprintLedger()
   await seedDoctorRecords(r.stateDir, async (tx) => {
-    const ledger = await tx.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger())
-    found = copyRecord(ledger.fingerprints[priceCrash().fingerprint])
+    found = copyRecord(await tx.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger()))
   })
   return found
+}
+
+/** Учёт выкаток по отпечатку сбоя случая. */
+async function ledgerOf(r: Repo): Promise<FingerprintLedger['fingerprints'][string] | undefined> {
+  return (await wholeLedgerOf(r)).fingerprints[priceCrash().fingerprint]
 }
 
 describe('лечение до выкатки: deploying → observing → итог', () => {
@@ -396,6 +409,117 @@ describe('лечение до выкатки: deploying → observing → ито
     expect(last.type).toBe('fix_ready')
     expect(last.short).toContain('стоп-кран')
     expect(last.short).toContain(fixBranch(r))
+  }, 90_000)
+
+  it('стоп-кран нажат, пока выкатка ждала замок → ничего не выкачено, допуск возвращён: попытка и место дня свободны', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    mkdirSync(dirname(r.lockPath), { recursive: true })
+    writeFileSync(r.lockPath, 'ручная выкатка\n')
+    const model = createScriptedModel()
+    scriptCure(model)
+    const doctor = await startDoctor(r, model, app, clock)
+
+    await doctor.receiveEvents([priceCrash()])
+    await settledCase(doctor, ['deploying'])
+    await pressStop(doctor)
+    rmSync(r.lockPath)
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('report_only')
+    expect(app.promotes).toBe(0)
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.type).toBe('fix_ready')
+    expect(last.short).toContain('стоп-кран')
+    await doctor.close()
+    const ledger = await wholeLedgerOf(r)
+    expect(ledger.fingerprints[priceCrash().fingerprint]?.autoDeploys).toEqual([])
+    expect(ledger.deploysToday.count).toBe(0)
+  }, 120_000)
+
+  it('откат не удался → нужен человек, отпечаток в учёте помечен «нужен человек»', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    const doctor = await startDoctor(r, model, app, clock)
+    app.failNext('rollback', 100)
+    let sent = false
+    clock.beforeWake = async () => {
+      if (sent || app.promotes === 0) return
+      sent = true
+      await doctor.receiveEvents(Array.from({ length: 6 }, () => priceCrash()))
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('needs_human')
+    expect(app.rollbacks).toBe(0)
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.type).toBe('needs_human')
+    expect(last.short).toContain('откат не удался')
+    await doctor.close()
+    expect(await ledgerOf(r)).toMatchObject({ needsHuman: true, autoDeploys: [expect.objectContaining({ deploymentId: 1 })] })
+  }, 90_000)
+
+  it('два случая с одним отпечатком доходят до решения: допуск получает не больше, чем позволяет предел', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    // Ответы модели — по номеру случая: лечения идут вперемешку.
+    const answers: Record<string, ScriptStep[]> = { '1': cureSteps(), '2': cureSteps() }
+    const model = createScriptedModel()
+    const routed: ScriptStep = (context) => {
+      const caseId = /Случай (\d+),/.exec(JSON.stringify(context))?.[1] ?? ''
+      const next = answers[caseId]?.shift()
+      if (!next) throw new Error(`нет ответа для случая ${caseId}`)
+      return typeof next === 'function' ? next(context, undefined) : next
+    }
+    model.script(...Array.from({ length: 10 }, () => routed))
+    const doctor = await startDoctor(r, model, app, clock, { limits: { autoDeploysPerFingerprintPerDay: 1 } })
+    const first = priceCrash()
+    // Тот же сбой во втором приложении: свой случай, но отпечаток тот же.
+    const second = { ...priceCrash('test-app-2'), fingerprint: first.fingerprint }
+
+    await doctor.receiveEvents([first, second])
+    const settled = [await settledCase(doctor, FINAL_STATES, 90_000, 1), await settledCase(doctor, FINAL_STATES, 90_000, 2)]
+
+    expect(settled.map((sick) => sick.fingerprint)).toEqual([first.fingerprint, first.fingerprint])
+    expect(app.promotes).toBe(1)
+    expect(settled.map((sick) => sick.state).sort()).toEqual(['healed', 'report_only'])
+    const limited = (await reports(doctor)).filter((report) => report.type === 'fix_ready')
+    expect(limited).toHaveLength(1)
+    expect(limited[0]!.short).toContain('лимит выкаток исчерпан')
+    await doctor.close()
+    const ledger = await wholeLedgerOf(r)
+    expect(ledger.fingerprints[first.fingerprint]?.autoDeploys).toHaveLength(1)
+    expect(ledger.deploysToday.count).toBe(1)
+  }, 180_000)
+
+  it('учёт выкаток не пустил после решения «выкатывать» → случай закрыт отчётом, без выкатки и без повторов фазы', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    vi.mocked(admitAutoDeployIn).mockResolvedValueOnce({ admitted: false, reasons: ['attempts_exhausted'] })
+    const doctor = await startDoctor(r, model, app, clock)
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('report_only')
+    expect(app.promotes).toBe(0)
+    expect(vi.mocked(admitAutoDeployIn)).toHaveBeenCalledTimes(1)
+    const list = await reports(doctor)
+    expect(list.map((report) => report.type)).not.toContain('doctor_problem')
+    expect(list.at(-1)!.type).toBe('fix_ready')
+    expect(list.at(-1)!.short).toContain('лимит выкаток исчерпан')
+    await doctor.close()
+    expect((await ledgerOf(r))?.autoDeploys ?? []).toEqual([])
   }, 90_000)
 
   it('основная ветка ушла вперёд за окно → правка держится, но не влита: отчёт без адреса origin зовёт открыть запрос на слияние', async () => {

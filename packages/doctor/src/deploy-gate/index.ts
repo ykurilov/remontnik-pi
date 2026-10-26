@@ -34,6 +34,12 @@ export interface GateDecision {
   reasons: GateReason[]
 }
 
+/** Отказ по учёту выкаток: те же слова в решении и в отказе допуска после него. */
+export const ATTEMPT_REFUSALS = {
+  attempts_exhausted: 'Выкатки нет: лимит автоматических выкаток исчерпан.',
+  needs_human_after_rollback: 'Выкатки нет: после отката эта причина помечена «нужен человек».',
+} as const satisfies Partial<Record<GateReasonCode, string>>
+
 export interface DeployFacts {
   tests: { status: 'green' | 'red' | 'flaky' | 'not_run'; failed: string[] }
   /** `not_needed` — правка вне области сценариев; `not_run` — должен был идти, но не шёл. */
@@ -230,7 +236,7 @@ export function decideDeploy(facts: DeployFacts): GateDecision {
   ) {
     reasons.push({
       code: 'attempts_exhausted',
-      message: 'Выкатки нет: лимит автоматических выкаток исчерпан.',
+      message: ATTEMPT_REFUSALS.attempts_exhausted,
       numbers: {
         autoDeploysForFingerprint: attempts.autoDeploysForFingerprint,
         maxPerFingerprintPerDay: attempts.maxPerFingerprintPerDay,
@@ -243,7 +249,7 @@ export function decideDeploy(facts: DeployFacts): GateDecision {
   if (attempts.needsHumanAfterRollback) {
     reasons.push({
       code: 'needs_human_after_rollback',
-      message: 'Выкатки нет: после отката эта причина помечена «нужен человек».',
+      message: ATTEMPT_REFUSALS.needs_human_after_rollback,
     })
   }
 
