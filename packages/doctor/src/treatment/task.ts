@@ -20,6 +20,7 @@ import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
+import { configFilesAt, configFilesOfFix } from '../config-files/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { ATTEMPT_REFUSALS, decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
@@ -76,6 +77,7 @@ import {
   fixCanBeChecked,
   inspectFix,
   noDeployControls,
+  withMainlineConfigFiles,
   type DeployControls,
   type FixInspection,
   type GateClosing,
@@ -688,6 +690,12 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
    * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз, а
    * итог — «влил», даже если стоп-кран нажали, пока врач лежал после слияния.
    */
+  /** Файлы правки, которые подключает настройка на свежей основной ветке (она могла уйти вперёд после проверки). */
+  async function mainlineConfigFilesIn(changedPaths: readonly string[]): Promise<string[]> {
+    const current = new Set(await configFilesAt(deps.guard, await deps.guard.mainlineHead()))
+    return changedPaths.filter((path) => current.has(path))
+  }
+
   async function settleMainline(runtime: Runtime, checkpoint: DeployPhase, context: Context): Promise<MainlineResult> {
     const config = await deps.loadConfig()
     const { branch } = checkpoint
@@ -698,6 +706,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       if (controls?.autoDeploy === 'stopped') {
         return (await deps.guard.isInMainline(checkpoint.fixCommit)) ? { kind: 'merged', into: config.repo.mainBranch } : { kind: 'stopped', branch }
       }
+      const configFiles = await mainlineConfigFilesIn(checkpoint.changedPaths)
+      if (configFiles.length > 0) return { kind: 'merge_failed', branch, reason: `правка меняет файлы, которые подключает настройка Ремонтника на основной ветке: ${configFiles.join(', ')}` }
       await deps.guard.mergeIntoMain(branch, checkpoint.fixCommit)
       return { kind: 'merged', into: config.repo.mainBranch }
     } catch (error) {
@@ -1047,7 +1057,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           }
           const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
           const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
-          const inspection = inspectFix(await deps.loadConfig(), files, doc.case)
+          // Файлы настройки — по git на основе и на самой правке, а не по прошлому чтению настройки.
+          const configFiles = await configFilesOfFix(deps.guard, treating.baseCommit, fixCommit)
+          const inspection = inspectFix(await deps.loadConfig(), files, doc.case, configFiles)
           const fixed = { diagnosis, fix, fixCommit, changedPaths, inspection }
           // Правке нельзя доверить собственную проверку: без проверок и без отправки — сразу к решению.
           const next = fixCanBeChecked(inspection) ? ({ phase: 'verifying', ...fixed } as const) : ({ phase: 'gated', ...fixed, pushed: false } as const)
@@ -1165,8 +1177,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       gated: async (task, runtime, context) => {
         const { caseId } = task.input
         const checkpoint = task.state.checkpoint
-        const { checks, diagnosis, fix, inspection } = checkpoint
+        const { checks, diagnosis, fix } = checkpoint
         if (await followUpReclaim(runtime, caseId, context)) return
+        // Перед выкаткой — файлы настройки на свежей основной ветке: она могла уйти вперёд после проверки правки.
+        const inspection = deps.deployer ? withMainlineConfigFiles(checkpoint.inspection, checkpoint.changedPaths, await mainlineConfigFilesIn(checkpoint.changedPaths)) : checkpoint.inspection
         const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
         const config = await deps.loadConfig()
         const sick = await readCase(runtime, caseId, context)

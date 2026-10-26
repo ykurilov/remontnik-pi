@@ -58,7 +58,8 @@ function isNewTest(file: ChangedFile): boolean {
   return file.status === 'added' && matchesAllowMask(TEST_FILE_MASKS, file.path) && !isRunnerConfigOrEvalPath(file.path) && !matchesAnyMask(TEST_SUPPORT_MASKS, file.path)
 }
 
-export function findProtectedChanges(config: RemontnikConfig, files: readonly ChangedFile[]): ProtectedChange[] {
+/** `configFiles` — файлы, которые подключает настройка на основе и на правке (`config-files`). */
+export function findProtectedChanges(config: RemontnikConfig, files: readonly ChangedFile[], configFiles: readonly string[]): ProtectedChange[] {
   const found = new Map<string, string>()
   const add = (path: string, why: string) => {
     if (!found.has(path)) found.set(path, why)
@@ -74,7 +75,7 @@ export function findProtectedChanges(config: RemontnikConfig, files: readonly Ch
       if (!isNewTest(file) && !matchesAllowMask(config.fixablePaths, path)) add(file.path, `вне путей, которые можно править (${config.fixablePaths.join(', ')})`)
     }
   }
-  for (const hit of findForbiddenZones(config, files)) {
+  for (const hit of findForbiddenZones(config, files, configFiles)) {
     if (PROTECTED_ZONES.has(hit.zone)) add(hit.path, `зона ${hit.zone} (${hit.rule})`)
   }
   return files.flatMap((file) => {

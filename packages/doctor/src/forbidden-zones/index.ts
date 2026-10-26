@@ -175,8 +175,10 @@ function commandPathRule(commandPaths: readonly string[], path: string): string 
 /**
  * Файлы правки, попавшие в запретные зоны. Пустой список — правка вне зон.
  * Маски: настройка приложения + встроенные запреты (их нельзя снять) + запреты по умолчанию, если приложение их не сняло.
+ * `configFiles` — файлы, которые подключает `remontnik.config.*` (`config-files`): правка в них меняет саму настройку,
+ * поэтому они — зона `remontnik`, где бы ни лежали.
  */
-export function findForbiddenZones(config: ZoneConfig, files: readonly ChangedFile[]): ForbiddenZoneHit[] {
+export function findForbiddenZones(config: ZoneConfig, files: readonly ChangedFile[], configFiles: readonly string[] = []): ForbiddenZoneHit[] {
   const { forbidden } = config
   const pathRules: Array<{ zone: ForbiddenZone; masks: readonly string[] }> = [
     { zone: 'schema', masks: [...forbidden.schema, ...MIGRATION_FOLDER_MASKS] },
@@ -194,6 +196,7 @@ export function findForbiddenZones(config: ZoneConfig, files: readonly ChangedFi
     },
   ]
   const commandPaths = settingsCommandPaths(config)
+  const settingsFiles = new Set(configFiles)
 
   const hits: ForbiddenZoneHit[] = []
   for (const file of files) {
@@ -210,6 +213,7 @@ export function findForbiddenZones(config: ZoneConfig, files: readonly ChangedFi
       }
       const commandRule = commandPathRule(commandPaths, path)
       if (commandRule) add('build_and_deploy', commandRule, path)
+      if (settingsFiles.has(path)) add('remontnik', 'файл подключает настройка Ремонтника (remontnik.config)', path)
     }
 
     const isManifest = paths.some((path) => matchesMask(PACKAGE_MANIFEST, path))

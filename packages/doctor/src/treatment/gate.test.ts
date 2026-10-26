@@ -30,12 +30,12 @@ function checks(overrides: { tests?: Partial<ChecksResult['tests']>; eval?: Part
 function facts(files: ChangedFile[], ...rest: [result?: ChecksResult | undefined, day?: ReturnType<typeof emptySpendDay>]) {
   const result = rest.length > 0 ? rest[0] : checks()
   const day = rest[1] ?? emptySpendDay()
-  return deployFactsOf({ inspection: inspectFix(config, files, appIncident), checks: result, controls: noDeployControls(), attempts: noAttempts, spendDay: day, limits: config.limits })
+  return deployFactsOf({ inspection: inspectFix(config, files, appIncident, []), checks: result, controls: noDeployControls(), attempts: noAttempts, spendDay: day, limits: config.limits })
 }
 
 describe('осмотр правки: одно место для фактов о диффе', () => {
   it('правка в src с новым тестом — чистая, её можно проверять', () => {
-    const inspection = inspectFix(config, fixInSrc, appIncident)
+    const inspection = inspectFix(config, fixInSrc, appIncident, [])
     expect(inspection.forbiddenZones).toEqual([])
     expect(inspection.protectedChanges).toEqual([])
     expect(inspection.diff.suspicious).toEqual([])
@@ -43,19 +43,19 @@ describe('осмотр правки: одно место для фактов о 
   })
 
   it('правка в оплате — запретная зона, но проверять её можно: человеку нужна проверенная правка', () => {
-    const inspection = inspectFix(config, [file('src/payments/charge.ts')], appIncident)
+    const inspection = inspectFix(config, [file('src/payments/charge.ts')], appIncident, [])
     expect(inspection.forbiddenZones.map((hit) => hit.zone)).toEqual(['money'])
     expect(fixCanBeChecked(inspection)).toBe(true)
   })
 
   it('изменён существующий тест — проверять нельзя: модель подделала бы собственную проверку', () => {
-    const inspection = inspectFix(config, [file('src/price.ts'), file('test/price.test.ts')], appIncident)
+    const inspection = inspectFix(config, [file('src/price.ts'), file('test/price.test.ts')], appIncident, [])
     expect(inspection.diff.existingTestChanges.map((change) => change.path)).toEqual(['test/price.test.ts'])
     expect(fixCanBeChecked(inspection)).toBe(false)
   })
 
   it('подозрительный код — проверять нельзя', () => {
-    const inspection = inspectFix(config, [file('src/price.ts', '@@ -1 +1 @@\n-a\n+const key = process.env.SECRET\n')], appIncident)
+    const inspection = inspectFix(config, [file('src/price.ts', '@@ -1 +1 @@\n-a\n+const key = process.env.SECRET\n')], appIncident, [])
     expect(inspection.diff.suspicious.map((finding) => finding.signal)).toContain('environment_access')
     expect(fixCanBeChecked(inspection)).toBe(false)
   })
@@ -112,7 +112,7 @@ describe('факты для decideDeploy', () => {
       deploysToday: { day: '2026-11-02', count: 1 },
     }
     const attempts = deployAttemptsOf(ledger, { fingerprint: 'fp', now, timeZone: 'UTC', limits: config.limits })
-    const result = deployFactsOf({ inspection: inspectFix(config, fixInSrc, appIncident), checks: checks(), controls: noDeployControls(), attempts, spendDay: emptySpendDay(), limits: config.limits })
+    const result = deployFactsOf({ inspection: inspectFix(config, fixInSrc, appIncident, []), checks: checks(), controls: noDeployControls(), attempts, spendDay: emptySpendDay(), limits: config.limits })
     expect(result.attempts).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 1, needsHumanAfterRollback: true })
     expect(decideDeploy(result).reasons.map((reason) => reason.code)).toEqual(['needs_human_after_rollback'])
   })
@@ -140,7 +140,7 @@ describe('причина в Agent Chat SDK', () => {
   )
 
   it('правка лезет в SDK (патч пакета) → SDK, даже если диагноз его не назвал', () => {
-    const inspection = inspectFix(config, [file('patches/@ykurilov+agent-chat-server+1.2.0.patch', '@@ -0,0 +1 @@\n+x\n', 'added')], { where: 'src/price.ts:5', stack: appStack })
+    const inspection = inspectFix(config, [file('patches/@ykurilov+agent-chat-server+1.2.0.patch', '@@ -0,0 +1 @@\n+x\n', 'added')], { where: 'src/price.ts:5', stack: appStack }, [])
     expect(agentChatSdkPackage(diagnosis, inspection)).toBe('@ykurilov/agent-chat-server')
   })
 
@@ -149,7 +149,7 @@ describe('причина в Agent Chat SDK', () => {
     ['верхний кадр в пакете SDK у pnpm', 'src/bot/bot.ts:40', 'Error: lost\n    at /srv/app/node_modules/.pnpm/@ykurilov+agent-chat-core@1.4.0/node_modules/@ykurilov/agent-chat-core/dist/turn.js:88:11'],
     ['место сбоя в SDK', 'node_modules/@ykurilov/agent-chat-core/dist/turn.js:88:11', ''],
   ])('%s, модель пакет не назвала → SDK по стеку; выкатки нет без человека', (_what, where, stack) => {
-    const inspection = inspectFix(config, fixInSrc, { where, stack })
+    const inspection = inspectFix(config, fixInSrc, { where, stack }, [])
     expect(agentChatSdkPackage(diagnosis, inspection)).toBe('@ykurilov/agent-chat-core')
     const decision = decideDeploy(deployFactsOf({ inspection, checks: checks(), controls: noDeployControls(), attempts: noAttempts, spendDay: emptySpendDay(), limits: config.limits }))
     expect(decision.verdict).toBe('report_only')
@@ -161,7 +161,7 @@ describe('причина в Agent Chat SDK', () => {
     const inspection = inspectFix(config, fixInSrc, {
       where: 'src/bot/bot.ts:40:7',
       stack: 'Error: x\n    at reply (src/bot/bot.ts:40:7)\n    at runTurn (node_modules/@ykurilov/agent-chat-core/dist/turn.js:12:3)',
-    })
+    }, [])
     expect(agentChatSdkPackage(diagnosis, inspection)).toBeUndefined()
     expect(inspection.forbiddenZones).toEqual([])
   })

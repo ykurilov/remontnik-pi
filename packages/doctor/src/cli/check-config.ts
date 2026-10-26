@@ -6,9 +6,10 @@ import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { CASE_NETWORK_LABEL } from '../case-networks/index.js'
 import { MIN_SECRET_LENGTH, secretProblems } from '../intake/http-kit.js'
 import { parseServicesFile } from '../case-services/index.js'
-import { findForbiddenZones } from '../forbidden-zones/index.js'
+import { matchesAllowMask } from '../path-mask/index.js'
+import type { ConfigCodeReader } from '../service/config-reader.js'
 import { loadMainBranchConfig } from '../service/config-source.js'
-import { doctorStartPlan, type DoctorEnv } from '../service/start.js'
+import { configReaderFromEnv, doctorStartPlan, type DoctorEnv } from '../service/start.js'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 
 // `remontnik-doctor check-config`: всё, на чём споткнётся старт врача, — одним списком и до старта.
@@ -29,6 +30,8 @@ export interface Finding {
 export interface CheckConfigDeps {
   docker?: string
   gh?: string
+  /** Где выполняется код настройки; по умолчанию — как при старте врача, в контейнере из его образа. */
+  configReader?: ConfigCodeReader
 }
 
 const COMMAND_TIMEOUT_MS = 30_000
@@ -69,24 +72,27 @@ function configEnvNames(config: RemontnikConfig): string[] {
   return names
 }
 
-/** Файл, который подключает настройка, врач может поправить так же, как любой другой, — и тем изменить саму настройку. */
-function importsOutsideForbiddenZones(config: RemontnikConfig, localImports: string[]): Finding[] {
-  const outside = localImports.filter((path) => findForbiddenZones(config, [{ path, status: 'modified', added: 0, removed: 0 }]).length === 0)
-  return outside.map((path) => ({
+/**
+ * Файлы, которые подключает настройка, врач не правит никогда (шлюз правки, `config-files`). Если такой файл в `fixablePaths`,
+ * владелец, скорее всего, ждёт, что врач его чинит, — предупреждаем. Это не дыра в защите, поэтому не ошибка.
+ */
+function importsInFixablePaths(config: RemontnikConfig, localImports: string[]): Finding[] {
+  return localImports.filter((path) => matchesAllowMask(config.fixablePaths, path)).map((path) => ({
     level: 'warning',
     area: 'настройка',
-    problem: `настройка подключает файл ${path}, а он вне запретных зон: врач может его изменить и этим изменить настройку`,
-    fix: `держите файлы настройки в запретных зонах: назовите его remontnik.config.<имя>.ts или добавьте ${path} в forbidden.extra`,
+    problem: `настройка подключает файл ${path} из fixablePaths: врач его не правит, правка в нём — только отчёт человеку`,
+    fix: `если врач должен чинить ${path}, уберите его из импортов настройки; общий с настройкой текст держите в remontnik.config.<имя>.ts`,
   }))
 }
 
-async function checkSettings(env: DoctorEnv): Promise<{ findings: Finding[]; config?: RemontnikConfig }> {
+async function checkSettings(env: DoctorEnv, deps: CheckConfigDeps): Promise<{ findings: Finding[]; config?: RemontnikConfig }> {
   const repoDir = value(env, 'REMONTNIK_CONFIG_REPO_DIR')
   if (!repoDir) return { findings: [] }
   const mainBranch = value(env, 'REMONTNIK_MAIN_BRANCH') ?? 'main'
   try {
-    const { config, localImports } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
-    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }, ...importsOutsideForbiddenZones(config, localImports)] }
+    const reader = deps.configReader ?? configReaderFromEnv(env, deps.docker ? { docker: deps.docker } : {})
+    const { config, localImports } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch, reader })
+    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }, ...importsInFixablePaths(config, localImports)] }
   } catch (error) {
     const issues = (error as { issues?: unknown }).issues
     if (Array.isArray(issues)) {
@@ -183,6 +189,29 @@ function ipv4Range(cidr: string): { start: number; end: number } | undefined {
   return { start, end: start + size - 1 }
 }
 
+/**
+ * Контейнер чтения настройки монтирует копию её файлов из папки состояния по пути врача: у врача и у хоста
+ * этот путь должен быть один (том «путь:путь» в compose), иначе Docker смонтирует пустую папку хоста.
+ */
+async function checkStateMount(env: DoctorEnv, docker: string, container: string, stateDir: string): Promise<Finding[]> {
+  const inspect = await run(docker, ['inspect', '--format', '{{json .Mounts}}', container], env)
+  let mounts: { Source?: string; Destination?: string }[] = []
+  try {
+    mounts = JSON.parse(inspect.stdout) ?? []
+  } catch {}
+  const path = stateDir.replace(/\/+$/, '')
+  const holder = mounts
+    .filter((mount) => mount.Destination && (path === mount.Destination || path.startsWith(`${mount.Destination.replace(/\/+$/, '')}/`)))
+    .sort((a, b) => b.Destination!.length - a.Destination!.length)[0]
+  if (holder && holder.Source === holder.Destination) return []
+  return [{
+    level: 'error',
+    area: 'docker',
+    problem: 'папка состояния REMONTNIK_STATE_DIR смонтирована у врача не тем же путём, что на хосте: контейнер чтения настройки не увидит копию её файлов',
+    fix: 'смонтируйте папку состояния одинаковым путём у хоста и врача (том «путь:путь», как в deploy/compose.remontnik.yml)',
+  }]
+}
+
 async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
   const version = await run(docker, ['version', '--format', '{{.Server.Version}}'], env)
   if (!version.ok) {
@@ -205,6 +234,8 @@ async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
         findings.push({ level: 'error', area: 'docker', problem: `контейнер врача не подключён к сети приложения «${network}»`, fix: 'подключите врача к сети приложения в compose (networks) или исправьте REMONTNIK_LISTEN_NETWORK' })
       }
     }
+    const stateDir = value(env, 'REMONTNIK_STATE_DIR')
+    if (inspect.ok && stateDir) findings.push(...(await checkStateMount(env, docker, container, stateDir)))
   }
   if (findings.length === 0) findings.push({ level: 'ok', area: 'docker', problem: 'Docker доступен, врач на месте', fix: '' })
 
@@ -292,7 +323,7 @@ async function checkGithub(env: DoctorEnv, gh: string, config: RemontnikConfig |
 
 /** Все проверки подряд; ни одна не меняет сервер, репозиторий или GitHub. */
 export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = {}): Promise<Finding[]> {
-  const { config, findings: settings } = await checkSettings(env)
+  const { config, findings: settings } = await checkSettings(env, deps)
   return [
     ...settings,
     ...checkEnvironment(env, config),
