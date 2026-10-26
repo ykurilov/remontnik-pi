@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
+const setupFile = fileURLToPath(new URL('./vitest.setup.ts', import.meta.url))
 const packagesDirectory = fileURLToPath(new URL('./packages/', import.meta.url))
 
 export default defineConfig({
@@ -19,6 +20,7 @@ export default defineConfig({
       'apps/*/test/**/*.test.ts',
       'apps/*/deploy/**/*.test.ts',
     ],
+    setupFiles: [setupFile],
     // Падения врача — своя группа: `vitest.crash.config.ts`.
     exclude: ['**/node_modules/**', '**/dist/**', '**/*.live.test.ts', 'packages/*/test/crash/**'],
   },

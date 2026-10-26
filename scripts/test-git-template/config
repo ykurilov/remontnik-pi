@@ -1,0 +1,3 @@
+# Шаблон git-репозиториев в тестах (GIT_TEMPLATE_DIR из vitest.setup.ts): без автообслуживания git.
+[maintenance]
+	auto = false
