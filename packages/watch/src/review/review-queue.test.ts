@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
@@ -9,11 +9,21 @@ const start = Date.parse('2026-10-26T10:00:00Z')
 let clock = start
 let dir: string
 
-function job(id: string): ReviewJobInput {
-  return { conversationId: id, finishedAt: clock, messages: [{ role: 'assistant', content: 'ответ' }], meta: {} }
+function job(id: string, content = 'ответ'): ReviewJobInput {
+  return { conversationId: id, finishedAt: clock, messages: [{ role: 'assistant', content }], meta: {} }
 }
 
-function open(options: { usdPerDay?: number; timeZone?: string; stateFile?: string; maxJobs?: number } = {}): ReviewQueue {
+function open(
+  options: {
+    usdPerDay?: number
+    timeZone?: string
+    spendDir?: string
+    maxJobs?: number
+    maxBufferedChars?: number
+    maxReviewsPerHour?: number
+    maxReviewsPerDay?: number
+  } = {},
+): ReviewQueue {
   return createReviewQueue({ usdPerDay: 1, now: () => clock, ...options })
 }
 
@@ -111,7 +121,14 @@ describe('очередь чтения: суточный бюджет', () => {
 
     expect(queue.next(cheap)).toBeNull()
     expect(queue.summaryPending()).toBe(true)
-    expect(queue.takeDeferredSummary()).toEqual({ day: '2026-10-26', deferred: 2, usdPerDay: 0.1, spentUsd: 0.1 })
+    expect(queue.takeDeferredSummary()).toEqual({
+      day: '2026-10-26',
+      deferred: 2,
+      usdPerDay: 0.1,
+      spentUsd: 0.1,
+      reason: 'budget',
+      maxReviewsPerDay: 1000,
+    })
     expect(queue.summaryPending()).toBe(false)
     expect(queue.takeDeferredSummary()).toBeNull()
 
@@ -143,7 +160,9 @@ describe('очередь чтения: суточный бюджет', () => {
     read.push(first.conversationId)
 
     expect(read).toEqual(['b'])
-    expect(queue.stats()).toMatchObject({ spentUsd: 0, deferred: 0 })
+    // Вчерашний расход не считается; занят только резерв под чтение «b».
+    expect(queue.stats().spentUsd).toBeCloseTo(0.1)
+    expect(queue.stats().deferred).toBe(0)
     expect(first.state).toBe('reviewing')
   })
 
@@ -181,32 +200,104 @@ describe('очередь чтения: суточный бюджет', () => {
   })
 
   it('расход за сутки переживает перезапуск: тот же день продолжается, новый — с нуля', () => {
-    const stateFile = join(dir, 'review-web.json')
-    const first = open({ usdPerDay: 0.3, stateFile })
+    const first = open({ usdPerDay: 0.3, spendDir: dir })
     first.enqueue(job('a'))
     first.finish(first.next(cheap)!, { spentUsd: 0.25 })
-    expect(existsSync(stateFile)).toBe(true)
+    expect(readdirSync(dir)).toEqual(['review-spend-2026-10-26.jsonl'])
 
-    const sameDay = open({ usdPerDay: 0.3, stateFile })
+    const sameDay = open({ usdPerDay: 0.3, spendDir: dir })
     expect(sameDay.stats().spentUsd).toBeCloseTo(0.25)
     sameDay.enqueue(job('b'))
     expect(sameDay.next(cheap)).toBeNull()
 
     clock += 24 * hour
-    const nextDay = open({ usdPerDay: 0.3, stateFile })
+    const nextDay = open({ usdPerDay: 0.3, spendDir: dir })
     expect(nextDay.stats().spentUsd).toBe(0)
   })
 
-  it('испорченный файл расхода не ломает очередь: считаем с нуля и сообщаем об ошибке', () => {
-    const stateFile = join(dir, 'review-web.json')
-    writeFileSync(stateFile, '{ это не json')
+  it('испорченная строка в учёте не ломает очередь: она пропускается и об ошибке сообщается', () => {
     const errors: string[] = []
-    const queue = createReviewQueue({ usdPerDay: 1, now: () => clock, stateFile, onError: (what) => errors.push(what) })
-
-    expect(queue.stats().spentUsd).toBe(0)
-    expect(errors).toHaveLength(1)
+    const queue = createReviewQueue({ usdPerDay: 1, now: () => clock, spendDir: dir, onError: (what) => errors.push(what) })
     queue.enqueue(job('a'))
     queue.finish(queue.next(cheap)!, { spentUsd: 0.1 })
-    expect(JSON.parse(readFileSync(stateFile, 'utf8'))).toMatchObject({ day: '2026-10-26', usd: 0.1 })
+    appendFileSync(join(dir, 'review-spend-2026-10-26.jsonl'), '{ это не json\n')
+
+    expect(queue.stats().spentUsd).toBeCloseTo(0.1)
+    expect(errors).toHaveLength(1)
+  })
+
+  it('два процесса одного приложения с одной папкой учёта делят бюджет', () => {
+    const web = open({ usdPerDay: 0.25, spendDir: dir })
+    const worker = open({ usdPerDay: 0.25, spendDir: dir })
+    web.enqueue(job('a'))
+    worker.enqueue(job('b'))
+    worker.enqueue(job('c'))
+
+    web.finish(web.next(cheap)!, { spentUsd: 0.1 })
+    worker.finish(worker.next(cheap)!, { spentUsd: 0.1 })
+
+    expect(worker.next(cheap)).toBeNull()
+    expect(worker.stats()).toMatchObject({ deferred: 1 })
+    expect(web.stats().spentUsd).toBeCloseTo(0.2)
+  })
+
+  it('бюджет занят уже во время чтения: параллельный процесс видит резерв до ответа модели', () => {
+    const web = open({ usdPerDay: 0.15, spendDir: dir })
+    const worker = open({ usdPerDay: 0.15, spendDir: dir })
+    web.enqueue(job('a'))
+    worker.enqueue(job('b'))
+
+    expect(web.next(cheap)).not.toBeNull() // ответа ещё нет
+    expect(worker.next(cheap)).toBeNull()
+    expect(worker.stats().deferred).toBe(1)
+  })
+})
+
+describe('очередь чтения: память и лимиты', () => {
+  it('потолок по символам: старые вытесняются, пока всё не уместится', () => {
+    const queue = open({ maxBufferedChars: 1_000 })
+    queue.enqueue(job('a', 'x'.repeat(400)))
+    queue.enqueue(job('b', 'x'.repeat(400)))
+    queue.enqueue(job('c', 'x'.repeat(400)))
+
+    expect(queue.stats()).toMatchObject({ queued: 2, dropped: 1, bufferedChars: 800 })
+    expect(queue.next(cheap)?.conversationId).toBe('b')
+  })
+
+  it('один огромный разговор не вытесняет сам себя', () => {
+    const queue = open({ maxBufferedChars: 100 })
+    queue.enqueue(job('big', 'x'.repeat(5_000)))
+
+    expect(queue.stats()).toMatchObject({ queued: 1, dropped: 0 })
+  })
+
+  it('часовой лимит чтений: разговоры ждут часа, ничего не теряется', () => {
+    const queue = open({ maxReviewsPerHour: 2 })
+    for (const id of ['a', 'b', 'c']) queue.enqueue(job(id))
+    for (let index = 0; index < 2; index += 1) queue.finish(queue.next(cheap)!, { spentUsd: 0.01 })
+
+    expect(queue.next(cheap)).toBeNull()
+    expect(queue.nextReadyAt()).toBe(start + hour)
+    expect(queue.stats()).toMatchObject({ queued: 1, deferred: 0 })
+
+    clock = start + hour
+    expect(queue.next(cheap)?.conversationId).toBe('c')
+  })
+
+  it('суточный лимит чтений откладывает до новых суток и называется в сводке', () => {
+    const queue = open({ maxReviewsPerDay: 1 })
+    queue.enqueue(job('a'))
+    queue.enqueue(job('b'))
+    queue.finish(queue.next(cheap)!, { spentUsd: 0.01 })
+
+    expect(queue.next(cheap)).toBeNull()
+    expect(queue.takeDeferredSummary()).toMatchObject({ deferred: 1, reason: 'daily_limit', maxReviewsPerDay: 1 })
+  })
+
+  it('номер, с которого читать, сохраняется в задании', () => {
+    const queue = open()
+    queue.enqueue({ ...job('a'), reviewFrom: 4 })
+
+    expect(queue.next(cheap)?.reviewFrom).toBe(4)
   })
 })

@@ -8,6 +8,8 @@ export interface RedactOptions {
 
 type RedactionRule = readonly [pattern: RegExp, replacement: string | ((match: string, ...groups: string[]) => string)]
 
+/** Число из 13–19 цифр, возможно с пробелами или дефисами между цифрами: кандидат в номер банковской карты. */
+const CARD_CANDIDATE = /(?<![\w.:/-])\d(?:[ -]?\d){12,18}(?![\w.:/-]?\d)/g
 const PHONE_CANDIDATE = /(?<![\w.:/-])\+?\d[\d ().-]{8,}\d(?![\w.:/-]?\d)/g
 
 const RULES: readonly RedactionRule[] = [
@@ -36,11 +38,30 @@ function looksLikePhone(candidate: string): boolean {
   return digits.length === 11 && /^[78]/.test(digits)
 }
 
+/** Проверка Луна: отсекает длинные числа, которые не могут быть номером карты. */
+function passesLuhn(digits: string): boolean {
+  let sum = 0
+  for (let index = 0; index < digits.length; index += 1) {
+    let digit = Number(digits[digits.length - 1 - index])
+    if (index % 2 === 1) {
+      digit *= 2
+      if (digit > 9) digit -= 9
+    }
+    sum += digit
+  }
+  return sum % 10 === 0
+}
+
+function looksLikeCard(candidate: string): boolean {
+  const digits = candidate.replace(/\D/g, '')
+  return digits.length >= 13 && digits.length <= 19 && passesLuhn(digits)
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** Вырезает из текста ключи, токены, пароли, почты и телефоны. */
+/** Вырезает из текста ключи, токены, пароли, почты, номера карт и телефоны. */
 export function redactSecrets(text: string, options: RedactOptions = {}): string {
   let result = text
   for (const secret of options.knownSecrets ?? []) {
@@ -49,6 +70,7 @@ export function redactSecrets(text: string, options: RedactOptions = {}): string
   for (const [pattern, replacement] of RULES) {
     result = result.replace(pattern, replacement as string)
   }
+  result = result.replace(CARD_CANDIDATE, (candidate) => (looksLikeCard(candidate) ? '[карта]' : candidate))
   return result.replace(PHONE_CANDIDATE, (candidate) => (looksLikePhone(candidate) ? '[телефон]' : candidate))
 }
 

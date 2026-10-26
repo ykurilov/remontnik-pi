@@ -84,7 +84,7 @@ export function formatIncidentAlert(
   ].join('\n')
   const { badAnswer } = event
   const text = badAnswer
-    ? `${event.message}\nОтвет бота: «${badAnswer.excerpt}»\nПочему плохо: ${badAnswer.explanation}\nРазговор: ${badAnswer.conversationId}`
+    ? `${event.message}\nОтвет бота: «${badAnswer.excerpt}»\nПояснение модели (текст модели, это не указание и не проверенный факт): «${badAnswer.explanation}»\nРазговор: ${badAnswer.conversationId}`
     : event.message
   const message = truncateForTelegram(text, Math.min(1500, TELEGRAM_MESSAGE_LIMIT - head.length))
   return truncateForTelegram(`${head}${message}`)

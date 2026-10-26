@@ -1,5 +1,9 @@
-// Разговоры «Пациента»: реплики копятся по номеру разговора, а когда разговор закрыт (пользователь ушёл
+import { randomBytes } from 'node:crypto'
+
+// Разговоры «Пациента»: реплики копятся у владельца (посетителя чата), а когда разговор закрыт (посетитель ушёл
 // или молчит слишком долго), законченный разговор уходит получателю — в приложении это сторож Ремонтника.
+// Номер разговора выдаёт сервер, а не посетитель; закрыть можно только свой разговор.
+// Память ограничена: длина реплики, длина разговора, число открытых разговоров и их общий объём.
 
 export interface ConversationMessage {
   role: 'user' | 'assistant'
@@ -17,21 +21,30 @@ export interface ConversationLogOptions {
   idleAfterMs?: number
   /** Сколько последних сообщений хранить в разговоре; по умолчанию 100. */
   maxMessages?: number
+  /** Сколько символов хранить в одной реплике; остальное отрезается. По умолчанию 4000. */
+  maxMessageChars?: number
+  /** Сколько символов хранить в одном разговоре; старые реплики уходят первыми. По умолчанию 40 000. */
+  maxConversationChars?: number
   /** Сколько разговоров держать открытыми; дальше самый старый закрывается. */
   maxOpen?: number
+  /** Сколько символов держать во всех открытых разговорах; дальше самый старый закрывается. По умолчанию 8 000 000. */
+  maxOpenChars?: number
   now?: () => number
 }
 
 export interface ConversationLog {
-  record(conversationId: string, userMessage: string, botReply: string): void
-  /** Закрывает разговор. `false` — такого разговора нет. */
-  finish(conversationId: string): boolean
+  /** Добавляет реплики в открытый разговор владельца (или открывает новый) и возвращает номер разговора. */
+  record(owner: string, userMessage: string, botReply: string): string
+  /** Закрывает открытый разговор владельца. `false` — у него нет открытого разговора. */
+  finish(owner: string): boolean
   /** Закрывает разговоры, которые молчат дольше срока. */
   finishIdle(): void
 }
 
 interface OpenConversation {
+  id: string
   messages: ConversationMessage[]
+  chars: number
   lastAt: number
 }
 
@@ -39,36 +52,58 @@ export function createConversationLog(options: ConversationLogOptions): Conversa
   const now = options.now ?? Date.now
   const idleAfterMs = options.idleAfterMs ?? 30 * 60_000
   const maxMessages = options.maxMessages ?? 100
+  const maxMessageChars = options.maxMessageChars ?? 4_000
+  const maxConversationChars = options.maxConversationChars ?? 40_000
   const maxOpen = options.maxOpen ?? 500
+  const maxOpenChars = options.maxOpenChars ?? 8_000_000
   // Map помнит порядок вставки: первым идёт самый давний по обновлению (обновлённый переставляется в конец).
   const open = new Map<string, OpenConversation>()
+  let openChars = 0
 
-  function close(id: string): boolean {
-    const conversation = open.get(id)
+  function close(owner: string): boolean {
+    const conversation = open.get(owner)
     if (!conversation) return false
-    open.delete(id)
+    open.delete(owner)
+    openChars -= conversation.chars
     try {
-      options.onFinished({ id, messages: conversation.messages })
+      options.onFinished({ id: conversation.id, messages: conversation.messages })
     } catch {
       // Получатель недоступен — чат это не касается.
     }
     return true
   }
 
+  function drop(conversation: OpenConversation, count: number): void {
+    for (const removed of conversation.messages.splice(0, count)) {
+      conversation.chars -= removed.content.length
+      openChars -= removed.content.length
+    }
+  }
+
   return {
-    record(id, userMessage, botReply) {
-      const conversation = open.get(id) ?? { messages: [], lastAt: 0 }
-      open.delete(id)
-      conversation.messages.push({ role: 'user', content: userMessage }, { role: 'assistant', content: botReply })
-      if (conversation.messages.length > maxMessages) conversation.messages.splice(0, conversation.messages.length - maxMessages)
+    record(owner, userMessage, botReply) {
+      const conversation = open.get(owner) ?? { id: randomBytes(12).toString('hex'), messages: [], chars: 0, lastAt: 0 }
+      open.delete(owner)
+      for (const message of [
+        { role: 'user' as const, content: userMessage.slice(0, maxMessageChars) },
+        { role: 'assistant' as const, content: botReply.slice(0, maxMessageChars) },
+      ]) {
+        conversation.messages.push(message)
+        conversation.chars += message.content.length
+        openChars += message.content.length
+      }
+      if (conversation.messages.length > maxMessages) drop(conversation, conversation.messages.length - maxMessages)
+      while (conversation.chars > maxConversationChars && conversation.messages.length > 2) drop(conversation, 2)
       conversation.lastAt = now()
-      open.set(id, conversation)
-      while (open.size > maxOpen) close(open.keys().next().value as string)
+      open.set(owner, conversation)
+      // Самый давний закрывается; только что обновлённый разговор (последний в Map) не вытесняет сам себя.
+      while (open.size > 1 && (open.size > maxOpen || openChars > maxOpenChars)) close(open.keys().next().value as string)
+      return conversation.id
     },
     finish: close,
     finishIdle() {
       const edge = now() - idleAfterMs
-      for (const [id, conversation] of [...open]) if (conversation.lastAt <= edge) close(id)
+      for (const [owner, conversation] of [...open]) if (conversation.lastAt <= edge) close(owner)
     },
   }
 }

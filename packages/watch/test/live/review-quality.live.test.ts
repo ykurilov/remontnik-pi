@@ -1,16 +1,20 @@
-import { writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createModelRoute, FALLBACK_MODEL, PRIMARY_MODEL, type ModelRoute } from '@ykurilov/remontnik-core/model-route'
 import { describe, expect, it } from 'vitest'
 import { createConversationReviewer, type ReviewedFinding } from '../../src/review/index.js'
-import { BOT_DESCRIPTION, loadConversations } from '../fixtures/conversations.js'
+import { BOT_DESCRIPTION, BOT_PLACES, loadConversations } from '../fixtures/conversations.js'
 
 // Живой тест качества чтения (SC-009): настоящий DeepSeek на выдуманном размеченном наборе.
 // Запуск: DEEPSEEK_API_KEY=… [OPENROUTER_API_KEY=…] pnpm --filter @ykurilov/remontnik-watch test:live
 // Без ключа DeepSeek тест пропускается. Ключи в вывод и файлы не попадают.
 // REMONTNIK_LIVE_REPORT=<файл> — дополнительно записать отчёт в файл (vitest не показывает вывод зелёных тестов).
+// REMONTNIK_LIVE_EFFORT=low|high|max — уровень рассуждения модели (по умолчанию тот, что выбран в сторожe).
 
 const deepseekKey = process.env.DEEPSEEK_API_KEY
 const openRouterKey = process.env.OPENROUTER_API_KEY
+const effort = ['low', 'high', 'max'].find((level) => level === process.env.REMONTNIK_LIVE_EFFORT) as 'low' | 'high' | 'max' | undefined
 const MIN_FOUND_SHARE = 0.8
 const MAX_FALSE_SHARE = 0.1
 
@@ -45,9 +49,12 @@ describe.skipIf(!deepseekKey)('качество чтения разговоро�
     const errors: string[] = []
     const reviewer = createConversationReviewer({
       botDescription: BOT_DESCRIPTION,
+      places: BOT_PLACES,
+      ...(effort ? { reasoningEffort: effort } : {}),
       usdPerDay: 5,
       minConfidence: 0.7,
       model: measured,
+      spendDir: mkdtempSync(join(tmpdir(), 'remontnik-live-')),
       retryDelaysMs: [2_000, 5_000],
       onFinding: (item) => found.set(item.conversationId, [...(found.get(item.conversationId) ?? []), item]),
       onError: (what, error) => errors.push(`${what}: ${error instanceof Error ? error.message : String(error)}`),

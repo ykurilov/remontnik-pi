@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { SESSION_COOKIE, createSessionStore } from './auth/sessions.ts'
 import { createBot } from './bot/bot.ts'
@@ -58,14 +59,33 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   throw new HttpError(400, 'ожидается JSON-объект')
 }
 
-function send(response: ServerResponse, status: number, body: string, contentType: string): void {
-  response.writeHead(status, { 'content-type': contentType })
+function send(response: ServerResponse, status: number, body: string, contentType: string, headers: Record<string, string> = {}): void {
+  response.writeHead(status, { 'content-type': contentType, ...headers })
   response.end(body)
 }
 
 const sendHtml = (response: ServerResponse, html: string, status = 200) => send(response, status, html, 'text/html; charset=utf-8')
-const sendJson = (response: ServerResponse, status: number, body: unknown) =>
-  send(response, status, JSON.stringify(body), 'application/json; charset=utf-8')
+const sendJson = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) =>
+  send(response, status, JSON.stringify(body), 'application/json; charset=utf-8', headers)
+
+// Посетитель чата без входа: сервер выдаёт ему случайную метку в куке и по ней находит его разговор.
+const VISITOR_COOKIE = 'patient_chat'
+const VISITOR_ID = /^[0-9a-f]{32}$/
+
+function parseVisitor(cookieHeader: string | undefined): string | null {
+  const value = (cookieHeader ?? '')
+    .split(';')
+    .map((part) => part.trim().split('='))
+    .find(([name]) => name === VISITOR_COOKIE)?.[1]
+  return value !== undefined && VISITOR_ID.test(value) ? value : null
+}
+
+function visitorOf(cookieHeader: string | undefined): { id: string; isNew: boolean } {
+  const known = parseVisitor(cookieHeader)
+  return known ? { id: known, isNew: false } : { id: randomBytes(16).toString('hex'), isNew: true }
+}
+
+const visitorCookie = (id: string) => `${VISITOR_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax`
 
 function redirect(response: ServerResponse, location: string, headers: Record<string, string> = {}): void {
   response.writeHead(303, { location, ...headers })
@@ -134,14 +154,14 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
       case 'GET /chat':
         return sendHtml(response, chatPage(bug))
       case 'POST /api/chat': {
-        const { message, conversationId } = await readJson(request)
+        const { message } = await readJson(request)
         if (typeof message !== 'string' || message.trim() === '') throw new HttpError(400, 'пустое сообщение')
         try {
           const reply = await bot.reply(message)
-          if (typeof conversationId === 'string' && conversationId !== '' && conversationId.length <= 64) {
-            conversations.record(conversationId, message, reply)
-          }
-          return sendJson(response, 200, { reply })
+          // Посетителя узнаём по куке, которую выдаёт сервер; номер разговора тоже выдаёт сервер.
+          const visitor = visitorOf(request.headers.cookie)
+          const conversationId = conversations.record(visitor.id, message, reply)
+          return sendJson(response, 200, { reply, conversationId }, visitor.isNew ? { 'set-cookie': visitorCookie(visitor.id) } : {})
         } catch (error) {
           if (!(error instanceof ModelProviderError)) throw error
           reportError({ kind: 'model_error', error, model: error.model, provider: error.provider })
@@ -149,9 +169,9 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
         }
       }
       case 'POST /api/chat/finish': {
-        const { conversationId } = await readJson(request)
-        if (typeof conversationId !== 'string' || conversationId === '') throw new HttpError(400, 'нужен номер разговора')
-        if (!conversations.finish(conversationId)) return sendJson(response, 404, { error: 'разговор не найден' })
+        // Закрывается только разговор самого посетителя; чужой номер или его отсутствие значения не имеют.
+        const visitor = parseVisitor(request.headers.cookie)
+        if (!visitor || !conversations.finish(visitor)) return sendJson(response, 404, { error: 'разговор не найден' })
         return sendJson(response, 200, { finished: true })
       }
       default:

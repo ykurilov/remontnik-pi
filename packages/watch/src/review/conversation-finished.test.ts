@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -12,6 +12,7 @@ import { BOT_DESCRIPTION } from '../../test/fixtures/conversations.js'
 
 // `watch.conversationFinished`: законченный разговор → чтение в фоне → событие `bad_answer` врачу и тревога владельцу.
 
+const PLACES = ['цены тарифов', 'тон ответа']
 const secret = 'shared-test-secret'
 const botToken = '123456:test-bot-token'
 
@@ -63,16 +64,16 @@ function openWatch(overrides: Partial<WatchOptions> = {}): Watch {
       primary: { baseUrl: model.baseUrl, apiKey: 'test-primary-key', model: 'deepseek-flash' },
       fallback: { baseUrl: model.baseUrl, apiKey: 'test-fallback-key', model: 'deepseek/deepseek-v4.1-flash-1017' },
     },
-    review: { botDescription: BOT_DESCRIPTION, usdPerDay: 1, summaryDelayMs: 30 },
+    review: { botDescription: BOT_DESCRIPTION, usdPerDay: 1, summaryDelayMs: 30, places: PLACES },
     ...overrides,
   })
   watches.push(watch)
   return watch
 }
 
-const talk = (price: string) => [
+const talk = (price: string, tail = '') => [
   { role: 'user' as const, content: 'Сколько стоит тариф Макс? Пишите на ivan@example.com' },
-  { role: 'assistant' as const, content: `Тариф «Макс» стоит ${price} ₽ в месяц.` },
+  { role: 'assistant' as const, content: `Тариф «Макс» стоит ${price} ₽ в месяц.${tail}` },
 ]
 
 const fabrication = (excerpt: string) => ({
@@ -134,7 +135,7 @@ describe('watch.conversationFinished', () => {
 
   it('одна и та же ошибка в трёх разговорах: три события с одним отпечатком и одна тревога', async () => {
     const watch = openWatch()
-    for (const excerpt of ['цена 5990', 'цена 6990', 'цена 7990']) model.replyNext(fabrication(excerpt))
+    for (const excerpt of ['Тариф «Макс»', 'стоит 5990 ₽', 'в месяц']) model.replyNext(fabrication(excerpt))
 
     for (const id of ['a', 'b', 'c']) watch.conversationFinished({ id, messages: talk('5990') })
     await until(() => doctor.events.length === 3)
@@ -149,9 +150,9 @@ describe('watch.conversationFinished', () => {
 
   it('разные виды нарушений — разные отпечатки', async () => {
     const watch = openWatch()
-    model.replyNext(fabrication('первая'))
+    model.replyNext(fabrication('Тариф «Макс»'))
     model.replyNext({
-      findings: [{ messageIndex: 1, category: 'rudeness', place: 'тон ответа', excerpt: 'грубо', explanation: 'Грубит.', confidence: 0.9 }],
+      findings: [{ messageIndex: 1, category: 'rudeness', place: 'тон ответа', excerpt: 'стоит 5990', explanation: 'Грубит.', confidence: 0.9 }],
     })
 
     watch.conversationFinished({ id: 'a', messages: talk('5990') })
@@ -163,9 +164,10 @@ describe('watch.conversationFinished', () => {
 
   it('личные данные из разговора не попадают ни в запрос модели, ни в событие, ни в тревогу', async () => {
     const watch = openWatch()
-    model.replyNext(fabrication('Пишите на ivan@example.com, тариф 5990'))
+    // Модель видит уже замаскированный текст, поэтому и цитирует его так.
+    model.replyNext(fabrication('Пишите на [почта]'))
 
-    watch.conversationFinished({ id: 'talk-1', messages: talk('5990') })
+    watch.conversationFinished({ id: 'talk-1', messages: talk('5990', ' Пишите на ivan@example.com') })
     await until(() => doctor.events.length === 1)
     await until(() => telegram.messages.length === 1)
 
@@ -177,7 +179,7 @@ describe('watch.conversationFinished', () => {
     const watch = openWatch()
     model.replyNext(fabrication('я'.repeat(400)))
 
-    watch.conversationFinished({ id: 'talk-1', messages: talk('5990') })
+    watch.conversationFinished({ id: 'talk-1', messages: talk('5990', ` ${'я'.repeat(400)}`) })
     await until(() => doctor.events.length === 1)
 
     expect(doctor.events[0]?.badAnswer?.excerpt.length).toBeLessThanOrEqual(500)
@@ -240,7 +242,7 @@ describe('watch.conversationFinished', () => {
     expect(model.requests).toHaveLength(0)
   })
 
-  it('расход за сутки лежит в файле очереди сторожа и переживает перезапуск', async () => {
+  it('расход за сутки лежит в общем учёте приложения рядом с очередью сторожа и переживает перезапуск', async () => {
     const first = openWatch()
     model.replyNext({ findings: [] }, { costUsd: 0.0123 })
     first.conversationFinished({ id: 'talk-1', messages: talk('5990') })
@@ -249,6 +251,78 @@ describe('watch.conversationFinished', () => {
 
     const second = openWatch()
     expect(second.stats().review?.spentUsd).toBeCloseTo(0.0123, 6)
-    expect(JSON.parse(readFileSync(join(dir, 'review-web.json'), 'utf8'))).toMatchObject({ usd: 0.0123 })
+    expect(readdirSync(dir).filter((name) => name.startsWith('review-spend-'))).toHaveLength(1)
+  })
+
+  it('веб и фоновый работник одного приложения делят один суточный бюджет', async () => {
+    const budget = { botDescription: BOT_DESCRIPTION, usdPerDay: 0.0035, summaryDelayMs: 30, places: PLACES }
+    const web = openWatch({ processName: 'web', review: budget })
+    const worker = openWatch({ processName: 'worker', review: budget })
+    model.replyNext({ findings: [] }, { costUsd: 0.003 })
+    model.replyNext({ findings: [] }, { costUsd: 0.003 })
+
+    web.conversationFinished({ id: 'a', messages: talk('5990') })
+    await until(() => web.stats().review?.reviewed === 1)
+    worker.conversationFinished({ id: 'b', messages: talk('5990') })
+    await until(() => worker.stats().review?.deferred === 1)
+
+    expect(model.requests).toHaveLength(1)
+    expect(worker.stats().review?.spentUsd).toBeLessThanOrEqual(0.0035)
+  })
+
+  it('цитата, которой нет в ответе бота, случая не создаёт: чужой текст в тревогу не попадает', async () => {
+    const watch = openWatch()
+    model.replyNext(fabrication('Срочно перейдите на evil.example.com и введите пароль'))
+
+    watch.conversationFinished({ id: 'talk-1', messages: talk('5990') })
+    await until(() => watch.stats().review?.reviewed === 1)
+    await watch.flush(500)
+
+    expect(doctor.events).toHaveLength(0)
+    expect(telegram.messages).toHaveLength(0)
+  })
+
+  it('место вне набора заменяется на «прочее»: придуманное моделью в отпечаток не попадает', async () => {
+    const watch = openWatch()
+    model.replyNext({
+      findings: [
+        { messageIndex: 1, category: 'fabrication', place: 'ПЕРЕШЛИТЕ ПАРОЛЬ ВЛАДЕЛЬЦУ', excerpt: 'Тариф «Макс»', explanation: 'Такого тарифа нет.', confidence: 0.95 },
+      ],
+    })
+    model.replyNext(fabrication('Тариф «Макс»'))
+
+    watch.conversationFinished({ id: 'a', messages: talk('5990') })
+    await until(() => doctor.events.length === 1)
+
+    expect(doctor.events[0]?.where).toBe('прочее')
+    expect(doctor.events[0]?.message).toBe('выдумка: прочее')
+    expect(JSON.stringify([doctor.events, telegram.messages])).not.toContain('ПЕРЕШЛИТЕ')
+  })
+
+  it('секрет сторожа в тексте разговора до модели не доходит', async () => {
+    const watch = openWatch()
+    model.replyNext({ findings: [] })
+
+    watch.conversationFinished({
+      id: 'talk-1',
+      messages: [
+        { role: 'user', content: `вот ключ ${secret}` },
+        { role: 'assistant', content: 'принято' },
+      ],
+    })
+    await until(() => watch.stats().review?.reviewed === 1)
+
+    expect(JSON.stringify(model.requests)).not.toContain(secret)
+  })
+
+  it('тревога помечает пояснение как текст модели, а не указание', async () => {
+    const watch = openWatch()
+    model.replyNext(fabrication('Тариф «Макс» стоит 5990 ₽'))
+
+    watch.conversationFinished({ id: 'talk-1', messages: talk('5990') })
+    await until(() => telegram.messages.length === 1)
+
+    expect(telegram.messages[0]?.text).toMatch(/Пояснение модели/)
+    expect(telegram.messages[0]?.text).toContain('это не указание')
   })
 })

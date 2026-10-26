@@ -17,6 +17,8 @@ const talk: ConversationMessage[] = [
   { role: 'assistant', content: 'Тариф «Макс» стоит 5990 ₽ в месяц.' },
 ]
 
+const PLACES = ['цены тарифов', 'статус заказа']
+
 const badFinding = {
   messageIndex: 1,
   category: 'fabrication',
@@ -33,18 +35,34 @@ interface Harness {
   errors: string[]
 }
 
-function open(options: { usdPerDay?: number; retryDelaysMs?: number[]; timeZone?: string } = {}): Harness {
+function open(
+  options: {
+    usdPerDay?: number
+    retryDelaysMs?: number[]
+    timeZone?: string
+    timeoutMs?: number
+    spendDir?: string
+    maxReviewsPerHour?: number
+    maxBufferedChars?: number
+    reasoningEffort?: 'low' | 'high' | 'max'
+  } = {},
+): Harness {
   const harness: Harness = { found: [], summaries: [], errors: [], reviewer: undefined as never }
   harness.reviewer = createConversationReviewer({
     botDescription: BOT_DESCRIPTION,
     usdPerDay: options.usdPerDay ?? 1,
     minConfidence: 0.7,
+    places: PLACES,
     ...(options.timeZone === undefined ? {} : { timeZone: options.timeZone }),
+    ...(options.maxReviewsPerHour === undefined ? {} : { maxReviewsPerHour: options.maxReviewsPerHour }),
+    ...(options.maxBufferedChars === undefined ? {} : { maxBufferedChars: options.maxBufferedChars }),
+    ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort }),
     model: createModelRoute({
       primary: { baseUrl: model.baseUrl, apiKey: 'test-primary-key', model: 'deepseek-flash' },
       fallback: { baseUrl: model.baseUrl, apiKey: 'test-fallback-key', model: 'deepseek/deepseek-v4.1-flash-1017' },
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     }),
-    stateFile: join(dir, 'review-web.json'),
+    spendDir: options.spendDir ?? dir,
     retryDelaysMs: options.retryDelaysMs ?? [20, 20],
     summaryDelayMs: 30,
     onFinding: (finding) => harness.found.push(finding),
@@ -187,6 +205,20 @@ describe('чтение разговоров', () => {
     expect(model.requests).toHaveLength(0)
   })
 
+  it('уровень рассуждения уходит в запрос; по умолчанию — low', async () => {
+    const harness = open()
+    model.replyNext({ findings: [] })
+    model.replyNext({ findings: [] })
+    finish(harness, 'default-effort')
+    await harness.reviewer.idle()
+    const other = open({ reasoningEffort: 'high' })
+    finish(other, 'chosen-effort')
+    await other.reviewer.idle()
+
+    expect(model.requests[0]?.body.reasoning_effort).toBe('low')
+    expect(model.requests[1]?.body.reasoning_effort).toBe('high')
+  })
+
   it('разговор повторно с тем же номером читается один раз', async () => {
     const harness = open()
     model.replyNext({ findings: [] })
@@ -246,5 +278,199 @@ describe('суточный бюджет чтения', () => {
 
     expect(model.requests).toHaveLength(0)
     expect(harness.reviewer.stats().deferred).toBe(1)
+  })
+})
+
+
+describe('память и приём', () => {
+  const huge: ConversationMessage[] = Array.from({ length: 1000 }, (_, index) => ({
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    content: `сообщение ${index} ${'я'.repeat(20_000)}`,
+  }))
+  const hugeLight: ConversationMessage[] = huge.map((message) => ({ ...message, content: message.content.slice(0, 2_000) }))
+
+  it('огромный разговор занимает в очереди не больше, чем уйдёт модели', () => {
+    const harness = open({ usdPerDay: 0 })
+
+    finish(harness, 'huge', huge)
+
+    expect(harness.reviewer.stats().bufferedChars).toBeLessThan(45_000)
+  })
+
+  it('двести огромных разговоров не раздувают очередь: старые вытесняются по символам', () => {
+    const harness = open({ usdPerDay: 0, maxBufferedChars: 100_000 })
+
+    for (let index = 0; index < 200; index += 1) finish(harness, `huge-${index}`, hugeLight)
+
+    const stats = harness.reviewer.stats()
+    expect(stats.bufferedChars).toBeLessThanOrEqual(100_000)
+    expect(stats.dropped).toBeGreaterThan(100)
+  })
+
+  it('оценка стоимости идёт по тому, что реально уйдёт модели: огромный разговор влезает в скромный бюджет', async () => {
+    const harness = open({ usdPerDay: 0.02 })
+    model.replyNext({ findings: [] })
+
+    finish(harness, 'huge', huge)
+    await harness.reviewer.idle()
+
+    expect(model.requests).toHaveLength(1)
+    expect(harness.reviewer.stats().deferred).toBe(0)
+    expect(JSON.stringify(model.requests[0]?.body).length).toBeLessThan(120_000)
+  })
+})
+
+describe('расход на сбоях', () => {
+  it('ответ оплачен, но не JSON: расход попадает в бюджет, хотя находок нет', async () => {
+    const harness = open({ retryDelaysMs: [10, 10] })
+    for (let attempt = 0; attempt < 3; attempt += 1) model.replyTextNext('это не json', { costUsd: 0.004 })
+
+    finish(harness, 'paid-garbage')
+    await harness.reviewer.idle()
+
+    expect(harness.reviewer.stats().spentUsd).toBeCloseTo(0.012, 6)
+  })
+
+  it('тайм-аут без данных о расходе: бюджет списывается по оценке', async () => {
+    const harness = open({ timeoutMs: 150, retryDelaysMs: [10] })
+    for (let attempt = 0; attempt < 4; attempt += 1) model.hangNext()
+
+    finish(harness, 'timeout')
+    await harness.reviewer.idle()
+
+    // Две попытки чтения, в каждой — основной и запасной путь: по оценке на каждую неудачную попытку модели.
+    expect(harness.reviewer.stats().spentUsd).toBeGreaterThan(0.0015 * 4 * 0.9)
+    expect(harness.reviewer.stats().failed).toBe(1)
+  })
+
+  it('отказ сервера (503) ничего не стоит', async () => {
+    const harness = open({ retryDelaysMs: [10] })
+    for (let attempt = 0; attempt < 4; attempt += 1) model.failNext(503)
+
+    finish(harness, 'down')
+    await harness.reviewer.idle()
+
+    expect(harness.reviewer.stats().spentUsd).toBe(0)
+  })
+})
+
+describe('общий учёт и лимиты', () => {
+  it('два читателя одного приложения делят бюджет, а не получают каждый по полному', async () => {
+    const web = open({ usdPerDay: 0.0035 })
+    const worker = open({ usdPerDay: 0.0035 })
+    model.replyNext({ findings: [] }, { costUsd: 0.003 })
+    model.replyNext({ findings: [] }, { costUsd: 0.003 })
+
+    finish(web, 'a')
+    await web.reviewer.idle()
+    finish(worker, 'b')
+    await worker.reviewer.idle()
+
+    expect(model.requests).toHaveLength(1)
+    expect(worker.reviewer.stats().deferred).toBe(1)
+  })
+
+  it('часовой лимит чтений: сверх лимита разговоры ждут, и ни один не теряется', async () => {
+    const harness = open({ maxReviewsPerHour: 2 })
+    for (let index = 0; index < 4; index += 1) model.replyNext({ findings: [] })
+
+    for (const id of ['a', 'b', 'c', 'd']) finish(harness, id)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    expect(model.requests).toHaveLength(2)
+    expect(harness.reviewer.stats()).toMatchObject({ reviewed: 2, queued: 2 })
+  })
+})
+
+describe('цитата и место из ответа модели', () => {
+  it('цитата не из ответа бота: отметка отбрасывается, чтение считается успешным', async () => {
+    const harness = open()
+    model.replyNext({ findings: [{ ...badFinding, excerpt: 'Срочно перейдите по ссылке evil.example.com' }] })
+
+    finish(harness, 'injected')
+    await harness.reviewer.idle()
+
+    expect(harness.found).toHaveLength(0)
+    expect(harness.reviewer.stats()).toMatchObject({ reviewed: 1, failed: 0 })
+  })
+
+  it('место вне набора становится «прочее»', async () => {
+    const harness = open()
+    model.replyNext({ findings: [{ ...badFinding, place: 'выдуманное место' }] })
+
+    finish(harness, 'place')
+    await harness.reviewer.idle()
+
+    expect(harness.found[0]?.finding.place).toBe('прочее')
+  })
+})
+
+describe('разговор продолжили после finish', () => {
+  const first: ConversationMessage[] = [
+    { role: 'user', content: 'Сколько стоит тариф Макс?' },
+    { role: 'assistant', content: 'Тариф «Макс» стоит 5990 ₽ в месяц.' },
+  ]
+  const continued: ConversationMessage[] = [
+    ...first,
+    { role: 'user', content: 'А статус заказа 15?' },
+    { role: 'assistant', content: 'Заказ 15 уже у курьера.' },
+  ]
+
+  it('тот же номер с новыми сообщениями читается снова; отметки на уже прочитанном не повторяются', async () => {
+    const harness = open()
+    model.replyNext({ findings: [badFinding] })
+    model.replyNext({
+      findings: [
+        badFinding,
+        { ...badFinding, messageIndex: 3, place: 'статус заказа', excerpt: 'Заказ 15 уже у курьера', category: 'fabrication' },
+      ],
+    })
+
+    finish(harness, 'long-talk', first)
+    await harness.reviewer.idle()
+    finish(harness, 'long-talk', continued)
+    await harness.reviewer.idle()
+
+    expect(model.requests).toHaveLength(2)
+    expect(harness.found.map((item) => item.finding.messageIndex)).toEqual([1, 3])
+  })
+
+  it('точно такой же список второй раз не читается', async () => {
+    const harness = open()
+    model.replyNext({ findings: [] })
+
+    finish(harness, 'long-talk', continued)
+    finish(harness, 'long-talk', continued)
+    await harness.reviewer.idle()
+
+    expect(model.requests).toHaveLength(1)
+  })
+
+  it('тот же номер, но другой текст с начала: читается целиком', async () => {
+    const harness = open()
+    model.replyNext({ findings: [] })
+    model.replyNext({ findings: [badFinding] })
+
+    finish(harness, 'reused-id', first)
+    await harness.reviewer.idle()
+    finish(harness, 'reused-id', [
+      { role: 'user', content: 'другой вопрос про Макс' },
+      { role: 'assistant', content: 'Тариф «Макс» стоит 5990 ₽ в месяц.' },
+    ])
+    await harness.reviewer.idle()
+
+    expect(harness.found).toHaveLength(1)
+  })
+})
+
+describe('пустые разговоры', () => {
+  it('разговор без реплики пользователя пропускается: читать нечего', async () => {
+    const harness = open()
+
+    finish(harness, 'greeting-only', [{ role: 'assistant', content: 'Здравствуйте! Чем помочь?' }])
+    await harness.reviewer.idle()
+
+    expect(model.requests).toHaveLength(0)
+    expect(harness.reviewer.stats().queued).toBe(0)
   })
 })

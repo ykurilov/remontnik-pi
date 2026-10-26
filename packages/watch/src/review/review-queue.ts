@@ -1,10 +1,12 @@
-import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import type { ConversationMessage, ReviewFinding } from './rubric.js'
+import { dayKey } from './day.js'
+import { createSpendLedger, type SpendLedger } from './spend-ledger.js'
 
 // Очередь чтения законченных разговоров с суточным бюджетом.
 // Разговоры читаются по одному. Если оценка стоимости следующего не влезает в остаток бюджета на сутки,
 // разговор получает состояние `deferred_budget` и ждёт новых суток; бюджет не превышается никогда.
-// Сутки считаются по поясу из настройки. Расход за сутки хранится в маленьком файле и переживает перезапуск.
+// Расход и число чтений считает общий учёт приложения (`spend-ledger`): им делятся все процессы приложения.
+// Память очереди ограничена и числом разговоров, и суммарным числом символов в них.
 
 export type ReviewJobState = 'queued' | 'reviewing' | 'reviewed' | 'deferred_budget' | 'failed'
 
@@ -14,6 +16,8 @@ export interface ReviewJobInput {
   finishedAt: number
   messages: ConversationMessage[]
   meta: Record<string, unknown>
+  /** С какого сообщения искать нарушения: раньше уже читали (разговор продолжили после `finish`). */
+  reviewFrom?: number
 }
 
 export interface ReviewJob extends ReviewJobInput {
@@ -23,6 +27,10 @@ export interface ReviewJob extends ReviewJobInput {
   /** Не раньше какого времени пробовать снова, мс. */
   notBefore: number
   findings: ReviewFinding[]
+  /** Сколько символов занимает разговор в памяти. */
+  chars: number
+  /** Резерв бюджета под текущую попытку. */
+  reservationId: string | null
 }
 
 export interface DeferredSummary {
@@ -30,6 +38,9 @@ export interface DeferredSummary {
   deferred: number
   usdPerDay: number
   spentUsd: number
+  /** Что кончилось: деньги суток или число чтений в сутки. */
+  reason: 'budget' | 'daily_limit'
+  maxReviewsPerDay: number
 }
 
 export interface ReviewQueueStats {
@@ -38,7 +49,7 @@ export interface ReviewQueueStats {
   spentUsd: number
   queued: number
   reviewing: number
-  /** Сейчас ждут новых суток из-за бюджета. */
+  /** Сейчас ждут новых суток из-за бюджета или лимита. */
   deferred: number
   /** Прочитано за всё время работы очереди. */
   reviewed: number
@@ -46,17 +57,26 @@ export interface ReviewQueueStats {
   failed: number
   /** Вытеснено потолком очереди. */
   dropped: number
+  /** Символов в ожидающих разговорах. */
+  bufferedChars: number
+  /** Чтений за сегодня во всех процессах приложения. */
+  readsToday: number
 }
 
 export interface ReviewQueueOptions {
   usdPerDay: number
+  /** Сколько чтений в час и в сутки допускается на приложение. */
+  maxReviewsPerHour?: number
+  maxReviewsPerDay?: number
   /** Пояс (IANA) для границы суток; по умолчанию UTC. Неизвестный пояс — ошибка. */
   timeZone?: string
   now?: () => number
-  /** Файл расхода за сутки. Без него расход живёт только в памяти. */
-  stateFile?: string
+  /** Папка общего учёта расхода приложения. Без неё расход живёт только в памяти. */
+  spendDir?: string
   /** Потолок ожидающих разговоров; дальше вытесняется самый старый. */
   maxJobs?: number
+  /** Потолок символов во всех ожидающих разговорах; дальше вытесняется самый старый. */
+  maxBufferedChars?: number
   onError?: (what: string, error?: unknown) => void
 }
 
@@ -64,8 +84,8 @@ export interface ReviewQueue {
   /** Ставит разговор в очередь; ничего не читает и не ждёт. */
   enqueue(input: ReviewJobInput): void
   /**
-   * Следующий разговор для чтения или `null`. Разговоры, чья оценка стоимости не влезает в остаток бюджета,
-   * откладываются до новых суток.
+   * Следующий разговор для чтения или `null`. Бюджет под него уже занят. Разговоры, чья оценка стоимости не влезает
+   * в остаток бюджета, откладываются до новых суток; при упоре в часовой лимит чтения ждут своего часа.
    */
   next(estimateUsd: (job: ReviewJob) => number): ReviewJob | null
   finish(job: ReviewJob, result: { spentUsd: number; findings?: ReviewFinding[] }): void
@@ -81,104 +101,90 @@ export interface ReviewQueue {
 }
 
 export const DEFAULT_MAX_REVIEW_JOBS = 200
-const BUDGET_TOLERANCE_USD = 1e-9
+export const DEFAULT_MAX_BUFFERED_CHARS = 4_000_000
+export const DEFAULT_MAX_REVIEWS_PER_HOUR = 100
+export const DEFAULT_MAX_REVIEWS_PER_DAY = 1000
 
-const formatters = new Map<string, Intl.DateTimeFormat>()
+export { dayKey }
 
-/** Календарный день `ГГГГ-ММ-ДД` в заданном поясе. */
-export function dayKey(ms: number, timeZone: string): string {
-  let formatter = formatters.get(timeZone)
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
-    formatters.set(timeZone, formatter)
-  }
-  return formatter.format(new Date(ms))
-}
-
-interface SpendRecord {
-  day: string
-  usd: number
-  reviews: number
-  deferred: number
+function charsOf(messages: readonly ConversationMessage[]): number {
+  let total = 0
+  for (const message of messages) total += message.content.length
+  return total
 }
 
 export function createReviewQueue(options: ReviewQueueOptions): ReviewQueue {
   const now = options.now ?? Date.now
   const timeZone = options.timeZone ?? 'UTC'
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_REVIEW_JOBS
+  const maxBufferedChars = options.maxBufferedChars ?? DEFAULT_MAX_BUFFERED_CHARS
+  const maxReviewsPerDay = options.maxReviewsPerDay ?? DEFAULT_MAX_REVIEWS_PER_DAY
   const onError = options.onError ?? (() => {})
   const today = (): string => dayKey(now(), timeZone)
   today() // неизвестный пояс падает здесь, при создании
+
+  const ledger: SpendLedger = createSpendLedger({
+    usdPerDay: options.usdPerDay,
+    maxReviewsPerHour: options.maxReviewsPerHour ?? DEFAULT_MAX_REVIEWS_PER_HOUR,
+    maxReviewsPerDay,
+    timeZone,
+    now,
+    onError,
+    ...(options.spendDir === undefined ? {} : { dir: options.spendDir }),
+  })
 
   let queued: ReviewJob[] = []
   let deferred: ReviewJob[] = []
   const reviewing = new Set<ReviewJob>()
   let day = today()
-  let spentUsd = 0
-  let reviewsToday = 0
   let summaryTaken = false
+  let deferredReason: DeferredSummary['reason'] = 'budget'
   let reviewedTotal = 0
   let failedTotal = 0
   let droppedTotal = 0
 
-  function persist(): void {
-    if (!options.stateFile) return
-    const record: SpendRecord = { day, usd: spentUsd, reviews: reviewsToday, deferred: deferred.length }
-    try {
-      const temporary = `${options.stateFile}.tmp`
-      writeFileSync(temporary, JSON.stringify(record))
-      renameSync(temporary, options.stateFile)
-    } catch (error) {
-      onError('расход чтения разговоров не записан', error)
-    }
-  }
-
-  function restore(): void {
-    if (!options.stateFile) return
-    let text: string
-    try {
-      text = readFileSync(options.stateFile, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') onError('расход чтения разговоров не прочитан', error)
-      return
-    }
-    try {
-      const record = JSON.parse(text) as Partial<SpendRecord> | null
-      if (record === null || typeof record !== 'object' || typeof record.day !== 'string' || typeof record.usd !== 'number' || !(record.usd >= 0)) {
-        throw new Error('неверная запись расхода')
-      }
-      if (record.day === day) {
-        spentUsd = record.usd
-        reviewsToday = typeof record.reviews === 'number' ? record.reviews : 0
-      }
-    } catch (error) {
-      onError('файл расхода чтения разговоров испорчен, считаю с нуля', error)
-    }
-  }
-
-  /** Новые сутки: расход с нуля, отложенные возвращаются в начало очереди. */
+  /** Новые сутки: отложенные возвращаются в начало очереди. */
   function rollOver(): void {
     const current = today()
     if (current === day) return
     day = current
-    spentUsd = 0
-    reviewsToday = 0
     summaryTaken = false
     for (const job of deferred) job.state = 'queued'
     queued = [...deferred, ...queued]
     deferred = []
-    persist()
   }
 
-  restore()
+  function bufferedChars(): number {
+    let total = 0
+    for (const job of queued) total += job.chars
+    for (const job of deferred) total += job.chars
+    return total
+  }
+
+  function release(job: ReviewJob, spentUsd: number): void {
+    reviewing.delete(job)
+    if (job.reservationId !== null) ledger.settle(job.reservationId, spentUsd)
+    job.reservationId = null
+  }
 
   return {
     enqueue(input) {
       rollOver()
-      queued.push({ ...input, state: 'queued', attempts: 0, notBefore: 0, findings: [] })
-      while (queued.length + deferred.length > maxJobs) {
+      queued.push({
+        ...input,
+        state: 'queued',
+        attempts: 0,
+        notBefore: 0,
+        findings: [],
+        chars: charsOf(input.messages),
+        reservationId: null,
+      })
+      let total = bufferedChars()
+      while (queued.length + deferred.length > 1 && (queued.length + deferred.length > maxJobs || total > maxBufferedChars)) {
         const oldest = deferred.length > 0 ? deferred.shift() : queued.shift()
-        if (oldest) droppedTotal += 1
+        if (!oldest) break
+        droppedTotal += 1
+        total -= oldest.chars
       }
     },
     next(estimateUsd) {
@@ -186,42 +192,43 @@ export function createReviewQueue(options: ReviewQueueOptions): ReviewQueue {
       const ready = now()
       for (const job of [...queued]) {
         if (job.notBefore > ready) continue
-        queued.splice(queued.indexOf(job), 1)
-        if (spentUsd + estimateUsd(job) > options.usdPerDay + BUDGET_TOLERANCE_USD) {
-          job.state = 'deferred_budget'
-          deferred.push(job)
-          continue
+        const reserved = ledger.reserve(estimateUsd(job))
+        if (reserved.ok) {
+          queued.splice(queued.indexOf(job), 1)
+          job.state = 'reviewing'
+          job.reservationId = reserved.id
+          reviewing.add(job)
+          return job
         }
-        job.state = 'reviewing'
-        reviewing.add(job)
-        return job
+        if (reserved.reason === 'hourly_limit') {
+          // Упёрлись в часовой лимит чтений: все остальные упрутся так же, ждём, пока освободится место.
+          for (const waiting of queued) waiting.notBefore = Math.max(waiting.notBefore, reserved.retryAt)
+          return null
+        }
+        queued.splice(queued.indexOf(job), 1)
+        if (deferred.length === 0) deferredReason = reserved.reason
+        job.state = 'deferred_budget'
+        deferred.push(job)
       }
       return null
     },
     finish(job, result) {
-      reviewing.delete(job)
-      spentUsd += result.spentUsd
-      reviewsToday += 1
+      release(job, result.spentUsd)
       reviewedTotal += 1
       job.state = 'reviewed'
       job.findings = result.findings ?? []
-      persist()
     },
     retryLater(job, result) {
-      reviewing.delete(job)
-      spentUsd += result.spentUsd
+      release(job, result.spentUsd)
       job.attempts += 1
       job.notBefore = result.at
       job.state = 'queued'
       queued.push(job)
-      persist()
     },
     abandon(job, result) {
-      reviewing.delete(job)
-      spentUsd += result.spentUsd
+      release(job, result.spentUsd)
       failedTotal += 1
       job.state = 'failed'
-      persist()
     },
     nextReadyAt() {
       rollOver()
@@ -237,20 +244,29 @@ export function createReviewQueue(options: ReviewQueueOptions): ReviewQueue {
       rollOver()
       if (summaryTaken || deferred.length === 0) return null
       summaryTaken = true
-      return { day, deferred: deferred.length, usdPerDay: options.usdPerDay, spentUsd }
+      return {
+        day,
+        deferred: deferred.length,
+        usdPerDay: options.usdPerDay,
+        spentUsd: ledger.spentToday(),
+        reason: deferredReason,
+        maxReviewsPerDay,
+      }
     },
     stats() {
       rollOver()
       return {
         day,
         usdPerDay: options.usdPerDay,
-        spentUsd,
+        spentUsd: ledger.spentToday(),
         queued: queued.length,
         reviewing: reviewing.size,
         deferred: deferred.length,
         reviewed: reviewedTotal,
         failed: failedTotal,
         dropped: droppedTotal,
+        bufferedChars: bufferedChars(),
+        readsToday: ledger.readsToday(),
       }
     },
   }

@@ -55,6 +55,16 @@ export interface WatchOptions {
     timeZone?: string
     /** Через сколько после первого отложенного разговора слать сводку «отложено N»; по умолчанию 5 минут. */
     summaryDelayMs?: number
+    /**
+     * Места нарушений: правила и темы из описания бота. Модель выбирает место из этого набора; в отпечаток случая
+     * попадает только оно. Без набора место у всех нарушений «общее».
+     */
+    places?: readonly string[]
+    /** Сколько чтений в час и в сутки допускается на приложение (все процессы вместе); по умолчанию 100 и 1000. */
+    maxReviewsPerHour?: number
+    maxReviewsPerDay?: number
+    /** Уровень рассуждения модели при чтении; по умолчанию `low`. */
+    reasoningEffort?: 'low' | 'high' | 'max'
   }
   /** Дополнительная вычистка личных данных приложения, поверх встроенной. */
   redact?: (text: string) => string
@@ -118,10 +128,6 @@ const EMPTY_QUEUE_STATS: OutboxStats = {
   lost: 0,
   oldestPendingAt: null,
   nextAttemptAt: null,
-}
-
-function safeName(processName: string): string {
-  return processName.replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 64) || 'process'
 }
 
 /** Отмена запроса (пользователь нажал «Стоп») — не сбой. */
@@ -457,8 +463,14 @@ export function createWatch(options: WatchOptions): Watch {
           ...(options.review.minConfidence === undefined ? {} : { minConfidence: options.review.minConfidence }),
           ...(options.review.timeZone === undefined ? {} : { timeZone: options.review.timeZone }),
           ...(options.review.summaryDelayMs === undefined ? {} : { summaryDelayMs: options.review.summaryDelayMs }),
+          ...(options.review.places === undefined ? {} : { places: options.review.places }),
+          ...(options.review.maxReviewsPerHour === undefined ? {} : { maxReviewsPerHour: options.review.maxReviewsPerHour }),
+          ...(options.review.maxReviewsPerDay === undefined ? {} : { maxReviewsPerDay: options.review.maxReviewsPerDay }),
+          ...(options.review.reasoningEffort === undefined ? {} : { reasoningEffort: options.review.reasoningEffort }),
           model: route,
-          stateFile: join(options.dir, `review-${safeName(options.processName)}.json`),
+          // Расход и число чтений общие на приложение: веб и фоновый работник делят один бюджет.
+          spendDir: options.dir,
+          knownSecrets,
           now,
           ...(options.redact ? { redact: options.redact } : {}),
           onFinding: recordBadAnswer,

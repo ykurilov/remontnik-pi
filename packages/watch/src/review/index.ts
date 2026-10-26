@@ -1,9 +1,17 @@
-import { ModelRouteError, type ModelRoute, type ModelUsage } from '@ykurilov/remontnik-core/model-route'
+import { createHash } from 'node:crypto'
+import {
+  ModelRouteError,
+  type ModelRoute,
+  type ModelUsage,
+  type ReasoningEffort,
+} from '@ykurilov/remontnik-core/model-route'
 import { createReviewQueue, type DeferredSummary, type ReviewJob, type ReviewQueueStats } from './review-queue.js'
 import {
   REVIEW_MAX_OUTPUT_TOKENS,
   ReviewResponseError,
   buildReviewRequest,
+  cleanConversation,
+  compactConversation,
   parseReviewResponse,
   type ConversationMessage,
   type ReviewFinding,
@@ -28,7 +36,9 @@ export const REVIEW_RETRY_DELAYS_MS = Object.freeze([60_000, 600_000]) as readon
 const DEFERRED_RECHECK_MS = 10 * 60_000
 const DEFAULT_SUMMARY_DELAY_MS = 5 * 60_000
 const MAX_CONVERSATION_MESSAGES = 1000
-const MAX_STORED_MESSAGE_CHARS = 20_000
+const MAX_REMEMBERED_CONVERSATIONS = 10_000
+/** Уровень рассуждения при чтении: см. specs/001-self-healing-kit/research.md, раздел «Уровень рассуждения при чтении». */
+export const DEFAULT_REVIEW_REASONING_EFFORT: ReasoningEffort = 'low'
 const SESSION_ID = 'remontnik-review'
 const ROLES: readonly string[] = ['user', 'assistant', 'system', 'tool']
 
@@ -55,8 +65,19 @@ export interface ConversationReviewerOptions {
   model: ModelRoute
   /** Вычистка приложения поверх встроенной. */
   redact?: (text: string) => string
-  /** Файл расхода за сутки. */
-  stateFile?: string
+  /** Набор мест нарушений (правила и темы из описания бота): место попадает в отпечаток случая только из него. */
+  places?: readonly string[]
+  /** Точные секреты сторожа (ключи, токены): вырезаются из разговора до модели. */
+  knownSecrets?: readonly string[]
+  /** Уровень рассуждения модели при чтении; по умолчанию см. `DEFAULT_REVIEW_REASONING_EFFORT`. */
+  reasoningEffort?: ReasoningEffort
+  /** Папка общего учёта расхода приложения: её делят все процессы приложения. Без неё учёт в памяти процесса. */
+  spendDir?: string
+  /** Сколько чтений в час и в сутки допускается на приложение (по умолчанию 100 и 1000). */
+  maxReviewsPerHour?: number
+  maxReviewsPerDay?: number
+  /** Потолок символов во всех ожидающих разговорах. */
+  maxBufferedChars?: number
   /** Паузы перед повторами после сбоя; число попыток — на одну больше. */
   retryDelaysMs?: readonly number[]
   maxJobs?: number
@@ -80,16 +101,30 @@ export interface ConversationReviewer {
   close(): void
 }
 
-function snapshotMessages(raw: unknown): ConversationMessage[] | null {
+interface Snapshot {
+  /** Сообщения после обрезки: ещё не сжатые, чтобы по ним сравнивать разговоры. */
+  messages: ConversationMessage[]
+  hashOfFirst(count: number): string
+}
+
+/** Копия сообщений в пределах, которые нужны чтению; `null` — это не разговор. */
+function snapshotMessages(raw: unknown): Snapshot | null {
   if (!Array.isArray(raw)) return null
   const messages: ConversationMessage[] = []
   for (const item of raw.slice(-MAX_CONVERSATION_MESSAGES)) {
     if (item === null || typeof item !== 'object') return null
     const { role, content } = item as { role?: unknown; content?: unknown }
     if (typeof role !== 'string' || !ROLES.includes(role) || typeof content !== 'string') return null
-    messages.push({ role: role as ConversationMessage['role'], content: content.slice(0, MAX_STORED_MESSAGE_CHARS) })
+    messages.push({ role: role as ConversationMessage['role'], content })
   }
-  return messages
+  return {
+    messages,
+    hashOfFirst(count) {
+      const hash = createHash('sha256')
+      for (const message of messages.slice(0, count)) hash.update(`${message.role}\0${message.content.length}\0${message.content}\0`)
+      return hash.digest('hex')
+    },
+  }
 }
 
 function costOf(usage: ModelUsage): number {
@@ -107,27 +142,48 @@ export function createConversationReviewer(options: ConversationReviewerOptions)
   const minConfidence = options.minConfidence ?? 0.7
   const retryDelays = options.retryDelaysMs ?? REVIEW_RETRY_DELAYS_MS
   const maxAttempts = retryDelays.length + 1
+  const places = options.places ?? []
+  const reasoningEffort = options.reasoningEffort ?? DEFAULT_REVIEW_REASONING_EFFORT
   const onError = options.onError ?? (() => {})
   const queue = createReviewQueue({
     usdPerDay: options.usdPerDay,
     now,
     onError,
     ...(options.timeZone === undefined ? {} : { timeZone: options.timeZone }),
-    ...(options.stateFile === undefined ? {} : { stateFile: options.stateFile }),
+    ...(options.spendDir === undefined ? {} : { spendDir: options.spendDir }),
     ...(options.maxJobs === undefined ? {} : { maxJobs: options.maxJobs }),
+    ...(options.maxBufferedChars === undefined ? {} : { maxBufferedChars: options.maxBufferedChars }),
+    ...(options.maxReviewsPerHour === undefined ? {} : { maxReviewsPerHour: options.maxReviewsPerHour }),
+    ...(options.maxReviewsPerDay === undefined ? {} : { maxReviewsPerDay: options.maxReviewsPerDay }),
   })
-  const knownIds = new Set<string>()
+  /** Что уже читали по номеру разговора: число сообщений и отпечаток их текста. */
+  const known = new Map<string, { count: number; hash: string }>()
+  /** Запрос и очищенный разговор считаются один раз на задание: по ним и оценка, и отправка, и сверка цитат. */
+  const prepared = new WeakMap<ReviewJob, { request: ReturnType<typeof buildReviewRequest>; cleaned: ConversationMessage[] }>()
   const abort = new AbortController()
-  const fixedChars = options.botDescription.length + 4000
   let closed = false
   let timer: ReturnType<typeof setTimeout> | null = null
   let running: Promise<void> | null = null
   let summaryTimer: ReturnType<typeof setTimeout> | null = null
   const summaryDelayMs = options.summaryDelayMs ?? DEFAULT_SUMMARY_DELAY_MS
 
-  /** Дорогая оценка с запасом: весь текст по два символа на токен и полный потолок ответа. */
+  function prepare(job: ReviewJob): { request: ReturnType<typeof buildReviewRequest>; cleaned: ConversationMessage[] } {
+    let ready = prepared.get(job)
+    if (!ready) {
+      const cleaned = cleanConversation(job.messages, {
+        ...(options.redact ? { redact: options.redact } : {}),
+        ...(options.knownSecrets ? { knownSecrets: options.knownSecrets } : {}),
+      })
+      const request = buildReviewRequest({ botDescription: options.botDescription, places, messages: cleaned })
+      ready = { request, cleaned }
+      prepared.set(job, ready)
+    }
+    return ready
+  }
+
+  /** Дорогая оценка с запасом: ровно то, что уйдёт модели, по два символа на токен, и полный потолок ответа. */
   function estimateUsd(job: ReviewJob): number {
-    const chars = fixedChars + job.messages.reduce((sum, message) => sum + message.content.length + 16, 0)
+    const chars = prepare(job).request.messages.reduce((sum, message) => sum + message.content.length + 16, 0)
     return Math.ceil(chars / CHARS_PER_TOKEN) * INPUT_USD_PER_TOKEN + REVIEW_MAX_OUTPUT_TOKENS * OUTPUT_USD_PER_TOKEN
   }
 
@@ -142,30 +198,44 @@ export function createConversationReviewer(options: ConversationReviewerOptions)
     queue.retryLater(job, { spentUsd, at: now() + (retryDelays[job.attempts] ?? 0) })
   }
 
+  /** Расход ошибки модели: оплаченный ответ, который не приняли, и попытки с неизвестной ценой — по оценке. */
+  function failureCost(error: unknown, job: ReviewJob): number {
+    if (!(error instanceof ModelRouteError)) return 0
+    return (error.usage ? costOf(error.usage) : 0) + error.unknownCostAttempts * estimateUsd(job)
+  }
+
   async function review(job: ReviewJob): Promise<void> {
-    const request = buildReviewRequest({
-      botDescription: options.botDescription,
-      messages: job.messages,
-      ...(options.redact ? { redact: options.redact } : {}),
-    })
+    const { request, cleaned } = prepare(job)
     let result: Awaited<ReturnType<ModelRoute['completeJson']>>
     try {
       result = await options.model.completeJson(
-        { messages: request.messages, maxTokens: REVIEW_MAX_OUTPUT_TOKENS, temperature: 0, sessionId: SESSION_ID },
+        {
+          messages: request.messages,
+          maxTokens: REVIEW_MAX_OUTPUT_TOKENS,
+          temperature: 0,
+          sessionId: SESSION_ID,
+          reasoningEffort,
+        },
         { signal: abort.signal },
       )
     } catch (error) {
       if (closed) {
-        queue.retryLater(job, { spentUsd: 0, at: Number.POSITIVE_INFINITY })
+        // Остановка посреди запроса: он мог уйти и быть оплачен, поэтому бюджет списывается по оценке.
+        queue.retryLater(job, { spentUsd: estimateUsd(job), at: Number.POSITIVE_INFINITY })
         return
       }
-      fail(job, error, 0)
+      fail(job, error, failureCost(error, job))
       return
     }
-    const spentUsd = costOf(result.usage)
+    const spentUsd = costOf(result.usage) + result.unknownCostAttempts * estimateUsd(job)
     let findings: ReviewFinding[]
     try {
-      findings = parseReviewResponse(result.json, { messages: job.messages, minConfidence })
+      findings = parseReviewResponse(result.json, {
+        messages: cleaned,
+        minConfidence,
+        places,
+        fromIndex: job.reviewFrom ?? 0,
+      })
     } catch (error) {
       fail(job, error instanceof ReviewResponseError ? error : new ReviewResponseError(String(error)), spentUsd)
       return
@@ -188,6 +258,8 @@ export function createConversationReviewer(options: ConversationReviewerOptions)
         } catch (error) {
           queue.abandon(job, { spentUsd: 0 })
           onError(`чтение разговора ${job.conversationId} сорвалось`, error)
+        } finally {
+          prepared.delete(job)
         }
       }
       scheduleSummary()
@@ -235,16 +307,31 @@ export function createConversationReviewer(options: ConversationReviewerOptions)
       try {
         if (closed || conversation === null || typeof conversation !== 'object') return
         const { id, meta } = conversation
-        const messages = snapshotMessages(conversation.messages)
-        if (typeof id !== 'string' || id === '' || !messages || !messages.some((message) => message.role === 'assistant')) return
-        if (knownIds.has(id)) return
-        knownIds.add(id)
-        if (knownIds.size > 10_000) knownIds.delete(knownIds.values().next().value as string)
+        const snapshot = snapshotMessages(conversation.messages)
+        if (typeof id !== 'string' || id === '' || !snapshot) return
+        const { messages } = snapshot
+        // Без реплики пользователя или без ответа бота читать нечего.
+        if (!messages.some((message) => message.role === 'user') || !messages.some((message) => message.role === 'assistant')) return
+
+        // Тот же номер: тот же разговор — пропуск; разговор продолжили — читаем снова, но ищем только в новых сообщениях.
+        const before = known.get(id)
+        let reviewFrom = 0
+        const hash = snapshot.hashOfFirst(messages.length)
+        if (before) {
+          if (before.count === messages.length && before.hash === hash) return
+          if (messages.length > before.count && snapshot.hashOfFirst(before.count) === before.hash) reviewFrom = before.count
+        }
+        known.delete(id)
+        known.set(id, { count: messages.length, hash })
+        if (known.size > MAX_REMEMBERED_CONVERSATIONS) known.delete(known.keys().next().value as string)
+
         queue.enqueue({
           conversationId: id,
           finishedAt: now(),
-          messages,
+          // В памяти остаётся только то, что уйдёт модели: длинные сообщения обрезаны, середина длинного разговора пропущена.
+          messages: compactConversation(messages),
           meta: meta !== null && typeof meta === 'object' ? { ...meta } : {},
+          ...(reviewFrom > 0 ? { reviewFrom } : {}),
         })
         wake(0)
       } catch (error) {

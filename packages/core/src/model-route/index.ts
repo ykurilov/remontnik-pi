@@ -43,7 +43,11 @@ export interface JsonCompletionRequest {
   temperature?: number
   /** Номер переписки для кэша OpenRouter (`x-session-id`). */
   sessionId?: string
+  /** Уровень рассуждения модели; без него поставщик решает сам. */
+  reasoningEffort?: ReasoningEffort
 }
+
+export type ReasoningEffort = 'low' | 'high' | 'max'
 
 export interface ModelUsage {
   promptTokens: number
@@ -61,6 +65,8 @@ export interface JsonCompletionResult<T = unknown> {
   route: ModelRouteName
   model: string
   usage: ModelUsage
+  /** Сколько прежних попыток этого вызова могли быть оплачены, но расход по ним неизвестен (тайм-аут). */
+  unknownCostAttempts: number
 }
 
 export interface ModelRoute {
@@ -76,13 +82,25 @@ export class ModelRouteError extends Error {
   readonly reason: ModelRouteFailure
   readonly route: ModelRouteName
   readonly status: number | null
+  /** Расход оплаченного ответа, который всё же не удалось принять; `null` — расход не известен или ответа не было. */
+  usage: ModelUsage | null
+  /** Сколько попыток этого вызова могли быть оплачены, но расход по ним неизвестен (тайм-аут, ответ без `usage`). */
+  unknownCostAttempts: number
 
-  constructor(message: string, reason: ModelRouteFailure, route: ModelRouteName, status: number | null = null) {
+  constructor(
+    message: string,
+    reason: ModelRouteFailure,
+    route: ModelRouteName,
+    status: number | null = null,
+    cost: { usage?: ModelUsage | null; unknownCostAttempts?: number } = {},
+  ) {
     super(message)
     this.name = 'ModelRouteError'
     this.reason = reason
     this.route = route
     this.status = status
+    this.usage = cost.usage ?? null
+    this.unknownCostAttempts = cost.unknownCostAttempts ?? 0
   }
 }
 
@@ -134,6 +152,10 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
     }
     if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens
     if (request.temperature !== undefined) body.temperature = request.temperature
+    if (request.reasoningEffort !== undefined) {
+      if (route === 'primary') body.reasoning_effort = request.reasoningEffort
+      else body.reasoning = { effort: request.reasoningEffort }
+    }
     if (route === 'fallback') body.usage = { include: true }
 
     const controller = new AbortController()
@@ -153,7 +175,11 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
         })
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
-        throw new ModelRouteError(`модель недоступна (${route}): ${clean(detail)}`, 'unavailable', route)
+        // Тайм-аут: запрос ушёл и мог быть оплачен. Обрыв связи или отмена снаружи — нет.
+        const timedOut = controller.signal.aborted && !signal?.aborted
+        throw new ModelRouteError(`модель недоступна (${route}): ${clean(detail)}`, 'unavailable', route, null, {
+          unknownCostAttempts: timedOut ? 1 : 0,
+        })
       }
       if (!response.ok) {
         const detail = clean((await response.text().catch(() => '')).slice(0, 500))
@@ -167,7 +193,9 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
       try {
         payload = (await response.json()) as OpenAiCompletion
       } catch {
-        throw new ModelRouteError(`ответ модели не JSON (${route})`, 'bad_response', route, response.status)
+        throw new ModelRouteError(`ответ модели не JSON (${route})`, 'bad_response', route, response.status, {
+          unknownCostAttempts: 1,
+        })
       }
     } finally {
       clearTimeout(timer)
@@ -175,24 +203,32 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
     }
 
     const text = payload.choices?.[0]?.message?.content ?? ''
+    const usage = payload.usage
+    const knownUsage: ModelUsage | null = usage
+      ? {
+          promptTokens: usage.prompt_tokens ?? 0,
+          completionTokens: usage.completion_tokens ?? 0,
+          cachedPromptTokens: usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0,
+          costUsd: typeof usage.cost === 'number' ? usage.cost : null,
+        }
+      : null
     let json: unknown
     try {
       json = JSON.parse(text)
     } catch {
-      throw new ModelRouteError(`модель вернула не JSON (${route})`, 'bad_response', route, response.status)
+      // Ответ получен и оплачен: расход несём в ошибке, чтобы вызывающий его не потерял.
+      throw new ModelRouteError(`модель вернула не JSON (${route})`, 'bad_response', route, response.status, {
+        usage: knownUsage,
+        unknownCostAttempts: knownUsage ? 0 : 1,
+      })
     }
-    const usage = payload.usage ?? {}
     return {
       json,
       text,
       route,
       model: endpoint.model,
-      usage: {
-        promptTokens: usage.prompt_tokens ?? 0,
-        completionTokens: usage.completion_tokens ?? 0,
-        cachedPromptTokens: usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0,
-        costUsd: typeof usage.cost === 'number' ? usage.cost : null,
-      },
+      usage: knownUsage ?? { promptTokens: 0, completionTokens: 0, cachedPromptTokens: 0, costUsd: null },
+      unknownCostAttempts: 0,
     }
   }
 
@@ -200,6 +236,8 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
     async completeJson<T>(request: JsonCompletionRequest, callOptions: { signal?: AbortSignal } = {}) {
       if (onFallbackSince !== null && Date.now() - onFallbackSince >= retryPrimaryAfterMs) onFallbackSince = null
 
+      // Попытки основного пути, которые могли быть оплачены, но стоимость по ним неизвестна.
+      let earlierUnknownCost = 0
       if (onFallbackSince === null) {
         try {
           const result = await callEndpoint('primary', request, callOptions.signal)
@@ -208,10 +246,18 @@ export function createModelRoute(options: ModelRouteOptions): ModelRoute {
           const switchToFallback =
             error instanceof ModelRouteError && error.reason === 'unavailable' && !callOptions.signal?.aborted
           if (!switchToFallback) throw error
+          earlierUnknownCost = error.unknownCostAttempts
           onFallbackSince = Date.now()
         }
       }
-      return (await callEndpoint('fallback', request, callOptions.signal)) as JsonCompletionResult<T>
+      try {
+        const result = await callEndpoint('fallback', request, callOptions.signal)
+        result.unknownCostAttempts += earlierUnknownCost
+        return result as JsonCompletionResult<T>
+      } catch (error) {
+        if (error instanceof ModelRouteError) error.unknownCostAttempts += earlierUnknownCost
+        throw error
+      }
     },
     state: () => ({ onFallbackSince }),
   }
