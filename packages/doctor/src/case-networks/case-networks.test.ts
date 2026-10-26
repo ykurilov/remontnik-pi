@@ -30,7 +30,7 @@ function fakeDocker() {
   const state = join(root, 'state.json')
   const calls = join(root, 'calls.json')
   writeFileSync(state, JSON.stringify({ networks: [], taken: [], next: 1 }))
-  writeFileSync(calls, '[]')
+  writeFileSync(calls, '')
   const docker = join(root, 'docker')
   writeFileSync(
     docker,
@@ -38,10 +38,13 @@ function fakeDocker() {
 const fs = require('node:fs')
 const args = process.argv.slice(2)
 const state = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'))
-const calls = JSON.parse(fs.readFileSync(${JSON.stringify(calls)}, 'utf8'))
-calls.push(args)
-fs.writeFileSync(${JSON.stringify(calls)}, JSON.stringify(calls))
-const save = () => fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(state))
+// Команды идут параллельно: журнал — дописыванием строк, состояние — заменой файла целиком.
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n')
+const save = () => {
+  const draft = ${JSON.stringify(state)} + '.' + process.pid
+  fs.writeFileSync(draft, JSON.stringify(state))
+  fs.renameSync(draft, ${JSON.stringify(state)})
+}
 const flag = (name) => { const i = args.indexOf(name); return i === -1 ? undefined : args[i + 1] }
 const flags = (name) => args.flatMap((a, i) => (a === name ? [args[i + 1]] : []))
 const fail = (text) => { process.stderr.write(text + '\\n'); process.exit(1) }
@@ -75,7 +78,7 @@ if (verb === 'create') {
   const read = () => JSON.parse(readFileSync(state, 'utf8')) as { networks: FakeNetwork[]; taken: string[] }
   return {
     docker,
-    calls: () => JSON.parse(readFileSync(calls, 'utf8')) as string[][],
+    calls: () => readFileSync(calls, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]),
     networks: () => read().networks,
     tamper: (id: string, change: Partial<FakeNetwork>) => {
       const current = read()
@@ -121,6 +124,14 @@ function networks(docker: string, overrides: Partial<CaseNetworksOptions> = {}) 
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function until(condition: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('условие не наступило')
+    await wait(20)
+  }
+}
 
 describe('сети случая', () => {
   it('первая команда копии создаёт закрытую сеть без адреса моста, врач подключается на свой адрес', async () => {
@@ -228,7 +239,8 @@ describe('жизнь сетей', () => {
     await wait(250)
     expect(fake.networks()).toHaveLength(1) // пока команда идёт, сеть живёт
     lease.done()
-    await wait(300)
+    // Удаление — несколько вызовов docker: ждём, пока сеть уйдёт, а не фиксированное время.
+    await until(() => fake.networks().length === 0)
     expect(detached).toEqual(['checks 10.213.0.2'])
     expect(fake.calls()).toEqual(expect.arrayContaining([['network', 'disconnect', '--force', id, 'remontnik-doctor'], ['network', 'rm', id]]))
     expect(fake.networks()).toEqual([])
