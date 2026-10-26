@@ -235,6 +235,17 @@ export async function createCaseGateway(plan: DoctorStartPlan, options: { docker
 export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string } = {}): Promise<DoctorService> {
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
   const configSource = configSourceOf(env, mainBranch, options)
+  // Чтения настройки, оборванные падением врача: их контейнеры и копии файлов. До первого чтения — даже если оно упадёт.
+  const gatewayContainer = env.REMONTNIK_GATEWAY_CONTAINER?.trim()
+  const stateDir = env.REMONTNIK_STATE_DIR?.trim()
+  if (gatewayContainer && stateDir) {
+    await removeOrphanConfigReads({
+      gatewayContainer,
+      scratchDir: configReadDirOf(stateDir),
+      ...(options.docker ? { docker: options.docker } : {}),
+      ...(options.log ? { log: options.log } : {}),
+    })
+  }
   const { config } = await configSource.load()
   const plan = doctorStartPlan(env, config, { ...options, configSource })
   const listen = 'network' in plan.listen
@@ -245,13 +256,6 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   try {
     // Сначала контейнеры верстака прошлого запуска (их команды обрываются) и службы для тестов, потом их сети.
     await removeOrphanWorkbenches({ homesDir: plan.runner.homesDir, ...(options.docker ? { docker: options.docker } : {}), ...(options.log ? { log: options.log } : {}) })
-    // Чтения настройки, оборванные падением врача: их контейнеры и копии файлов.
-    await removeOrphanConfigReads({
-      gatewayContainer: plan.gateway.container,
-      scratchDir: configReadDirOf(plan.service.stateDir),
-      ...(options.docker ? { docker: options.docker } : {}),
-      ...(options.log ? { log: options.log } : {}),
-    })
     await gateway.caseServices.removeStale()
     await gateway.caseNetworks.removeStale()
     service = await startDoctorService({

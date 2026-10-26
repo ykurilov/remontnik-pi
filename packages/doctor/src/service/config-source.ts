@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { defineRemontnikConfig, type RemontnikConfig } from '@ykurilov/remontnik-core/config'
@@ -186,7 +186,27 @@ function checkoutFileReader(realCheckout: string): (path: string) => Promise<str
     const real = realpathSync(absolute)
     if (!real.startsWith(realCheckout + sep)) throw new ConfigSourceError('outside_checkout', `Файл настройки ${path} ведёт за пределы рабочей копии`)
     if (real !== absolute) throw symlinkRefusal(path)
-    return statSync(real).isFile() ? readFileSync(real, 'utf8') : undefined
+    return readWithoutFollowing(real, path)
+  }
+}
+
+/**
+ * Текст обычного файла без перехода по ссылке (`O_NOFOLLOW`): файл, подменённый ссылкой после проверки пути, — отказ,
+ * а не чтение того, куда ссылка ведёт. Не обычный файл (папка) — `undefined`.
+ */
+function readWithoutFollowing(absolute: string, path: string): string | undefined {
+  let fd: number
+  try {
+    fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw symlinkRefusal(path)
+    if ((error as NodeJS.ErrnoException).code === 'EISDIR') return undefined
+    throw error
+  }
+  try {
+    return fstatSync(fd).isFile() ? readFileSync(fd, 'utf8') : undefined
+  } finally {
+    closeSync(fd)
   }
 }
 
@@ -211,7 +231,9 @@ async function gatherConfigFilesOf(file: string, checkout: string): Promise<Conf
   const entry = basename(file)
   const texts = new Map<string, string>()
   if (entry.endsWith('.json')) {
-    texts.set(entry, readFileSync(join(realCheckout, entry), 'utf8'))
+    const text = readWithoutFollowing(join(realCheckout, entry), entry)
+    if (text === undefined) throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: это не обычный файл`)
+    texts.set(entry, text)
     return { entry, files: [entry], texts }
   }
   const readFile = checkoutFileReader(realCheckout)

@@ -170,6 +170,17 @@ describe('старт врача', () => {
     }
   })
 
+  it('первое чтение настройки упало — остатки прошлых чтений всё равно убраны', async () => {
+    const repoDir = appRepo()
+    writeFileSync(join(repoDir, 'remontnik.config.json'), '{ не JSON')
+    const stateDir = join(repoDir, '..', 'state')
+    const fake = fakeDocker({ 'remontnik-app': '127.0.0.1' })
+    mkdirSync(join(stateDir, 'config-read', 'config-old'), { recursive: true })
+    await expect(startDoctorFromEnv(serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: stateDir }), { docker: fake.docker })).rejects.toThrow()
+    expect(fake.calls()).toContain('ps -aq --filter label=remontnik.config-read=remontnik-doctor')
+    expect(readdirSync(join(stateDir, 'config-read'))).toEqual([])
+  })
+
   it('врача нет в сети приложения → служба не стартует, хранилище не создаётся', async () => {
     const repoDir = appRepo()
     const stateDir = join(repoDir, '..', 'state')

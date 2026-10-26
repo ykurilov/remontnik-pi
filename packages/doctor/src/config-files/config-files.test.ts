@@ -67,6 +67,17 @@ describe('collectConfigFiles: что подключает настройка', (
     ])
   })
 
+  it('кривой % в пути импорта — проблема в списке, а не падение; остальные импорты собираются', async () => {
+    const found = await collectConfigFiles(
+      'remontnik.config.ts',
+      reader({ 'remontnik.config.ts': `import './src/a%zz.ts'\nimport './src/b.ts'\n`, 'src/b.ts': 'export {}\n' }),
+    )
+    expect(found).toEqual({
+      files: ['remontnik.config.ts', 'src/b.ts'],
+      problems: ['remontnik.config.ts: импорт ./src/a%zz.ts — в пути неправильная последовательность с %'],
+    })
+  })
+
   it('JSON-настройка ничего не подключает', async () => {
     expect(await collectConfigFiles('remontnik.config.json', reader({ 'remontnik.config.json': '{"x": "./src/a.ts"}', 'src/a.ts': '' }))).toEqual({
       files: ['remontnik.config.json'],
@@ -115,6 +126,13 @@ describe('configFilesAt: файлы настройки на ревизии по 
     expect(await configFilesAt(r.guard, base)).toEqual(['remontnik.config.ts', 'src/bot/description.ts'])
     expect(await configFilesAt(r.guard, head)).toEqual(['remontnik.config.ts', 'src/bot/description.ts', 'src/bot/plans.ts'])
     expect(await configFilesOfFix(r.guard, base, head)).toEqual(['remontnik.config.ts', 'src/bot/description.ts', 'src/bot/plans.ts'])
+  })
+
+  it('кривой % в пути импорта не роняет шлюз: файлы настройки всё равно в списке', async () => {
+    const r = repo()
+    r.write('remontnik.config.ts', `import './src/a%zz.ts'\nimport { B } from './src/b.ts'\nexport default { B }\n`)
+    r.write('src/b.ts', `export const B = 1\n`)
+    expect(await configFilesAt(r.guard, r.commit('настройка'))).toEqual(['remontnik.config.ts', 'src/b.ts'])
   })
 
   it('нет файла настройки — пустой список', async () => {

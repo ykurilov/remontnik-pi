@@ -17,7 +17,7 @@ const REPO_ROOT = 'file:///repo/'
 export interface ConfigFiles {
   /** Пути от корня репозитория: файл настройки, подключённые им файлы и `package.json`, задающие их тип модулей. */
   files: string[]
-  /** Импорты, которые врач не поддерживает (абсолютный путь, выход из репозитория). Пусто — всё в порядке. */
+  /** Импорты, которые врач не поддерживает (абсолютный путь, выход из репозитория, кривой %). Пусто — всё в порядке. */
   problems: string[]
 }
 
@@ -26,7 +26,11 @@ function resolveOwnFile(from: string, specifier: string): { path: string } | { p
   if (/^\.{1,2}\//.test(specifier)) {
     const url = new URL(specifier, REPO_ROOT + from)
     if (!url.href.startsWith(REPO_ROOT)) return { problem: `${from}: импорт ${specifier} ведёт за пределы репозитория` }
-    return { path: decodeURIComponent(url.pathname.slice(new URL(REPO_ROOT).pathname.length)) }
+    try {
+      return { path: decodeURIComponent(url.pathname.slice(new URL(REPO_ROOT).pathname.length)) }
+    } catch {
+      return { problem: `${from}: импорт ${specifier} — в пути неправильная последовательность с %` }
+    }
   }
   if (specifier.startsWith('/') || /^file:/i.test(specifier)) {
     return { problem: `${from}: импорт ${specifier} — абсолютный путь; свои файлы подключайте по относительному пути` }
