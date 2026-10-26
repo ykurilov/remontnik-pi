@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { checkPages, createBrowserTools, takeCaseScreenshotsIn, withPageCheck, type BrowserClient, type PageCheck } from '../browser-tools/index.js'
 import type { JsonValue } from '@earendil-works/chord'
 import type { Context } from '@earendil-works/chord/context'
 import {
@@ -186,6 +187,8 @@ export interface TreatmentDeps {
   boot: string
   /** Новый отчёт записан: пора отправлять. */
   onReport(): void
+  /** Служба браузера врача (`REMONTNIK_BROWSER_*`) и окружение для ссылки на живой экран. Нет — браузера нет. */
+  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>> }
   now(): number
 }
 
@@ -254,6 +257,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       short: redactSecrets(text.short, { knownSecrets }),
       full: redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets }),
       ...(text.stopSwitch ? { stopSwitch: true as const } : {}),
+      ...(text.screenshots ? { screenshots: text.screenshots } : {}),
     }
   }
 
@@ -264,7 +268,17 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   /** Отчёт и состояние случая внутри фиксации задачи. */
   async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: ReportText): Promise<number> {
     const opened = await setCaseStateIn(records, caseId, state)
-    const report = await deps.reports.addIn(records, { type, caseId, short: text.short, full: text.full, telegram: 'pending', ...(text.stopSwitch ? { stopSwitch: true } : {}) })
+    // Снимки экрана, снятые браузером врача по случаю, уходят в ближайший отчёт.
+    const screenshots = [...(text.screenshots ?? []), ...(await takeCaseScreenshotsIn(records, caseId))]
+    const report = await deps.reports.addIn(records, {
+      type,
+      caseId,
+      short: text.short,
+      full: text.full,
+      telegram: 'pending',
+      ...(text.stopSwitch ? { stopSwitch: true } : {}),
+      ...(screenshots.length > 0 ? { screenshots } : {}),
+    })
     opened.reportIds.push(report.reportId)
     return report.reportId
   }
@@ -480,6 +494,15 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     }
   }
 
+  /** Страницы из `browser.pagesToCheck` сразу после выкатки; итог запоминается — повтор шага браузер не гоняет. */
+  async function pageCheckOf(runtime: Runtime, context: Context): Promise<PageCheck | undefined> {
+    const kept = await runtime.memo<JsonValue>('pageCheck', context)
+    if (kept !== undefined) return (kept ?? undefined) as unknown as PageCheck | undefined
+    const check = await checkPages(deps.browser?.client, (await deps.loadConfig()).browser)
+    await runtime.memo('pageCheck', (check ?? null) as unknown as JsonValue, context)
+    return check
+  }
+
   /**
    * Фазы `deploying` и `observing`: шаг выкатки. Пока выкатка ждёт замок, задача спит в `deploying`; когда правка
    * выкачена, одной фиксацией — случай `observing`, отчёт «выкатил, наблюдаю» и чекпойнт `observing`.
@@ -505,7 +528,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     const { deployment } = step
     if (step.kind === 'sleep') {
       await deps.guard.removeWorktree(candidateDir).catch(() => {})
-      const deployed = step.stage === 'observing' ? await redactedReport(deploymentReport({ case: doc.case, deployment }), checkpoint.baseRunning) : undefined
+      const deployed =
+        step.stage === 'observing'
+          ? await redactedReport(withPageCheck(deploymentReport({ case: doc.case, deployment }), await pageCheckOf(runtime, context)), checkpoint.baseRunning)
+          : undefined
       await runtime.commit(async (tx) => {
         const records = recordTransactionOver(tx)
         if (deployed) await reportIn(records, caseId, 'observing', 'deployed', deployed)
@@ -904,7 +930,17 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
   const extension: Extension = defineExtension({
     name: 'remontnik.doctor',
-    tools: [...doctorTools()],
+    tools: [
+      ...doctorTools(
+        createBrowserTools({
+          ...(deps.browser?.client ? { client: deps.browser.client } : {}),
+          ...(deps.browser?.env ? { env: deps.browser.env } : {}),
+          loadConfig: deps.loadConfig,
+          reports: deps.reports,
+          onReport: deps.onReport,
+        }),
+      ),
+    ],
     hooks: [doctorToolGuard, budgetHook],
     tasks: [task],
   })

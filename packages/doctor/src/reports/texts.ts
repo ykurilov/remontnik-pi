@@ -175,6 +175,18 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
   return { short, full }
 }
 
+/**
+ * Браузер врача упёрся в проверку для человека (капча, код из SMS). Есть живой экран — ссылка на него: человек
+ * проходит проверку и жмёт «Вернуть», врач продолжает с того же шага. Нет — врач продолжает без браузера.
+ */
+export function browserNeedsHumanReport(input: { case: ReportCase; reason: string; liveLink?: string; waitMinutes: number }): ReportText {
+  const next = input.liveLink
+    ? `Пройдите её на живом экране: ${input.liveLink} — затем нажмите «Вернуть», и я продолжу с того же шага. Жду до ${input.waitMinutes} мин, потом продолжу без браузера.`
+    : 'Живой экран не включён (browser.live): продолжаю лечение без браузера.'
+  const short = `${head(input.case)}: браузер врача остановился на проверке для человека — ${input.reason}. ${next}`
+  return { short, full: [short, '', ...caseLines(input.case)].join('\n') }
+}
+
 const version = (value: string | undefined) => (value ? value.slice(0, 12) : '—')
 /** Время из ISO-строки: `12:31 UTC`. */
 const clock = (iso: string | undefined) => (iso ? `${iso.slice(11, 16)} UTC` : '—')
