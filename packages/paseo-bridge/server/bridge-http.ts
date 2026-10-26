@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS } from '@ykurilov/remontnik-core/incident'
-import { ReplayGuard, SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
+import { NONCE_HEADER, ReplayGuard, SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import { AgentPost, type PaseoAgentsPort } from './agent-post.js'
 import type { BridgeApp, BridgeConfig } from './bridge-config.js'
 import { BridgeStateStore, type TaskRecord } from './bridge-state.js'
@@ -169,6 +169,8 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   const { config, log } = options
   const state = new BridgeStateStore(options.stateFile, log)
   const replays = new ReplayGuard()
+  /** Запросы, подписанные до запуска моста, не принимаются: память повторов после перезапуска пуста. */
+  const startedAt = Date.now()
   /** Задачи, которые сейчас принимаются: повтор того же `taskId` ждёт первый приём, а не пишет второе письмо. */
   const receiving = new Map<string, Promise<Json>>()
   /** Итоги, которые сейчас уходят врачу. */
@@ -370,9 +372,9 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
 
   function verify(request: IncomingMessage, method: string, target: string, body: string, entry: BridgeApp | undefined): void {
     if (!entry) throw new Refusal(401, 'bad_signature')
-    const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: entry.secret })
+    const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: entry.secret, notBefore: startedAt })
     if (!check.ok) throw new Refusal(401, check.reason)
-    if (!replays.firstSeen(headerValue(request, SIGNATURE_HEADER)!)) throw new Refusal(401, 'replayed')
+    if (!replays.firstSeen(headerValue(request, NONCE_HEADER)!)) throw new Refusal(401, 'replayed')
   }
 
   const handler: BridgeHandler = async (request, response) => {

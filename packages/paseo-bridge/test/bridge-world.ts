@@ -67,6 +67,12 @@ export class FakeDoctor {
   requests: DoctorRequest[] = []
   reports: { reportId: number; caseId?: number; type: string; short: string; full: string; createdAt: string }[] = []
   acked: number[] = []
+  /** Что врач уже считает подтверждённым Paseo до начала проверки (его память, а не память моста). */
+  ackedBefore = 0
+  /** Старый врач: поля `acked` в ленте нет. */
+  omitAckedField = false
+  /** Врач отдаёт страницу не больше стольки отчётов, сколько ни проси (обрезка по размеру). */
+  pageLimit = Number.POSITIVE_INFINITY
   /** Чем подписывать ответы: своим секретом, чужим или не подписывать. */
   answerSigning: 'own' | 'foreign' | 'none' = 'own'
   /** Свой ответ на запрос вместо обычного. */
@@ -120,8 +126,9 @@ export class FakeDoctor {
     if (method === 'GET' && url.pathname === '/v1/reports') {
       const after = Number(url.searchParams.get('after') ?? '0')
       const limit = Number(url.searchParams.get('limit') ?? '50')
-      const reports = this.reports.filter((report) => report.reportId > after).slice(0, limit)
-      return { status: 200, body: { reports, last: reports.at(-1)?.reportId ?? after } }
+      const reports = this.reports.filter((report) => report.reportId > after).slice(0, Math.min(limit, this.pageLimit))
+      const acked = Math.max(this.ackedBefore, ...this.acked)
+      return { status: 200, body: { reports, last: reports.at(-1)?.reportId ?? after, ...(this.omitAckedField ? {} : { acked }) } }
     }
     if (method === 'POST' && url.pathname === '/v1/reports/ack') {
       this.acked.push((JSON.parse(body) as { upTo: number }).upTo)

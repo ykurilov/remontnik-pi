@@ -12,6 +12,9 @@ export const DEFAULT_MAX_SKEW_MS = 300_000
 
 export type SignatureHeaders = { [SIGNATURE_HEADER]: string; [TIMESTAMP_HEADER]: string }
 
+/** Подпись принимается только в одном виде: `sha256=` и ровно 64 строчных hex-знака. */
+const SIGNATURE_FORMAT = /^sha256=([0-9a-f]{64})$/
+
 export type SignatureCheck = { ok: true } | { ok: false; reason: 'missing' | 'bad_signature' | 'stale' }
 
 function computeSignature(timestamp: string, body: string, secret: string): string {
@@ -53,15 +56,11 @@ export function verifySignedBody(input: VerifySignedBodyInput): SignatureCheck {
   const signature = readHeader(input.headers, SIGNATURE_HEADER)
   const timestamp = readHeader(input.headers, TIMESTAMP_HEADER)
   if (!signature || !timestamp) return { ok: false, reason: 'missing' }
-  if (input.secret === '' || !/^\d+$/.test(timestamp) || !signature.startsWith('sha256=')) {
-    return { ok: false, reason: 'bad_signature' }
-  }
+  const format = SIGNATURE_FORMAT.exec(signature)
+  if (input.secret === '' || !/^\d+$/.test(timestamp) || !format) return { ok: false, reason: 'bad_signature' }
 
   const expected = Buffer.from(computeSignature(timestamp, input.body, input.secret), 'hex')
-  const received = Buffer.from(signature.slice('sha256='.length), 'hex')
-  if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
-    return { ok: false, reason: 'bad_signature' }
-  }
+  if (!timingSafeEqual(Buffer.from(format[1]!, 'hex'), expected)) return { ok: false, reason: 'bad_signature' }
 
   const skew = Math.abs((input.now ?? Date.now()) - Number(timestamp) * 1000)
   if (skew > (input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS)) return { ok: false, reason: 'stale' }
@@ -99,15 +98,18 @@ function checkSignature(
   now: number,
   maxSkewMs: number,
   message: (timestamp: string) => string,
+  notBefore?: number,
 ): SignatureCheck {
   const signature = readHeader(headers, SIGNATURE_HEADER)
   const timestamp = readHeader(headers, TIMESTAMP_HEADER)
   if (!signature || !timestamp) return { ok: false, reason: 'missing' }
-  if (secret === '' || !/^\d+$/.test(timestamp) || !signature.startsWith('sha256=')) return { ok: false, reason: 'bad_signature' }
+  const format = SIGNATURE_FORMAT.exec(signature)
+  if (secret === '' || !/^\d+$/.test(timestamp) || !format) return { ok: false, reason: 'bad_signature' }
   const expected = Buffer.from(hmac(message(timestamp), secret), 'hex')
-  const received = Buffer.from(signature.slice('sha256='.length), 'hex')
-  if (received.length !== expected.length || !timingSafeEqual(received, expected)) return { ok: false, reason: 'bad_signature' }
+  if (!timingSafeEqual(Buffer.from(format[1]!, 'hex'), expected)) return { ok: false, reason: 'bad_signature' }
   if (Math.abs(now - Number(timestamp) * 1000) > maxSkewMs) return { ok: false, reason: 'stale' }
+  // Подпись, поставленная до запуска принимающей стороны, могла быть уже принята: память повторов после перезапуска пуста.
+  if (notBefore !== undefined && Number(timestamp) < Math.floor(notBefore / 1000)) return { ok: false, reason: 'stale' }
   return { ok: true }
 }
 
@@ -141,6 +143,8 @@ export interface VerifySignedRequestInput {
   secret: string
   now?: number
   maxSkewMs?: number
+  /** Момент запуска принимающей стороны: запросы с отметкой раньше этой секунды отвергаются как `stale`. */
+  notBefore?: number
 }
 
 /** Проверка подписи запроса. Повтор той же подписи отсекает `ReplayGuard` у принимающей стороны. */
@@ -150,7 +154,30 @@ export function verifySignedRequest(input: VerifySignedRequestInput): SignatureC
   if (!NONCE.test(nonce)) return { ok: false, reason: 'bad_signature' }
   return checkSignature(input.headers, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (timestamp) =>
     requestMessage(timestamp, nonce, input.method, input.target, input.body),
+    input.notBefore,
   )
+}
+
+export interface PrecheckSignedRequestInput {
+  headers: HeaderSource
+  now?: number
+  maxSkewMs?: number
+  notBefore?: number
+}
+
+/**
+ * Дешёвая проверка заголовков подписанного запроса без секрета и без тела: на месте ли они, правильного ли вида
+ * и не слишком ли старая отметка времени. Верность подписи проверяет `verifySignedRequest`.
+ */
+export function precheckSignedRequest(input: PrecheckSignedRequestInput): SignatureCheck {
+  const signature = readHeader(input.headers, SIGNATURE_HEADER)
+  const timestamp = readHeader(input.headers, TIMESTAMP_HEADER)
+  const nonce = readHeader(input.headers, NONCE_HEADER)
+  if (!signature || !timestamp || !nonce) return { ok: false, reason: 'missing' }
+  if (!SIGNATURE_FORMAT.test(signature) || !/^\d+$/.test(timestamp) || !NONCE.test(nonce)) return { ok: false, reason: 'bad_signature' }
+  if (Math.abs((input.now ?? Date.now()) - Number(timestamp) * 1000) > (input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS)) return { ok: false, reason: 'stale' }
+  if (input.notBefore !== undefined && Number(timestamp) < Math.floor(input.notBefore / 1000)) return { ok: false, reason: 'stale' }
+  return { ok: true }
 }
 
 export interface SignedRequestRef {
@@ -191,7 +218,7 @@ export function verifySignedResponse(input: {
 }
 
 /**
- * Память увиденных подписей на время окна: подпись, уже принятая раз, второй раз не проходит.
+ * Память увиденных ключей на время окна: ключ, уже принятый раз, второй раз не проходит.
  * Окно по умолчанию — вдвое больше допуска по времени: подпись годна на `maxSkew` в обе стороны.
  */
 export class ReplayGuard {
@@ -204,16 +231,23 @@ export class ReplayGuard {
     this.maxEntries = maxEntries
   }
 
-  firstSeen(signature: string, now: number = Date.now()): boolean {
-    for (const [key, expires] of this.seen) {
-      if (expires > now) break
-      this.seen.delete(key)
+  /** Смотрит, не принят ли ключ уже, ничего не запоминая: для дешёвой проверки до чтения тела. */
+  wasSeen(key: string, now: number = Date.now()): boolean {
+    const expires = this.seen.get(key)
+    return expires !== undefined && expires > now
+  }
+
+  /** Запоминает ключ и говорит, был ли он первым. Ключом берут разовую метку запроса (`X-Remontnik-Nonce`), а не строку подписи. */
+  firstSeen(key: string, now: number = Date.now()): boolean {
+    for (const [old, oldExpires] of this.seen) {
+      if (oldExpires > now) break
+      this.seen.delete(old)
     }
-    const expires = this.seen.get(signature)
+    const expires = this.seen.get(key)
     if (expires !== undefined && expires > now) return false
     if (this.seen.size >= this.maxEntries) this.seen.delete(this.seen.keys().next().value!)
-    this.seen.delete(signature)
-    this.seen.set(signature, now + this.windowMs)
+    this.seen.delete(key)
+    this.seen.set(key, now + this.windowMs)
     return true
   }
 }

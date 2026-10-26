@@ -2,19 +2,14 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { redactValue } from '@ykurilov/remontnik-core/redact'
-import {
-  DEFAULT_MAX_SKEW_MS,
-  SIGNATURE_HEADER,
-  TIMESTAMP_HEADER,
-  verifySignedBody,
-} from '@ykurilov/remontnik-core/signed-http'
+import { verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health.
 
 export const INTAKE_MAX_EVENTS = 50
 export const INTAKE_MAX_BODY_BYTES = 1024 * 1024
 export const INTAKE_BODY_TIMEOUT_MS = 10_000
-const REFUSE_LINGER_MS = 1_000
 
 export interface IntakeHandlerOptions {
   secret: string
@@ -23,73 +18,11 @@ export interface IntakeHandlerOptions {
   health(): unknown
   /** Срок на чтение тела; не успел — 408 и соединение закрывается. */
   bodyTimeoutMs?: number
+  /** Лента отчётов: `/v1/reports*` отдаются ей. Не задана — этих адресов нет. */
+  reportsFeed?: IntakeHandler
 }
 
-export type IntakeHandler = (request: IncomingMessage, response: ServerResponse) => Promise<void>
-
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
-  if (response.headersSent) return
-  response.writeHead(status, { 'content-type': 'application/json' })
-  response.end(JSON.stringify(body))
-}
-
-/**
- * Отказ без чтения остатка тела: ответ сразу, остаток выбрасываем, через секунду соединение рвём,
- * даже если клиент ещё пишет. `Connection: close` не ставим: с ним Node закрывает сокет с непрочитанным телом,
- * и клиент получает сброс вместо ответа.
- */
-function refuse(request: IncomingMessage, response: ServerResponse, status: number, body: unknown): void {
-  setTimeout(() => request.destroy(), REFUSE_LINGER_MS).unref()
-  request.resume()
-  sendJson(response, status, body)
-}
-
-function headerValue(request: IncomingMessage, name: string): string | undefined {
-  const value = request.headers[name.toLowerCase()]
-  return Array.isArray(value) ? value[0] : value
-}
-
-/** Проверка заголовков подписи до тела: нет их или отметка времени устарела — тело не нужно. */
-function precheckSignature(request: IncomingMessage, now: number): 'missing' | 'stale' | null {
-  const signature = headerValue(request, SIGNATURE_HEADER)
-  const timestamp = headerValue(request, TIMESTAMP_HEADER)
-  if (!signature || !timestamp) return 'missing'
-  if (/^\d+$/.test(timestamp) && Math.abs(now - Number(timestamp) * 1000) > DEFAULT_MAX_SKEW_MS) return 'stale'
-  return null
-}
-
-type BodyResult = { ok: true; body: string } | { ok: false; reason: 'too_large' | 'timeout' | 'aborted' }
-
-/** Тело целиком, не больше предела и не дольше срока. */
-function readLimitedBody(request: IncomingMessage, limit: number, timeoutMs: number): Promise<BodyResult> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    let settled = false
-    const finish = (result: BodyResult) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      request.off('data', onData)
-      request.off('end', onEnd)
-      request.off('error', onAbort)
-      request.off('aborted', onAbort)
-      resolve(result)
-    }
-    const onData = (chunk: Buffer) => {
-      size += chunk.length
-      if (size > limit) finish({ ok: false, reason: 'too_large' })
-      else chunks.push(chunk)
-    }
-    const onEnd = () => finish({ ok: true, body: Buffer.concat(chunks).toString('utf8') })
-    const onAbort = () => finish({ ok: false, reason: 'aborted' })
-    const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs)
-    request.on('data', onData)
-    request.on('end', onEnd)
-    request.on('error', onAbort)
-    request.on('aborted', onAbort)
-  })
-}
+export type { IntakeHandler }
 
 const isString = (value: unknown): value is string => typeof value === 'string'
 
@@ -119,6 +52,10 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     const path = (request.url ?? '/').split('?')[0]
     if (request.method === 'GET' && path === '/health') {
       sendJson(response, 200, options.health())
+      return
+    }
+    if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {
+      await options.reportsFeed(request, response)
       return
     }
     if (request.method !== 'POST' || path !== '/v1/events') {
