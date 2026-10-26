@@ -9,7 +9,9 @@ import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../in
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
+import { createControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
@@ -240,13 +242,20 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   }
 
   const feed = options.reportsFeed
+  const controls = createControls(opened.records)
   let intake: IntakeServer
   try {
     intake = await startIntakeServer({
       handler: createIntakeHandler({
         secret: options.sharedSecret,
         receiveEvents,
-        health: () => ({ ok: harnessState === 'open', harness: harnessState, autoDeploy: 'on' }),
+        health: async () => ({
+          ok: harnessState === 'open',
+          harness: harnessState,
+          // Хранилище отказало — состояние стоп-крана неизвестно, но /health всё равно отвечает.
+          autoDeploy: await controls.read().then((read) => read.autoDeploy, () => 'unknown'),
+        }),
+        deployControls: createDeployControlsHandler({ controls, secret: options.sharedSecret }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),
       host: options.listen.host,

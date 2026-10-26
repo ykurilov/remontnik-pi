@@ -171,6 +171,26 @@ describe('git-замок', () => {
     expect(git(r.repoDir, 'rev-parse', 'remontnik/pre-deploy/1')).toBe(before)
   })
 
+  it('метка прежней версии: на заданном коммите и в origin; повтор безопасен, другой коммит под той же меткой — отказ', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const running = await guard.resolve('HEAD')
+    writeFileSync(join(r.repoDir, 'app.ts'), 'export const answer = 2\n')
+    git(r.repoDir, 'commit', '-am', 'дальше')
+    const later = await guard.resolve('HEAD')
+
+    await guard.tagPreDeploy('remontnik/pre-deploy/2026-10-26-7-1', running)
+    await guard.tagPreDeploy('remontnik/pre-deploy/2026-10-26-7-1', running)
+
+    expect(git(r.origin, 'rev-parse', 'refs/tags/remontnik/pre-deploy/2026-10-26-7-1^{commit}')).toBe(running)
+    expect((await rejection(guard.tagPreDeploy('remontnik/pre-deploy/2026-10-26-7-1', later))).code).toBe('forbidden')
+    expect((await rejection(guard.tagPreDeploy('release-1', running))).code).toBe('forbidden')
+    expect((await rejection(guard.tagPreDeploy('remontnik/pre-deploy/x', 'main'))).code).toBe('forbidden')
+    // Чужие метки в origin врач не трогает.
+    expect((await rejection(guard.run(['push', 'origin', 'refs/tags/v1:refs/tags/v1']))).code).toBe('forbidden')
+    expect((await rejection(guard.run(['push', 'origin', '+refs/tags/remontnik/x:refs/tags/remontnik/x']))).code).toBe('forbidden')
+  })
+
   it('проверочная копия с fresh пересоздаётся начисто: мусор прошлого прогона пропадает', async () => {
     const r = repo()
     const guard = guardFor(r)

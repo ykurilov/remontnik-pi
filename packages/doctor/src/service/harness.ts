@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
+import { BACKGROUND_CONTEXT, type Context } from '@earendil-works/chord/context'
 import { createModels } from '@earendil-works/pi-ai/models'
 import type { Models } from '@earendil-works/pi-ai'
 import {
@@ -15,9 +15,11 @@ import {
   type SessionDocFamilyToken,
   type SessionEnd,
   type Storage,
+  type TaskRuntime,
   type Tx,
 } from '@earendil-works/pi-durable'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
+import type { Deployer, DeployRequest, DeployStep } from '../deployer/deploy-sequence.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 
 // Единственное место, где записи врача касаются pi-durable: коллекции записей — семейства документов Session,
@@ -48,6 +50,12 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   spend: recordFamily('remontnik.spend'),
   /** Сколько расхода модели по случаю уже записано в дни. */
   'spend-case': recordFamily('remontnik.spend-case'),
+  /** Ошибки приложения по часам: уровень до выкатки и рост после неё. */
+  'error-hour': recordFamily('remontnik.error-hour'),
+  deployment: recordFamily('remontnik.deployment'),
+  'deployment-index': recordFamily('remontnik.deployment-index'),
+  /** Стоп-кран автовыкатки. */
+  controls: recordFamily('remontnik.controls'),
 }
 
 /** Семейство документов коллекции записей: для чтения из задач pi-durable (`runtime.snapshot`). */
@@ -71,6 +79,8 @@ export interface OpenDoctorHarnessOptions {
   models?: Models
   /** Окружение выполнения инструментов модели (верстак). */
   env?: HarnessOptions['env']
+  /** Для проверок: будить спящие задачи самим (подменённые часы). */
+  onWake?: HarnessOptions['onWake']
 }
 
 export interface DoctorHarness {
@@ -114,6 +124,44 @@ export function recordStoreOver(harness: Harness): RecordStore {
 }
 
 /**
+ * Записи врача из задачи pi-durable: каждая транзакция — фиксация задачи без смены её чекпойнта. Сама по себе она не
+ * продвигает фазу: фаза всё равно заканчивается своим чекпойнтом, сном или итогом.
+ */
+export function taskRecordStore<I, S, R, H extends object>(runtime: TaskRuntime<I, S, R, H>, context: Context): RecordStore {
+  return {
+    async transaction(change) {
+      let result: Awaited<ReturnType<typeof change>> | undefined
+      await runtime.commit(async (tx) => {
+        result = await change(recordTransactionOver(tx))
+        return undefined
+      }, context)
+      return result as Awaited<ReturnType<typeof change>>
+    },
+    async read(collection, key) {
+      const value = await runtime.snapshot(recordFamilyOf(collection), key, context)
+      return value === undefined ? undefined : (copy(value) as never)
+    },
+  }
+}
+
+/**
+ * Выкатка из фазы задачи лечения — одной строкой: шаг выкатки, а когда ей надо ждать (замок, тик наблюдения), задача
+ * засыпает на `checkpoint` и фаза должна сразу вернуться. На `done` фаза сама фиксирует следующий чекпойнт или итог.
+ * Повтор фазы после перезапуска безопасен: выкатка продолжает свою запись `deployment/<id>`.
+ */
+export async function runDeploymentInTask<I, S, R, H extends object>(
+  runtime: TaskRuntime<I, S, R, H>,
+  deployer: Deployer,
+  request: DeployRequest,
+  checkpoint: S,
+  context: Context,
+): Promise<DeployStep> {
+  const step = await deployer.step(request, { store: taskRecordStore(runtime, context), now: () => runtime.now() })
+  if (step.kind === 'sleep') await runtime.sleepUntil(step.until, checkpoint, context)
+  return step
+}
+
+/**
  * Инструменты модели-врача идут по очереди, а не все вызовы хода разом. Иначе команда в верстаке могла бы подменить
  * часть пути символьной ссылкой между проверкой пути файловым инструментом и самой записью. Команда держит верстак
  * до конца: контейнер гаснет вместе с ней, фоновые процессы в нём не переживают вызов.
@@ -134,6 +182,7 @@ export async function openDoctorHarness(options: OpenDoctorHarnessOptions): Prom
       onReport: options.onReport,
       ...(options.env ? { env: options.env } : {}),
       ...(options.now ? { now: options.now } : {}),
+      ...(options.onWake ? { onWake: options.onWake } : {}),
     },
     BACKGROUND_CONTEXT,
   )

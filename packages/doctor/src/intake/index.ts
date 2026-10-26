@@ -5,7 +5,7 @@ import { redactValue } from '@ykurilov/remontnik-core/redact'
 import { verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
-// Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health.
+// Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health; рядом — лента отчётов и стоп-кран.
 
 export const INTAKE_MAX_EVENTS = 50
 export const INTAKE_MAX_BODY_BYTES = 1024 * 1024
@@ -15,11 +15,13 @@ export interface IntakeHandlerOptions {
   secret: string
   /** Записывает принятые события; повтор того же eventId должен быть безопасен. */
   receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }>
-  health(): unknown
+  health(): unknown | Promise<unknown>
   /** Срок на чтение тела; не успел — 408 и соединение закрывается. */
   bodyTimeoutMs?: number
   /** Лента отчётов: `/v1/reports*` отдаются ей. Не задана — этих адресов нет. */
   reportsFeed?: IntakeHandler
+  /** Стоп-кран выкаток: `POST /v1/control/deploys`. Не задан — адреса нет. */
+  deployControls?: IntakeHandler
 }
 
 export type { IntakeHandler }
@@ -51,7 +53,11 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
   return async (request, response) => {
     const path = (request.url ?? '/').split('?')[0]
     if (request.method === 'GET' && path === '/health') {
-      sendJson(response, 200, options.health())
+      sendJson(response, 200, await options.health())
+      return
+    }
+    if (options.deployControls && path === '/v1/control/deploys') {
+      await options.deployControls(request, response)
       return
     }
     if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {

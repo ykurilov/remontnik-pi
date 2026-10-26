@@ -1,14 +1,18 @@
 import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
+import type { Deployment, DeployRefusal, RollbackCause } from '../deployer/deploy-sequence.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
 import type { SuspiciousFinding } from '../diff-inspector/index.js'
 import type { ProtectedChange } from '../treatment/protected-changes.js'
+import type { ReportType } from './index.js'
 
 // Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
 
 export interface ReportText {
   short: string
   full: string
+  /** Пути к снимкам экрана браузера врача. */
+  screenshots?: string[]
 }
 
 export interface ReportCase {
@@ -183,4 +187,83 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
     ...(reason.kind === 'eval_worse' ? checksLines(reason.checks) : []),
   ].join('\n')
   return { short, full }
+}
+
+const version = (value: string | undefined) => (value ? value.slice(0, 12) : '—')
+/** Время из ISO-строки: `12:31 UTC`. */
+const clock = (iso: string | undefined) => (iso ? `${iso.slice(11, 16)} UTC` : '—')
+
+const ROLLBACK_CAUSES: Record<RollbackCause, string> = {
+  health: 'приложение не прошло проверку здоровья',
+  error_rate: 'ошибок стало больше, чем до выкатки',
+  new_fingerprints: 'появились новые сбои',
+  promote_failed: 'команда promote не довела выкатку',
+  current_unavailable: 'приложение не говорит, какая версия работает',
+}
+
+const REFUSALS: Record<DeployRefusal, string> = {
+  stop_switch: 'включён стоп-кран',
+  current_unavailable: 'приложение не говорит, какая версия работает',
+  no_previous_build: 'на сервере нет прежней сборки, откатываться было бы некуда',
+  already_running: 'эта версия уже работает',
+  tag_failed: 'не смог поставить метку прежней версии в git',
+  build_failed: 'сборка не прошла',
+  promote_failed: 'команда promote не прошла, работает прежняя версия',
+}
+
+function deploymentLines(deployment: Deployment): string[] {
+  const tick = deployment.lastTick
+  return [
+    `Выкатка ${deployment.deploymentId}: ${version(deployment.previousVersion)} → ${version(deployment.candidateVersion)}`,
+    ...(deployment.preDeployTag ? [`Метка прежней версии: ${deployment.preDeployTag}`] : []),
+    ...(deployment.promotedAt ? [`Выкачено в ${clock(deployment.promotedAt)}, окно наблюдения до ${clock(deployment.observeUntil)}`] : []),
+    ...(tick
+      ? [`Последний замер (${clock(tick.at)}): ошибок ${tick.errors}, ${tick.errorsPerHour.toFixed(1)} в час${tick.newFingerprints.length > 0 ? `, новые сбои: ${tick.newFingerprints.join(', ')}` : ''}`]
+      : []),
+    ...(deployment.observation?.lastHealthReason ? [`Последний сбой здоровья: ${deployment.observation.lastHealthReason}`] : []),
+    ...(deployment.healthyAfterRollback === undefined
+      ? []
+      : [deployment.healthyAfterRollback ? 'После отката приложение здорово.' : `После отката приложение нездорово: ${deployment.healthAfterRollback ?? 'причина неизвестна'}`]),
+    ...(deployment.confirmFailed ? [`confirm не прошёл: ${deployment.confirmFailed}`] : []),
+    ...(deployment.detail ? [`Подробности: ${deployment.detail}`] : []),
+  ]
+}
+
+/**
+ * Отчёт о выкатке по её записи: тип и текст. `branch` — ветка правки, если выкатку не начинали (стоп-кран),
+ * `screenshots` — снимки экрана после выкатки.
+ */
+export function deploymentReport(input: { case: ReportCase; deployment: Deployment; branch?: string; screenshots?: string[] }): ReportText & { type: ReportType } {
+  const { deployment } = input
+  const candidate = version(deployment.candidateVersion)
+  const previous = version(deployment.previousVersion)
+  const [type, short]: [ReportType, string] = (() => {
+    switch (deployment.outcome) {
+      case 'in_progress':
+        return ['deployed', `${head(input.case)}: выкатил правку (версия ${candidate}), наблюдаю до ${clock(deployment.observeUntil)}.`]
+      case 'holding':
+        return ['deployed', `${head(input.case)}: правка выкачена (версия ${candidate}) и держится: окно наблюдения прошло без ухудшения.`]
+      case 'not_helped':
+        return ['not_helped', `${head(input.case)}: правка (версия ${candidate}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.`]
+      case 'rolled_back': {
+        const why = deployment.rollbackReason ?? (deployment.rollbackCause ? ROLLBACK_CAUSES[deployment.rollbackCause] : 'стало хуже')
+        const after = deployment.healthyAfterRollback === false ? ` Но и после отката приложение нездорово. Нужен человек.` : ''
+        return ['rolled_back', `${head(input.case)}: откатил правку на прежнюю версию ${previous} — ${why}.${after}`]
+      }
+      case 'rollback_failed':
+        return ['needs_human', `${head(input.case)}: откат не удался за ${deployment.rollbackAttempts ?? 0} попытки, работает непонятно что. Нужен человек.`]
+      case 'superseded_by_human':
+        return [
+          'needs_human',
+          `${head(input.case)}: пока я наблюдал правку ${candidate}, человек выкатил свою версию ${version(deployment.supersededBy)}. Наблюдение остановил, ничего не откатывал; что делать с правкой — решение за человеком.`,
+        ]
+      case 'refused':
+        if (deployment.refusal === 'stop_switch') {
+          return ['fix_ready', `${head(input.case)}: включён стоп-кран, правку не выкатывал. Она готова в ветке ${input.branch ?? '—'}.`]
+        }
+        return ['needs_human', `${head(input.case)}: выкатку не начал — ${deployment.refusal ? REFUSALS[deployment.refusal] : 'отказ'}. Нужен человек.`]
+    }
+  })()
+  const full = [short, '', ...caseLines(input.case), ...deploymentLines(deployment)].join('\n')
+  return { type, short, full, ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: [...input.screenshots] } : {}) }
 }

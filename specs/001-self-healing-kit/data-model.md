@@ -125,15 +125,28 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | Поле | Тип |
 |---|---|
 | `deploymentId` | число |
-| `caseId` | число |
+| `caseId`, `appName`, `fingerprint` | случай и его отпечаток |
 | `previousVersion` | строка из `current` до выкатки |
-| `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>` |
+| `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>-<deploymentId>` |
 | `candidateVersion` | sha правки |
-| `startedAt`, `promotedAt`, `endedAt` | время |
+| `candidateDir` | рабочая копия правки, где идёт `build` |
+| `stage` | `starting` \| `locked` \| `tagging` \| `building` \| `promoting` \| `observing` \| `rolling_back` \| `confirming` \| `done` — шаг, с которого выкатка продолжится после перезапуска |
+| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?` | время |
 | `baseline` | `{ errorsPerHour, knownFingerprints7d[] }` |
-| `observeUntil` | время конца окна |
-| `outcome` | `in_progress` \| `holding` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` |
-| `rollbackReason` | string? |
+| `observeUntil`, `nextTickAt` | конец окна и следующий тик наблюдения |
+| `observation`, `lastTick` | счёт сбоев здоровья подряд и последний замер ошибок |
+| `promoteRequested` | намерение `promote` записано: дальше по `current` видно, прошёл ли он |
+| `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` |
+| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` |
+| `rollbackCause`, `rollbackReason`, `rollbackAttempts` | почему и сколько раз откатывал (не больше 3) |
+| `healthyAfterRollback`, `healthAfterRollback` | здоровье после отката |
+| `supersededBy`, `confirmFailed`, `detail` | версия человека, сбой `confirm`, хвост вывода для отчёта |
+
+Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую.
+
+### ErrorHour — ошибки приложения по часам (документ `remontnik.error-hour/<app>/<YYYY-MM-DDTHH>`)
+
+`{ minutes: { [минута]: число }, fingerprints: { [fp]: { count, lastAt } }, overflow }` — не больше 200 отпечатков в часе. Пишется книгой случаев вместе с приёмом события. Из него — уровень ошибок до выкатки (больший из «последний час» и «сутки / 24») и известные за 7 дней отпечатки.
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 
@@ -147,7 +160,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### Controls (документ `remontnik.controls`)
 
-`{ autoDeploy: "on" | "stopped", stoppedBy?, stoppedAt? }`.
+`{ autoDeploy: "on" | "stopped", stoppedBy?, stoppedAt? }`. Меняется командой `remontnik-doctor deploys stop|resume` и подписанным `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`; состояние видно в `/health` (`autoDeploy`).
 
 ### Report — отчёт (документ `remontnik.report/<reportId>`)
 
@@ -158,7 +171,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `type` | `case_received` \| `cause_found` \| `fix_ready` \| `deployed` \| `rolled_back` \| `not_helped` \| `needs_human` \| `no_cause_found` \| `budget_reached` \| `stand_broken` \| `doctor_problem` \| `handed_off` \| `paseo_done` \| `reclaimed` |
 | `short` | string ≤ 1000 (для Telegram) |
 | `full` | Markdown |
-| `screenshots` | пути к снимкам браузера? |
+| `screenshots` | пути к снимкам браузера?, не больше 10 |
 | `telegram` | `{ state: "pending" | "sent" | "failed" | "not_needed", attempts, messageId? }`; `not_needed` — только для журнала и Paseo (например, `case_received`: о сбое владелец уже узнал от сторожа) |
 | `createdAt` | время |
 

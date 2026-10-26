@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ChecksResult } from '../checks/index.js'
-import { causeFoundReport, fixReadyReport, noCauseFoundReport, standBrokenReport } from './texts.js'
+import type { Deployment } from '../deployer/deploy-sequence.js'
+import { causeFoundReport, deploymentReport, fixReadyReport, noCauseFoundReport, standBrokenReport } from './texts.js'
 
 const sick = { caseId: 7, appName: 'patient', kind: 'tool_error' as const, where: 'src/bot/tools.ts', message: 'orders storage timeout' }
 const diagnosis = {
@@ -83,5 +84,83 @@ describe('тексты отчётов лечения', () => {
     const text = standBrokenReport({ case: sick, branch: 'remontnik/7-orders', checks: broken })
     expect(text.short).toContain('стенд')
     expect(text.full).toContain('нет итога eval')
+  })
+})
+
+describe('тексты отчётов выкатки', () => {
+  const PREV = 'a'.repeat(40)
+  const CAND = 'c'.repeat(40)
+  const base: Deployment = {
+    deploymentId: 2,
+    caseId: 7,
+    appName: 'patient',
+    fingerprint: 'fp',
+    candidateVersion: CAND,
+    candidateDir: '/srv/copies/7',
+    stage: 'done',
+    outcome: 'holding',
+    startedAt: '2026-10-26T12:00:00.000Z',
+    previousVersion: PREV,
+    preDeployTag: 'remontnik/pre-deploy/2026-10-26-7-2',
+    promotedAt: '2026-10-26T12:01:00.000Z',
+    observeUntil: '2026-10-26T12:31:00.000Z',
+    lastTick: { at: '2026-10-26T12:31:00.000Z', errors: 0, errorsPerHour: 0, newFingerprints: [], caseFingerprintSeen: false },
+  }
+  const report = (deployment: Partial<Deployment>, extra: { branch?: string; screenshots?: string[] } = {}) =>
+    deploymentReport({ case: sick, deployment: { ...base, ...deployment }, ...extra })
+
+  it('держится: deployed с версией, меткой прежней и снимками экрана', () => {
+    const text = report({}, { screenshots: ['/state/shots/7-1.png'] })
+    expect(text.type).toBe('deployed')
+    expect(text.short).toContain('Случай 7')
+    expect(text.short).toContain(CAND.slice(0, 12))
+    expect(text.full).toContain('remontnik/pre-deploy/2026-10-26-7-2')
+    expect(text.full).toContain(PREV.slice(0, 12))
+    expect(text.screenshots).toEqual(['/state/shots/7-1.png'])
+  })
+
+  it('выкатка в окне наблюдения: deployed «наблюдаю до»', () => {
+    const text = report({ stage: 'observing', outcome: 'in_progress' })
+    expect(text.type).toBe('deployed')
+    expect(text.short).toContain('наблюдаю')
+    expect(text.short).toContain('12:31')
+  })
+
+  it('откат: причина, на какую версию вернулся и здоровье после', () => {
+    const text = report({ outcome: 'rolled_back', rollbackCause: 'error_rate', rollbackReason: 'ошибок 9, 18.0 в час против 1.0 до выкатки', healthyAfterRollback: true })
+    expect(text.type).toBe('rolled_back')
+    expect(text.short).toContain('откатил')
+    expect(text.short).toContain('ошибок 9')
+    expect(text.short).toContain(PREV.slice(0, 12))
+    expect(text.full).toContain('здоров')
+    const sick2 = report({ outcome: 'rolled_back', rollbackCause: 'health', rollbackReason: '3 сбоя здоровья подряд', healthyAfterRollback: false, healthAfterRollback: 'база недоступна' })
+    expect(sick2.short).toContain('Нужен человек')
+    expect(sick2.full).toContain('база недоступна')
+  })
+
+  it('не помогло: сбой случая повторился без ухудшения', () => {
+    const text = report({ outcome: 'not_helped', lastTick: { ...base.lastTick!, caseFingerprintSeen: true } })
+    expect(text.type).toBe('not_helped')
+    expect(text.short).toContain('не помогла')
+  })
+
+  it('откат не удался или человек выкатил своё — нужен человек', () => {
+    const failed = report({ outcome: 'rollback_failed', rollbackAttempts: 3, detail: 'откатывать некуда' })
+    expect(failed.type).toBe('needs_human')
+    expect(failed.short).toContain('Нужен человек')
+    expect(failed.full).toContain('откатывать некуда')
+    const human = report({ outcome: 'superseded_by_human', supersededBy: 'd'.repeat(40) })
+    expect(human.type).toBe('needs_human')
+    expect(human.short).toContain('d'.repeat(12))
+  })
+
+  it('стоп-кран: правка готова в ветке, не выкатывал; другие отказы — нужен человек с причиной', () => {
+    const stopped = report({ outcome: 'refused', refusal: 'stop_switch' }, { branch: 'remontnik/7-orders' })
+    expect(stopped.type).toBe('fix_ready')
+    expect(stopped.short).toContain('стоп-кран')
+    expect(stopped.short).toContain('remontnik/7-orders')
+    const noBuild = report({ outcome: 'refused', refusal: 'no_previous_build', detail: 'current: прежней сборки нет' })
+    expect(noBuild.type).toBe('needs_human')
+    expect(noBuild.short).toContain('прежней сборки')
   })
 })

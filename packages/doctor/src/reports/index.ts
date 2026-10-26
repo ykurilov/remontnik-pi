@@ -35,6 +35,9 @@ export type ReportTelegram =
   | { state: 'failed'; attempts: number }
   | { state: 'not_needed'; attempts: number }
 
+/** Сколько снимков экрана хранить в одном отчёте. */
+export const REPORT_SCREENSHOTS_LIMIT = 10
+
 export interface Report {
   reportId: number
   caseId?: number
@@ -43,6 +46,8 @@ export interface Report {
   full: string
   telegram: ReportTelegram
   createdAt: string
+  /** Пути к снимкам экрана браузера врача. */
+  screenshots?: string[]
 }
 
 export interface AddReportInput {
@@ -51,6 +56,7 @@ export interface AddReportInput {
   short: string
   full?: string
   telegram: 'pending' | 'not_needed'
+  screenshots?: string[]
 }
 
 export interface Reports {
@@ -153,6 +159,7 @@ export function createReports(options: CreateReportsOptions): Reports {
           full: truncateText(input.full ?? input.short, REPORT_FULL_LIMIT),
           telegram: input.telegram === 'pending' ? { state: 'pending', attempts: 0, nextAttemptAt: 0 } : { state: 'not_needed', attempts: 0 },
           createdAt: new Date(now()).toISOString(),
+          ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: input.screenshots.slice(0, REPORT_SCREENSHOTS_LIMIT) } : {}),
         }
         if (input.telegram === 'pending') index.pending.push(reportId)
         return copyRecord(await tx.doc<Report>('report', reportKey(reportId), report))

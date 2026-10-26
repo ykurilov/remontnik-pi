@@ -1,5 +1,6 @@
 import type { IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
+import { countErrorIn } from './error-hours.js'
 
 // Книга случаев: события склеиваются по приложению и отпечатку в один открытый случай.
 
@@ -116,6 +117,7 @@ export function createCaseBook(store: RecordStore): CaseBook {
           if (recent.has(event.eventId)) continue
           recent.add(event.eventId)
           index.recentEventIds.push(event.eventId)
+          await countErrorIn(tx, event, occurrences(event))
 
           const key = openKey(event.appName, event.fingerprint)
           const openId = index.open[key]
