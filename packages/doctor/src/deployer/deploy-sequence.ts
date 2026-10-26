@@ -117,6 +117,8 @@ export interface Deployment {
   /** Хвост вывода команды или причина: для отчёта человеку. */
   detail?: string
   supersededBy?: string
+  /** Правку уже подтверждали (`confirm` начат), а приложение потом вернулось к прежней версии. */
+  revertedAfterConfirm?: boolean
   /** Какая выкатка сняла замок этой, когда её задача умерла. */
   abandonedBy?: number
   /** `confirm` запускали (записано перед запуском): решение «правка держится» уже не пересматривается. */
@@ -676,6 +678,14 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               // Врач упал посреди `confirm` или сразу после: правку уже подтверждали, и откатывать её поздно. `confirm`
               // идёт ещё раз (повтор по договору безопасен), если работает всё ещё кандидат.
               const current = await commands.current()
+              if (current.ok && current.version !== null && current.version === deployment.previousVersion) {
+                // Откатывать подтверждённую правку поздно, подтверждать прежнюю версию — не наше дело.
+                return finish((draft) => {
+                  draft.outcome = 'superseded_by_human'
+                  draft.supersededBy = current.version!
+                  draft.revertedAfterConfirm = true
+                })
+              }
               if (current.ok && current.version !== null && current.version !== request.candidateVersion) return superseded(current.version)
             } else {
               const changed = await mainCopyChanged()

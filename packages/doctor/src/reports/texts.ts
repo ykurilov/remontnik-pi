@@ -296,6 +296,12 @@ export function deploymentReport(input: {
       case 'rollback_failed':
         return ['needs_human', `${head(input.case)}: откат не удался за ${deployment.rollbackAttempts ?? 0} попытки, работает непонятно что. Нужен человек.`]
       case 'superseded_by_human':
+        if (deployment.revertedAfterConfirm) {
+          return [
+            'needs_human',
+            `${head(input.case)}: правку ${candidate} я уже подтверждал, но приложение вернулось к прежней версии ${previous}. Не откатывал и confirm не повторял; почему вернулось и что делать с правкой — решение за человеком.`,
+          ]
+        }
         return [
           'needs_human',
           `${head(input.case)}: пока я наблюдал правку ${candidate}, человек выкатил свою версию ${version(deployment.supersededBy)}. Наблюдение остановил, ничего не откатывал; что делать с правкой — решение за человеком.`,
