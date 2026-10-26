@@ -149,8 +149,9 @@ export interface BlockedRequest {
 
 export interface NetworkGuard {
   /**
-   * На странице вписан пароль: до новой страницы (не смены адреса в той же странице) запросы и WebSocket на сайты
-   * вне allowedOrigins закрыты.
+   * На странице вписан пароль: запросы и WebSocket на сайты вне allowedOrigins закрыты во всём контексте, пока
+   * заперта хоть одна страница. Запираются все открытые страницы и окна, открытые позже: они могут прочитать пароль
+   * через `opener` или ссылку на окно.
    */
   passwordFilled(page: Page): void
 }
@@ -166,7 +167,10 @@ export async function installNetworkGuard(
   policy: SitePolicy,
   onBlocked: (blocked: BlockedRequest) => void,
 ): Promise<NetworkGuard> {
-  /** Страницы с вписанным паролем; значение — с тех пор ушёл запрос нового документа верхнего фрейма. */
+  /**
+   * Запертые страницы: в них вписан пароль или они жили рядом со страницей с паролем. Значение — с тех пор ушёл
+   * запрос нового документа верхнего фрейма.
+   */
   const locked = new Map<Page, { newDocument: boolean }>()
   const pageOf = (request: Request): Page | undefined => {
     try {
@@ -175,8 +179,8 @@ export async function installNetworkGuard(
       return undefined
     }
   }
-  // Запрос не из страницы (служебный работник) считается со страницей с паролем, если такая есть: строже.
-  const passwordOn = (page: Page | undefined) => (page ? locked.has(page) : locked.size > 0)
+  // Замок — на весь контекст: окно того же сайта читает пароль у соседа и шлёт его само.
+  const passwordOn = () => locked.size > 0
 
   await context.route('**/*', async (route: Route) => {
     const request = route.request()
@@ -189,7 +193,7 @@ export async function installNetworkGuard(
     }
     const page = pageOf(request)
     const decision = decideRequest(
-      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, passwordOnPage: passwordOn(page) },
+      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, passwordOnPage: passwordOn() },
       policy,
     )
     if (decision.allow) {
@@ -209,7 +213,7 @@ export async function installNetworkGuard(
   })
 
   // WebSocket — через замок с самого начала: сокет на другой сайт, открытый до пароля, закрывается, как только
-  // пароль вписан, иначе скрипт отправил бы пароль по уже открытому сокету. Рабочая вкладка в контексте одна.
+  // пароль вписан, иначе скрипт отправил бы пароль по уже открытому сокету.
   const foreignSockets = new Set<WebSocketRoute>()
   const closeForeign = (socket: WebSocketRoute) => {
     foreignSockets.delete(socket)
@@ -228,17 +232,27 @@ export async function installNetworkGuard(
   })
 
   const watched = new WeakSet<Page>()
+  const lock = (page: Page) => {
+    locked.set(page, { newDocument: false })
+    if (watched.has(page)) return
+    watched.add(page)
+    // Новый документ снимает замок страницы, только если других запертых нет: иначе новый документ живёт рядом
+    // с паролем. Смена адреса внутри страницы (history API) запроса документа не шлёт — замок остаётся.
+    page.on('framenavigated', (frame) => {
+      const state = locked.get(page)
+      if (frame !== page.mainFrame() || !state?.newDocument) return
+      if (locked.size === 1) locked.delete(page)
+      else state.newDocument = false
+    })
+    page.on('close', () => locked.delete(page))
+  }
+  context.on('page', (page) => {
+    if (locked.size > 0) lock(page)
+  })
   return {
     passwordFilled(page) {
-      locked.set(page, { newDocument: false })
+      for (const open of new Set([page, ...context.pages()])) lock(open)
       for (const socket of [...foreignSockets]) closeForeign(socket)
-      if (watched.has(page)) return
-      watched.add(page)
-      // Смена адреса внутри страницы (history API) запроса документа не шлёт — замок остаётся до новой страницы.
-      page.on('framenavigated', (frame) => {
-        if (frame === page.mainFrame() && locked.get(page)?.newDocument) locked.delete(page)
-      })
-      page.on('close', () => locked.delete(page))
     },
   }
 }

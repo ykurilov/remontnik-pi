@@ -3,7 +3,15 @@ import { DEFAULT_MAX_SKEW_MS, SIGNATURE_HEADER, TIMESTAMP_HEADER, type ReplayGua
 
 // Общие части HTTP врача: ответ JSON, отказ без чтения тела, заголовки, чтение тела с пределом и сроком.
 
-export type IntakeHandler = (request: IncomingMessage, response: ServerResponse) => Promise<void>
+/**
+ * Предел чужих запросов на путях управления: вызов тратит одно место, `false` — сверх предела (429). Чужой — без
+ * подписи, с негодной подписью или подписанный общим секретом; запрос владельца предел не тратит.
+ */
+export type ForeignAllowance = () => boolean
+
+export type IntakeHandler = (request: IncomingMessage, response: ServerResponse, foreignAllowed?: ForeignAllowance) => Promise<void>
+
+export const RATE_LIMITED = { error: 'rate_limited' } as const
 
 const REFUSE_LINGER_MS = 1_000
 

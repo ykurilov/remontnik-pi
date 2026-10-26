@@ -492,9 +492,10 @@ describe('команды агента через мост', () => {
     ).toEqual({ status: 409, body: { error: 'task_cancelled' } })
     const done = { app: 'shop', caseId: 7, kind: 'done', version: 'v13' }
     expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({ status: 200, body: { ok: true } })
+    // Итог принят — ключ погашен: повтор уже не подписать.
     expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({
-      status: 409,
-      body: { error: 'result_already_sent' },
+      status: 401,
+      body: { error: 'bad_signature' },
     })
     expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((r) => r.path)).toEqual([
       '/v1/handoffs/7/result',
@@ -519,7 +520,7 @@ describe('команды агента через мост', () => {
     const { server } = await bridgeWithTask()
     const letter = paseo.letters[0]!.text
     expect(letter).not.toContain(SHOP_SECRET)
-    for (const command of ['accept 7', 'case 7', 'done 7', 'cannot 7']) expect(letter).toContain(`remontnik-paseo ${command} --key ${taskKey()}`)
+    for (const command of ['accept 7', 'case 7', 'done 7', 'cannot 7']) expect(letter).toContain(`REMONTNIK_PASEO_KEY=${taskKey()} remontnik-paseo ${command}`)
 
     // Секрет моста на путях агента не годится: им подписывает только врач.
     expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({

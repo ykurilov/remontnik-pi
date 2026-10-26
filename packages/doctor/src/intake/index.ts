@@ -27,7 +27,7 @@ export interface IntakeHandlerOptions {
   deployControls?: IntakeHandler
   /** Снова поставить случай в работу: `POST /v1/control/cases`. Не задано — адреса нет. */
   caseRetry?: IntakeHandler
-  /** Предел запросов с одного адреса на `/v1/control/*`; по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
+  /** Предел чужих запросов с одного адреса на `/v1/control/*` (подпись владельца его не тратит); по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
   controlRateLimit?: RateLimitSettings
 }
 
@@ -72,21 +72,18 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
       sendJson(response, 200, await options.health())
       return
     }
-    // Команды владельца и стоп-кран: подбор и поток подписанных запросов упираются в предел до проверки подписи.
-    if (path.startsWith('/v1/control/') && !controlAllowed(request.socket.remoteAddress ?? '')) {
-      refuse(request, response, 429, { error: 'rate_limited' })
-      return
-    }
+    // Команды владельца и стоп-кран: чужие запросы (без подписи владельца) упираются в предел с одного адреса.
+    const foreignAllowed = () => controlAllowed(request.socket.remoteAddress ?? '')
     if (options.deployControls && path === '/v1/control/deploys') {
-      await options.deployControls(request, response)
+      await options.deployControls(request, response, foreignAllowed)
       return
     }
     if (options.caseRetry && path === '/v1/control/cases') {
-      await options.caseRetry(request, response)
+      await options.caseRetry(request, response, foreignAllowed)
       return
     }
     if (options.fingerprintRelease && path === '/v1/control/fingerprints') {
-      await options.fingerprintRelease(request, response)
+      await options.fingerprintRelease(request, response, foreignAllowed)
       return
     }
     if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {

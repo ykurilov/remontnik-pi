@@ -5,7 +5,8 @@ import { hostForUrl } from '../private-address.js'
 import { caseDetailsText } from '../task-text.js'
 
 // Консольная `remontnik-paseo`: агент приложения отчитывается врачу через мост на своём компьютере.
-// Команды подписаны ключом задачи из письма моста (`--key`); секрет моста консольной не нужен и не читается.
+// Команды подписаны ключом задачи из письма моста: `REMONTNIK_PASEO_KEY` или `--key` (флаг виден в списке процессов).
+// Секрет моста консольной не нужен и не читается.
 
 export interface PaseoCommandIo {
   env: Record<string, string | undefined>
@@ -14,11 +15,11 @@ export interface PaseoCommandIo {
   fetch?: typeof fetch
 }
 
-const USAGE = `Использование:
-  remontnik-paseo accept <caseId> --key <ключ> [--app <имя>]
-  remontnik-paseo done <caseId> --key <ключ> [--commit <sha>] [--deployed <версия>] [--app <имя>]
-  remontnik-paseo cannot <caseId> --key <ключ> --reason "<текст>" [--app <имя>]
-  remontnik-paseo case <caseId> --key <ключ> [--app <имя>]
+const USAGE = `Использование (ключ задачи — в REMONTNIK_PASEO_KEY или флагом --key <ключ>):
+  REMONTNIK_PASEO_KEY=<ключ> remontnik-paseo accept <caseId> [--app <имя>]
+  REMONTNIK_PASEO_KEY=<ключ> remontnik-paseo done <caseId> [--commit <sha>] [--deployed <версия>] [--app <имя>]
+  REMONTNIK_PASEO_KEY=<ключ> remontnik-paseo cannot <caseId> --reason "<текст>" [--app <имя>]
+  REMONTNIK_PASEO_KEY=<ключ> remontnik-paseo case <caseId> [--app <имя>]
 `
 
 const PATHS = { accept: '/v1/agent/accepted', done: '/v1/agent/result', cannot: '/v1/agent/result', case: '/v1/agent/case' }
@@ -60,8 +61,8 @@ export async function runPaseoCommand(argv: string[], io: PaseoCommandIo): Promi
     const caseId = Number(caseText)
     if (!Number.isSafeInteger(caseId) || caseId <= 0) throw new UsageError('номер случая — целое число больше нуля')
 
-    const key = values['key']?.trim()
-    if (!key) throw new UsageError('нужен ключ задачи из письма моста: --key <ключ>')
+    const key = (values['key'] ?? io.env.REMONTNIK_PASEO_KEY)?.trim()
+    if (!key) throw new UsageError('нужен ключ задачи из письма моста: REMONTNIK_PASEO_KEY=<ключ> или --key <ключ>')
 
     const config = loadBridgeAddressBook(io.env.REMONTNIK_PASEO_BRIDGE_CONFIG ?? DEFAULT_CONFIG_PATH)
     let app = values['app']

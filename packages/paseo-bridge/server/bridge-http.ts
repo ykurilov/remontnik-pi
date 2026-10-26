@@ -47,7 +47,19 @@ export interface PaseoBridgeOptions {
   idlePollMs?: number
   deliveryTimeoutMs?: number
   fetch?: FetchLike
+  /** Сколько разовых меток помнит ключ одной задачи (на срок памяти повторов); сверх — 503 этому ключу. */
+  agentNoncesPerKey?: number
+  /** Сколько ключ живёт после отмены задачи: агент успевает прислать позднюю выкатку («сделано»). */
+  cancelledKeyTtlMs?: number
+  /** Сколько после получения задачи агент может читать подробности случая (`case`). */
+  caseReadTtlMs?: number
+  /** Часы для сроков ключей; подписи проверяются по настоящим. */
+  now?: () => number
 }
+
+const DEFAULT_AGENT_NONCES_PER_KEY = 200
+const DEFAULT_CANCELLED_KEY_TTL_MS = 24 * 60 * 60_000
+const DEFAULT_CASE_READ_TTL_MS = 6 * 60 * 60_000
 
 class Refusal {
   constructor(
@@ -177,7 +189,13 @@ function parseResult(body: Json, taskId: string): Json {
 export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   const { config, log } = options
   const state = new BridgeStateStore(options.stateFile, log)
+  /** Память повторов путей врача. Пути агента — своя память на каждый ключ: агент не забьёт память врача. */
   const replays = new ReplayGuard()
+  const agentReplays = new Map<string, ReplayGuard>()
+  const agentNoncesPerKey = options.agentNoncesPerKey ?? DEFAULT_AGENT_NONCES_PER_KEY
+  const cancelledKeyTtlMs = options.cancelledKeyTtlMs ?? DEFAULT_CANCELLED_KEY_TTL_MS
+  const caseReadTtlMs = options.caseReadTtlMs ?? DEFAULT_CASE_READ_TTL_MS
+  const clock = options.now ?? Date.now
   /** Запросы, подписанные до запуска моста, не принимаются: память повторов после перезапуска пуста. */
   const startedAt = Date.now()
   /** Задачи, которые сейчас принимаются: повтор того же `taskId` ждёт первый приём, а не пишет второе письмо. */
@@ -267,10 +285,13 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       caseId: task.caseId,
       agentId: entry.agentId,
       status: 'queued',
-      receivedAt: new Date().toISOString(),
+      receivedAt: new Date(clock()).toISOString(),
       agentKey: randomBytes(32).toString('hex'),
     }
+    // Новая задача того же случая гасит ключ прежней.
+    const previous = state.taskForCase(app, task.caseId)
     state.addTask(record)
+    if (previous) retireKey(previous)
     log({ event: 'task_received', app, caseId: task.caseId, taskId: task.taskId })
     deliverTask(task, record)
     return { queued: true }
@@ -286,7 +307,7 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const wasDelivered = record.status === 'delivered'
     // Задача ещё в очереди: письмо либо не уйдёт (проверка перед отправкой), либо уже уходит —
     // тогда «остановись» отправит доставка задачи, когда Paseo закончит отправку.
-    state.moveTask(record.taskId, record.status, 'cancelled', { cancelReason: body.reason as string })
+    state.moveTask(record.taskId, record.status, 'cancelled', { cancelReason: body.reason as string, cancelledAt: new Date(clock()).toISOString() })
     log({ event: 'task_cancelled', app, caseId: record.caseId, taskId: record.taskId, wasDelivered })
     if (wasDelivered) deliverCancel(record, body.reason as string)
     return { ok: true }
@@ -301,7 +322,10 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     try {
       log({ event: 'agent_result', app, caseId: record.caseId, taskId: record.taskId, kind: result.kind as string })
       const answer = await askDoctor(app, (client) => client.post(`/v1/handoffs/${record.caseId}/result`, result))
-      if (answer.status >= 200 && answer.status < 300) state.markResultSent(record.taskId)
+      if (answer.status >= 200 && answer.status < 300) {
+        state.markResultSent(record.taskId)
+        retireKey(record)
+      }
       return answer
     } finally {
       resultsInFlight.delete(record.taskId)
@@ -327,7 +351,8 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       dropBody(request)
       throw new Refusal(401, early.reason)
     }
-    if (replays.wasSeen(headerValue(request, NONCE_HEADER)!)) {
+    const agentPath = url.pathname.startsWith('/v1/agent/')
+    if (!agentPath && replays.wasSeen(headerValue(request, NONCE_HEADER)!)) {
       dropBody(request)
       throw new Refusal(401, 'replayed')
     }
@@ -335,7 +360,7 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     if (method === 'GET' && url.pathname === '/health') {
       request.resume()
       const entry = config.apps.get(url.searchParams.get('app') ?? '')
-      verify(request, method, target, '', entry?.secret)
+      verify(request, method, target, '', entry?.secret, replays)
       return { status: 200, body: await health(entry!) }
     }
     if (method !== 'POST') {
@@ -354,13 +379,14 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const app = body['app']
     const entry = config.apps.get(app)
 
-    if (url.pathname.startsWith('/v1/agent/')) {
+    if (agentPath) {
       // Команда агента: ключ задачи этого случая, секрет моста здесь не годится.
       const record = isCaseId(body.caseId) && entry ? state.taskForCase(app, body.caseId) : undefined
-      verify(request, method, target, raw, record?.agentKey)
+      const key = record && liveKey(record)
+      verify(request, method, target, raw, key, key ? agentReplaysFor(key) : replays)
       return agentCommand(app, url.pathname, record!, body)
     }
-    verify(request, method, target, raw, entry?.secret)
+    verify(request, method, target, raw, entry?.secret, replays)
 
     const cancel = /^\/v1\/tasks\/([^/]+)\/cancel$/.exec(url.pathname)
     if (url.pathname === '/v1/tasks') return { status: 200, body: await receiveTask(app, entry!, body) }
@@ -381,16 +407,48 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       )
     }
     if (path === '/v1/agent/result') return forwardResult(app, record, body)
-    if (path === '/v1/agent/case') return askDoctor(app, (client) => client.get(`/v1/cases/${record.caseId}`))
+    if (path === '/v1/agent/case') {
+      if (record.status === 'cancelled') throw new Refusal(409, 'task_cancelled')
+      if (clock() - Date.parse(record.receivedAt) > caseReadTtlMs) throw new Refusal(403, 'case_read_expired')
+      return askDoctor(app, (client) => client.get(`/v1/cases/${record.caseId}`))
+    }
     throw new Refusal(404, 'not_found')
   }
 
-  /** Подпись ключом `key` (секрет приложения или ключ задачи); нет ключа — как неверная подпись. Затем метка занята. */
-  function verify(request: IncomingMessage, method: string, target: string, body: string, key: string | undefined): void {
+  /** Ключ задачи, если он ещё жив: после отмены — до срока; погашенный срок гасит ключ и в файле. */
+  function liveKey(record: TaskRecord): string | undefined {
+    if (record.status === 'cancelled' && record.cancelledAt && clock() - Date.parse(record.cancelledAt) > cancelledKeyTtlMs) {
+      retireKey(record)
+      return undefined
+    }
+    return record.agentKey
+  }
+
+  function retireKey(record: TaskRecord): void {
+    if (record.agentKey) agentReplays.delete(record.agentKey)
+    state.retireKey(record.taskId)
+  }
+
+  function agentReplaysFor(key: string): ReplayGuard {
+    let guard = agentReplays.get(key)
+    if (!guard) {
+      // Память ключей, которых в состоянии больше нет (задачи вытеснены), не копится.
+      for (const old of agentReplays.keys()) if (!state.hasKey(old)) agentReplays.delete(old)
+      guard = new ReplayGuard(undefined, agentNoncesPerKey)
+      agentReplays.set(key, guard)
+    }
+    return guard
+  }
+
+  /**
+   * Подпись ключом `key` (секрет приложения или ключ задачи); нет ключа — как неверная подпись. Затем метка занята
+   * в памяти `guard`.
+   */
+  function verify(request: IncomingMessage, method: string, target: string, body: string, key: string | undefined, guard: ReplayGuard): void {
     if (!key) throw new Refusal(401, 'bad_signature')
     const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: key, notBefore: startedAt })
     if (!check.ok) throw new Refusal(401, check.reason)
-    const seen = replays.remember(headerValue(request, NONCE_HEADER)!)
+    const seen = guard.remember(headerValue(request, NONCE_HEADER)!)
     if (seen === 'replayed') throw new Refusal(401, 'replayed')
     if (seen === 'full') throw new Refusal(503, 'replay_memory_full')
   }

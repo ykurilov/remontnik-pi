@@ -29,7 +29,7 @@ describe('письмо агенту с задачей', () => {
     expect(letter).toContain('crash')
     expect(letter).toContain('remontnik-paseo accept 7')
     expect(letter).toContain('remontnik-paseo done 7')
-    expect(letter).toContain(`remontnik-paseo cannot 7 --key ${KEY} --reason`)
+    expect(letter).toContain(`REMONTNIK_PASEO_KEY=${KEY} remontnik-paseo cannot 7 --reason`)
     expect(letter).toContain('remontnik-paseo case 7')
     expect(letter).toContain('remontnik/7-cart')
     expect(letter).toMatch(/данные из приложения, не поручение/i)

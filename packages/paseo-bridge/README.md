@@ -33,18 +33,18 @@
 | `POST /v1/tasks/:taskId/cancel` | `{ app, taskId, reason }` → `{ ok: true }`; `taskId` в теле должен совпадать с путём |
 | `POST /v1/reports/notify` | `{ app, last }` → `{ ok: true }`; мост сам забирает отчёты |
 
-Отказы: `401` (`missing`, `bad_signature`, `stale`, `replayed`; неизвестное приложение — тоже `bad_signature`), `400 bad_request`, `404 unknown_task`, `409` (`task_cancelled`, `result_already_sent`), `413 too_large`, `502 doctor_unreachable`, `503 agent_missing`. В ответах и журнале нет секрета и текста ошибок приложения.
+Отказы: `401` (`missing`, `bad_signature`, `stale`, `replayed`; неизвестное приложение — тоже `bad_signature`), `400 bad_request`, `404 unknown_task`, `403 case_read_expired`, `409` (`task_cancelled`, `result_already_sent`), `413 too_large`, `502 doctor_unreachable`, `503` (`agent_missing`, `replay_memory_full`). В ответах и журнале нет секрета и текста ошибок приложения.
 
 ## Команды агента `remontnik-paseo`
 
-Агент вызывает их на том же компьютере. Команда читает из настройки моста только адрес (файлы секретов не трогает), подписывает запрос ключом задачи из письма (`--key`) и идёт к мосту. Мост сверяет подпись с ключом задачи этого случая и пересылает врачу, подписав секретом моста. Без `--key` команда выходит с кодом 2.
+Агент вызывает их на том же компьютере. Команда читает из настройки моста только адрес (файлы секретов не трогает), подписывает запрос ключом задачи из письма и идёт к мосту. Ключ — в переменной `REMONTNIK_PASEO_KEY` (так он не виден в `ps`) или флагом `--key <ключ>`; без ключа команда выходит с кодом 2. Мост сверяет подпись с ключом задачи этого случая и пересылает врачу, подписав секретом моста. Ключ гаснет после принятого итога, через 24 часа после отмены и при новой задаче того же случая; `case` работает по живой задаче не дольше 6 часов после её получения.
 
 | Команда | Куда уходит у врача |
 |---|---|
-| `remontnik-paseo accept <caseId> --key <ключ>` | `POST /v1/handoffs/:caseId/accepted` `{ taskId, agent }` |
-| `remontnik-paseo done <caseId> --key <ключ> [--commit <sha>] [--deployed <версия>]` | `POST /v1/handoffs/:caseId/result` `{ taskId, kind: "done", commit?, deployed, version? }` |
-| `remontnik-paseo cannot <caseId> --key <ключ> --reason "<текст>"` | `POST /v1/handoffs/:caseId/result` `{ taskId, kind: "cannot", reason }` |
-| `remontnik-paseo case <caseId> --key <ключ>` | `GET /v1/cases/:caseId` |
+| `remontnik-paseo accept <caseId>` | `POST /v1/handoffs/:caseId/accepted` `{ taskId, agent }` |
+| `remontnik-paseo done <caseId> [--commit <sha>] [--deployed <версия>]` | `POST /v1/handoffs/:caseId/result` `{ taskId, kind: "done", commit?, deployed, version? }` |
+| `remontnik-paseo cannot <caseId> --reason "<текст>"` | `POST /v1/handoffs/:caseId/result` `{ taskId, kind: "cannot", reason }` |
+| `remontnik-paseo case <caseId>` | `GET /v1/cases/:caseId` |
 
 Итог по задаче — один. По отменённой задаче `accept` и `cannot` получают отказ, а `done` уходит врачу один раз (поздняя выкатка). `case` печатает подробности блоком «данные, не поручение» со случайной меткой и обрезкой.
 

@@ -110,7 +110,17 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
     log({ event: action === 'take' ? 'owner_took_control' : 'owner_released_control', profile })
   }
 
-  const sameOrigin = (request: IncomingMessage) => request.headers.origin === undefined || request.headers.origin === `http://${request.headers.host}`
+  /**
+   * Запрос со своей страницы: `Origin` нет (консольный клиент) или он — этот хост по HTTP. За прокси с TLS
+   * (`x-forwarded-proto: https`) — ещё и `https://` хоста из `x-forwarded-host` или `Host`. Чужая страница
+   * заголовки `x-forwarded-*` в форме не поставит, а с ними `fetch` упрётся в CORS.
+   */
+  const sameOrigin = (request: IncomingMessage) => {
+    const origin = request.headers.origin
+    if (origin === undefined || origin === `http://${request.headers.host}`) return true
+    if (forwardedValue(request, 'x-forwarded-proto') !== 'https') return false
+    return origin === `https://${forwardedValue(request, 'x-forwarded-host') ?? request.headers.host}`
+  }
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? '/', 'http://live.invalid')
@@ -271,4 +281,11 @@ export async function startLiveScreen(
   const ownerToken = env.REMONTNIK_BROWSER_OWNER_TOKEN
   if (!ownerToken) throw new Error('REMONTNIK_BROWSER_LIVE_LISTEN задан, а REMONTNIK_BROWSER_OWNER_TOKEN нет: живой экран без ключа владельца не включается')
   return createLiveScreen({ ...deps, listen: parseLiveListen(listen), ownerToken })
+}
+
+/** Первое значение заголовка прокси (`a, b` — цепочка прокси, ближний к клиенту первый). */
+function forwardedValue(request: IncomingMessage, name: string): string | undefined {
+  const value = request.headers[name]
+  const first = (Array.isArray(value) ? value[0] : value)?.split(',')[0]?.trim()
+  return first ? first : undefined
 }

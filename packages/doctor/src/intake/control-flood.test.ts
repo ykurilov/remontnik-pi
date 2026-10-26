@@ -83,21 +83,50 @@ describe('память повторов на путях управления', (
 })
 
 describe('предел запросов с одного адреса на путях управления', () => {
-  it('сверх предела — 429 rate_limited до чтения подписи; приём событий и /health предел не считают', async () => {
+  it('сверх предела — 429 rate_limited для неподписанных и подписанных общим секретом; приём событий и /health предел не считают', async () => {
     const controls = createControls(createMemoryRecordStore(), () => new Date())
     const url = await serve({
       deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
       controlRateLimit: { limit: 3, windowMs: 60_000 },
     })
     const target = '/v1/control/deploys'
-    for (let index = 0; index < 3; index += 1) {
+    expect((await fetch(`${url}${target}`, { method: 'POST', body: '{}' })).status).toBe(401)
+    for (let index = 0; index < 2; index += 1) {
       expect((await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))).status).toBe(200)
     }
     const limited = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))
     expect(limited.status).toBe(429)
     expect(await limited.json()).toEqual({ error: 'rate_limited' })
-    expect((await fetch(`${url}/v1/control/cases`, { method: 'POST', body: '{}' })).status).toBe(429)
+    expect((await fetch(`${url}${target}`, { method: 'POST', body: '{}' })).status).toBe(429)
     expect((await fetch(`${url}/health`)).status).toBe(200)
     expect((await fetch(`${url}/v1/events`, { method: 'POST', body: '{}' })).status).toBe(401)
+  })
+
+  it('команды владельца чужой поток с того же адреса не тормозит и сами предел не тратят', async () => {
+    const controls = createControls(createMemoryRecordStore(), () => new Date())
+    const retried: number[] = []
+    const url = await serve({
+      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
+      caseRetry: createCaseRetryHandler({
+        secret: SECRET,
+        controlSecret: CONTROL_SECRET,
+        retryCase: async (caseId) => {
+          retried.push(caseId)
+          return { retried: 'parked', attempt: 2 }
+        },
+      }),
+      controlRateLimit: { limit: 2, windowMs: 60_000 },
+    })
+    // Приложение (или мусор) с того же адреса съело весь предел.
+    for (let index = 0; index < 5; index += 1) await fetch(`${url}/v1/control/cases`, { method: 'POST', body: '{}' })
+    expect((await fetch(`${url}/v1/control/deploys`, signedPost('/v1/control/deploys', JSON.stringify({ action: 'stop', by: 'app' }), SECRET))).status).toBe(429)
+
+    for (let index = 0; index < 4; index += 1) {
+      const owner = await fetch(`${url}/v1/control/deploys`, signedPost('/v1/control/deploys', JSON.stringify({ action: index % 2 ? 'resume' : 'stop', by: 'owner' }), CONTROL_SECRET))
+      expect(owner.status).toBe(200)
+    }
+    const retry = await fetch(`${url}/v1/control/cases`, signedPost('/v1/control/cases', JSON.stringify({ caseId: 3, action: 'retry', by: 'owner' }), CONTROL_SECRET))
+    expect(retry.status).toBe(200)
+    expect(retried).toEqual([3])
   })
 })

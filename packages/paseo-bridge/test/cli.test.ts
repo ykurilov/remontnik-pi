@@ -38,11 +38,11 @@ function writeOwnerConfig(apps: string[]) {
   return file
 }
 
-async function run(argv: string[]) {
+async function run(argv: string[], env: Record<string, string> = {}) {
   let stdout = ''
   let stderr = ''
   const code = await runPaseoCommand(argv, {
-    env: { REMONTNIK_PASEO_BRIDGE_CONFIG: configFile },
+    env: { REMONTNIK_PASEO_BRIDGE_CONFIG: configFile, ...env },
     stdout: (text) => (stdout += text),
     stderr: (text) => (stderr += text),
   })
@@ -72,12 +72,12 @@ const handoffs = () =>
   doctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((request) => [request.path, JSON.parse(request.body)])
 
 describe('remontnik-paseo', () => {
-  it('accept и done доходят до врача через мост; итог по задаче — один', async () => {
+  it('accept и done доходят до врача через мост; итог по задаче — один (после него ключ погашен)', async () => {
     expect((await run(['accept', '7', '--key', key()])).code).toBe(0)
     expect((await run(['done', '7', '--key', key(), '--commit', 'abc1234', '--deployed', 'v12'])).code).toBe(0)
     const again = await run(['cannot', '7', '--key', key(), '--reason', 'нужна схема базы'])
     expect(again.code).toBe(1)
-    expect(again.stderr).toContain('result_already_sent')
+    expect(again.stderr).toContain('bad_signature')
     const taskId = shopTask().taskId
     expect(handoffs()).toEqual([
       ['/v1/handoffs/7/accepted', { taskId, agent: SHOP_AGENT }],
@@ -130,6 +130,9 @@ describe('remontnik-paseo', () => {
     rmSync(config.apps['shop']!.secretFile)
     expect((await run(['accept', '7', '--key', key()])).code).toBe(0)
 
+    // Ключ из окружения: в списке процессов и в истории оболочки его нет.
+    expect((await run(['accept', '7'], { REMONTNIK_PASEO_KEY: key() })).code).toBe(0)
+
     const noKey = await run(['accept', '7'])
     expect(noKey.code).toBe(2)
     expect(noKey.stderr).toMatch(/--key/)
@@ -137,7 +140,8 @@ describe('remontnik-paseo', () => {
     const wrongKey = await run(['done', '7', '--key', 'f'.repeat(64)])
     expect(wrongKey.code).toBe(1)
     expect(wrongKey.stderr).toContain('bad_signature')
-    expect(handoffs()).toEqual([['/v1/handoffs/7/accepted', { taskId: shopTask().taskId, agent: SHOP_AGENT }]])
+    const accepted = ['/v1/handoffs/7/accepted', { taskId: shopTask().taskId, agent: SHOP_AGENT }]
+    expect(handoffs()).toEqual([accepted, accepted])
   })
 
   it('несколько приложений в настройке — нужен --app', async () => {

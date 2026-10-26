@@ -238,4 +238,24 @@ describe('живой экран: чужая страница не шлёт POST'
     expect((await control(own)).status).toBe(200)
     expect((await control()).status).toBe(200)
   })
+
+  it('за прокси с TLS: Origin https://<хост> проходит, когда прокси говорит x-forwarded-proto: https', async () => {
+    const live = (await startLive(liveEnv))!
+    const cookie = await ownerCookie(live)
+    const host = new URL(live.url).host
+    const control = (headers: Record<string, string>) =>
+      fetch(`${live.url}/live/control`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ profile: 'remontnik', action: 'take' }),
+      })
+    expect((await control({ origin: `https://${host}` })).status).toBe(403)
+    expect((await control({ origin: `https://${host}`, 'x-forwarded-proto': 'https' })).status).toBe(200)
+    // Прокси ставит свой Host: имя сайта — в x-forwarded-host.
+    expect((await control({ origin: 'https://live.example.test', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'live.example.test' })).status).toBe(200)
+    expect((await control({ origin: 'https://evil.example', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'live.example.test' })).status).toBe(403)
+    const stream = await connectStream(live, { cookie, origin: `https://${host}`, 'x-forwarded-proto': 'https' })
+    expect(stream.opened).toBe(true)
+    stream.socket.close()
+  })
 })
