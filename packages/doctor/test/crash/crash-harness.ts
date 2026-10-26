@@ -8,7 +8,8 @@ import { emptyFingerprintLedger, LEDGER, type FingerprintLedger } from '../../sr
 import { copyRecord } from '../../src/records/index.js'
 import { seedDoctorRecords } from '../../src/testing/doctor-records.js'
 import { workbenchPath } from '../../src/workbench/index.js'
-import { BUGGY, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
+import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
+import { BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
 
 // Стенд падений (T081): врач идёт отдельным процессом (`doctor-child.ts`), его убивают в заданной точке
 // (`REMONTNIK_TEST_CRASH_AT`) и запускают снова на тех же записях, git и приложении. Итог читается после остановки.
@@ -103,18 +104,25 @@ export interface ChildState {
 
 export interface DoctorProcess {
   states: ChildState[]
+  /** Адрес врача, когда он запустился. */
+  url(): Promise<string>
+  /** Команда владельца `remontnik-doctor …` этому врачу. */
+  command(argv: string[]): Promise<{ code: number; out: string; err: string }>
   output(): string
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
   waitForState(states: readonly string[], timeoutMs?: number): Promise<ChildState>
+  waitForReport(type: string, timeoutMs?: number): Promise<ChildReport>
   stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
 
 /** Запустить врача на мире стенда; `crashAt` — где ему умереть, `sendEvent` — прислать сбой «Пациента» сразу после старта. */
-export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; sendEvent?: boolean } = {}): DoctorProcess {
+export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; faultAt?: 'fixing'; sendEvent?: boolean } = {}): DoctorProcess {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' }
   delete env.REMONTNIK_TEST_CRASH_AT
+  delete env.REMONTNIK_TEST_FAULT_AT
   delete env.REMONTNIK_TEST_SEND_EVENT
   if (options.crashAt) env.REMONTNIK_TEST_CRASH_AT = options.crashAt
+  if (options.faultAt) env.REMONTNIK_TEST_FAULT_AT = options.faultAt
   if (options.sendEvent) env.REMONTNIK_TEST_SEND_EVENT = '1'
   const child = spawn(process.execPath, ['--import', loader, '--no-warnings', '--experimental-transform-types', childEntry, world.worldPath], {
     cwd: repoRoot,
@@ -122,6 +130,7 @@ export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; se
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const states: ChildState[] = []
+  let address: string | undefined
   let output = ''
   let buffered = ''
   const waiters = new Set<() => void>()
@@ -134,6 +143,7 @@ export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; se
       const line = buffered.slice(0, newline)
       buffered = buffered.slice(newline + 1)
       if (line.startsWith('STATE ')) states.push(JSON.parse(line.slice(6)) as ChildState)
+      if (line.startsWith('URL ')) address = line.slice(4)
     }
     for (const wake of waiters) wake()
   })
@@ -151,27 +161,38 @@ export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; se
   void exited.then(() => {
     gone = true
   })
+  async function until<T>(found: () => T | undefined, what: string, timeoutMs: number): Promise<T> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const value = found()
+      if (value !== undefined) return value
+      if (gone) throw new Error(`врач вышел, не дождавшись: ${what}; последнее: ${states.at(-1)?.state}\n${output.slice(-4000)}`)
+      if (Date.now() > deadline) throw new Error(`не дождались: ${what}; последнее: ${states.at(-1)?.state}\n${output.slice(-4000)}`)
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 500)
+        waiters.add(() => {
+          clearTimeout(timer)
+          resolve()
+        })
+      })
+      waiters.clear()
+    }
+  }
+  const url = () => until(() => address, 'адрес врача', 60_000)
   return {
     states,
+    url,
+    async command(argv) {
+      const env = { REMONTNIK_DOCTOR_URL: await url(), REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }
+      let out = ''
+      let err = ''
+      const code = await runDoctorCommand(argv, { env, stdout: (text) => (out += text), stderr: (text) => (err += text) })
+      return { code, out, err }
+    },
     output: () => output,
     exited,
-    async waitForState(wanted, timeoutMs = 60_000) {
-      const deadline = Date.now() + timeoutMs
-      for (;;) {
-        const found = states.find((state) => wanted.includes(state.state))
-        if (found) return found
-        if (gone) throw new Error(`врач вышел, не дойдя до ${wanted.join('/')}; последнее: ${states.at(-1)?.state}\n${output.slice(-4000)}`)
-        if (Date.now() > deadline) throw new Error(`случай не дошёл до ${wanted.join('/')}: ${states.at(-1)?.state}\n${output.slice(-4000)}`)
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 500)
-          waiters.add(() => {
-            clearTimeout(timer)
-            resolve()
-          })
-        })
-        waiters.clear()
-      }
-    },
+    waitForState: (wanted, timeoutMs = 60_000) => until(() => states.find((state) => wanted.includes(state.state)), `случай в ${wanted.join('/')}`, timeoutMs),
+    waitForReport: (type, timeoutMs = 60_000) => until(() => states.findLast((state) => state.reports.some((report) => report.type === type))?.reports.find((report) => report.type === type), `отчёт ${type}`, timeoutMs),
     async stop() {
       if (!gone) child.kill('SIGTERM')
       return exited

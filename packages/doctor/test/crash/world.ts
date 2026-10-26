@@ -11,6 +11,9 @@ export const CRASH_POINTS = ['triage', 'diagnosing', 'fixing', 'mid_commit', 've
 export const ROLLBACK_CRASH_POINT = 'after_rollback'
 export type CrashPoint = (typeof CRASH_POINTS)[number] | typeof ROLLBACK_CRASH_POINT
 
+/** Секрет владельца врача на стенде: им подписывается `case <id> retry`. */
+export const CONTROL_SECRET = 'owner-test-secret'
+
 export interface ChildWorld {
   repoDir: string
   stateDir: string

@@ -10,7 +10,7 @@ import { startDoctorService, type DoctorService } from '../../src/service/index.
 import { testRemontnikConfig } from '../../src/testing/config.js'
 import { createScriptedModel } from '../../src/testing/scripted-model.js'
 import { createLocalRunner, type CommandRunner } from '../../src/workbench/index.js'
-import { CRASH_POINTS, FIXED, ROLLBACK_CRASH_POINT, NEW_TEST, priceCrash, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
+import { CONTROL_SECRET, CRASH_POINTS, FIXED, ROLLBACK_CRASH_POINT, NEW_TEST, priceCrash, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
 
 // Врач в отдельном процессе для проверок падений (T081). Всё, что должно пережить перезапуск, — на диске: записи
 // врача, git, состояние подставного приложения и сдвиг часов. С `REMONTNIK_TEST_CRASH_AT=<точка>` процесс убивает
@@ -18,6 +18,8 @@ import { CRASH_POINTS, FIXED, ROLLBACK_CRASH_POINT, NEW_TEST, priceCrash, type C
 
 const world = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as ChildWorld
 const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
+/** `fixing` — коммит правки один раз падает обычной ошибкой: задача лечения падает насовсем (task_faulted). */
+let faultAt = process.env.REMONTNIK_TEST_FAULT_AT
 if (crashAt && crashAt !== ROLLBACK_CRASH_POINT && !CRASH_POINTS.includes(crashAt)) throw new Error(`нет такой точки падения: ${crashAt}`)
 
 function crash(point: CrashPoint): void {
@@ -143,6 +145,10 @@ function crashingGuard(guard: GitGuard): GitGuard {
       return made
     },
     async commitAll(cwd, message) {
+      if (faultAt === 'fixing') {
+        faultAt = undefined
+        throw new Error('подстроенный сбой коммита')
+      }
       if (crashAt === 'mid_commit') {
         const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], { cwd, encoding: 'utf8' }).trim()
         writeFileSync(join(gitDir, 'index.lock'), '')
@@ -175,6 +181,7 @@ const config = testRemontnikConfig({
   observe: { ...testRemontnikConfig().observe, windowMinutes: 1, healthWindowTicks: 3 },
 })
 let caseState: string | undefined
+let reportCount = 0
 let doctor: DoctorService | undefined
 const loadConfig = async () => {
   // Решение о выкатке ещё не зафиксировано: врач падает посреди фазы `gated`.
@@ -206,6 +213,7 @@ const runner = createLocalRunner()
 const service = await startDoctorService({
   stateDir: world.stateDir,
   sharedSecret: 'shared-test-secret',
+  controlSecret: CONTROL_SECRET,
   listen: { host: '127.0.0.1', port: 0 },
   telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: world.telegramUrl },
   log: (line) => process.stderr.write(`${line}\n`),
@@ -226,6 +234,7 @@ const service = await startDoctorService({
 })
 
 doctor = service
+process.stdout.write(`URL ${service.url}\n`)
 process.on('SIGTERM', () => {
   void service.close().then(() => process.exit(0))
 })
@@ -235,9 +244,10 @@ if (process.env.REMONTNIK_TEST_SEND_EVENT) await service.receiveEvents([priceCra
 // Состояние случая — родителю в вывод: записи открыты этим процессом, читать их со стороны нельзя.
 for (;;) {
   const found = await service.caseBook.getCase(1)
-  if (found && found.state !== caseState) {
+  const reports = found ? await service.reports.list({ after: 0, limit: 50 }) : []
+  if (found && (found.state !== caseState || reports.length !== reportCount)) {
     caseState = found.state
-    const reports = await service.reports.list({ after: 0, limit: 50 })
+    reportCount = reports.length
     process.stdout.write(`STATE ${JSON.stringify({ state: found.state, reports: reports.map((report) => ({ type: report.type, short: report.short })) })}\n`)
   }
   await new Promise((resolve) => setTimeout(resolve, 25))

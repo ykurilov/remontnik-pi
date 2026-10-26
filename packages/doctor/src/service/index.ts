@@ -203,6 +203,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   let closing = false
   let reportsRef: Reports | null = null
   let openedRef: DoctorHarness | null = null
+  const reportsBeforeOpen: (() => void)[] = []
 
   const sendDirect = async (text: string): Promise<boolean> => {
     try {
@@ -232,6 +233,15 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     const what = TASK_REPORTS[info.type]
     if (!what || !('task' in info) || !info.task) return
     const task = info.task
+    // Остановку задачи pi-durable сообщает ещё при открытии хранилища: отчёт ждёт, пока появятся записи отчётов.
+    if (!reportsRef && harnessState === 'open') {
+      reportsBeforeOpen.push(() => handleTaskReport(error, info, what, task))
+      return
+    }
+    handleTaskReport(error, info, what, task)
+  }
+
+  function handleTaskReport(error: unknown, info: ReportInfo, what: string, task: { id: TaskId; kind: string }): void {
     void caseOfTask(task).then((caseId) => {
       const short =
         caseId === undefined
@@ -278,6 +288,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     onSendError: (error, report) => log(`[врач] отчёт ${report.reportId} не ушёл в Telegram: ${describeError(error)}`),
   })
   reportsRef = reports
+  for (const report of reportsBeforeOpen.splice(0)) report()
   await reportStorageFailure(options.stateDir, reports, log)
 
   let evalProxy: EvalProxy | undefined
