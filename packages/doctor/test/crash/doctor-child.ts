@@ -155,7 +155,11 @@ function fileBackedBrowser(): BrowserClient {
       if (command === 'url') return { ok: false, code: 'needs_human', message: 'капча на странице: нужен человек' }
       if (command === 'status') {
         statusCalls += 1
-        if (statusCalls === 1) crash(BROWSER_CRASH_POINT)
+        if (statusCalls === 1 && crashAt === BROWSER_CRASH_POINT) {
+          // Отчёт needs_human уже записан: родитель видит его до смерти врача, а не гадает по опросу.
+          await printState()
+          crash(BROWSER_CRASH_POINT)
+        }
         return { ok: true, state: state.ownerReturned ? 'ready' : 'needs_human' }
       }
       if (command === 'read') return { ok: true, url: `${SITE}/cabinet`, snapshot: 'Кабинет: вход выполнен' }
@@ -261,6 +265,17 @@ const config = testRemontnikConfig({
 let caseState: string | undefined
 let reportCount = 0
 let doctor: DoctorService | undefined
+
+async function printState(): Promise<void> {
+  if (!doctor) return
+  const found = await doctor.caseBook.getCase(1)
+  const reports = found ? await doctor.reports.list({ after: 0, limit: 50 }) : []
+  if (found && (found.state !== caseState || reports.length !== reportCount)) {
+    caseState = found.state
+    reportCount = reports.length
+    process.stdout.write(`STATE ${JSON.stringify({ state: found.state, reports: reports.map((report) => ({ type: report.type, short: report.short })) })}\n`)
+  }
+}
 const loadConfig = async () => {
   // Решение о выкатке ещё не зафиксировано: врач падает посреди фазы `gated`.
   if (crashAt === 'gated' && (await doctor?.caseBook.getCase(1))?.state === 'gated') crash('gated')
@@ -323,12 +338,6 @@ if (process.env.REMONTNIK_TEST_SEND_EVENT) await service.receiveEvents([priceCra
 
 // Состояние случая — родителю в вывод: записи открыты этим процессом, читать их со стороны нельзя.
 for (;;) {
-  const found = await service.caseBook.getCase(1)
-  const reports = found ? await service.reports.list({ after: 0, limit: 50 }) : []
-  if (found && (found.state !== caseState || reports.length !== reportCount)) {
-    caseState = found.state
-    reportCount = reports.length
-    process.stdout.write(`STATE ${JSON.stringify({ state: found.state, reports: reports.map((report) => ({ type: report.type, short: report.short })) })}\n`)
-  }
+  await printState()
   await new Promise((resolve) => setTimeout(resolve, 25))
 }

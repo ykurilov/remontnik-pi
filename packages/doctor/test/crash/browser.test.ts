@@ -12,7 +12,7 @@ describe.concurrent('врач падает посреди ожидания че�
     const world = await createCrashWorld()
     onTestFinished(() => world.close())
 
-    const { final, beforeCrash, restartOutput } = await crashAndRestart(world, BROWSER_CRASH_POINT, {
+    const { final, reportsBeforeCrash, restartOutput } = await crashAndRestart(world, BROWSER_CRASH_POINT, {
       browser: true,
       async afterRestart(doctor) {
         const before = statusPolls(world.browserState().calls)
@@ -21,7 +21,8 @@ describe.concurrent('врач падает посреди ожидания че�
       },
     })
 
-    expect(beforeCrash).toContain('diagnosing')
+    // Врач умер уже после отчёта: после перезапуска он не повторяется.
+    expect(reportsBeforeCrash).toEqual(['case_received', 'needs_human'])
     expect(final.state).toBe('healed')
     expect(restartOutput).toContain('HUMAN returned seen')
     expect(final.reports.map((report) => report.type)).toEqual(['case_received', 'needs_human', 'deployed', 'deployed'])

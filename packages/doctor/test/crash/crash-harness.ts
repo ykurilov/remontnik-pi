@@ -244,8 +244,8 @@ export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): Do
 export interface CrashOutcome {
   /** Что увидели после перезапуска: итог случая и отчёты. */
   final: ChildState
-  /** Состояния случая в первом (убитом) запуске. */
-  beforeCrash: string[]
+  /** Отчёты, записанные до смерти врача. */
+  reportsBeforeCrash: string[]
   /** Вывод врача после перезапуска. */
   restartOutput: string
 }
@@ -277,7 +277,11 @@ export async function crashAndRestart(
   try {
     await afterRestart?.(second)
     const final = await second.waitForState(FINAL_STATES, 90_000)
-    return { final, beforeCrash: first.states.map((state) => state.state), restartOutput: second.output() }
+    return {
+      final,
+      reportsBeforeCrash: (first.states.at(-1)?.reports ?? []).map((report) => report.type),
+      restartOutput: second.output(),
+    }
   } finally {
     const stopped = await second.stop()
     if (stopped.code !== 0 && stopped.signal !== 'SIGTERM') throw new Error(`врач не остановился чисто: ${stopped.signal ?? stopped.code}\n${second.output().slice(-4000)}`)
