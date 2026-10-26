@@ -223,8 +223,13 @@ export interface DockerRunnerOptions {
   image: string
   /** Где лежат HOME копий (на сервере, вне папки копий). */
   homesDir: string
-  /** Сеть контейнера: нужна для установки пакетов, но не внутренняя сеть приложения. По умолчанию `bridge`. */
+  /**
+   * Сеть команд модели и установки зависимостей: внутренняя сеть Docker, где наружу ведёт только прокси выхода
+   * (`outsideEnv`) к реестру пакетов. Не сеть приложения. Не задана — `none`: сети у контейнера нет совсем.
+   */
   network?: string
+  /** Постоянные переменные команд в сети `network` (адрес прокси выхода). Во внутреннюю сеть проверок не уходят. */
+  outsideEnv?: Record<string, string>
   /**
    * Внутренняя сеть Docker (`internal: true`) для тестов, проверки типов и eval: выхода наружу нет, видны только
    * прокси модели и службы тестов приложения. Не задана — такие команды не запускаются.
@@ -240,6 +245,15 @@ export interface DockerRunnerOptions {
 }
 
 const DOCKER_STEP_TIMEOUT_SECONDS = 120
+
+/** Окружение клиента `docker`: только то, что ему нужно, без ключей врача. */
+function dockerClientEnv(): Record<string, string> {
+  return {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+    ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
+  }
+}
 const DOCKER_KILL_TIMEOUT_SECONDS = 30
 
 /**
@@ -252,11 +266,7 @@ const DOCKER_KILL_TIMEOUT_SECONDS = 30
 export function createDockerRunner(options: DockerRunnerOptions): CommandRunner {
   const docker = options.docker ?? 'docker'
   const user = options.user ?? (process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined)
-  const clientEnv = {
-    PATH: process.env.PATH ?? '/usr/bin:/bin',
-    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-    ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
-  }
+  const clientEnv = dockerClientEnv()
   const spoiledMark = (copyDir: string) => `${homeOf(options.homesDir, copyDir)}.spoiled`
   const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
   const dockerStep = (args: string[], cwd: string, timeoutSeconds: number, signal?: AbortSignal) =>
@@ -284,7 +294,8 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
       const envFile = join(envDir, 'env')
       let created: RunResult
       try {
-        writeFileSync(envFile, envFileText(runOptions.env ?? {}), { mode: 0o600 })
+        const env = runOptions.network === 'internal' ? (runOptions.env ?? {}) : { ...runOptions.env, ...options.outsideEnv }
+        writeFileSync(envFile, envFileText(env), { mode: 0o600 })
         const args = dockerCreateArgs({
           name,
           image: options.image,
@@ -292,7 +303,7 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
           home: homeOf(options.homesDir, copyDir),
           workdir: resolve(runOptions.cwd),
           writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
-          network: runOptions.network === 'internal' ? options.internalNetwork! : (options.network ?? 'bridge'),
+          network: runOptions.network === 'internal' ? options.internalNetwork! : (options.network ?? 'none'),
           ...(user ? { user } : {}),
           envFile,
           memory: options.memory ?? '4g',
@@ -314,5 +325,30 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
       if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
       return result
     },
+  }
+}
+
+/**
+ * Сеть Docker существует и закрыта: `internal: true` (нет шлюза наружу), а у моста нет адреса на хосте
+ * (`com.docker.network.bridge.inhibit_ipv4`). Без второго контейнер видит службы самого сервера, слушающие
+ * все адреса, по адресу моста. Врач проверяет это на старте для сети верстака и сети проверок, чтобы ошибка
+ * в compose не открыла контейнерам интернет, локальную сеть или сервер.
+ */
+export async function assertInternalDockerNetwork(name: string, docker = 'docker'): Promise<void> {
+  if (name === 'none') return
+  const result = await spawnWithTimeout(
+    {
+      file: docker,
+      args: ['network', 'inspect', '--format', '{{.Internal}} {{.Driver}} {{index .Options "com.docker.network.bridge.inhibit_ipv4"}}', name],
+      cwd: tmpdir(),
+      env: dockerClientEnv(),
+    },
+    { cwd: tmpdir(), timeoutSeconds: DOCKER_STEP_TIMEOUT_SECONDS },
+  )
+  if (result.exitCode !== 0) throw new Error(`сеть Docker «${name}» не найдена: ${(result.spawnError ?? result.output).trim().slice(-300)}`)
+  const [internal, driver, inhibitIpv4] = result.output.trim().split(/\s+/)
+  if (internal !== 'true') throw new Error(`сеть Docker «${name}» не закрыта: нужна internal: true, иначе контейнеры верстака видят интернет и локальную сеть`)
+  if (driver === 'bridge' && inhibitIpv4 !== 'true') {
+    throw new Error(`у сети Docker «${name}» мост с адресом на хосте: нужна опция com.docker.network.bridge.inhibit_ipv4: "true", иначе контейнеры видят службы сервера`)
   }
 }

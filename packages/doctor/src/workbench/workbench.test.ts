@@ -6,7 +6,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createGitGuard } from '../git-guard/index.js'
 import { bashCallPolicy } from '../treatment/tools.js'
-import { ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, type CommandRunner } from './index.js'
+import { assertInternalDockerNetwork, ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, type CommandRunner } from './index.js'
 
 const dirs: string[] = []
 
@@ -307,6 +307,33 @@ describe('исполнитель в контейнере', () => {
     expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['remontnik-install', 'remontnik-eval'])
   })
 
+  it('сеть не задана → у контейнера нет сети совсем', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    expect(flagValue(fake.calls()[0]!, '--network')).toBe('none')
+  })
+
+  it('адрес прокси выхода — только командам во внешней сети, не проверкам', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({
+      image: 'example.test/app-dev:1',
+      homesDir: join(b.root, 'homes'),
+      docker: fake.docker,
+      network: 'remontnik-workbench',
+      internalNetwork: 'remontnik-checks',
+      outsideEnv: { HTTPS_PROXY: 'http://10.0.0.2:3128' },
+    })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { HTTPS_PROXY: 'http://model.example.com' }, timeoutSeconds: 5 })
+    await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    const [install, tests] = fake.envFile().split(/^-rw-------/m).filter(Boolean)
+    expect(install).toContain('HTTPS_PROXY=http://10.0.0.2:3128\n')
+    expect(install).not.toContain('model.example.com')
+    expect(tests).not.toContain('HTTPS_PROXY')
+  })
+
   it('внутренняя сеть не задана → команда для неё не запускается', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
@@ -417,4 +444,40 @@ describe('исполнитель в контейнере', () => {
       expect(args![args!.length - 1]).toBe(command)
     },
   )
+})
+
+describe('проверка закрытой сети на старте', () => {
+  function fakeInspect(root: string, internal: string, exit = 0) {
+    const docker = join(root, 'docker-inspect')
+    writeFileSync(docker, `#!/bin/sh\nprintf '%s\\n' "$@" > '${root}/inspect.args'\n${exit === 0 ? `echo ${internal}` : "echo 'Error: No such network' >&2"}\nexit ${exit}\n`, { mode: 0o755 })
+    return docker
+  }
+
+  it('закрытая сеть без адреса моста на хосте → можно', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
+    dirs.push(root)
+    await expect(assertInternalDockerNetwork('remontnik-workbench', fakeInspect(root, "'true bridge true'"))).resolves.toBeUndefined()
+    const args = readFileSync(join(root, 'inspect.args'), 'utf8').split('\n')
+    expect(args.slice(0, 3)).toEqual(['network', 'inspect', '--format'])
+    expect(args[4]).toBe('remontnik-workbench')
+  })
+
+  it.each([
+    ['обычная сеть', "'false bridge <no value>'", /не закрыта/],
+    ['закрытая, но мост с адресом на хосте', "'true bridge <no value>'", /inhibit_ipv4/],
+  ])('%s → врач не стартует', async (_what, answer, error) => {
+    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
+    dirs.push(root)
+    await expect(assertInternalDockerNetwork('remontnik-workbench', fakeInspect(root, answer))).rejects.toThrow(error)
+  })
+
+  it('сети нет → врач не стартует', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
+    dirs.push(root)
+    await expect(assertInternalDockerNetwork('remontnik-missing', fakeInspect(root, '', 1))).rejects.toThrow(/не найдена/)
+  })
+
+  it('`none` — сети нет, проверять нечего', async () => {
+    await expect(assertInternalDockerNetwork('none', '/nonexistent/docker')).resolves.toBeUndefined()
+  })
 })

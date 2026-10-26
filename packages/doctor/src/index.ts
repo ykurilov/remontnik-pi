@@ -4,6 +4,7 @@ export { createReportsFeedHandler, type ReportsFeedAccess } from './intake/repor
 export { createMemoryRecordStore, type RecordStore, type RecordTransaction } from './records/index.js'
 export { REPORT_FULL_LIMIT, REPORT_RETRY_DELAYS_MS, createReports, type Report, type ReportType, type Reports } from './reports/index.js'
 export { startDoctorService, type DoctorService, type DoctorServiceOptions } from './service/index.js'
+export { doctorStartPlan, startDoctorFromEnv, type DoctorEnv } from './service/start.js'
 export { createGitGuard, slugify, treatmentBranch, type GitGuard, type GitGuardOptions } from './git-guard/index.js'
 export { type DoctorTreatmentOptions } from './service/index.js'
 export {
@@ -17,6 +18,7 @@ export {
   type TreatmentOutcome,
   type TreatmentResult,
 } from './treatment/index.js'
-export { createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
+export { assertInternalDockerNetwork, createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
+export { startEgressProxy, type EgressProxy, type EgressProxyOptions } from './egress-proxy/index.js'
 export { createEvalProxy, type EvalProxy, type EvalProxyOptions } from './eval-proxy/index.js'
 export { runDoctorCommand, type DoctorCommandIo } from './cli/run-doctor-command.js'
