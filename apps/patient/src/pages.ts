@@ -86,3 +86,26 @@ export function chatPage(bug: PatientBug | null): string {
 });`,
   )
 }
+
+// Страницы для проверки браузера Ремонтника: там, где нужен человек, браузер должен остановиться.
+export function captchaPage(): string {
+  return layout(
+    'Проверка',
+    `<h1>Подтвердите, что вы человек</h1>
+<div class="g-recaptcha" data-sitekey="patient-demo-sitekey"></div>
+<iframe title="captcha" src="/captcha-frame?kind=recaptcha"></iframe>`,
+  )
+}
+
+export function captchaFramePage(): string {
+  return '<!doctype html><html lang="ru"><body><label><input type="checkbox"> Я не робот</label></body></html>'
+}
+
+export function confirmCodePage(): string {
+  return layout(
+    'Код',
+    `<h1>Подтверждение входа</h1>
+<p>Мы отправили код подтверждения в SMS.</p>
+<label>Код <input name="code" inputmode="numeric" autocomplete="one-time-code"></label>`,
+  )
+}

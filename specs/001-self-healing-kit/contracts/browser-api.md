@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран).
+`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран). `REMONTNIK_BROWSER_LISTEN?` — адрес службы, по умолчанию `0.0.0.0:7700`. Для консольных команд — `REMONTNIK_BROWSER_URL?` (по умолчанию `http://127.0.0.1:7700`).
 
 ## HTTP `POST /v1/<команда>` с `Authorization: Bearer`
 
@@ -28,6 +28,8 @@
 `danger`: `none` \| `submit` \| `send` \| `pay` \| `delete` \| `publish`. `send`, `pay`, `delete`, `publish` отклоняются всегда.
 
 Любой ответ при капче или запросе кода: `{ ok: false, code: "needs_human", message }`.
+
+Ещё коды отказа: `refused_field` (`fill-password` не в поле пароля), `refused_profile` (вход от другого профиля), `refused_human_control`, `not_found`, `bad_request`, `timeout`. Неверный ключ — HTTP 401.
 
 ## Живой экран (только для владельца)
 
