@@ -180,8 +180,6 @@ services:
 | `maxDiffLines` | 300 | правка больше — человеку |
 | `maxDiffFiles` | 15 | правка шире — человеку |
 
-Пока этап 10 не влит в основную ветку, вместо `watchModelUsdPerDay` и `doctorModelUsdPerDay` действует общий `modelUsdPerDay` ($5), а потолок сторожа задаётся в `review.usdPerDay`.
-
 ### `reports` — куда слать отчёты
 
 | Поле | Что это |
@@ -190,6 +188,8 @@ services:
 | `telegram.chatIdEnv?` | имя переменной с чатом. Врачу чат нужен: без этого поля он не стартует |
 | `telegram.apiBaseUrlEnv?` | имя переменной с адресом своего прокси Telegram |
 | `telegram.proxyTokenEnv?` | имя переменной с ключом этого прокси |
+
+Под отчётами о готовой правке, выкатке, откате и «правка не помогла» врач ставит кнопку «Остановить автовыкатку» (`callback_data: "remontnik:stop"`). Если стоп-кран уже включён, кнопки нет, а в тексте сказано, что он включён. Нажатие разбирает приложение через `watch.handleStopButton(callbackQuery)`: стоп уходит врачу, только если нажали в чате тревог. Пустить выкатки снова кнопкой нельзя.
 
 ### `handoff?` — кто лечит первым
 
@@ -251,7 +251,7 @@ services:
 | переменные из `handoff.paseo.*Env` | да, при `"paseo-first"` | адрес моста, секрет моста, адрес приёма |
 | `REMONTNIK_REPORTS_TOKEN` | нет | забор отчётов `reports pull` без моста |
 | `REMONTNIK_BROWSER_URL`, `REMONTNIK_BROWSER_TOKEN` | при браузере | адрес и ключ браузера врача |
-| `REMONTNIK_DOCTOR_URL` | для команд | адрес врача для консольных команд (`deploys`, `reports`) |
+| `REMONTNIK_DOCTOR_URL` | для команд | адрес врача для консольных команд (`deploys`, `reports`, `fingerprint`). В контейнере врача шаблон compose задаёт его сам: `http://remontnik-doctor-app:7800` — имя врача только в сети приложения |
 
 \* Одна из двух.
 
@@ -270,11 +270,13 @@ services:
 
 ## Консольные команды врача
 
+Команды есть в `PATH` контейнера врача: `docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor <команда>`. Адрес врача и секреты уже в окружении контейнера. Команды браузера — так же: `exec -T browser remontnik-browser <команда>`.
+
 | Команда | Что делает |
 |---|---|
 | `remontnik-doctor start` | служба врача; всё — из окружения |
 | `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы и правила GitHub до старта; код 1 — есть ошибки |
 | `remontnik-doctor deploys stop` / `resume` | стоп-кран; `resume` — только секретом владельца |
 | `remontnik-doctor deploys confirm <версия>` | подтвердить версию брошенной выкатки; только секретом владельца |
-| `remontnik-doctor fingerprint <отпечаток> release` | снять «нужен человек» после отката; только секретом владельца (этап 10) |
+| `remontnik-doctor fingerprint <отпечаток> release` | снять «нужен человек» после отката; только секретом владельца |
 | `remontnik-doctor reports pull` / `ack <номер>` | забор отчётов по `REMONTNIK_REPORTS_TOKEN` |

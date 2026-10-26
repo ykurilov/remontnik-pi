@@ -72,13 +72,17 @@ services:
       REMONTNIK_GATEWAY_CONTAINER: remontnik-doctor
       REMONTNIK_CASE_SUBNETS: ${REMONTNIK_CASE_SUBNETS:-10.213.0.0/16}
       REMONTNIK_BROWSER_URL: http://remontnik-browser:7700
+      # Для консольных команд внутри контейнера (`exec doctor remontnik-doctor deploys stop`): имя врача только
+      # в сети приложения. Своё имя контейнера отвечало бы и адресом во внешней сети, где приёма нет.
+      REMONTNIK_DOCTOR_URL: http://remontnik-doctor-app:7800
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${REMONTNIK_APP_DIR}:${REMONTNIK_APP_DIR}
       - ${REMONTNIK_STATE_DIR}:${REMONTNIK_STATE_DIR}
     networks:
       outside: {}
-      app: {}
+      app:
+        aliases: [remontnik-doctor-app]
 
   # По желанию: docker compose --profile browser up -d. Адрес для врача — http://remontnik-browser:7700,
   # порт наружу не публикуется. Ключи браузера — в своём файле окружения (REMONTNIK_BROWSER_ENV_FILE).

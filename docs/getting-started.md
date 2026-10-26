@@ -57,7 +57,7 @@ const hooks = agentChatWatchHooks(watch, { inner: appHooks, afterTurn: true })
 
 **Чтение разговоров.** Сторож может читать законченные разговоры и замечать плохие ответы бота. Для этого:
 
-- в `createWatch` добавьте `model` (ключи DeepSeek и OpenRouter приложения) и `review` (`botDescription` — что бот должен делать, `limits: config.limits` — дневной потолок `watchModelUsdPerDay`; пока этап 10 не влит — `usdPerDay`);
+- в `createWatch` добавьте `model` (ключи DeepSeek и OpenRouter приложения) и `review` (`botDescription` — что бот должен делать, `limits: config.limits` — дневной потолок `watchModelUsdPerDay`);
 - там, где разговор закрывается, вызовите `watch.conversationFinished({ id, messages })`.
 
 Проверка: тест приложения бросает ошибку в процессе со сторожем — в папке очереди появляется запись, `watch.stats()` показывает её в очереди.
@@ -218,14 +218,30 @@ gh api /repos/OWNER/REPO/rulesets
 
 ## 11. Стоп-кран
 
-Остановить автовыкатки можно в любой момент:
+Под отчётами врача о выкатке и о готовой правке стоит кнопка «Остановить автовыкатку». Бот тревог принадлежит приложению, поэтому нажатие приходит к нему. Приложение передаёт нажатие сторожу:
 
-```sh
-docker run --rm --network "$REMONTNIK_APP_NETWORK" --env-file "$REMONTNIK_ENV_FILE" \
-  -e REMONTNIK_DOCTOR_URL=http://remontnik-doctor:7800 remontnik-doctor:local deploys stop --by owner
+```ts
+// В обработчике обновлений бота тревог (webhook или опрос), до своих кнопок:
+if (update.callback_query) {
+  const answer = await watch.handleStopButton(update.callback_query)
+  if (answer !== null) {
+    await bot.answerCallbackQuery(update.callback_query.id, { text: answer })
+    return
+  }
+}
 ```
 
-Команда идёт из сети приложения: только там врач слушает. Снова пустить — `deploys resume`: только с секретом владельца. Если приложение показывает свою кнопку «Остановить автовыкатку», нажатие оно передаёт врачу подписанным запросом `POST /v1/control/deploys` `{"action":"stop","by":"…"}`. Подпись — `signRequest` из `@ykurilov/remontnik-core/signed-http`, общим секретом.
+`handleStopButton` проверяет, что нажали в чате тревог, и отправляет врачу подписанный общим секретом стоп. Он возвращает текст для ответа на нажатие или `null`, если кнопка не его. Бросать он не умеет: при сбое в тексте будет совет остановить из консоли.
+
+Остановить из консоли сервера:
+
+```sh
+docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor deploys stop --by owner
+```
+
+Снова пустить выкатки — `deploys resume`, только с секретом владельца. Кнопкой этого сделать нельзя.
+
+Проверка: нажмите кнопку под любым отчётом о выкатке. Бот ответит «Автовыкатка остановлена», а следующий отчёт придёт без кнопки, с припиской «Стоп-кран включён».
 
 ## 12. Браузер врача (по желанию)
 
@@ -239,7 +255,7 @@ docker run --rm --network "$REMONTNIK_APP_NETWORK" --env-file "$REMONTNIK_ENV_FI
 
    ```sh
    docker compose -f deploy/compose.remontnik.yml exec -T browser \
-     node /app/dist/cli/main.js logins add --site https://app.example.com --login remontnik@example.com --profile remontnik --password-stdin < password-file
+     remontnik-browser logins add --site https://app.example.com --login remontnik@example.com --profile remontnik --password-stdin < password-file
    ```
 
    Номер входа (команда `logins list`) — в `browser.loginEntryId` настройки.

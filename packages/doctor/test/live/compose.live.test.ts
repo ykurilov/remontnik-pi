@@ -503,4 +503,11 @@ test('база из службы отвечает', async () => {
     expect(out.result.spawnError).toMatch(/по ID/)
     expect(caseNetworks()).toEqual([])
   })
+
+  it('консольные команды врача — изнутри его контейнера: compose exec doctor remontnik-doctor', () => {
+    const exec = (...args: string[]) => docker(['compose', '-p', PROJECT, '-f', composeFile, 'exec', '-T', 'doctor', ...args], { env: composeEnv })
+    expect(exec('sh', '-c', 'command -v remontnik-doctor').trim()).toBe('/usr/local/bin/remontnik-doctor')
+    // Стоп-кран без `docker run --network`: адрес врача и общий секрет уже в окружении контейнера.
+    expect(JSON.parse(exec('remontnik-doctor', 'deploys', 'stop', '--by', 'live'))).toEqual({ autoDeploy: 'stopped' })
+  })
 })
