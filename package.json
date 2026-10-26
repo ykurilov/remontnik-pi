@@ -13,7 +13,7 @@
     "build": "pnpm -r --if-present build",
     "check-pins": "node scripts/check-pins.mjs",
     "check-public": "node scripts/check-public.mjs",
-    "verify": "pnpm test && pnpm typecheck && pnpm build && pnpm check-pins && pnpm check-public",
+    "verify": "pnpm test && pnpm build && pnpm typecheck && pnpm check-pins && pnpm check-public",
     "changeset": "changeset"
   },
   "devDependencies": {

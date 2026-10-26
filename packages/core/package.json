@@ -1,21 +1,54 @@
 {
   "name": "@ykurilov/remontnik-core",
   "version": "0.0.0",
-  "description": "Ремонтник Pi: пакет core",
+  "description": "Ремонтник Pi: общие части — настройка, случаи, вычистка, путь к модели, Telegram, подпись запросов",
   "license": "MIT",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "import": "./dist/config/index.js"
+    },
+    "./incident": {
+      "types": "./dist/incident/index.d.ts",
+      "import": "./dist/incident/index.js"
+    },
+    "./redact": {
+      "types": "./dist/redact/index.d.ts",
+      "import": "./dist/redact/index.js"
+    },
+    "./model-route": {
+      "types": "./dist/model-route/index.d.ts",
+      "import": "./dist/model-route/index.js"
+    },
+    "./telegram": {
+      "types": "./dist/telegram/index.d.ts",
+      "import": "./dist/telegram/index.js"
+    },
+    "./signed-http": {
+      "types": "./dist/signed-http/index.d.ts",
+      "import": "./dist/signed-http/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
   }
 }

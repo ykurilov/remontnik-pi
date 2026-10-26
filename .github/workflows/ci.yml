@@ -19,8 +19,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
-      - run: pnpm typecheck
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm check-pins
       - run: pnpm check-public
       - uses: gitleaks/gitleaks-action@v2

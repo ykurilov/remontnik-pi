@@ -6,7 +6,13 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "start": "node src/main.ts",
+    "test": "vitest run",
+    "eval": "node eval/run-eval.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@ykurilov/remontnik-core": "workspace:*"
   }
 }

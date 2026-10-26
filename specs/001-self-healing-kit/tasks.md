@@ -25,7 +25,7 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T005 [P] Тест и скрипт открытости: `scripts/check-public.test.mjs`, `scripts/check-public.mjs` — публичные IPv4, домены вне `example.com`/`.test`/`.invalid`, строки вида ключей; частный запретный список из `~/.config/remontnik/denylist.txt`, если файл есть
 - [X] T006 [P] Changesets с группой `fixed` для всех `@ykurilov/remontnik-*`: `.changeset/config.json`, `.changeset/README.md`, `RELEASING.md`, заготовка `CHANGES.md`
 - [X] T007 [P] CI `.github/workflows/ci.yml`: установка, тесты, типы, сборка, `check-pins`, `check-public`, `gitleaks` по всей истории
-- [X] T008 Скрипт `pnpm verify` (тесты → типы → сборка → check-pins → check-public) в `package.json`; `README.md` — что это, лицензия MIT; поле `license: "MIT"` во всех `package.json`
+- [X] T008 Скрипт `pnpm verify` (тесты → сборка → типы → check-pins → check-public; сборка до типов — пакеты видят типы друг друга из `dist`) в `package.json`; `README.md` — что это, лицензия MIT; поле `license: "MIT"` во всех `package.json`
 
 **Контрольная точка**: `pnpm verify` зелёный на пустых пакетах.
 
@@ -37,23 +37,23 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T009 [P] Тест настройки `packages/core/src/config/config.test.ts`: схема из contracts/remontnik-config.md; встроенные запреты R7 нельзя убрать; пустые `forbidden.schema|money|access` отклоняются
-- [ ] T010 [P] Тест отпечатка `packages/core/src/incident/fingerprint.test.ts`: числа, адреса, идентификаторы вырезаются; одинаковый сбой → одинаковый отпечаток; `fingerprint` «sha256, 16 символов»; обрезка `message` «≤ 2000», `stack` «≤ 8000», `context` «≤ 4 КБ»
-- [ ] T011 [P] Тест вычистки `packages/core/src/redact/redact.test.ts`: ключи, `Bearer`, токены ботов Telegram, почты, телефоны
-- [ ] T012 [P] Тест пути к модели `packages/core/src/model-route/model-route.test.ts`: переход на запасной при 429, 5xx, сетевой ошибке, тайм-ауте; при прочих 4xx — ошибка; возврат на основной через `retryPrimaryAfterMs` (подменённые часы)
-- [ ] T013 [P] Тесты `packages/core/src/telegram/telegram.test.ts` (обрезка, токен вырезан из ошибок, прокси-заголовок) и `packages/core/src/signed-http/signed-http.test.ts` (подпись, неверная подпись, старая отметка времени)
+- [X] T009 [P] Тест настройки `packages/core/src/config/config.test.ts`: схема из contracts/remontnik-config.md; встроенные запреты R7 нельзя убрать; пустые `forbidden.schema|money|access` отклоняются
+- [X] T010 [P] Тест отпечатка `packages/core/src/incident/fingerprint.test.ts`: числа, адреса, идентификаторы вырезаются; одинаковый сбой → одинаковый отпечаток; `fingerprint` «sha256, 16 символов»; обрезка `message` «≤ 2000», `stack` «≤ 8000», `context` «≤ 4 КБ»
+- [X] T011 [P] Тест вычистки `packages/core/src/redact/redact.test.ts`: ключи, `Bearer`, токены ботов Telegram, почты, телефоны
+- [X] T012 [P] Тест пути к модели `packages/core/src/model-route/model-route.test.ts`: переход на запасной при 429, 5xx, сетевой ошибке, тайм-ауте; при прочих 4xx — ошибка; возврат на основной через `retryPrimaryAfterMs` (подменённые часы)
+- [X] T013 [P] Тесты `packages/core/src/telegram/telegram.test.ts` (обрезка, токен вырезан из ошибок, прокси-заголовок) и `packages/core/src/signed-http/signed-http.test.ts` (подпись, неверная подпись, старая отметка времени)
 
 ### Реализация
 
-- [ ] T014 [P] `defineRemontnikConfig`, схема и встроенные запреты в `packages/core/src/config/`
-- [ ] T015 [P] Типы `IncidentEvent` (поля и пределы из data-model.md) и `fingerprint()` в `packages/core/src/incident/`
-- [ ] T016 [P] Вычистка в `packages/core/src/redact/`
-- [ ] T017 [P] Путь к модели DeepSeek → OpenRouter на `fetch` (OpenAI-совместимый протокол, ответ JSON) в `packages/core/src/model-route/`; идентификаторы моделей — по одной константе
-- [ ] T018 [P] Telegram и подпись запросов в `packages/core/src/telegram/`, `packages/core/src/signed-http/`
-- [ ] T019 [P] Подставные серверы Telegram и OpenAI-совместимой модели для тестов в `packages/core/src/testing/` (подпуть `/testing`)
-- [ ] T020 «Пациент»: HTTP-сервер со страницами (кабинет со входом, веб-чат с ботом-заглушкой), заложенные ошибки по `PATIENT_BUG` (падение, ошибка «модели», ошибка инструмента, ошибка только на странице, ошибка в «оплате», ухудшающая правка) в `apps/patient/src/`
-- [ ] T021 «Пациент»: тесты, подставной eval с итогом в формате contracts/deploy-commands.md, файл `apps/patient/remontnik.config.ts`
-- [ ] T022 «Пациент»: команды выкатки на папках (`releases/<версия>`, `current`, `previous`) — `build`, `promote`, `confirm`, `rollback`, `current`, `health` — в `apps/patient/deploy/` с тестом `apps/patient/deploy/deploy.test.ts`
+- [X] T014 [P] `defineRemontnikConfig`, схема и встроенные запреты в `packages/core/src/config/`
+- [X] T015 [P] Типы `IncidentEvent` (поля и пределы из data-model.md) и `fingerprint()` в `packages/core/src/incident/`
+- [X] T016 [P] Вычистка в `packages/core/src/redact/`
+- [X] T017 [P] Путь к модели DeepSeek → OpenRouter на `fetch` (OpenAI-совместимый протокол, ответ JSON) в `packages/core/src/model-route/`; идентификаторы моделей — по одной константе
+- [X] T018 [P] Telegram и подпись запросов в `packages/core/src/telegram/`, `packages/core/src/signed-http/`
+- [X] T019 [P] Подставные серверы Telegram и OpenAI-совместимой модели для тестов в `packages/core/src/testing/` (подпуть `/testing`)
+- [X] T020 «Пациент»: HTTP-сервер со страницами (кабинет со входом, веб-чат с ботом-заглушкой), заложенные ошибки по `PATIENT_BUG` (падение, ошибка «модели», ошибка инструмента, ошибка только на странице, ошибка в «оплате», ухудшающая правка) в `apps/patient/src/`
+- [X] T021 «Пациент»: тесты, подставной eval с итогом в формате contracts/deploy-commands.md, файл `apps/patient/remontnik.config.ts`
+- [X] T022 «Пациент»: команды выкатки на папках (`releases/<версия>`, `current`, `previous`) — `build`, `promote`, `confirm`, `rollback`, `current`, `health` — в `apps/patient/deploy/` с тестом `apps/patient/deploy/deploy.test.ts`
 
 **Контрольная точка**: core покрыт тестами, «Пациент» запускается, выкатывается и откатывается на папках.
 
