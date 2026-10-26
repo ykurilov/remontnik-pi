@@ -13,6 +13,13 @@ export interface DoctorAnswer {
   body: unknown
 }
 
+/** Ответ врача длиннее предела: подпись по нему проверить нельзя, но можно попросить меньше. */
+export class DoctorAnswerTooLarge extends Error {
+  constructor() {
+    super('ответ врача слишком большой')
+  }
+}
+
 export type FetchLike = typeof fetch
 
 export class DoctorClient {
@@ -72,7 +79,7 @@ async function readLimited(response: Response): Promise<string> {
     size += value.byteLength
     if (size > DOCTOR_MAX_ANSWER_BYTES) {
       await reader.cancel()
-      throw new Error('ответ врача слишком большой')
+      throw new DoctorAnswerTooLarge()
     }
     chunks.push(value)
   }

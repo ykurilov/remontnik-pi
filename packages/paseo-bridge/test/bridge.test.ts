@@ -89,6 +89,30 @@ describe('подпись и приложение', () => {
     expect(await response.json()).toEqual({ error: 'stale' })
   })
 
+  it('запрос, подписанный до запуска моста, отвергается: после перезапуска память повторов пуста', async () => {
+    const { server } = await bridgeFor()
+    const body = JSON.stringify(shopTask())
+    const { signRequest } = await import('@ykurilov/remontnik-core/signed-http')
+    const response = await fetch(`${server.url}/v1/tasks`, {
+      method: 'POST',
+      headers: signRequest({ method: 'POST', target: '/v1/tasks', body, secret: SHOP_SECRET, now: Date.now() - 10_000 }),
+      body,
+    })
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: 'stale' })
+    expect(paseo.letters).toEqual([])
+  })
+
+  it('подпись в верхнем регистре не принимается, повтор запроса по-прежнему отсекается', async () => {
+    const { server } = await bridgeFor()
+    const url = `${server.url}/v1/tasks`
+    const request = signedPostRequest(url, shopTask(), SHOP_SECRET)
+    const shouted = { ...request, headers: { ...request.headers, 'X-Remontnik-Signature': request.headers['X-Remontnik-Signature'].toUpperCase().replace('SHA256=', 'sha256=') } }
+    expect(await send(url, shouted)).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(await send(url, request)).toMatchObject({ status: 200 })
+    expect(await send(url, request)).toEqual({ status: 401, body: { error: 'replayed' } })
+  })
+
   it('неполная задача — отказ 400', async () => {
     const { server } = await bridgeFor()
     for (const broken of [
@@ -247,7 +271,10 @@ describe('отчёты', () => {
   }
 
   const reportNumbers = () =>
-    paseo.lettersTo(SHOP_AGENT).map((text) => Number(/Отчёт Ремонтника №(\d+)/.exec(text)?.[1]))
+    paseo
+      .lettersTo(SHOP_AGENT)
+      .flatMap((text) => /Отчёт Ремонтника №(\d+)/.exec(text)?.[1] ?? [])
+      .map(Number)
 
   it('по курсору, по порядку, без повторов номера, с подтверждением', async () => {
     addReports(1, 2, 3)
@@ -330,8 +357,9 @@ describe('отчёты', () => {
     expect(reportNumbers()).toEqual([1])
   })
 
-  it('испорченный файл состояния — откладывается в .corrupt, старые отчёты лавиной не уходят', async () => {
+  it('испорченный файл состояния — откладывается в .corrupt, курсор берётся из подтверждения врача, старые отчёты лавиной не уходят', async () => {
     addReports(1, 2, 3)
+    shopDoctor.ackedBefore = 3
     const stateFile = freshStateFile()
     writeFileSync(stateFile, '{"tasks": [ обрыв')
     const started = await bridgeFor(stateFile)
@@ -339,9 +367,71 @@ describe('отчёты', () => {
     expect(reportNumbers()).toEqual([])
     expect(readdirSync(dirname(stateFile)).some((name) => name.includes('.corrupt'))).toBe(true)
     expect(started.journal).toContainEqual(expect.objectContaining({ event: 'state_corrupt' }))
+    expect(started.journal).toContainEqual(expect.objectContaining({ event: 'report_cursor_restored', app: 'shop', cursor: 3 }))
     addReports(4)
     await started.bridge.pullReports('shop')
     expect(reportNumbers()).toEqual([4])
+  })
+
+  it('испорченный файл состояния — отчёты, которые врач ещё не считает подтверждёнными, не теряются', async () => {
+    addReports(1, 2, 3)
+    shopDoctor.ackedBefore = 1
+    const stateFile = freshStateFile()
+    writeFileSync(stateFile, '{"tasks": [ обрыв')
+    const started = await bridgeFor(stateFile)
+    await started.bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([2, 3])
+  })
+
+  it('испорченный файл состояния и старый врач без поля acked — пропуск до конца ленты, без лавины', async () => {
+    addReports(1, 2, 3)
+    shopDoctor.omitAckedField = true
+    const stateFile = freshStateFile()
+    writeFileSync(stateFile, '{"tasks": [ обрыв')
+    const started = await bridgeFor(stateFile)
+    await started.bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([])
+    addReports(4)
+    await started.bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([4])
+  })
+
+  it('врач отдаёт страницу, обрезанную по размеру, — мост продолжает, пока есть отчёты', async () => {
+    addReports(1, 2, 3, 4, 5)
+    shopDoctor.pageLimit = 2
+    const { bridge } = await bridgeFor()
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1, 2, 3, 4, 5])
+    expect(shopDoctor.acked.at(-1)).toBe(5)
+  })
+
+  it('отчёт, который мост не принимает (слишком большой текст), пропускается: журнал, короткое письмо агенту, курсор идёт дальше', async () => {
+    addReports(1, 2, 3)
+    shopDoctor.reports[1]!.full = 'ы'.repeat(70 * 1024)
+    const { bridge, journal } = await bridgeFor()
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1, 3])
+    const notices = paseo.lettersTo(SHOP_AGENT).filter((text) => text.includes('пропущен'))
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toContain('№2')
+    expect(notices[0]).toContain('remontnik-doctor reports pull')
+    expect(notices[0]).not.toContain('ы'.repeat(100))
+    expect(journal).toContainEqual(expect.objectContaining({ event: 'report_skipped', app: 'shop', reportId: 2 }))
+    expect(shopDoctor.acked.at(-1)).toBe(3)
+
+    const lettersBefore = paseo.letters.length
+    await bridge.pullReports('shop')
+    expect(paseo.letters).toHaveLength(lettersBefore)
+  })
+
+  it('ответ врача больше предела моста — мост просит по одному отчёту, а непосильный пропускает', async () => {
+    addReports(1, 2, 3)
+    shopDoctor.reports[1]!.full = 'x'.repeat(300_000)
+    const { bridge, journal } = await bridgeFor()
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1, 3])
+    expect(paseo.lettersTo(SHOP_AGENT).filter((text) => text.includes('пропущен') && text.includes('№2'))).toHaveLength(1)
+    expect(journal).toContainEqual(expect.objectContaining({ event: 'report_skipped', reportId: 2 }))
   })
 
   it('письмо не ушло — курсор возвращается, отчёт уходит позже ровно один раз', async () => {

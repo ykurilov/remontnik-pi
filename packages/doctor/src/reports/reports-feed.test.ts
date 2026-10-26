@@ -1,4 +1,5 @@
-import { NONCE_HEADER, signRequest, verifySignedResponse } from '@ykurilov/remontnik-core/signed-http'
+import { request as httpRequest } from 'node:http'
+import { NONCE_HEADER, SIGNATURE_HEADER, signRequest, verifySignedResponse } from '@ykurilov/remontnik-core/signed-http'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -305,6 +306,25 @@ describe('лента отчётов: доступ для моста', () => {
     expect(second.body).toEqual({ error: 'replayed' })
   })
 
+  it('подпись принимается только строчными hex: верхний регистр и хвост — 401 bad_signature, повтор настоящего запроса — replayed', async () => {
+    const path = '/v1/reports?after=0&limit=50'
+    const signature = signRequest({ method: 'GET', target: path, body: '', secret: BRIDGE_SECRET })
+    const upper = { ...signature, [SIGNATURE_HEADER]: signature[SIGNATURE_HEADER].toUpperCase().replace('SHA256=', 'sha256=') }
+    const tail = { ...signature, [SIGNATURE_HEADER]: `${signature[SIGNATURE_HEADER]}zz` }
+
+    expect((await send(bridge, 'GET', path, '', upper)).body).toEqual({ error: 'bad_signature' })
+    expect((await send(bridge, 'GET', path, '', tail)).body).toEqual({ error: 'bad_signature' })
+    expect((await send(bridge, 'GET', path, '', signature)).status).toBe(200)
+    expect((await send(bridge, 'GET', path, '', signature)).body).toEqual({ error: 'replayed' })
+  })
+
+  it('запрос, подписанный до запуска врача, — 401 stale: после перезапуска память повторов пуста', async () => {
+    const answer = await asBridge('GET', '/v1/reports?after=0', undefined, { now: Date.now() - 10_000 })
+
+    expect(answer.status).toBe(401)
+    expect(answer.body).toEqual({ error: 'stale' })
+  })
+
   it('ключ доступа владельца на адресе моста не принимается', async () => {
     await addReports(1)
 
@@ -353,6 +373,59 @@ describe('лента отчётов: доступ для моста', () => {
 
     expect(answer.status).toBe(200)
     expect(answer.headers.get('location')).toBeNull()
+  })
+})
+
+/** POST /v1/reports/ack, у которого тело обещано, но не пришло: ответ должен прийти по одним заголовкам. */
+function ackWithoutBody(headers: Record<string, string>): Promise<{ status: number; body: any; waitedMs: number }> {
+  const startedAt = Date.now()
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(`${bridge.url}/v1/reports/ack`, { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': '40', ...headers } })
+    outgoing.on('response', (response) => {
+      let text = ''
+      response.on('data', (chunk) => (text += chunk))
+      response.on('end', () => {
+        outgoing.destroy()
+        resolve({ status: response.statusCode ?? 0, body: text === '' ? null : JSON.parse(text), waitedMs: Date.now() - startedAt })
+      })
+    })
+    outgoing.on('error', reject)
+    outgoing.flushHeaders()
+  })
+}
+
+describe('лента отчётов: ack отказывает по заголовкам, не дожидаясь тела', () => {
+  const sign = () => signRequest({ method: 'POST', target: '/v1/reports/ack', body: JSON.stringify({ upTo: 0 }), secret: BRIDGE_SECRET })
+
+  it('подпись не того вида — 401 сразу', async () => {
+    const good = sign()
+    const answer = await ackWithoutBody({ ...good, [SIGNATURE_HEADER]: good[SIGNATURE_HEADER].toUpperCase().replace('SHA256=', 'sha256=') })
+
+    expect(answer).toMatchObject({ status: 401, body: { error: 'bad_signature' } })
+    expect(answer.waitedMs).toBeLessThan(2_000)
+  })
+
+  it('метка запроса не того вида или нет вовсе — 401 сразу', async () => {
+    const good = sign()
+    expect(await ackWithoutBody({ ...good, [NONCE_HEADER]: 'short' })).toMatchObject({ status: 401, body: { error: 'bad_signature' } })
+    const { [NONCE_HEADER]: _dropped, ...withoutNonce } = good
+    expect(await ackWithoutBody(withoutNonce)).toMatchObject({ status: 401, body: { error: 'missing' } })
+  })
+
+  it('отметка раньше запуска врача — 401 stale сразу', async () => {
+    const early = signRequest({ method: 'POST', target: '/v1/reports/ack', body: '{}', secret: BRIDGE_SECRET, now: Date.now() - 10_000 })
+
+    expect(await ackWithoutBody(early)).toMatchObject({ status: 401, body: { error: 'stale' } })
+  })
+
+  it('метка уже принятого запроса — 401 replayed сразу, без чтения тела', async () => {
+    const used = signRequest({ method: 'GET', target: '/v1/reports?after=0', body: '', secret: BRIDGE_SECRET })
+    expect((await send(bridge, 'GET', '/v1/reports?after=0', '', used)).status).toBe(200)
+
+    const answer = await ackWithoutBody({ ...used })
+
+    expect(answer).toMatchObject({ status: 401, body: { error: 'replayed' } })
+    expect(answer.waitedMs).toBeLessThan(2_000)
   })
 })
 

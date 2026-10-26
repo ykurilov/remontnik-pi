@@ -3,12 +3,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   NONCE_HEADER,
   ReplayGuard,
-  SIGNATURE_HEADER,
+  precheckSignedRequest,
   signResponse,
   verifySignedRequest,
 } from '@ykurilov/remontnik-core/signed-http'
 import type { Report, Reports } from '../reports/index.js'
-import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Лента отчётов для Paseo (R13, contracts/doctor-api.md): `GET /v1/reports` и `POST /v1/reports/ack`.
 // Два вида доступа, оба закрытые:
@@ -78,6 +78,8 @@ export function createReportsFeedHandler(options: ReportsFeedOptions): IntakeHan
   if (access.kind === 'bridge' && access.secret === '') throw new Error('[remontnik] секрет моста пуст')
   const replayGuard = access.kind === 'bridge' ? (access.replayGuard ?? new ReplayGuard()) : null
   const now = options.now ?? Date.now
+  /** Запросы, подписанные до запуска врача, не принимаются: память повторов после перезапуска пуста. */
+  const startedAt = now()
 
   async function getReports(url: URL): Promise<Answer> {
     const after = nonNegativeInteger(url.searchParams.get('after'), 0)
@@ -148,9 +150,14 @@ export function createReportsFeedHandler(options: ReportsFeedOptions): IntakeHan
       return
     }
     if (access.kind === 'bridge') {
-      const early = precheckSignature(request, now())
-      if (early) {
-        refuse(request, response, 401, { error: early })
+      // Всё, что видно по заголовкам, решается до чтения тела: вид подписи и метки, время, повтор метки.
+      const early = precheckSignedRequest({ headers: request.headers, now: now(), notBefore: startedAt })
+      if (!early.ok) {
+        refuse(request, response, 401, { error: early.reason })
+        return
+      }
+      if (replayGuard!.wasSeen(headerValue(request, NONCE_HEADER)!, now())) {
+        refuse(request, response, 401, { error: 'replayed' })
         return
       }
     }
@@ -175,12 +182,13 @@ export function createReportsFeedHandler(options: ReportsFeedOptions): IntakeHan
         headers: request.headers,
         secret: access.secret,
         now: now(),
+        notBefore: startedAt,
       })
       if (!check.ok) {
         reply(request, response, unsigned(401, check.reason))
         return
       }
-      if (!replayGuard!.firstSeen(headerValue(request, SIGNATURE_HEADER)!, now())) {
+      if (!replayGuard!.firstSeen(headerValue(request, NONCE_HEADER)!, now())) {
         reply(request, response, { status: 401, body: { error: 'replayed' }, signed: true })
         return
       }
