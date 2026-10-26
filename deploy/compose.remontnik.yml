@@ -11,6 +11,10 @@
 #   DOCKER_GID             группа сокета Docker на сервере: stat -c %g /var/run/docker.sock
 #   REMONTNIK_UID/GID      владелец папок выше (по умолчанию 10001)
 #   REMONTNIK_DOCTOR_MEMORY предел памяти врача (по умолчанию 2g): зеркало реестра и прокси eval держат ответы в ней
+#   REMONTNIK_PROJECT / REMONTNIK_CONTAINER_NAME / REMONTNIK_BROWSER_CONTAINER / REMONTNIK_OUTSIDE_NETWORK
+#                          имена проекта, контейнеров врача и браузера и внешней сети (по умолчанию remontnik,
+#                          remontnik-doctor, remontnik-browser, remontnik-outside). Второму врачу на том же хосте
+#                          задайте другие: контейнер врача называется так же, как REMONTNIK_GATEWAY_CONTAINER
 #   REMONTNIK_CASE_SUBNETS пул подсетей для сетей случая (по умолчанию 10.213.0.0/16; не должен пересекаться
 #                          с сетями сервера — занятые подсети врач пропускает сам)
 #
@@ -34,7 +38,7 @@
 # Службы тестов приложения (checks.services, например временная база) врач поднимает сам отдельным проектом
 # compose в сети проверок случая: без портов, томов и секретов; после проверок убирает.
 
-name: remontnik
+name: ${REMONTNIK_PROJECT:-remontnik}
 
 x-hardening: &hardening
   read_only: true
@@ -50,7 +54,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/doctor.Dockerfile
-    container_name: remontnik-doctor
+    container_name: ${REMONTNIK_CONTAINER_NAME:-remontnik-doctor}
     command: [start]
     user: ${REMONTNIK_UID:-10001}:${REMONTNIK_GID:-10001}
     # Предел памяти врача: чужой код в контейнерах случая не съест память сервера через зеркало и прокси.
@@ -69,9 +73,9 @@ services:
       # Приём событий — только на адресе врача в сети приложения, не на всех адресах.
       REMONTNIK_LISTEN_NETWORK: ${REMONTNIK_APP_NETWORK}
       # Имя контейнера врача: врач подключает себя к сетям случая.
-      REMONTNIK_GATEWAY_CONTAINER: remontnik-doctor
+      REMONTNIK_GATEWAY_CONTAINER: ${REMONTNIK_CONTAINER_NAME:-remontnik-doctor}
       REMONTNIK_CASE_SUBNETS: ${REMONTNIK_CASE_SUBNETS:-10.213.0.0/16}
-      REMONTNIK_BROWSER_URL: http://remontnik-browser:7700
+      REMONTNIK_BROWSER_URL: http://${REMONTNIK_BROWSER_CONTAINER:-remontnik-browser}:7700
       # Для консольных команд внутри контейнера (`exec doctor remontnik-doctor deploys stop`): имя врача только
       # в сети приложения. Своё имя контейнера отвечало бы и адресом во внешней сети, где приёма нет.
       REMONTNIK_DOCTOR_URL: http://remontnik-doctor-app:7800
@@ -92,7 +96,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/browser.Dockerfile
-    container_name: remontnik-browser
+    container_name: ${REMONTNIK_BROWSER_CONTAINER:-remontnik-browser}
     restart: unless-stopped
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -109,7 +113,7 @@ volumes:
 
 networks:
   outside:
-    name: remontnik-outside
+    name: ${REMONTNIK_OUTSIDE_NETWORK:-remontnik-outside}
   app:
     name: ${REMONTNIK_APP_NETWORK:?REMONTNIK_APP_NETWORK — сеть Docker приложения}
     external: true
