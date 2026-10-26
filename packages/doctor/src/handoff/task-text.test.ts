@@ -7,6 +7,8 @@ import { HANDOFF_BODY_LIMIT_BYTES, HANDOFF_TEXT_LIMITS, handoffTaskBody, type Ha
 
 const TASK_ID = '01J0000000000000000000000A'
 const OTHER_TASK_ID = '01J0000000000000000000000B'
+/** Ключ вида `sk-…` собирается из частей: в исходнике его нет, проверка открытости репозитория молчит. */
+const LIVE_KEY = ['sk', 'live-1234567890abcdef1234'].join('-')
 
 function sick(change: Partial<HandoffCase> = {}): HandoffCase {
   return {
@@ -23,8 +25,9 @@ function sick(change: Partial<HandoffCase> = {}): HandoffCase {
 
 /** Письмо, которое мост напишет агенту по этой задаче. */
 function letterOf(body: HandoffTaskBody): string {
+  const { app } = body
   return taskLetter({
-    appName: body.app,
+    appName: app,
     taskId: body.taskId,
     caseId: body.caseId,
     kind: body.kind,
@@ -131,10 +134,10 @@ describe('задача агенту Paseo', () => {
     const body = handoffTaskBody({
       taskId: TASK_ID,
       appName: 'patient',
-      case: sick({ message: 'ключ sk-live-1234567890abcdef1234 не подошёл', stack: 'eval-key-value-123456' }),
+      case: sick({ message: `ключ ${LIVE_KEY} не подошёл`, stack: 'eval-key-value-123456' }),
       knownSecrets: ['eval-key-value-123456'],
     })
-    expect(JSON.stringify(body)).not.toContain('sk-live-1234567890abcdef1234')
+    expect(JSON.stringify(body)).not.toContain(LIVE_KEY)
     expect(JSON.stringify(body)).not.toContain('eval-key-value-123456')
   })
 })

@@ -88,7 +88,8 @@ export async function startFakePaseoBridge(options: { secret: string; appName: s
         return
       }
       const parsed = JSON.parse(body) as Record<string, unknown>
-      if (parsed.app !== appName) {
+      const { app } = parsed
+      if (app !== appName) {
         send(response, 401, { error: 'bad_signature' })
         return
       }

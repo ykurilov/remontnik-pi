@@ -110,7 +110,7 @@ async function startWorld(options: { app?: FakeDeployApp; withBridge?: boolean }
   const config = handoffConfig()
   const loadConfig = async () => config
   const guard = createGitGuard({ repoDir: r.repoDir, worktreesDir: r.worktreesDir, mainBranch: 'main', mainline: 'pull-request', author: { name: 'Ремонтник', email: 'doctor@example.invalid' } })
-  const app = options.app
+  const { app } = options
   const bridge = await startFakePaseoBridge({ secret: BRIDGE_SECRET, appName: APP })
   cleanups.push(() => bridge.close())
   const deployer = app

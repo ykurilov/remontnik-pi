@@ -163,7 +163,8 @@ export function createHandoffsHandler(options: HandoffsHandlerOptions): IntakeHa
     }
     // Секрет и так привязан к приложению: `app` не обязателен, но если указан — должен совпасть. Чужое приложение
     // отвечает так же, как неверная подпись: имена приложений не перебрать.
-    if (body.app !== undefined && body.app !== options.appName) {
+    const { app } = body
+    if (app !== undefined && app !== options.appName) {
       reply(request, response, { status: 401, body: { error: 'bad_signature' }, signed: false })
       return
     }
