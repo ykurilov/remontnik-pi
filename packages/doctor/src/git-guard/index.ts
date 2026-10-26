@@ -99,12 +99,15 @@ export interface GitGuard {
    * Рабочую копию основной ветки не трогает: её держат выкатки, и смена копии посреди чужой выкатки — её отказ.
    */
   mergeIntoMain(branch: string, commit: string): Promise<void>
+  /** Ревизия `commit` уже в основной ветке origin (по свежему fetch). */
+  isInMainline(commit: string): Promise<boolean>
   /**
-   * Замки git, брошенные убитым врачом (его git убит посреди коммита вместе с ним): в gitdir копий врача и у веток и
-   * меток `remontnik/…`. Только на старте врача, пока его git не идёт. Замки основной копии не трогает. Возвращает
-   * убранные пути относительно общего gitdir.
+   * Замки git, брошенные убитым врачом (его git убит вместе с ним): в gitdir копий врача, у веток и меток `remontnik/…`,
+   * у веток origin и `packed-refs.lock` — их оставляет убитый fetch или push. Только на старте врача, пока его git
+   * не идёт. Замки основной копии (индекс, её ветки) не трогает. Копию, где ещё может писать живой git (`inUse`:
+   * её контейнер не удалось убрать), не трогает тоже. Возвращает убранные пути относительно общего gitdir.
    */
-  clearStaleLocks(): Promise<string[]>
+  clearStaleLocks(options?: { inUse?: (copyDir: string) => boolean }): Promise<string[]>
 }
 
 const TRANSLIT: Record<string, string> = {
@@ -266,6 +269,8 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
   const policy: Policy = { repoDir, worktreesDir, mainBranch: options.mainBranch, mainline: options.mainline, remote }
   const knownSecrets = Object.values(options.env ?? {}).filter((value) => value.length >= 6)
   const clean = (text: string) => redactSecrets(text, { knownSecrets })
+  /** Очередь создания копий: см. `addWorktree`. */
+  let copyLine: Promise<void> = Promise.resolve()
 
   function canonical(path: string): string {
     // Ссылки не должны уводить проверку пути в сторону: сравниваем настоящие пути.
@@ -419,6 +424,12 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     }
   }
 
+  /** Основная ветка origin сейчас: fetch и её ревизия. */
+  async function fetchedMainline(): Promise<string> {
+    await run(['fetch', remote])
+    return (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
+  }
+
   async function tagExists(name: string): Promise<boolean> {
     try {
       await run(['rev-parse', '--verify', '--quiet', `refs/tags/${name}`])
@@ -438,6 +449,26 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     const staged = gitlinks(await run(['ls-files', '--stage', '-z'], { cwd }))
     const committed = new Set(gitlinks(await run(['ls-tree', '-r', '-z', 'HEAD'], { cwd })))
     return staged.filter((path) => !committed.has(path))
+  }
+
+  /** Новая копия: ветка или отделённая голова, sparse без исключённых файлов. Уже готовая копия остаётся. */
+  async function addCopy(add: AddWorktreeOptions): Promise<void> {
+    const path = resolve(add.path)
+    if (add.fresh) await removeCopy(path)
+    else if (existsSync(path)) {
+      verifiedGitDir(path)
+      return
+    }
+    const target =
+      add.branch === undefined
+        ? ['--detach', path, add.base]
+        : (await branchExists(add.branch))
+          ? [path, add.branch]
+          : ['-b', add.branch, path, add.base]
+    await run(['worktree', 'add', '--no-checkout', ...target])
+    const patterns = ['/*', ...(add.exclude ?? []).map((file) => `!/${escapeSparsePath(file)}`)]
+    await run(['sparse-checkout', 'set', '--no-cone', '--stdin'], { cwd: path }, `${patterns.join('\n')}\n`)
+    await run(['checkout'], { cwd: path })
   }
 
   /** Удаляет копию целиком (с мусором проверок) и забывает её в git. Только внутри папки копий. */
@@ -499,24 +530,14 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       return (await run(['rev-parse', '--verify', `${ref}^{commit}`], resolveOptions)).trim()
     },
 
-    async addWorktree(add) {
-      const path = resolve(add.path)
-      if (add.fresh) await removeCopy(path)
-      else if (existsSync(path)) {
-        verifiedGitDir(path)
-        return
-      }
-      const target =
-        add.branch === undefined
-          ? ['--detach', path, add.base]
-          : (await branchExists(add.branch))
-            ? [path, add.branch]
-            : ['-b', add.branch, path, add.base]
-      await run(['worktree', 'add', '--no-checkout', ...target])
-      const patterns = ['/*', ...(add.exclude ?? []).map((file) => `!/${escapeSparsePath(file)}`)]
-      await run(['sparse-checkout', 'set', '--no-cone', '--stdin'], { cwd: path }, `${patterns.join('\n')}\n`)
-      await run(['checkout'], { cwd: path })
+    // Копии — по одной: первый `sparse-checkout set` пишет общий `.git/config`, и вторая копия в ту же минуту
+    // спотыкалась бы о его замок.
+    addWorktree: (add) => {
+      const added = copyLine.then(() => addCopy(add))
+      copyLine = added.catch(() => {})
+      return added
     },
+
 
     removeWorktree: (path) => removeCopy(resolve(path)),
 
@@ -534,29 +555,33 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       return readChangedFiles((args) => run(args, { cwd }), base)
     },
 
-    async clearStaleLocks() {
+    async clearStaleLocks(clearOptions = {}) {
       const removed: string[] = []
       const drop = (path: string) => {
         rmSync(path, { force: true })
         removed.push(relative(commonGitDir, path))
       }
+      const ownDir = canonical(worktreesDir)
       const admins = join(commonGitDir, 'worktrees')
       for (const name of existsSync(admins) ? readdirSync(admins) : []) {
         const admin = join(admins, name)
         let copy: string
         try {
-          copy = dirname(readFileSync(join(admin, 'gitdir'), 'utf8').trim())
+          copy = canonical(dirname(readFileSync(join(admin, 'gitdir'), 'utf8').trim()))
         } catch {
           continue
         }
-        if (!inside(canonical(worktreesDir), canonical(copy))) continue
+        if (!inside(ownDir, copy)) continue
+        // Путь копии — как его знает врач, а не настоящий: по нему исполнитель помнит испорченные копии.
+        if (clearOptions.inUse?.(join(worktreesDir, relative(ownDir, copy)))) continue
         for (const file of readdirSync(admin)) if (file.endsWith('.lock')) drop(join(admin, file))
       }
-      for (const refs of ['refs/heads', 'refs/tags']) {
-        const own = join(commonGitDir, refs, TREATMENT_BRANCH_PREFIX)
+      const lockDirs = [join(commonGitDir, 'refs/heads', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/tags', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/remotes', remote)]
+      for (const own of lockDirs) {
         if (!existsSync(own)) continue
         for (const file of readdirSync(own, { recursive: true, encoding: 'utf8' })) if (file.endsWith('.lock')) drop(join(own, file))
       }
+      if (existsSync(join(commonGitDir, 'packed-refs.lock'))) drop(join(commonGitDir, 'packed-refs.lock'))
       return removed
     },
 
@@ -599,12 +624,16 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: вливать можно только ревизию по её полному id')
       const head = (await run(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`])).trim()
       if (head !== commit) throw new GitGuardError('forbidden', `git-замок: ветка ${branch} ушла с проверенной ревизии`)
-      await run(['fetch', remote])
-      const mainline = (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
+      const mainline = await fetchedMainline()
       if (await isAncestor(commit, mainline)) return
       if (!(await isAncestor(mainline, commit))) throw new GitGuardError('diverged', `git-замок: основная ветка ${options.mainBranch} ушла вперёд мимо правки`)
       // Обычный push без `+`: origin примет его, только если основная ветка всё ещё предок правки.
       await run(['push', remote, `${commit}:refs/heads/${options.mainBranch}`])
+    },
+
+    async isInMainline(commit) {
+      if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: ревизия — по её полному id')
+      return isAncestor(commit, await fetchedMainline())
     },
   }
 }

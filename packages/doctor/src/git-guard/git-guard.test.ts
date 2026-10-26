@@ -126,6 +126,18 @@ describe('git-замок', () => {
     expect(git(r.repoDir, 'rev-parse', 'refs/remotes/origin/main')).toBe(human)
   })
 
+  it('копии для нескольких случаев разом создаются без драки за общий .git/config', async () => {
+    // Первый sparse-checkout в репозитории пишет общий конфиг: одновременные копии спотыкались о его замок.
+    for (let round = 0; round < 12; round += 1) {
+      const r = repo()
+      const guard = guardFor(r)
+      const base = await guard.resolve('HEAD')
+      const cases = [1, 2, 3, 4, 5, 6, 7, 8]
+      await Promise.all(cases.map((id) => guard.addWorktree({ path: join(r.worktreesDir, String(id)), branch: treatmentBranch(id, 'x'), base, exclude: ['.env'] })))
+      for (const id of cases) expect(readFileSync(join(r.worktreesDir, String(id), 'app.ts'), 'utf8')).toBe('export const answer = 1\n')
+    }
+  }, 60_000)
+
   it('повторное создание той же копии после перезапуска не падает', async () => {
     const r = repo()
     const guard = guardFor(r)

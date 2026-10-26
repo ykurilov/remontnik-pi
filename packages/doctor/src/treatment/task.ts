@@ -461,7 +461,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   /**
    * Правка осталась работать — ветка уходит в основную: `merge` — git-замком, проверенной ревизией и только вперёд,
    * `pull-request` — ждёт запроса на слияние. Стоп-кран, нажатый за окно, слияние останавливает: правка ждёт человека.
-   * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз.
+   * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз, а
+   * итог — «влил», даже если стоп-кран нажали, пока врач лежал после слияния.
    */
   async function settleMainline(runtime: Runtime, checkpoint: DeployPhase, context: Context): Promise<MainlineResult> {
     const config = await deps.loadConfig()
@@ -470,7 +471,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     try {
       if (!checkpoint.pushed) await deps.guard.push(branch)
       if (config.repo.mainline !== 'merge') return { kind: 'pull_request', branch }
-      if (controls?.autoDeploy === 'stopped') return { kind: 'stopped', branch }
+      if (controls?.autoDeploy === 'stopped') {
+        return (await deps.guard.isInMainline(checkpoint.fixCommit)) ? { kind: 'merged', into: config.repo.mainBranch } : { kind: 'stopped', branch }
+      }
       await deps.guard.mergeIntoMain(branch, checkpoint.fixCommit)
       return { kind: 'merged', into: config.repo.mainBranch }
     } catch (error) {
