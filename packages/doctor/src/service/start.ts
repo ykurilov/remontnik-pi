@@ -79,6 +79,18 @@ function listenOf(env: DoctorEnv): DoctorStartPlan['listen'] {
 }
 
 /**
+ * Мост Paseo (`handoff.paseo`): адрес для моста в частной сети и секрет моста — лента отчётов и команды агента;
+ * в режиме «сначала Paseo» ещё адрес самого моста — туда уходят случаи. Имена переменных — из настройки.
+ */
+function paseoBridgeOf(env: DoctorEnv, config: RemontnikConfig): Pick<DoctorServiceOptions, 'paseoBridge'> & { bridge?: NonNullable<DoctorServiceOptions['reportsFeed']>['bridge'] } {
+  const paseo = config.handoff.paseo
+  if (!paseo) return {}
+  const bridge = { listen: parseListen(required(env, paseo.listenEnv), paseo.listenEnv), secret: required(env, paseo.bridgeSecretEnv), appName: config.app.name }
+  if (config.handoff.mode !== 'paseo-first') return { bridge }
+  return { bridge, paseoBridge: { url: required(env, paseo.bridgeUrlEnv) } }
+}
+
+/**
  * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
  * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
@@ -99,6 +111,7 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const model = createDoctorModels(env)
   const browserClient = browserClientFromEnv(env)
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
+  const { bridge, paseoBridge } = paseoBridgeOf(env, config)
   const sharedSecret = required(env, 'REMONTNIK_SHARED_SECRET')
   // Секрет владельца снимает стоп-кран выкаток: утечка общего секрета не должна давать того же.
   const controlSecret = env.REMONTNIK_CONTROL_SECRET?.trim() || undefined
@@ -133,7 +146,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
         ...(apiBaseUrl ? { apiBaseUrl } : {}),
         ...(proxyToken ? { proxyToken } : {}),
       },
-      ...(reportsToken ? { reportsFeed: { token: reportsToken } } : {}),
+      ...(reportsToken || bridge ? { reportsFeed: { ...(reportsToken ? { token: reportsToken } : {}), ...(bridge ? { bridge } : {}) } } : {}),
+      ...(paseoBridge ? { paseoBridge } : {}),
       treatment: {
         guard,
         loadConfig,

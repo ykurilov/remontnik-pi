@@ -5,6 +5,7 @@ import type { Wake } from '@earendil-works/pi-durable'
 import { fauxAssistantMessage, fauxToolCall, type AssistantMessage, type TranscriptContext } from '@earendil-works/pi-ai'
 import type { BrowserAnswer, BrowserClient } from '../../src/browser-tools/index.js'
 import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
+import { createPaseoBridgeClient, type PaseoBridgeClient } from '../../src/handoff/index.js'
 import type { AppCommands, CommandOutcome } from '../../src/deployer/app-commands.js'
 import { createDeployer, createDeployLock } from '../../src/deployer/index.js'
 import { createGitGuard, GitGuardError, type GitGuard } from '../../src/git-guard/index.js'
@@ -13,11 +14,13 @@ import { testRemontnikConfig } from '../../src/testing/config.js'
 import { createScriptedModel } from '../../src/testing/scripted-model.js'
 import { createLocalRunner, type CommandRunner } from '../../src/workbench/index.js'
 import {
+  BRIDGE_SECRET,
   BROWSER_CRASH_POINT,
   CONTROL_SECRET,
   CRASH_POINTS,
   FIXED,
   NEW_TEST,
+  PASEO_CRASH_POINTS,
   priceCrash,
   ROLLBACK_CRASH_POINT,
   type ChildWorld,
@@ -30,7 +33,8 @@ import {
 // врача, git, состояние подставного приложения и сдвиг часов. С `REMONTNIK_TEST_CRASH_AT=<точка>` процесс убивает
 // себя (SIGKILL) в этой точке, как убил бы его сбой сервера; без неё — работает, пока его не остановят (SIGTERM).
 // `REMONTNIK_TEST_STOP_BEFORE_CRASH` — перед смертью владелец жмёт стоп-кран; `REMONTNIK_TEST_BROWSER` — у врача есть
-// браузер, и диагноз начинается со страницы, где нужна проверка человеком.
+// браузер, и диагноз начинается со страницы, где нужна проверка человеком. С `paseoBridgeUrl` в мире — режим
+// «сначала Paseo»: случай уходит подставному мосту стенда, адрес врача для моста — строкой `BRIDGE`.
 
 const world = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as ChildWorld
 const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
@@ -38,7 +42,7 @@ const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
 let faultAt = process.env.REMONTNIK_TEST_FAULT_AT
 const stopBeforeCrash = process.env.REMONTNIK_TEST_STOP_BEFORE_CRASH === '1'
 const withBrowser = process.env.REMONTNIK_TEST_BROWSER === '1'
-const knownPoints: readonly string[] = [...CRASH_POINTS, ROLLBACK_CRASH_POINT, BROWSER_CRASH_POINT]
+const knownPoints: readonly string[] = [...CRASH_POINTS, ROLLBACK_CRASH_POINT, BROWSER_CRASH_POINT, ...PASEO_CRASH_POINTS]
 if (crashAt && !knownPoints.includes(crashAt)) throw new Error(`нет такой точки падения: ${crashAt}`)
 const SITE = 'http://127.0.0.1:4100'
 
@@ -95,7 +99,10 @@ function fileBackedApp(): { commands: AppCommands; running: () => string | null;
     async health() {
       change((s) => s.calls.push('health'))
       healthCalls += 1
-      if (healthCalls === 2) crash('observing')
+      if (healthCalls === 2) {
+        crash('observing')
+        crash('paseo_observing')
+      }
       // Правка «делает хуже» во всём мире, где падают после отката: здоровье плохое, пока она работает.
       if (world.sickFix && read().previous !== null) return { ok: false, reason: 'health: 500' }
       return { ok: true }
@@ -164,6 +171,32 @@ function fileBackedBrowser(): BrowserClient {
       }
       if (command === 'read') return { ok: true, url: `${SITE}/cabinet`, snapshot: 'Кабинет: вход выполнен' }
       throw new Error(`неожиданная команда браузера ${command}`)
+    },
+  }
+}
+
+/** Клиент моста с точками падения: мост принял задачу, агент работает, отмена ещё не ушла. */
+function crashingBridge(client: PaseoBridgeClient): PaseoBridgeClient {
+  return {
+    async health() {
+      if ((await doctor?.caseBook.getCase(1))?.state === 'paseo_working') crash('paseo_working')
+      return client.health()
+    },
+    async sendTask(task) {
+      const sent = await client.sendTask(task)
+      if (sent && crashAt === 'handoff_sent') {
+        await printState()
+        crash('handoff_sent')
+      }
+      return sent
+    },
+    async cancel(taskId, reason) {
+      // Отчёт reclaimed уже записан: родитель видит его до смерти врача.
+      if (crashAt === 'before_cancel') {
+        await printState()
+        crash('before_cancel')
+      }
+      return client.cancel(taskId, reason)
     },
   }
 }
@@ -261,6 +294,14 @@ const config = testRemontnikConfig({
         },
       }
     : {}),
+  ...(world.paseoBridgeUrl
+    ? {
+        handoff: {
+          mode: 'paseo-first' as const,
+          paseo: { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 3_600_000, workTimeoutMs: 3_600_000 },
+        },
+      }
+    : {}),
 })
 let caseState: string | undefined
 let reportCount = 0
@@ -311,6 +352,13 @@ const service = await startDoctorService({
   listen: { host: '127.0.0.1', port: 0 },
   telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: world.telegramUrl },
   log: (line) => process.stderr.write(`${line}\n`),
+  ...(world.paseoBridgeUrl
+    ? {
+        reportsFeed: { bridge: { listen: { host: '127.0.0.1', port: 0 }, secret: BRIDGE_SECRET, appName: config.app.name } },
+        // Частые проверки: часы врача перескакивают только на время пробуждения, сроки агента далеко.
+        paseoBridge: { client: crashingBridge(createPaseoBridgeClient({ url: world.paseoBridgeUrl, secret: BRIDGE_SECRET, appName: config.app.name })), pollMs: 200 },
+      }
+    : {}),
   now: clock.now,
   onWake: clock.onWake,
   treatment: {
@@ -330,6 +378,7 @@ const service = await startDoctorService({
 
 doctor = service
 process.stdout.write(`URL ${service.url}\n`)
+if (service.bridgeUrl) process.stdout.write(`BRIDGE ${service.bridgeUrl}\n`)
 process.on('SIGTERM', () => {
   void service.close().then(() => process.exit(0))
 })

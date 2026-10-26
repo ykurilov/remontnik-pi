@@ -9,7 +9,8 @@ import { copyRecord } from '../../src/records/index.js'
 import { seedDoctorRecords } from '../../src/testing/doctor-records.js'
 import { workbenchPath } from '../../src/workbench/index.js'
 import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
-import { BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState, type FakeBrowserState } from './world.js'
+import { startFakePaseoBridge, type FakePaseoBridge } from '../../src/testing/fake-paseo-bridge.js'
+import { BRIDGE_SECRET, BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState, type FakeBrowserState } from './world.js'
 
 // Стенд падений (T081): врач идёт отдельным процессом (`doctor-child.ts`), его убивают в заданной точке
 // (`REMONTNIK_TEST_CRASH_AT`) и запускают снова на тех же записях, git и приложении. Итог читается после остановки.
@@ -18,7 +19,7 @@ const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
 const loader = join(repoRoot, 'scripts/source-loader/register.mjs')
 const childEntry = fileURLToPath(new URL('./doctor-child.ts', import.meta.url))
 
-export const FINAL_STATES = ['healed', 'rolled_back', 'not_helped', 'report_only', 'needs_human', 'no_cause_found', 'stand_broken']
+export const FINAL_STATES = ['healed', 'healed_by_paseo', 'rolled_back', 'not_helped', 'report_only', 'needs_human', 'no_cause_found', 'stand_broken']
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } }).trim()
@@ -30,6 +31,8 @@ export interface CrashWorld extends ChildWorld {
   base: string
   worldPath: string
   telegram: FakeTelegramServer
+  /** Подставной мост Paseo, если мир в режиме «сначала Paseo». */
+  bridge?: FakePaseoBridge
   appState(): FakeAppState
   editAppState(edit: (state: FakeAppState) => void): void
   browserState(): FakeBrowserState
@@ -49,7 +52,7 @@ function editJson<T>(path: string, edit: (state: T) => void): void {
 }
 
 /** Репозиторий приложения с ошибкой, подставное приложение на прежней версии и подставной Telegram. */
-export async function createCrashWorld(options: { sickFix?: boolean } = {}): Promise<CrashWorld> {
+export async function createCrashWorld(options: { sickFix?: boolean; paseo?: boolean } = {}): Promise<CrashWorld> {
   const root = mkdtempSync(join(tmpdir(), 'remontnik-crash-'))
   const origin = join(root, 'origin.git')
   const repoDir = join(root, 'main')
@@ -67,6 +70,7 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
   git(repoDir, 'push', 'origin', 'main')
   const base = git(repoDir, 'rev-parse', 'HEAD')
   const telegram = await startFakeTelegram()
+  const bridge = options.paseo ? await startFakePaseoBridge({ secret: BRIDGE_SECRET, appName: 'test-app' }) : undefined
   const worktreesDir = join(root, 'worktrees')
   const world: ChildWorld = {
     repoDir,
@@ -79,6 +83,7 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
     clockPath: join(root, 'clock-offset'),
     browserStatePath: join(root, 'browser.json'),
     sickFix: options.sickFix ?? false,
+    ...(bridge ? { paseoBridgeUrl: bridge.url } : {}),
   }
   const initial: FakeAppState = { running: base, previous: null, candidate: null, promotes: 0, rollbacks: 0, calls: [] }
   writeFileSync(world.appStatePath, JSON.stringify(initial))
@@ -92,6 +97,7 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
     base,
     worldPath,
     telegram,
+    ...(bridge ? { bridge } : {}),
     appState: () => readJson<FakeAppState>(world.appStatePath),
     editAppState: (edit) => editJson(world.appStatePath, edit),
     browserState: () => readJson<FakeBrowserState>(world.browserStatePath),
@@ -109,6 +115,7 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
     },
     async close() {
       await telegram.close()
+      await bridge?.close()
       rmSync(root, { recursive: true, force: true })
     },
   }
@@ -128,6 +135,8 @@ export interface DoctorProcess {
   states: ChildState[]
   /** Адрес врача, когда он запустился. */
   url(): Promise<string>
+  /** Адрес врача для моста Paseo. */
+  bridgeUrl(): Promise<string>
   /** Команда владельца `remontnik-doctor …` этому врачу. */
   command(argv: string[]): Promise<{ code: number; out: string; err: string }>
   output(): string
@@ -171,6 +180,7 @@ export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): Do
   })
   const states: ChildState[] = []
   let address: string | undefined
+  let bridgeAddress: string | undefined
   let output = ''
   let buffered = ''
   const waiters = new Set<() => void>()
@@ -184,6 +194,7 @@ export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): Do
       buffered = buffered.slice(newline + 1)
       if (line.startsWith('STATE ')) states.push(JSON.parse(line.slice(6)) as ChildState)
       if (line.startsWith('URL ')) address = line.slice(4)
+      if (line.startsWith('BRIDGE ')) bridgeAddress = line.slice(7)
     }
     for (const wake of waiters) wake()
   })
@@ -222,6 +233,7 @@ export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): Do
   return {
     states,
     url,
+    bridgeUrl: () => until(() => bridgeAddress, 'адрес врача для моста', 60_000),
     async command(argv) {
       const env = { REMONTNIK_DOCTOR_URL: await url(), REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }
       let out = ''
@@ -257,10 +269,17 @@ export interface CrashOutcome {
 export async function crashAndRestart(
   world: CrashWorld,
   crashAt: CrashPoint,
-  options: Omit<RunDoctorOptions, 'crashAt' | 'sendEvent'> & { whileDown?: () => void; afterRestart?: (doctor: DoctorProcess) => Promise<void> } = {},
+  options: Omit<RunDoctorOptions, 'crashAt' | 'sendEvent'> & {
+    /** Что делать с первым врачом, пока он жив (агент Paseo берёт случай и т. п.). */
+    whileUp?: (doctor: DoctorProcess) => Promise<void>
+    whileDown?: () => void
+    afterRestart?: (doctor: DoctorProcess) => Promise<void>
+  } = {},
 ): Promise<CrashOutcome> {
-  const { whileDown, afterRestart, ...run } = options
+  const { whileUp, whileDown, afterRestart, ...run } = options
   const first = runDoctor(world, { ...run, crashAt, sendEvent: true })
+  // Ошибка помощника не важна, если врач всё равно умер в точке: её видно по итогу ниже.
+  void whileUp?.(first).catch(() => {})
   const died = await Promise.race([
     first.exited,
     new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 60_000)),
