@@ -108,7 +108,7 @@ export function deployFactsOf(input: {
     attempts: input.attempts,
     spend: {
       modelUsd: modelSpentUsd(input.spendDay),
-      modelLimitUsd: input.limits.modelUsdPerDay,
+      modelLimitUsd: input.limits.doctorModelUsdPerDay,
       evalUsd: evalSpentUsd(input.spendDay),
       evalLimitUsd: input.limits.evalUsdPerDay,
     },

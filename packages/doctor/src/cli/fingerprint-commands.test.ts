@@ -2,7 +2,7 @@ import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { createIntakeHandler, startIntakeServer, type IntakeServer } from '../intake/index.js'
-import { readDeployAttempts, recordAutoDeployIn, recordRollbackIn } from '../ledgers/fingerprint-ledger.js'
+import { admitAutoDeployIn, readDeployAttempts, recordRollbackIn } from '../ledgers/fingerprint-ledger.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
 import { runDoctorCommand } from './run-doctor-command.js'
 
@@ -19,7 +19,7 @@ let server: IntakeServer
 beforeEach(async () => {
   store = createMemoryRecordStore()
   await store.transaction(async (tx) => {
-    await recordAutoDeployIn(tx, { fingerprint: FP, deploymentId: 1, at: Date.now() - 60_000, timeZone: 'UTC' })
+    await admitAutoDeployIn(tx, { fingerprint: FP, deploymentId: 1, at: Date.now() - 60_000, timeZone: 'UTC', limits })
     await recordRollbackIn(tx, { fingerprint: FP, deploymentId: 1, at: Date.now() })
   })
   server = await startIntakeServer({
@@ -102,6 +102,10 @@ describe('POST /v1/control/fingerprints', () => {
     expect(first.status).toBe(200)
     const again = await post({ fingerprint: FP, action: 'release', by: 'owner' }, OWNER, first.headers)
     expect(again).toMatchObject({ status: 401, body: { error: 'replayed' } })
+  })
+
+  it('секрет владельца совпадает с общим → обработчик не создаётся', () => {
+    expect(() => createFingerprintReleaseHandler({ records: store, secret: SHARED, controlSecret: SHARED })).toThrow(/совпадает с общим/)
   })
 
   it('тело не по контракту → 400', async () => {

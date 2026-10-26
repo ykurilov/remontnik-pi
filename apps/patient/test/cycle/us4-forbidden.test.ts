@@ -113,7 +113,6 @@ async function startDoctor(r: SickRepo, model: ScriptedModel): Promise<DoctorSer
       models: model.models,
       model: model.model,
       evalEnv: {},
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
     },

@@ -6,10 +6,10 @@ import { fileURLToPath } from 'node:url'
 import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import {
+  admitAutoDeployIn,
   createGitGuard,
   createLocalRunner,
   nextDayStartMs,
-  recordAutoDeployIn,
   recordRollbackIn,
   startDoctorService,
   type CaseState,
@@ -21,12 +21,13 @@ import patientConfig from '../../remontnik.config.ts'
 
 // История 7 на «Пациенте»: деньги и циклы под контролем.
 // Деньги: дневной потолок модели кончился — случай записан и отложен, владелец получил сообщение, в новые сутки
-// лечение продолжается с того же шага. Циклы: учёт выкаток по отпечатку (его пишет выкатка) не пускает правку
+// лечение продолжается с того же шага. Циклы: учёт выкаток по отпечатку (допуск в нём спрашивает выкатка) не пускает правку
 // после отката и сверх дневного предела — она ждёт в отчёте. Сам цикл «выкатка → откат» — после этапа выкатки.
 
 const patientRoot = fileURLToPath(new URL('../../', import.meta.url))
 const PATIENT_FILES = ['src/bugs.ts', 'src/bot/bot.ts', 'src/bot/fake-model.ts', 'src/bot/plans.ts', 'src/bot/tools.ts', 'eval/run-eval.ts']
 const PLANS = 'src/bot/plans.ts'
+const DEPLOY_LIMITS = { autoDeploysPerFingerprintPerDay: 2, autoDeploysPerDay: 5 }
 const BOT = 'src/bot/bot.ts'
 const NEW_TEST = 'test/default-plan.test.ts'
 const BOT_TEST = `import { test } from 'node:test'
@@ -84,19 +85,19 @@ function sickPatientRepo() {
 
 type SickRepo = ReturnType<typeof sickPatientRepo>
 
-/** Часы врача: с полудня 2 ноября по UTC; `toNextDay` — на начало следующих суток. */
+/** Часы врача: с полудня 2 ноября по UTC; `toNextDay` — на начало следующих суток, позже запаса продолжения (минута). */
 function doctorClock() {
   let shift = NOON - Date.now()
   const now = () => Date.now() + shift
   return {
     now,
     toNextDay() {
-      shift += nextDayStartMs(now(), 'UTC') - now() + 1_000
+      shift += nextDayStartMs(now(), 'UTC') - now() + 2 * 60_000
     },
   }
 }
 
-async function startDoctor(r: SickRepo, model: ScriptedModel, now: () => number, limits: { modelUsdPerDay?: number } = {}): Promise<DoctorService> {
+async function startDoctor(r: SickRepo, model: ScriptedModel, now: () => number, limits: { doctorModelUsdPerDay?: number } = {}): Promise<DoctorService> {
   const config = testRemontnikConfig({
     app: { name: 'patient', timeZone: 'UTC' },
     workbench: { image: 'node:22', install: 'true', bashTimeoutMs: 60_000 },
@@ -125,7 +126,6 @@ async function startDoctor(r: SickRepo, model: ScriptedModel, now: () => number,
       models: model.models,
       model: model.model,
       evalEnv: {},
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
     },
@@ -197,7 +197,7 @@ describe('история 7 на «Пациенте»: деньги', () => {
     })
     const model = createScriptedModel({ costPerResponseUsd: 0.2 })
     model.script(...healingScript(r))
-    const doctor = await startDoctor(r, model, doctorClock().now, { modelUsdPerDay: 1 })
+    const doctor = await startDoctor(r, model, doctorClock().now, { doctorModelUsdPerDay: 1 })
 
     await doctor.receiveEvents([priceCrash()])
     const deferred = await caseIn(doctor, ['deferred_budget'], (types) => types.includes('budget_reached'))
@@ -215,18 +215,18 @@ describe('история 7 на «Пациенте»: деньги', () => {
   it('потолок кончился посреди лечения → отложено; в новые сутки лечение продолжается и правка готова', async () => {
     const r = sickPatientRepo()
     const clock = doctorClock()
-    const model = createScriptedModel({ costPerResponseUsd: 0.2 })
+    const model = createScriptedModel({ costPerResponseUsd: 0.18 })
     model.script(...healingScript(r))
 
-    // Потолок 1 → работа до 0.9: пять ответов по 0.2 — диагноз и начало правки.
-    const today = await startDoctor(r, model, clock.now, { modelUsdPerDay: 1 })
+    // Потолок 1 → работа до 0.9: пять броней по 0.18 — диагноз и начало правки; на шестую денег нет.
+    const today = await startDoctor(r, model, clock.now, { doctorModelUsdPerDay: 1 })
     await today.receiveEvents([priceCrash()])
     await caseIn(today, ['deferred_budget'], (types) => types.includes('budget_reached'))
     expect(model.requests).toHaveLength(5)
     await cleanups.pop()!()
 
     clock.toNextDay()
-    const tomorrow = await startDoctor(r, model, clock.now, { modelUsdPerDay: 1 })
+    const tomorrow = await startDoctor(r, model, clock.now, { doctorModelUsdPerDay: 1 })
     const healed = await caseIn(tomorrow, FINAL)
 
     expect(healed.state).toBe('report_only')
@@ -253,7 +253,7 @@ describe('история 7 на «Пациенте»: циклы (учёт вы�
   it('правку по этому сбою уже откатывали → новая правка только отчётом, нужен человек', async () => {
     const fingerprint = priceCrash().fingerprint
     const report = await healWithLedger(async (tx) => {
-      await recordAutoDeployIn(tx, { fingerprint, deploymentId: 1, at: NOON - 3_600_000, timeZone: 'UTC' })
+      await admitAutoDeployIn(tx, { fingerprint, deploymentId: 1, at: NOON - 3_600_000, timeZone: 'UTC', limits: DEPLOY_LIMITS })
       await recordRollbackIn(tx, { fingerprint, deploymentId: 1, at: NOON - 3_000_000 })
     })
 
@@ -263,7 +263,7 @@ describe('история 7 на «Пациенте»: циклы (учёт вы�
 
   it('за сутки уже 5 автовыкаток → зелёная правка ждёт в отчёте', async () => {
     const report = await healWithLedger(async (tx) => {
-      for (let id = 1; id <= 5; id += 1) await recordAutoDeployIn(tx, { fingerprint: `other-${id}`, deploymentId: id, at: NOON - id * 600_000, timeZone: 'UTC' })
+      for (let id = 1; id <= 5; id += 1) await admitAutoDeployIn(tx, { fingerprint: `other-${id}`, deploymentId: id, at: NOON - id * 600_000, timeZone: 'UTC', limits: DEPLOY_LIMITS })
     })
 
     expect(report.type).toBe('fix_ready')

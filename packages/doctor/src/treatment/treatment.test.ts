@@ -16,6 +16,7 @@ import { testRemontnikConfig } from '../testing/config.js'
 import { callTool, callTools, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
 import { createLocalRunner, type CommandRunner } from '../workbench/index.js'
 import { DOCTOR_TOOL_NAMES } from './index.js'
+import { RESUME_MARGIN_MS } from './task.js'
 import { nextDayStartMs } from '../ledgers/spend-ledger.js'
 
 // Лечение целиком на маленьком репозитории: модель по сценарию, локальный исполнитель, настоящий git.
@@ -55,14 +56,14 @@ const MODEL_KEY = ['model', 'key', 'example', '0000', '0000'].join('-')
 const FINAL_STATES: CaseState[] = ['report_only', 'no_cause_found', 'stand_broken', 'needs_human']
 const NOON = Date.UTC(2026, 10, 2, 12)
 
-/** Часы врача: идут как настоящие, но с полудня 2 ноября по UTC; `toNextDay` переводит их на начало следующих суток. */
+/** Часы врача: идут как настоящие, но с полудня 2 ноября по UTC; `toNextDay` переводит их на начало следующих суток с запасом продолжения. */
 function doctorClock() {
   let shift = NOON - Date.now()
   const now = () => Date.now() + shift
   return {
     now,
     toNextDay() {
-      shift += nextDayStartMs(now(), 'UTC') - now() + 1_000
+      shift += nextDayStartMs(now(), 'UTC') - now() + RESUME_MARGIN_MS + 1_000
     },
   }
 }
@@ -106,7 +107,7 @@ function repo() {
 type Repo = ReturnType<typeof repo>
 
 interface DoctorOptions {
-  limits?: { diagnoseUsdPerCase?: number; modelUsdPerDay?: number; evalUsdPerDay?: number; evalUsdPerCase?: number }
+  limits?: { diagnoseUsdPerCase?: number; doctorModelUsdPerDay?: number; evalUsdPerDay?: number; evalUsdPerCase?: number }
   /** Проверки и карта eval приложения. */
   checks?: RemontnikConfigInput['checks']
   evalScope?: RemontnikConfigInput['evalScope']
@@ -117,6 +118,10 @@ interface DoctorOptions {
   treatment?: Partial<DoctorTreatmentOptions>
   /** Часы врача. */
   now?: () => number
+  /** Пояс приложения; по умолчанию UTC. */
+  timeZone?: string
+  /** Журнал врача. */
+  log?: (line: string) => void
 }
 
 function doctorGuard(r: Repo): GitGuard {
@@ -137,6 +142,7 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
     evalScope: options.evalScope ?? [],
     closedPaths: ['secret/**'],
     limits: { diagnoseUsdPerCase: 1, ...options.limits },
+    ...(options.timeZone ? { app: { ...base.app, timeZone: options.timeZone } } : {}),
     deploy: { ...base.deploy, commands: { ...base.deploy.commands, ...(options.current ? { current: options.current } : {}) } },
   })
   const guard = doctorGuard(r)
@@ -146,7 +152,7 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
     listen: { host: '127.0.0.1', port: 0 },
     telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: telegram.baseUrl },
     exit: () => {},
-    log: () => {},
+    log: options.log ?? (() => {}),
     ...(options.now ? { now: options.now } : {}),
     treatment: {
       guard: options.wrapGuard ? options.wrapGuard(guard) : guard,
@@ -154,7 +160,6 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
       worktreesDir: r.worktreesDir,
       models: model.models,
       model: model.model,
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
       ...options.treatment,
@@ -552,17 +557,17 @@ describe('лечение: задача remontnik.treatment', () => {
   it('дневной бюджет модели общий для случаев и переживает перезапуск: оба случая отложены до следующих суток', async () => {
     const r = repo()
     const clock = doctorClock()
-    const limits = { diagnoseUsdPerCase: 5, modelUsdPerDay: 0.5 }
-    const first = createScriptedModel({ costPerResponseUsd: 0.3 })
+    const limits = { diagnoseUsdPerCase: 5, doctorModelUsdPerDay: 0.5 }
+    const first = createScriptedModel({ costPerResponseUsd: 0.2 })
     first.script(...Array.from({ length: 40 }, () => callTool('bash', { command: 'true' })))
     const firstDoctor = await startDoctor(r, first, { limits, now: clock.now })
     await firstDoctor.receiveEvents([priceCrash()])
     expect((await settledCase(firstDoctor, ['deferred_budget'])).state).toBe('deferred_budget')
-    // Запас 10%: потолок 0.5, работа встаёт на 0.45 — после второго ответа по 0.3.
+    // Запас 10%: потолок 0.5, работать можно до 0.45 — два запроса по 0.2; на бронь третьего денег нет, он не уходит.
     expect(first.requests).toHaveLength(2)
     await cleanups.pop()!()
 
-    const second = createScriptedModel({ costPerResponseUsd: 0.3 })
+    const second = createScriptedModel({ costPerResponseUsd: 0.2 })
     second.script(...diagnosisSteps(), ...fixSteps())
     const doctor = await startDoctor(r, second, { limits, now: clock.now })
     await doctor.receiveEvents([priceCrash('нет тарифа basic')])
@@ -578,15 +583,14 @@ describe('лечение: задача remontnik.treatment', () => {
   it('дневной бюджет кончился посреди работы → случай отложен и продолжается в новые сутки с того же шага', async () => {
     const r = repo()
     const clock = doctorClock()
-    // Сверка по таймеру — раз в минуту: запрос сверх потолка держит проверка перед запросом и будит сверку.
-    const options = { limits: { diagnoseUsdPerCase: 5, modelUsdPerDay: 0.5 }, now: clock.now, treatment: { budgetPollMs: 60_000 } }
-    const model = createScriptedModel({ costPerResponseUsd: 0.2 })
+    const options = { limits: { diagnoseUsdPerCase: 5, doctorModelUsdPerDay: 0.5 }, now: clock.now }
+    const model = createScriptedModel({ costPerResponseUsd: 0.15 })
     model.script(...diagnosisSteps(), ...fixSteps())
 
     const firstDay = await startDoctor(r, model, options)
     await firstDay.receiveEvents([priceCrash()])
     await deferredCase(firstDay, 1)
-    // 0.2 + 0.2 < 0.45 — третий запрос ушёл; 0.6 — четвёртый уже нет.
+    // Работать можно до 0.45: три брони по 0.15 прошли, на четвёртую денег нет — запрос не ушёл.
     expect(model.requests).toHaveLength(3)
     await cleanups.pop()!()
 
@@ -608,6 +612,82 @@ describe('лечение: задача remontnik.treatment', () => {
     const types = (await thirdDay.reports.list({ after: 0, limit: 20 })).map((report) => report.type)
     expect(types.filter((type) => type === 'budget_reached')).toHaveLength(2)
     expect(types.at(-1)).not.toBe('no_cause_found')
+  }, 60_000)
+
+  it('падение посреди этапа после отложения: после перезапуска тот же запрос, без новой просьбы продолжить', async () => {
+    const r = repo()
+    const clock = doctorClock()
+    // Работать можно до 0.45: четыре запроса по 0.1 в сутки.
+    const options = { limits: { diagnoseUsdPerCase: 5, doctorModelUsdPerDay: 0.5 }, now: clock.now }
+    const first = createScriptedModel({ costPerResponseUsd: 0.1 })
+    first.script(...diagnosisSteps(), hang)
+    const firstDay = await startDoctor(r, first, options)
+    await firstDay.receiveEvents([priceCrash()])
+    await deferredCase(firstDay, 1)
+    expect(first.requests).toHaveLength(4)
+    await cleanups.pop()!()
+
+    // Новые сутки: просьба продолжить дописывает диагноз, первый запрос правки повисает — врач падает.
+    clock.toNextDay()
+    const secondDay = await startDoctor(r, first, options)
+    await settledCase(secondDay, ['fixing'])
+    const deadline = Date.now() + 10_000
+    while (first.pending() > 0) {
+      if (Date.now() > deadline) throw new Error('модель не дошла до правки')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    expect(first.requests).toHaveLength(6)
+    await cleanups.pop()!()
+
+    clock.toNextDay()
+    const second = createScriptedModel({ costPerResponseUsd: 0.1 })
+    second.script(...fixSteps())
+    const thirdDay = await startDoctor(r, second, options)
+    expect((await settledCase(thirdDay)).state).toBe('report_only')
+    // Ровно шаги правки: повисший запрос повторён тем же, лишнего платного запроса с просьбой продолжить нет.
+    expect(second.requests).toHaveLength(fixSteps().length)
+    const asked = second.requests[0]!.messages.filter((message) => message.role === 'user').map((message) => JSON.stringify(message.content))
+    expect(asked).toHaveLength(3)
+    expect(asked.filter((text) => text.includes('дневной бюджет'))).toHaveLength(1)
+    expect(asked.at(-1)).not.toContain('дневной бюджет')
+    const types = (await thirdDay.reports.list({ after: 0, limit: 20 })).map((report) => report.type)
+    expect(types).toEqual(['case_received', 'budget_reached', 'fix_ready'])
+  }, 60_000)
+
+  it('проснулся, а по поясу приложения всё те же сутки → снова отложен, но без второго отчёта', async () => {
+    const r = repo()
+    const clock = doctorClock()
+    // День уже наполовину истрачен другим случаем: сегодня случаю хватит на четыре запроса по 0.1.
+    await seedDoctorRecords(r.stateDir, async (tx) => {
+      ;(await tx.doc('spend', '2026-11-02', { model: {} as Record<string, number>, eval: {} })).model['99'] = 0.5
+    })
+    const limits = { diagnoseUsdPerCase: 5, doctorModelUsdPerDay: 1 }
+    const model = createScriptedModel({ costPerResponseUsd: 0.1 })
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const firstDay = await startDoctor(r, model, { limits, now: clock.now })
+    await firstDay.receiveEvents([priceCrash()])
+    await deferredCase(firstDay, 1)
+    expect(model.requests).toHaveLength(4)
+    await cleanups.pop()!()
+
+    // Начало суток по UTC, а пояс приложения сменили: в Лос-Анджелесе ещё 2 ноября, и его деньги кончились.
+    clock.toNextDay()
+    const log: string[] = []
+    const sameDay = await startDoctor(r, model, { limits, now: clock.now, timeZone: 'America/Los_Angeles', log: (line) => log.push(line) })
+    const deadline = Date.now() + 30_000
+    while (!log.some((line) => line.includes('не отправлен (случай 1)'))) {
+      if (Date.now() > deadline) throw new Error('запрос не упёрся в потолок')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    expect((await settledCase(sameDay, ['deferred_budget'])).state).toBe('deferred_budget')
+    expect(model.requests).toHaveLength(4)
+    await cleanups.pop()!()
+
+    clock.toNextDay()
+    const nextDay = await startDoctor(r, model, { limits, now: clock.now, timeZone: 'America/Los_Angeles' })
+    expect((await settledCase(nextDay)).state).toBe('report_only')
+    const types = (await nextDay.reports.list({ after: 0, limit: 20 })).map((report) => report.type)
+    expect(types.filter((type) => type === 'budget_reached')).toHaveLength(1)
   }, 60_000)
 
   it('плохой ответ: выдержка — данными после вычистки; правку нечем проверить по карте → eval не запускался, не готово', async () => {

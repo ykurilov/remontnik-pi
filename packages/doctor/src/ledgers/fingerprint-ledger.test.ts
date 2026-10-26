@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { decideDeploy } from '../deploy-gate/index.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
 import {
+  admitAutoDeployIn,
   readDeployAttempts,
-  recordAutoDeployIn,
   recordRollbackIn,
   releaseFingerprint,
   type DeployAttemptLimits,
@@ -16,7 +16,8 @@ const limits: DeployAttemptLimits = { autoDeploysPerFingerprintPerDay: 2, autoDe
 const noon = Date.UTC(2026, 10, 2, 12)
 
 async function deploy(store: RecordStore, fingerprint: string, deploymentId: number, at: number, timeZone = 'UTC') {
-  await store.transaction((tx) => recordAutoDeployIn(tx, { fingerprint, deploymentId, at, timeZone }))
+  const admitted = await store.transaction((tx) => admitAutoDeployIn(tx, { fingerprint, deploymentId, at, timeZone, limits }))
+  expect(admitted).toEqual({ admitted: true })
 }
 
 async function attempts(store: RecordStore, fingerprint: string, now: number, timeZone = 'UTC') {
@@ -106,6 +107,41 @@ describe('учёт попыток выкатки', () => {
     await deploy(store, 'fp-a', 99, noon)
     const ledger = await store.read<{ fingerprints: Record<string, { autoDeploys: unknown[] }> }>('ledger', 'main')
     expect(ledger?.fingerprints['fp-a']?.autoDeploys.length).toBeLessThanOrEqual(2)
+  })
+})
+
+describe('допуск автовыкатки: проверить и записать одной транзакцией', () => {
+  it('при 4 из 5 за сутки два случая просят разом → проходит ровно один', async () => {
+    const store = createMemoryRecordStore()
+    for (let id = 1; id <= 4; id += 1) await deploy(store, `fp-${id}`, id, noon - id * 60_000)
+    const both = await Promise.all(
+      ['fp-a', 'fp-b'].map((fingerprint, index) =>
+        store.transaction((tx) => admitAutoDeployIn(tx, { fingerprint, deploymentId: 10 + index, at: noon, timeZone: 'UTC', limits })),
+      ),
+    )
+    expect(both.filter((answer) => answer.admitted)).toHaveLength(1)
+    expect(both.find((answer) => !answer.admitted)).toEqual({ admitted: false, reasons: ['attempts_exhausted'] })
+    expect((await attempts(store, 'fp-c', noon)).autoDeploysToday).toBe(5)
+  })
+
+  it('отказ — с причиной и без записи: предел по отпечатку, «нужен человек» после отката', async () => {
+    const store = createMemoryRecordStore()
+    await deploy(store, 'fp-a', 1, noon - 2 * HOUR)
+    await deploy(store, 'fp-a', 2, noon - HOUR)
+    const admit = (fingerprint: string, deploymentId: number) =>
+      store.transaction((tx) => admitAutoDeployIn(tx, { fingerprint, deploymentId, at: noon, timeZone: 'UTC', limits }))
+    expect(await admit('fp-a', 3)).toEqual({ admitted: false, reasons: ['attempts_exhausted'] })
+    await store.transaction((tx) => recordRollbackIn(tx, { fingerprint: 'fp-a', deploymentId: 2, at: noon }))
+    expect(await admit('fp-a', 3)).toEqual({ admitted: false, reasons: ['attempts_exhausted', 'needs_human_after_rollback'] })
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 2, autoDeploysToday: 2 })
+  })
+
+  it('повтор той же выкатки после перезапуска пропускается, даже когда предел уже выбран', async () => {
+    const store = createMemoryRecordStore()
+    await deploy(store, 'fp-a', 1, noon - HOUR)
+    await deploy(store, 'fp-a', 2, noon - 30_000)
+    await deploy(store, 'fp-a', 2, noon)
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 2, autoDeploysToday: 2 })
   })
 })
 

@@ -19,11 +19,12 @@ export {
 } from './treatment/index.js'
 export {
   LEDGER,
+  admitAutoDeployIn,
   deployAttemptsOf,
   readDeployAttempts,
-  recordAutoDeployIn,
   recordRollbackIn,
   releaseFingerprint,
+  type AutoDeployAdmission,
   type DeployAttemptLimits,
   type FingerprintLedger,
 } from './ledgers/fingerprint-ledger.js'

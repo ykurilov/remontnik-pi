@@ -5,8 +5,9 @@ import { spendDayKey } from './spend-ledger.js'
 // Защита от циклов «правка → откат → правка» (FR-032, data-model: FingerprintLedger), документ `remontnik.ledger`.
 // Автовыкатки считаются по отпечатку и по приложению за сутки в поясе приложения. Откат правки помечает отпечаток
 // «нужен человек»: автоматических выкаток по нему нет, пока владелец не снимет пометку командой `fingerprint <fp> release`.
-// Выкатка только вызывает запись: `recordAutoDeployIn` перед выкаткой, `recordRollbackIn` после отката — в своих
-// транзакциях, повтор той же выкатки (фаза после перезапуска) не считается второй попыткой.
+// Выкатка спрашивает допуск `admitAutoDeployIn`: проверка пределов и запись попытки — одной транзакцией, поэтому два
+// случая разом не проходят оба на последнем свободном месте. `recordRollbackIn` — после отката. Повтор той же выкатки
+// (фаза после перезапуска) допускается и не считается второй попыткой.
 
 export const LEDGER = { collection: 'ledger', key: 'main' } as const
 
@@ -66,19 +67,32 @@ export async function readDeployAttempts(
   return deployAttemptsOf(await store.read<FingerprintLedger>(LEDGER.collection, LEDGER.key), input)
 }
 
-/** Автовыкатка по отпечатку началась. Повтор той же выкатки ничего не меняет. */
-export async function recordAutoDeployIn(
+export type AutoDeployRefusal = 'attempts_exhausted' | 'needs_human_after_rollback'
+export type AutoDeployAdmission = { admitted: true } | { admitted: false; reasons: AutoDeployRefusal[] }
+
+/**
+ * Допуск автовыкатки по отпечатку: те же правила, что у решения о выкатке, и запись попытки при допуске.
+ * Отказ ничего не пишет. Повтор той же выкатки допускается без второй записи.
+ */
+export async function admitAutoDeployIn(
   tx: RecordTransaction,
-  input: { fingerprint: string; deploymentId: number; at: number; timeZone: string },
-): Promise<void> {
+  input: { fingerprint: string; deploymentId: number; at: number; timeZone: string; limits: DeployAttemptLimits },
+): Promise<AutoDeployAdmission> {
   const ledger = await ledgerIn(tx)
+  const known = Object.hasOwn(ledger.fingerprints, input.fingerprint) ? ledger.fingerprints[input.fingerprint] : undefined
+  if (known?.autoDeploys.some((deploy) => deploy.deploymentId === input.deploymentId)) return { admitted: true }
+  const attempts = deployAttemptsOf(ledger, { fingerprint: input.fingerprint, now: input.at, timeZone: input.timeZone, limits: input.limits })
+  const reasons: AutoDeployRefusal[] = []
+  if (attempts.autoDeploysForFingerprint >= attempts.maxPerFingerprintPerDay || attempts.autoDeploysToday >= attempts.maxPerDay) reasons.push('attempts_exhausted')
+  if (attempts.needsHumanAfterRollback) reasons.push('needs_human_after_rollback')
+  if (reasons.length > 0) return { admitted: false, reasons }
   const record = recordFor(ledger, input.fingerprint)
-  if (record.autoDeploys.some((deploy) => deploy.deploymentId === input.deploymentId)) return
   // Сутки в любом поясе короче двух: всё старше уже не нужно ни одному счёту.
   record.autoDeploys = record.autoDeploys.filter((deploy) => input.at - Date.parse(deploy.at) < 2 * DAY_MS)
   record.autoDeploys.push({ at: new Date(input.at).toISOString(), deploymentId: input.deploymentId })
   const day = spendDayKey(input.at, input.timeZone)
   ledger.deploysToday = ledger.deploysToday.day === day ? { day, count: ledger.deploysToday.count + 1 } : { day, count: 1 }
+  return { admitted: true }
 }
 
 /** Правку по отпечатку откатили: дальше по нему только отчёты, пока человек не снимет пометку. */

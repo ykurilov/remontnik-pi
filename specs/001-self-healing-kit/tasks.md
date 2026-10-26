@@ -259,7 +259,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 - [X] T110 [P] [US7] Тест `packages/doctor/src/ledgers/fingerprint-ledger.test.ts`: 2 выкатки на отпечаток в сутки, 5 на приложение, «нужен человек» после отката, снятие командой
 - [X] T111 [P] [US7] Тест `packages/doctor/src/ledgers/spend-ledger.test.ts`: граница суток по поясу; запас 10%; блок обращения к модели; блок eval
-- [X] T112 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/`
+- [X] T112 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/` (допуск `admitAutoDeployIn` — проверить и записать одной транзакцией; **к выкатке пока не подключён**, подключает этап 6)
 - [X] T113 [US7] Учёт расходов через хуки `beforeRequest`/`afterResponse` и стоимость eval; `deferred_budget` с продолжением на следующие сутки через `sleepUntil` в `packages/doctor/src/ledgers/spend-ledger.ts`
 - [X] T114 [US7] Интеграционный тест `apps/patient/test/cycle/us7-loop.test.ts`: сценарии loop и budget (budget и допуск по учёту выкаток готовы; живой цикл «выкатка → откат» — после этапа выкатки)
 

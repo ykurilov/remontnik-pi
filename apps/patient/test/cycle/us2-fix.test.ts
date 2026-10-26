@@ -115,7 +115,6 @@ async function startDoctor(r: SickRepo, model: ScriptedModel, limits: { diagnose
       models: model.models,
       model: model.model,
       evalEnv: {},
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
     },

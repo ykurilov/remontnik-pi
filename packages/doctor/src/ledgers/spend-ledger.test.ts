@@ -5,14 +5,16 @@ import {
   closeInterruptedEval,
   emptySpendDay,
   evalSpentUsd,
-  modelDayTotalUsd,
-  modelBlock,
+  closeCaseEvalIn,
+  holdModelIn,
   modelSpentUsd,
+  settleModelHoldIn,
   nextDayStartMs,
   recordEvalObserved,
   settleEvalWithProxyFact,
   spendDayKey,
   waitingForEval,
+  type CaseSpend,
   type EvalReservation,
   type SpendDay,
   joinEvalQueueIn,
@@ -62,29 +64,67 @@ describe('граница суток', () => {
   })
 })
 
-describe('блок обращения к модели', () => {
-  const limits = { modelUsdPerDay: 5 }
+describe('бронь запроса к модели: потолок до запроса, а не после', () => {
+  const limits = { doctorModelUsdPerDay: 1 }
+  const dayKey = '2026-11-02'
+  const now = Date.UTC(2026, 10, 2, 12)
 
-  it('за день считается и то, что разговор случая потратил, но ещё не записано', () => {
-    const day: SpendDay = { model: { '1': 2, '2': 1 }, eval: {} }
-    expect(modelDayTotalUsd(day, { recordedModelUsd: 2 }, 2.5)).toBeCloseTo(3.5)
-    expect(modelDayTotalUsd(day, { recordedModelUsd: 2 }, 2)).toBeCloseTo(3)
-    expect(modelDayTotalUsd(undefined, undefined, 0.4)).toBeCloseTo(0.4)
+  function hold(store: RecordStore, input: { caseKey?: string; holdId: string; maxUsd: number; boot?: string; caseLimitUsd?: number }) {
+    return store.transaction((tx) =>
+      holdModelIn(tx, { dayKey, holdId: input.holdId, maxUsd: input.maxUsd, boot: input.boot ?? 'boot-a', now, limits, caseLimitUsd: input.caseLimitUsd ?? 5, ...(input.caseKey ? { caseKey: input.caseKey } : {}) }),
+    )
+  }
+
+  it('параллельные запросы разных случаев вместе не выходят за дневной потолок с запасом', async () => {
+    const store = createMemoryRecordStore()
+    const answers = await Promise.all(Array.from({ length: 6 }, (_, index) => hold(store, { caseKey: String(index + 1), holdId: `h${index}`, maxUsd: 0.2 })))
+    // Потолок 1, работать можно до 0.9: проходят 4 брони по 0.2.
+    expect(answers.filter((answer) => answer.held)).toHaveLength(4)
+    expect(answers.filter((answer) => !answer.held)).toEqual(Array.from({ length: 2 }, () => ({ held: false, block: 'day_budget' })))
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect(Object.values(day?.modelHolds ?? {}).reduce((sum, item) => sum + item.usd, 0)).toBeLessThanOrEqual(usableUsd(limits.doctorModelUsdPerDay) + 1e-9)
   })
 
-  it('запас 10%: модель останавливается на 90% дневного потолка', () => {
-    expect(modelBlock({ caseUsd: 0, caseLimitUsd: 1, dayUsd: 4.49, limits })).toBeUndefined()
-    expect(modelBlock({ caseUsd: 0, caseLimitUsd: 1, dayUsd: 4.5, limits })).toBe('day_budget')
+  it('итог ответа заменяет бронь: остаток возвращается, расход ложится на день и на случай', async () => {
+    const store = createMemoryRecordStore()
+    expect(await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.8 })).toEqual({ held: true })
+    expect(await hold(store, { caseKey: '2', holdId: 'h2', maxUsd: 0.2 })).toEqual({ held: false, block: 'day_budget' })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.1 }))
+    expect(await hold(store, { caseKey: '2', holdId: 'h2', maxUsd: 0.2 })).toEqual({ held: true })
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect(day?.model).toEqual({ '1': 0.1 })
+    expect(Object.keys(day?.modelHolds ?? {})).toEqual(['h2'])
+    expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.1)
   })
 
-  it('потолок случая — без запаса; день важнее случая', () => {
-    expect(modelBlock({ caseUsd: 0.99, caseLimitUsd: 1, dayUsd: 1, limits })).toBeUndefined()
-    expect(modelBlock({ caseUsd: 1, caseLimitUsd: 1, dayUsd: 1, limits })).toBe('budget')
-    expect(modelBlock({ caseUsd: 1, caseLimitUsd: 1, dayUsd: 4.6, limits })).toBe('day_budget')
+  it('денег на бронь нет → отказ; день исчерпан → отказ даже бесплатному запросу; нулевой потолок — модель не зовётся', async () => {
+    const store = createMemoryRecordStore()
+    await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.9 })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.9 }))
+    expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0 })).toEqual({ held: false, block: 'day_budget' })
+    const zero = await store.transaction((tx) => holdModelIn(tx, { dayKey: '2026-11-03', holdId: 'z', maxUsd: 0, boot: 'boot-a', now, limits: { doctorModelUsdPerDay: 0 }, caseLimitUsd: 5 }))
+    expect(zero).toEqual({ held: false, block: 'day_budget' })
   })
 
-  it('нулевой потолок дня — модель не зовётся вовсе', () => {
-    expect(modelBlock({ caseUsd: 0, caseLimitUsd: 1, dayUsd: 0, limits: { modelUsdPerDay: 0 } })).toBe('day_budget')
+  it('потолок случая — без запаса, по всему случаю; отказ помечен в учёте случая и снимается следующей бронью', async () => {
+    const store = createMemoryRecordStore()
+    expect(await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.3, caseLimitUsd: 0.5 })).toEqual({ held: true })
+    expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.3, caseLimitUsd: 0.5 })).toEqual({ held: false, block: 'budget' })
+    expect((await store.read<CaseSpend>('spend-case', '1'))?.refused).toBe('budget')
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.1 }))
+    expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.3, caseLimitUsd: 0.5 })).toEqual({ held: true })
+    expect((await store.read<CaseSpend>('spend-case', '1'))?.refused).toBeUndefined()
+  })
+
+  it('бронь прошлого запуска врача (упал посреди запроса) списывается целиком', async () => {
+    const store = createMemoryRecordStore()
+    await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.4, boot: 'boot-old' })
+    await hold(store, { holdId: 'h-free', maxUsd: 0.1, boot: 'boot-old' })
+    expect(await hold(store, { caseKey: '2', holdId: 'h2', maxUsd: 0.1 })).toEqual({ held: true })
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect(modelSpentUsd(day)).toBeCloseTo(0.5)
+    expect(Object.keys(day?.modelHolds ?? {})).toEqual(['h2'])
+    expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.4)
   })
 })
 
@@ -168,8 +208,8 @@ describe('бронь eval в записях: гонки и сбои', () => {
   const now = Date.UTC(2026, 10, 2, 12)
   const dayKey = '2026-11-02'
 
-  async function reserve(store: RecordStore, caseKey: string, at = now) {
-    return store.transaction((tx) => reserveEvalIn(tx, { dayKey, caseKey, now: at, limits }))
+  async function reserve(store: RecordStore, caseKey: string, at = now, boot = 'boot-a') {
+    return store.transaction((tx) => reserveEvalIn(tx, { dayKey, caseKey, now: at, boot, limits }))
   }
 
   it('два случая бронируют одновременно → вместе не больше дневного потолка с запасом, поровну', async () => {
@@ -212,6 +252,35 @@ describe('бронь eval в записях: гонки и сбои', () => {
     expect(day?.eval[before.id!]).toMatchObject({ actualUsd: 0.3 })
     // Прерванная бронь больше не держит деньги: 1.8 − 0.3 = 1.5, доля случая 1.
     expect(after.admission).toEqual({ kind: 'reserve', usd: 1 })
+  })
+
+  it('бронь чужого случая от прошлого запуска врача или старше двух часов закрывается, а не держит деньги вечно', async () => {
+    const store = createMemoryRecordStore()
+    await reserve(store, '1', now, 'boot-old')
+    await reserve(store, '2', now - 3 * HOUR)
+    expect((await reserve(store, '3', now)).admission).toEqual({ kind: 'reserve', usd: 1 })
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect([day?.eval['case-1-0']?.actualUsd, day?.eval['case-2-0']?.actualUsd]).toEqual([0, 0])
+  })
+
+  it('свежая бронь чужого случая этого запуска не трогается', async () => {
+    const store = createMemoryRecordStore()
+    await reserve(store, '1', now - HOUR)
+    await reserve(store, '3', now)
+    expect((await store.read<SpendDay>('spend', dayKey))?.eval['case-1-0']?.actualUsd).toBeUndefined()
+  })
+
+  it('задачу случая сняли → его открытые брони за сегодня и вчера закрыты, из очереди он ушёл', async () => {
+    const store = createMemoryRecordStore()
+    await store.transaction((tx) => reserveEvalIn(tx, { dayKey: '2026-11-01', caseKey: '1', now: now - 24 * HOUR, boot: 'boot-a', limits }))
+    await reserve(store, '1')
+    await reserve(store, '2')
+    await store.transaction((tx) => joinEvalQueueIn(tx, '1', now))
+    await store.transaction((tx) => closeCaseEvalIn(tx, { caseKey: '1', dayKeys: ['2026-11-01', dayKey] }))
+    expect((await store.read<SpendDay>('spend', '2026-11-01'))?.eval['case-1-0']?.actualUsd).toBe(0)
+    const day = await store.read<SpendDay>('spend', dayKey)
+    expect([day?.eval['case-1-0']?.actualUsd, day?.eval['case-2-0']?.actualUsd]).toEqual([0, undefined])
+    expect((await store.read<EvalQueue>('eval-queue', 'main'))?.waiting).toEqual({})
   })
 
   it('ушёл из очереди → его больше не ждут', async () => {

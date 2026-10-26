@@ -47,7 +47,7 @@ function openWatch(doctorUrl: string, usdPerDay = 1): Watch {
       primary: { baseUrl: model.baseUrl, apiKey: 'test-primary-key', model: 'deepseek-flash' },
       fallback: { baseUrl: model.baseUrl, apiKey: 'test-fallback-key', model: 'deepseek/deepseek-v4.1-flash-1017' },
     },
-    review: { botDescription: BOT_DESCRIPTION, places: BOT_PLACES, usdPerDay, summaryDelayMs: 150 },
+    review: { botDescription: BOT_DESCRIPTION, places: BOT_PLACES, limits: { watchModelUsdPerDay: usdPerDay }, summaryDelayMs: 150 },
   })
   cleanups.push(() => watch.close())
   return watch

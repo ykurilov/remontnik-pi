@@ -97,7 +97,7 @@ describe('факты для decideDeploy', () => {
     day.model['2'] = 2
     day.eval['case-1-0'] = { reservedUsd: 1, actualUsd: 0.4 }
     const result = facts(fixInSrc, checks(), day)
-    expect(result.spend).toEqual({ modelUsd: 5, modelLimitUsd: config.limits.modelUsdPerDay, evalUsd: 0.4, evalLimitUsd: config.limits.evalUsdPerDay })
+    expect(result.spend).toEqual({ modelUsd: 5, modelLimitUsd: config.limits.doctorModelUsdPerDay, evalUsd: 0.4, evalLimitUsd: config.limits.evalUsdPerDay })
     expect(decideDeploy(result).reasons.map((reason) => reason.code)).toEqual(['budget_exhausted'])
   })
 

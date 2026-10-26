@@ -1,8 +1,10 @@
 // Дневной расход врача (data-model: SpendLedger) — в записях, поэтому переживает перезапуск.
-// Модель и eval считаются отдельно: у каждого свой дневной потолок (`modelUsdPerDay`, `evalUsdPerDay`).
+// Модель и eval считаются отдельно: у каждого свой дневной потолок (`doctorModelUsdPerDay`, `evalUsdPerDay`).
 // Сутки — по поясу приложения (`app.timeZone`). Дневные потолки — с запасом 10% (R1): последняя секунда потока
 // может не попасть в учёт при падении, поэтому работа останавливается на 90% потолка.
-// Модель записывается по ходу разговора приращениями; перед каждым запросом к модели — проверка (`modelBlock`).
+// Модель — бронью до каждого запроса (`holdModelIn`): наибольшая цена запроса при длине ответа до предела модели.
+// Денег на бронь нет — запрос не уходит. После ответа бронь заменяется настоящей ценой (`settleModelHoldIn`).
+// Бронь прошлого запуска врача (упал посреди запроса) списывается целиком: ответ мог быть оплачен.
 // Eval — бронью до запуска и фактом после. Бронь — доля случая (`evalUsdPerCase`), не больше остатка дня, и остаток
 // делится поровну с другими случаями, которые сейчас ждут eval (`eval-queue`); ставится прямо перед запуском eval.
 // Факт даёт прокси модели: до отправки каждого запроса к поставщику он ждёт записи его брони, после ответа —
@@ -17,10 +19,24 @@ export interface SpendDay {
   model: Record<string, number>
   /** Брони eval по прогонам проверки. */
   eval: Record<string, EvalReservation>
+  /** Брони запросов к модели, которые ещё идут. */
+  modelHolds?: Record<string, ModelHold>
+}
+
+export interface ModelHold {
+  /** Случай; пусто — запрос не от разговора случая (например, сжатие): он считается только в день. */
+  caseKey: string
+  usd: number
+  /** Запуск врача, который сделал бронь. */
+  boot: string
+  at: number
 }
 
 export interface EvalReservation {
   reservedUsd: number
+  /** Запуск врача и время брони: бронь мёртвого запуска или слишком старая закрывается. */
+  boot?: string
+  reservedAt?: number
   /** Итог: бронь закрыта. */
   actualUsd?: number
   /** Расход по прокси, пока eval идёт. */
@@ -29,9 +45,11 @@ export interface EvalReservation {
   inFlightUsd?: number
 }
 
-/** Сколько модель уже записала по случаю: приращение к дню — это разница с новым итогом разговора. */
+/** Расход модели по случаю за всё лечение. */
 export interface CaseSpend {
-  recordedModelUsd: number
+  modelUsd: number
+  /** Последнюю бронь случая не пустили: почему. Снимается следующей удачной бронью. */
+  refused?: ModelBlock
 }
 
 /** Случаи, которые дошли до проверки и могут попросить eval: номер случая → с какого момента ждёт. */
@@ -52,6 +70,10 @@ export type EvalAdmission =
 export const SPEND_MARGIN = 0.1
 /** Отметка ожидания eval старше этого — случай уже не ждёт (упал или снят), его не считаем. */
 export const EVAL_WAITING_STALE_MS = 2 * 3_600_000
+/** Бронь eval старше этого — прогон точно не идёт (дольше eval не живёт): бронь закрывается. */
+export const EVAL_RESERVATION_STALE_MS = 2 * 3_600_000
+/** Ключ дня для запросов к модели не от случая. */
+const NO_CASE = '-'
 const USD_EPSILON = 1e-9
 const DAY_SEARCH_MS = 26 * 3_600_000
 
@@ -97,16 +119,73 @@ export function evalSpentUsd(day: SpendDay | undefined): number {
   return Object.values(day?.eval ?? {}).reduce((sum, item) => sum + (item.actualUsd ?? item.reservedUsd), 0)
 }
 
-/** Расход модели за день вместе с тем, что разговор случая уже потратил, но в день ещё не записано. */
-export function modelDayTotalUsd(day: SpendDay | undefined, recorded: CaseSpend | undefined, caseTotalUsd: number): number {
-  return modelSpentUsd(day) + Math.max(0, caseTotalUsd - (recorded?.recordedModelUsd ?? 0))
+/** Потолок расходов модели на случай. */
+export function caseLimitUsdOf(limits: { diagnoseUsdPerCase?: number | undefined; doctorModelUsdPerDay: number }): number {
+  return limits.diagnoseUsdPerCase ?? limits.doctorModelUsdPerDay
 }
 
-/** Можно ли модели ещё один запрос. Потолок случая — без запаса; дневной — с запасом и важнее случая. */
-export function modelBlock(input: { caseUsd: number; caseLimitUsd: number; dayUsd: number; limits: { modelUsdPerDay: number } }): ModelBlock | undefined {
-  const dayLimit = usableUsd(input.limits.modelUsdPerDay)
-  if (dayLimit <= 0 || input.dayUsd >= dayLimit - USD_EPSILON) return 'day_budget'
-  return input.caseUsd >= input.caseLimitUsd ? 'budget' : undefined
+function caseSpendIn(tx: RecordTransaction, caseKey: string): Promise<CaseSpend> {
+  return tx.doc<CaseSpend>('spend-case', caseKey, { modelUsd: 0 })
+}
+
+/** Не пройдёт ли ещё `addUsd` сверх потолка: уже исчерпан или вместе с новой бронью больше. */
+function exceeds(usedUsd: number, addUsd: number, limitUsd: number): boolean {
+  return limitUsd <= 0 || usedUsd >= limitUsd - USD_EPSILON || usedUsd + addUsd > limitUsd + USD_EPSILON
+}
+
+/**
+ * Бронь запроса к модели одной транзакцией. Дневной потолок — с запасом и важнее случая; потолок случая — без запаса
+ * и на всё лечение. Брони прошлого запуска врача сначала списываются целиком. Отказ ничего не бронирует.
+ */
+export async function holdModelIn(
+  tx: RecordTransaction,
+  input: {
+    dayKey: string
+    caseKey?: string
+    holdId: string
+    maxUsd: number
+    boot: string
+    now: number
+    caseLimitUsd: number
+    limits: { doctorModelUsdPerDay: number }
+  },
+): Promise<{ held: true } | { held: false; block: ModelBlock }> {
+  const day = await tx.doc<SpendDay>('spend', input.dayKey, emptySpendDay())
+  day.modelHolds ??= {}
+  // Черновик pi-durable: вложенное правится через документ — ссылка на только что присвоенный объект правок не запишет.
+  const holds = day.modelHolds
+  for (const [id, stale] of Object.entries(holds)) {
+    if (stale.boot === input.boot) continue
+    await chargeModelIn(tx, day, stale.caseKey, stale.usd)
+    delete holds[id]
+  }
+  const heldUsd = (caseKey?: string) => Object.values(holds).reduce((sum, item) => sum + (caseKey === undefined || item.caseKey === caseKey ? item.usd : 0), 0)
+  let block: ModelBlock | undefined
+  if (exceeds(modelSpentUsd(day) + heldUsd(), input.maxUsd, usableUsd(input.limits.doctorModelUsdPerDay))) block = 'day_budget'
+  const spend = input.caseKey === undefined ? undefined : await caseSpendIn(tx, input.caseKey)
+  if (!block && spend && exceeds(spend.modelUsd + heldUsd(input.caseKey), input.maxUsd, input.caseLimitUsd)) block = 'budget'
+  if (block) {
+    if (spend) spend.refused = block
+    return { held: false, block }
+  }
+  if (spend) delete spend.refused
+  holds[input.holdId] = { caseKey: input.caseKey ?? '', usd: input.maxUsd, boot: input.boot, at: input.now }
+  return { held: true }
+}
+
+/** Ответ пришёл (или запрос оборвался): бронь заменяется настоящей ценой. */
+export async function settleModelHoldIn(tx: RecordTransaction, input: { dayKey: string; holdId: string; actualUsd: number }): Promise<void> {
+  const day = await tx.doc<SpendDay>('spend', input.dayKey, emptySpendDay())
+  const hold = day.modelHolds?.[input.holdId]
+  if (!hold) return
+  delete day.modelHolds![input.holdId]
+  await chargeModelIn(tx, day, hold.caseKey, input.actualUsd)
+}
+
+async function chargeModelIn(tx: RecordTransaction, day: SpendDay, caseKey: string, usd: number): Promise<void> {
+  const key = caseKey === '' ? NO_CASE : caseKey
+  day.model[key] = (day.model[key] ?? 0) + usd
+  if (caseKey !== '') (await caseSpendIn(tx, caseKey)).modelUsd += usd
 }
 
 /** Сколько других случаев сейчас ждут eval. Свой и давно забытые не считаются. */
@@ -145,14 +224,19 @@ export async function leaveEvalQueueIn(tx: RecordTransaction, caseKey: string): 
 
 /**
  * Бронь eval случая одной транзакцией: брони его прогонов, прерванных перезапуском, закрываются фактом прокси,
- * остаток дня делится с ждущими. Не пустили — случай остаётся в очереди со свежей отметкой.
+ * как и чужие брони прошлого запуска врача или старше `EVAL_RESERVATION_STALE_MS`; остаток дня делится с ждущими.
+ * Не пустили — случай остаётся в очереди со свежей отметкой.
  */
 export async function reserveEvalIn(
   tx: RecordTransaction,
-  input: { dayKey: string; caseKey: string; now: number; limits: { evalUsdPerDay: number; evalUsdPerCase: number } },
+  input: { dayKey: string; caseKey: string; now: number; boot: string; limits: { evalUsdPerDay: number; evalUsdPerCase: number } },
 ): Promise<{ admission: EvalAdmission; id?: string }> {
   const day = await tx.doc<SpendDay>('spend', input.dayKey, emptySpendDay())
   const queue = await evalQueueIn(tx)
+  for (const item of Object.values(day.eval)) {
+    const dead = item.boot !== input.boot || input.now - (item.reservedAt ?? 0) > EVAL_RESERVATION_STALE_MS
+    if (dead) closeInterruptedEval(item)
+  }
   let attempt = 0
   for (; day.eval[`case-${input.caseKey}-${attempt}`]; attempt += 1) closeInterruptedEval(day.eval[`case-${input.caseKey}-${attempt}`]!)
   const admission = admitEval(day, input.limits, waitingForEval(queue, input.caseKey, input.now))
@@ -162,8 +246,17 @@ export async function reserveEvalIn(
   }
   if (Object.hasOwn(queue.waiting, input.caseKey)) delete queue.waiting[input.caseKey]
   const id = `case-${input.caseKey}-${attempt}`
-  day.eval[id] = { reservedUsd: admission.usd }
+  day.eval[id] = { reservedUsd: admission.usd, boot: input.boot, reservedAt: input.now }
   return { admission, id }
+}
+
+/** Задачу случая сняли: его открытые брони eval за эти дни закрываются фактом прокси, из очереди он уходит. */
+export async function closeCaseEvalIn(tx: RecordTransaction, input: { caseKey: string; dayKeys: string[] }): Promise<void> {
+  for (const dayKey of input.dayKeys) {
+    const day = await tx.doc<SpendDay>('spend', dayKey, emptySpendDay())
+    for (const [id, item] of Object.entries(day.eval)) if (id.startsWith(`case-${input.caseKey}-`)) closeInterruptedEval(item)
+  }
+  await leaveEvalQueueIn(tx, input.caseKey)
 }
 
 export function recordEvalObserved(item: EvalReservation, spend: EvalSpend): void {

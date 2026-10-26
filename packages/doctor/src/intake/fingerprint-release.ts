@@ -40,6 +40,8 @@ function parseCommand(body: string): { fingerprint: string; by: string } | undef
 export function createFingerprintReleaseHandler(options: FingerprintReleaseOptions): IntakeHandler {
   if (options.secret === '') throw new Error('[remontnik] общий секрет пуст')
   if (options.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
+  // Общий секрет есть у приложения: совпадение отдало бы ему право снимать «нужен человек».
+  if (options.controlSecret === options.secret) throw new Error('[remontnik] секрет владельца совпадает с общим секретом')
   const replayGuard = options.replayGuard ?? new ReplayGuard()
   const now = options.now ?? Date.now
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */

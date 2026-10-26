@@ -55,6 +55,11 @@ afterEach(async () => {
 })
 
 describe('каркас врача', () => {
+  it('секрет владельца совпадает с общим → врач не запускается и не открывает хранилище', async () => {
+    await expect(start({ controlSecret: secret })).rejects.toThrow(/совпадает с общим/)
+    expect(existsSync(join(stateDir, 'doctor.sqlite'))).toBe(false)
+  })
+
   it('открывает хранилище SQLite в папке состояния и отвечает на /health', async () => {
     const service = await start()
 
