@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { crashAndRestart, createCrashWorld, type CrashWorld, type DoctorProcess } from './crash-harness.js'
+import { STAND_BRIDGE_SILENCE_MS } from './world.js'
 
 // Врач падает посреди передачи случая агенту Paseo (T124): фазы передачи — чекпойнты, после перезапуска передача
 // продолжается. Мост не получает второго письма агенту, задача агента отменяется один раз, выкатку агента врач
@@ -12,6 +14,9 @@ async function agentGetsCase(world: CrashWorld, doctor: DoctorProcess): Promise<
 }
 
 const types = (reports: { type: string }[]) => reports.map((report) => report.type)
+
+/** Время по часам врача: сдвиг часов лежит в файле мира и переживает перезапуск. */
+const doctorNow = (world: CrashWorld) => Date.now() + Number(readFileSync(world.clockPath, 'utf8'))
 
 describe.concurrent('врач падает посреди передачи случая Paseo', () => {
   it('мост принял задачу, передача не записана → после перезапуска то же письмо, агент сделал — случай закрыт агентом', async ({ onTestFinished }) => {
@@ -97,5 +102,33 @@ describe.concurrent('врач падает посреди передачи сл�
     expect(world.bridge!.cancels).toHaveLength(1)
     expect(final.state).toBe('healed')
     expect(types(final.reports).filter((type) => type === 'reclaimed')).toHaveLength(1)
+  }, 180_000)
+  it('мост молчит → после перезапуска отсчёт молчания продолжается, а не начинается заново', async ({ onTestFinished }) => {
+    const world = await createCrashWorld({ paseo: true })
+    onTestFinished(() => world.close())
+    let restartAt = 0
+
+    const { final } = await crashAndRestart(world, 'bridge_silent', {
+      async whileUp(doctor) {
+        await agentGetsCase(world, doctor)
+        await world.bridge!.accept(1)
+        world.bridge!.health = 'down'
+      },
+      whileDown() {
+        // Врач пролежал почти всё молчание моста: забрать случай он должен вскоре после перезапуска.
+        world.advanceClock(STAND_BRIDGE_SILENCE_MS - 10_000)
+        restartAt = doctorNow(world)
+      },
+      async afterRestart(doctor) {
+        await doctor.waitForReport('reclaimed')
+        world.bridge!.health = 'up'
+      },
+    })
+
+    expect(final.state).toBe('healed')
+    const handoff = (await world.handoff(1))!
+    expect(handoff).toMatchObject({ owner: 'doctor', reclaimReason: 'bridge_unreachable', cancelSent: true })
+    expect(Date.parse(handoff.reclaimedAt!) - restartAt).toBeLessThan(STAND_BRIDGE_SILENCE_MS / 2)
+    expect(world.bridge!.cancels).toHaveLength(1)
   }, 180_000)
 })

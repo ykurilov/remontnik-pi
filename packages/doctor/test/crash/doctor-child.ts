@@ -23,6 +23,7 @@ import {
   PASEO_CRASH_POINTS,
   priceCrash,
   ROLLBACK_CRASH_POINT,
+  STAND_BRIDGE_SILENCE_MS,
   type ChildWorld,
   type CrashPoint,
   type FakeAppState,
@@ -175,12 +176,16 @@ function fileBackedBrowser(): BrowserClient {
   }
 }
 
-/** Клиент моста с точками падения: мост принял задачу, агент работает, отмена ещё не ушла. */
+/** Клиент моста с точками падения: мост принял задачу, агент работает, отмена ещё не ушла, мост молчит. */
 function crashingBridge(client: PaseoBridgeClient): PaseoBridgeClient {
+  let silentAnswers = 0
   return {
     async health() {
       if ((await doctor?.caseBook.getCase(1))?.state === 'paseo_working') crash('paseo_working')
-      return client.health()
+      const up = await client.health()
+      // Второй немой ответ: начало молчания записано при первом.
+      if (!up && (silentAnswers += 1) === 2) crash('bridge_silent')
+      return up
     },
     async sendTask(task) {
       const sent = await client.sendTask(task)
@@ -298,7 +303,7 @@ const config = testRemontnikConfig({
     ? {
         handoff: {
           mode: 'paseo-first' as const,
-          paseo: { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 3_600_000, workTimeoutMs: 3_600_000 },
+          paseo: { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 3_600_000, workTimeoutMs: 3_600_000, bridgeSilenceMs: STAND_BRIDGE_SILENCE_MS },
         },
       }
     : {}),

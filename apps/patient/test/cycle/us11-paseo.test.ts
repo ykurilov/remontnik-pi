@@ -444,6 +444,43 @@ describe('история 11 на «Пациенте»: сначала Paseo', ()
     expect(server(r).current).not.toBe(r.base)
   }, 120_000)
 
+  it('мост молчит, правка врача ждёт выкатки, агент выкатил свою → врач бросает свою выкатку и наблюдает версию агента', async () => {
+    const r = sickPatient()
+    const model = createScriptedModel()
+    model.script(...cure(r))
+    const clock = fakeClock()
+    const bridge = await startBridge()
+    const deployments: Deployment[] = []
+    const doctor = await startDoctor(r, model, clock, bridge, deployments)
+    const fix = agentFix(r, (plans) => plans.replace("DEFAULT_PLAN_ID = 'starter'", "DEFAULT_PLAN_ID = 'start'"))
+    let agentReported = false
+    clock.beforeWake = async () => {
+      const state = (await doctor.caseBook.getCase(1))?.state
+      if (state === 'handed_off') await bridge.accept(1)
+      if (state === 'paseo_working') bridge.health = 'down'
+      // Врач ждёт перед выкаткой: замок свободен, агент выкатывает и сообщает итог.
+      if (state === 'gated' && !agentReported) {
+        expect(agentDeploys(r, fix)).toBe(true)
+        expect(await bridge.done(1, { commit: fix.version, version: fix.version })).toEqual({ status: 200, body: { ok: true, late: true } })
+        agentReported = true
+      }
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const settled = await caseIn(doctor, SETTLED)
+
+    expect(agentReported).toBe(true)
+    expect(settled.state).toBe('healed_by_paseo')
+    expect(server(r)).toEqual({ current: fix.version, previous: r.base })
+    // Сборки врача не было: каждый шаг выкатки — наблюдение версии агента.
+    expect(deployments.length).toBeGreaterThan(0)
+    expect(deployments.every((deployment) => deployment.candidateVersion === fix.version)).toBe(true)
+    const handoff = (await doctor.handoffOf(1))!
+    expect(handoff).toMatchObject({ owner: 'doctor', reclaimReason: 'bridge_unreachable', lateResult: { kind: 'done', version: fix.version } })
+    expect(handoff.adoptedAt).toBeDefined()
+    expect(await reportTypes(doctor)).not.toContain('deployed')
+  }, 120_000)
+
   it('мост так и не вернулся → врач выкатывает свою правку только после срока работы агента', async () => {
     const r = sickPatient()
     const model = createScriptedModel()

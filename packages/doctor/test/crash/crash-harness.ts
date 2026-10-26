@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
+import { HANDOFF_COLLECTION, handoffKey, type Handoff } from '../../src/handoff/index.js'
 import { emptyFingerprintLedger, LEDGER, type FingerprintLedger } from '../../src/ledgers/fingerprint-ledger.js'
 import { copyRecord } from '../../src/records/index.js'
 import { seedDoctorRecords } from '../../src/testing/doctor-records.js'
@@ -40,6 +41,8 @@ export interface CrashWorld extends ChildWorld {
   /** Сдвинуть часы врача: столько времени прошло, пока он лежал. */
   advanceClock(ms: number): void
   ledger(): Promise<FingerprintLedger>
+  /** Документ передачи случая агенту Paseo; читать, когда врач остановлен. */
+  handoff(caseId: number): Promise<Handoff | undefined>
   close(): Promise<void>
 }
 
@@ -110,6 +113,14 @@ export async function createCrashWorld(options: { sickFix?: boolean; paseo?: boo
       let found = emptyFingerprintLedger()
       await seedDoctorRecords(world.stateDir, async (tx) => {
         found = copyRecord(await tx.doc<FingerprintLedger>(LEDGER.collection, LEDGER.key, emptyFingerprintLedger()))
+      })
+      return found
+    },
+    async handoff(caseId) {
+      let found: Handoff | undefined
+      await seedDoctorRecords(world.stateDir, async (tx) => {
+        const doc = await tx.doc<Handoff>(HANDOFF_COLLECTION, handoffKey(caseId), {} as Handoff)
+        found = doc.caseId === undefined ? undefined : copyRecord(doc)
       })
       return found
     },

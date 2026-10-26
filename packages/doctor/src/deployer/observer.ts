@@ -108,7 +108,7 @@ export async function readObservationTick(input: {
   at: Date
   /** С какого времени считать ошибки кандидата: с конца `promote`. */
   errorsFrom: Date
-  /** С какого времени повтор сбоя случая — «не помогло»; нет — с `errorsFrom`. */
+  /** С какого времени новые отпечатки и повтор сбоя случая; нет — с `errorsFrom`. */
   caseErrorsFrom?: Date
   baseline: ErrorBaseline
   caseFingerprint: string

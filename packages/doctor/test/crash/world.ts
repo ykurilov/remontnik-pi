@@ -27,14 +27,17 @@ export const ROLLBACK_CRASH_POINT = 'after_rollback'
 export const BROWSER_CRASH_POINT = 'browser_wait_human'
 /**
  * Режим «сначала Paseo»: мост принял задачу, а передача ещё не записана; агент работает; врач наблюдает выкатку агента;
- * врач забрал случай, а отменить задачу у моста не успел.
+ * врач забрал случай, а отменить задачу у моста не успел; мост молчит, а начало молчания уже записано.
  */
-export const PASEO_CRASH_POINTS = ['handoff_sent', 'paseo_working', 'paseo_observing', 'before_cancel'] as const
+export const PASEO_CRASH_POINTS = ['handoff_sent', 'paseo_working', 'paseo_observing', 'before_cancel', 'bridge_silent'] as const
 export type CrashPoint =
   | (typeof CRASH_POINTS)[number]
   | typeof ROLLBACK_CRASH_POINT
   | typeof BROWSER_CRASH_POINT
   | (typeof PASEO_CRASH_POINTS)[number]
+
+/** Сколько мост может молчать на стенде: минута по часам врача, а не 5 — опросов меньше. */
+export const STAND_BRIDGE_SILENCE_MS = 60_000
 
 /** Секрет моста Paseo на стенде. */
 export const BRIDGE_SECRET = 'bridge-test-secret'

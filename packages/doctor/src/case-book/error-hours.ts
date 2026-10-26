@@ -141,7 +141,8 @@ export async function readErrorBaseline(store: RecordStore, appName: string, at:
 
 /**
  * Что случилось с начала выкатки `from` до `to`. Время делится не меньше чем на минуту: одна ошибка в первые секунды —
- * не всплеск. Повтор сбоя случая — с `caseFrom`, если он позже `from`.
+ * не всплеск. Новые отпечатки и повтор сбоя случая — с `caseFrom`, если он позже `from`: до него мог работать прежний
+ * код, и его побочный сбой — не сбой новой версии.
  */
 export async function readErrorsSince(
   store: RecordStore,
@@ -160,7 +161,7 @@ export async function readErrorsSince(
     for (const [fingerprint, seen] of Object.entries(hour.fingerprints)) {
       const lastAt = Date.parse(seen.lastAt)
       if (fingerprint === window.caseFingerprint) caseFingerprintSeen ||= lastAt >= caseFrom
-      else if (lastAt >= window.from.getTime() && !known.has(fingerprint)) fresh.add(fingerprint)
+      else if (lastAt >= caseFrom && !known.has(fingerprint)) fresh.add(fingerprint)
     }
   }
   const elapsedHours = Math.max(to - from, MINUTE_MS) / HOUR_MS

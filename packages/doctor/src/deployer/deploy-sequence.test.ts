@@ -841,4 +841,19 @@ describe('чужая выкатка (adopt): врач наблюдает вык�
     await createCaseBook(after.records).recordEvents([caseEvent(START + MINUTE)])
     expect((await after.drive()).outcome).toBe('not_helped')
   })
+
+  it('новые сбои до отчёта агента — побочные сбои прежнего кода: не откат; после отчёта — откат new_fingerprints', async () => {
+    const sideEvents = (at: number) =>
+      ['a', 'b', 'c'].map((name) => createIncidentEvent({ appName: 'patient', kind: 'crash', where: `src/side-${name}.ts`, message: `побочный сбой ${name}`, occurredAt: new Date(at) }))
+    // Окно переходит через начало часа: сбои нового часа не попали в известные отпечатки уровня «до выкатки».
+    const adopt = { since: START - 3 * MINUTE, caseSince: START + 2 * MINUTE }
+
+    const before = rig({ app: adoptApp(), request: adopted(adopt) })
+    await createCaseBook(before.records).recordEvents(sideEvents(START + MINUTE))
+    expect((await before.drive()).outcome).toBe('holding')
+
+    const after = rig({ app: adoptApp(), request: adopted(adopt) })
+    await createCaseBook(after.records).recordEvents(sideEvents(START + 3 * MINUTE))
+    expect(await after.drive()).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'new_fingerprints' })
+  })
 })
