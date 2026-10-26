@@ -5,15 +5,27 @@
 //   $PATIENT_DEPLOY_ROOT/previous             ссылка на прежнюю версию (для отката)
 //   $PATIENT_DEPLOY_ROOT/candidate            ссылка на собранного кандидата
 //   $PATIENT_DEPLOY_ROOT/state.json           отметка «выкатка не подтверждена»
+//   $PATIENT_DEPLOY_ROOT/settings.json        настройки владельца, необязательно: { healthUrl, versionUrl, startTimeoutSeconds }
 //
 // Запуск: node deploy/remontnik-deploy.ts <build|promote|confirm|rollback|current|health>.
 // Перезапуск процесса «Пациента» после смены `current` — дело внешнего присмотра (systemd, pm2 и т. п.).
+// С versionUrl promote и rollback ждут, пока перезапущенный процесс ответит своей версией
+// (контракт: «promote 0 = кандидат работает»), не дольше startTimeoutSeconds (по умолчанию 60).
+// Адреса — в файле, а не в переменных: врач не передаёт командам выкатки переменные с URL в имени.
 import { cpSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { basename, join, relative, resolve, sep } from 'node:path'
 
 interface DeployState {
   unconfirmed: boolean
   rolledBackFrom?: string
+}
+
+interface DeploySettings {
+  /** Адрес проверки здоровья работающего приложения: 200 — здоров. */
+  healthUrl?: string
+  /** Адрес, по которому работающее приложение отвечает `{ version }`. */
+  versionUrl?: string
+  startTimeoutSeconds?: number
 }
 
 class DeployError extends Error {}
@@ -49,6 +61,16 @@ function pointLink(root: string, name: string, target: string): void {
 
 function removeLink(root: string, name: string): void {
   rmSync(join(root, name), { force: true })
+}
+
+function readSettings(root: string): DeploySettings {
+  const file = join(root, 'settings.json')
+  if (!existsSync(file)) return {}
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as DeploySettings
+  } catch (error) {
+    throw new DeployError(`${file} не читается: ${error instanceof Error ? error.message : String(error)}`)
+  }
 }
 
 function readState(root: string): DeployState {
@@ -97,7 +119,34 @@ function build(): string {
   return `собран кандидат ${version}`
 }
 
-function promote(): string {
+const DEFAULT_START_TIMEOUT_SECONDS = 60
+
+async function versionAnswered(url: string): Promise<string | null> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(5_000) })
+    if (response.status !== 200) return null
+    const body = (await response.json()) as { version?: unknown }
+    return typeof body.version === 'string' ? body.version : null
+  } catch {
+    return null
+  }
+}
+
+/** Ждёт, пока работающее приложение ответит нужной версией. Без versionUrl — сразу. */
+async function waitForRunningVersion(root: string, version: string): Promise<void> {
+  const { versionUrl: url, startTimeoutSeconds: seconds = DEFAULT_START_TIMEOUT_SECONDS } = readSettings(root)
+  if (!url) return
+  const deadline = Date.now() + seconds * 1000
+  let answered: string | null = null
+  while (Date.now() < deadline) {
+    answered = await versionAnswered(url)
+    if (answered === version) return
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  throw new DeployError(`${version} не заработала за ${seconds} с: ${url} отвечает ${answered === null ? 'ошибкой' : `версией ${answered}`}`)
+}
+
+async function promote(): Promise<string> {
   const root = deployRoot()
   const candidate = linkTarget(root, 'candidate')
   if (candidate === null || !existsSync(join(root, candidate))) throw new DeployError('нет собранного кандидата: сначала build')
@@ -106,6 +155,7 @@ function promote(): string {
   pointLink(root, 'current', candidate)
   removeLink(root, 'candidate')
   writeState(root, { unconfirmed: true })
+  await waitForRunningVersion(root, basename(candidate))
   return `работает ${basename(candidate)}`
 }
 
@@ -116,7 +166,7 @@ function confirm(): string {
   return 'выкатка подтверждена'
 }
 
-function rollback(): string {
+async function rollback(): Promise<string> {
   const root = deployRoot()
   const previous = linkTarget(root, 'previous')
   const running = versionOf(root, 'current')
@@ -128,6 +178,7 @@ function rollback(): string {
   pointLink(root, 'current', previous)
   removeLink(root, 'previous')
   writeState(root, { unconfirmed: false, ...(running ? { rolledBackFrom: running } : {}) })
+  await waitForRunningVersion(root, basename(previous))
   return `откат на ${basename(previous)}`
 }
 
@@ -142,7 +193,7 @@ async function health(): Promise<string> {
   if (version === null || !existsSync(join(root, 'current', 'release.json'))) {
     throw new DeployError('нездоров: нет работающей версии')
   }
-  const url = process.env.PATIENT_HEALTH_URL
+  const url = readSettings(root).healthUrl
   if (url) {
     const response = await fetch(url, { signal: AbortSignal.timeout(25_000) }).catch((error: unknown) => {
       throw new DeployError(`нездоров: ${url} недоступен (${error instanceof Error ? error.message : String(error)})`)

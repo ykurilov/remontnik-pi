@@ -67,10 +67,12 @@ pnpm --filter @ykurilov/remontnik-watch bench         # горячий путь:
 ## 6. Живая группа целиком
 
 ```bash
-pnpm test:live
+DEEPSEEK_API_KEY=… OPENROUTER_API_KEY=… pnpm test:live
 ```
 
 Docker-сборка врача, браузера и верстака; «Пациент» в контейнерах; настоящий DeepSeek. Ожидаемо: случай `crash` проходит от сбоя до `healed`, отчёты в подставном Telegram и в очереди Paseo (`remontnik-doctor reports pull`).
+
+Группа — все `packages/*/test/live/*.live.test.ts` (`vitest.live.config.ts`): шаблон compose на настоящем Docker, срок жизни верстака, качество чтения разговоров и цикл `crash` (`packages/doctor/test/live/crash-cycle.live.test.ts`). Нужна машина с Docker. Без Docker или ключей тесты пропускаются. В `pnpm verify` группа не входит: она платная. Потолок модели врача в настройке «Пациента» — $1 в сутки.
 
 ## 7. Подключение по инструкции
 
