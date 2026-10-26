@@ -15,6 +15,8 @@ export const PATIENT_BUGS = [
    * ломает сценарий eval с названным тарифом, который сейчас проходит.
    */
   'worsening_fix',
+  /** Бот выдумывает цену несуществующего тарифа «Макс»: падений нет, плохой ответ видно только при чтении разговора. */
+  'bad_answer',
 ] as const
 
 export type PatientBug = (typeof PATIENT_BUGS)[number]

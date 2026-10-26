@@ -82,6 +82,10 @@ export function formatIncidentAlert(
     `Отпечаток: ${event.fingerprint}`,
     '',
   ].join('\n')
-  const message = truncateForTelegram(event.message, Math.min(1500, TELEGRAM_MESSAGE_LIMIT - head.length))
+  const { badAnswer } = event
+  const text = badAnswer
+    ? `${event.message}\nОтвет бота: «${badAnswer.excerpt}»\nПочему плохо: ${badAnswer.explanation}\nРазговор: ${badAnswer.conversationId}`
+    : event.message
+  const message = truncateForTelegram(text, Math.min(1500, TELEGRAM_MESSAGE_LIMIT - head.length))
   return truncateForTelegram(`${head}${message}`)
 }

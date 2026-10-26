@@ -1,4 +1,5 @@
 import { defineRemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { BOT_DESCRIPTION } from './src/bot/description.ts'
 
 // Настройка Ремонтника для учебного «Пациента». Секретов здесь нет: только имена переменных окружения.
 export default defineRemontnikConfig({
@@ -37,5 +38,6 @@ export default defineRemontnikConfig({
     },
     lockFile: '.remontnik/deploy.lock',
   },
+  review: { botDescription: BOT_DESCRIPTION, usdPerDay: 0.5 },
   reports: { telegram: { botTokenEnv: 'PATIENT_ALERT_BOT_TOKEN', chatIdEnv: 'PATIENT_ALERT_CHAT_ID' } },
 })

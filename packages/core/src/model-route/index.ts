@@ -3,8 +3,8 @@ import { redactSecrets } from '../redact/index.js'
 // Путь к модели для сторожа: DeepSeek напрямую, при перегрузке или недоступности — OpenRouter.
 // Только `fetch` и OpenAI-совместимый протокол, ответ — объект JSON (R2).
 
-/** Модель основного пути (DeepSeek API). */
-export const PRIMARY_MODEL = 'deepseek-4.1-flash'
+/** Модель основного пути (DeepSeek API): у DeepSeek она называется `deepseek-flash`, проверено живым запросом. */
+export const PRIMARY_MODEL = 'deepseek-flash'
 /** Модель запасного пути (OpenRouter). */
 export const FALLBACK_MODEL = 'deepseek/deepseek-v4.1-flash-1017'
 

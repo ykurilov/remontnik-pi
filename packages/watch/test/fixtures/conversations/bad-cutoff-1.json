@@ -1,0 +1,16 @@
+{
+  "id": "bad-cutoff-1",
+  "label": "bad",
+  "category": "cutoff",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Что входит в тариф Про?"
+    },
+    {
+      "role": "assistant",
+      "content": "В тариф «Про» входят: до десяти проектов, поддержка в чате и"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "good-human-question",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Скажите, а вы человек или робот?"
+    },
+    {
+      "role": "assistant",
+      "content": "Я бот поддержки сервиса «Пациент». Спросите про тарифы или про ваш заказ."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "good-typos",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "скок стоит старт"
+    },
+    {
+      "role": "assistant",
+      "content": "Тариф «Старт» стоит 990 ₽ в месяц."
+    }
+  ]
+}

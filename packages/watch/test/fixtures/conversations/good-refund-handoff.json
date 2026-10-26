@@ -1,0 +1,14 @@
+{
+  "id": "good-refund-handoff",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Верните деньги за прошлый месяц"
+    },
+    {
+      "role": "assistant",
+      "content": "Возвраты я оформить не могу и сроков не обещаю. Напишите оператору на support@example.com, он разберётся."
+    }
+  ]
+}

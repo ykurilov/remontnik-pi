@@ -56,7 +56,7 @@ const hooks = agentChatWatchHooks(watch, { inner: appHooks, afterTurn: true }); 
 
 ```ts
 {
-  primary: { baseUrl?: string; apiKey: string; model: "deepseek-4.1-flash"; proxyToken?: string },
+  primary: { baseUrl?: string; apiKey: string; model: "deepseek-flash"; proxyToken?: string },
   fallback: { baseUrl?: string; apiKey: string; model: "deepseek/deepseek-v4.1-flash-1017"; proxyToken?: string },
   retryPrimaryAfterMs?: number, // 600_000
 }

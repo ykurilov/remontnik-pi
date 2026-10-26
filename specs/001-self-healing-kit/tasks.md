@@ -181,17 +181,17 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T073 [P] [US6] Выдуманный размеченный набор разговоров `packages/watch/test/fixtures/conversations/*.json` (хорошие и плохие по каждому виду: выдумка, грубость, выход из роли, пропущенный вопрос, обрыв, противоречие инструкции)
-- [ ] T074 [P] [US6] Тест очереди чтения `packages/watch/src/review/review-queue.test.ts`: бюджет на сутки по поясу настройки; `deferred_budget`; сводка «отложено N»
-- [ ] T075 [P] [US6] Тест рубрики `packages/watch/src/review/rubric.test.ts`: неизменный префикс байт в байт; личные данные замаскированы до модели; строгий разбор JSON; фильтр `minConfidence`; одинаковые отметки склеены
-- [ ] T076 [P] [US6] Живой тест качества `packages/watch/test/live/review-quality.live.test.ts`: ≥ 80% плохих найдено, ≤ 10% ложных
+- [X] T073 [P] [US6] Выдуманный размеченный набор разговоров `packages/watch/test/fixtures/conversations/*.json` (хорошие и плохие по каждому виду: выдумка, грубость, выход из роли, пропущенный вопрос, обрыв, противоречие инструкции)
+- [X] T074 [P] [US6] Тест очереди чтения `packages/watch/src/review/review-queue.test.ts`: бюджет на сутки по поясу настройки; `deferred_budget`; сводка «отложено N»
+- [X] T075 [P] [US6] Тест рубрики `packages/watch/src/review/rubric.test.ts`: неизменный префикс байт в байт; личные данные замаскированы до модели; строгий разбор JSON; фильтр `minConfidence`; одинаковые отметки склеены
+- [X] T076 [P] [US6] Живой тест качества `packages/watch/test/live/review-quality.live.test.ts`: ≥ 80% плохих найдено, ≤ 10% ложных
 
 ### Реализация
 
-- [ ] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
-- [ ] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
+- [X] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
+- [X] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
 - [ ] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
-- [ ] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
+- [X] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
 
 ---
 

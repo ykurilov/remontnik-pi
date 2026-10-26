@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { SESSION_COOKIE, createSessionStore } from './auth/sessions.ts'
 import { createBot } from './bot/bot.ts'
+import { createConversationLog, type FinishedConversation } from './bot/conversations.ts'
 import { ModelProviderError } from './bot/fake-model.ts'
 import type { ToolError } from './bot/tools.ts'
 import type { PatientBug } from './bugs.ts'
@@ -19,6 +20,10 @@ export interface PatientServerOptions {
   reportError?: (report: PatientErrorReport) => void
   /** Падение процесса при PATIENT_BUG=crash; в тестах подменяется. */
   crashProcess?: (error: Error) => void
+  /** Разговор закончился: пользователь ушёл (`POST /api/chat/finish`) или долго молчит. Сюда подключается сторож. */
+  conversationFinished?: (conversation: FinishedConversation) => void
+  /** Через сколько молчания разговор считается законченным; по умолчанию 30 минут. */
+  conversationIdleMs?: number
 }
 
 const MAX_BODY_BYTES = 64 * 1024
@@ -78,6 +83,11 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
     ...(options.crashProcess ? { crashProcess: options.crashProcess } : {}),
   })
 
+  const conversations = createConversationLog({
+    onFinished: options.conversationFinished ?? (() => {}),
+    ...(options.conversationIdleMs === undefined ? {} : { idleAfterMs: options.conversationIdleMs }),
+  })
+
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = new URL(request.url ?? '/', 'http://patient.invalid').pathname
     const key = `${request.method} ${path}`
@@ -110,22 +120,32 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
       case 'GET /chat':
         return sendHtml(response, chatPage(bug))
       case 'POST /api/chat': {
-        const { message } = await readJson(request)
+        const { message, conversationId } = await readJson(request)
         if (typeof message !== 'string' || message.trim() === '') throw new HttpError(400, 'пустое сообщение')
         try {
-          return sendJson(response, 200, { reply: await bot.reply(message) })
+          const reply = await bot.reply(message)
+          if (typeof conversationId === 'string' && conversationId !== '' && conversationId.length <= 64) {
+            conversations.record(conversationId, message, reply)
+          }
+          return sendJson(response, 200, { reply })
         } catch (error) {
           if (!(error instanceof ModelProviderError)) throw error
           reportError({ kind: 'model_error', error, model: error.model, provider: error.provider })
           return sendJson(response, 502, { error: 'модель недоступна, попробуйте позже' })
         }
       }
+      case 'POST /api/chat/finish': {
+        const { conversationId } = await readJson(request)
+        if (typeof conversationId !== 'string' || conversationId === '') throw new HttpError(400, 'нужен номер разговора')
+        if (!conversations.finish(conversationId)) return sendJson(response, 404, { error: 'разговор не найден' })
+        return sendJson(response, 200, { finished: true })
+      }
       default:
         return sendJson(response, 404, { error: 'не найдено' })
     }
   }
 
-  return createServer((request, response) => {
+  const server = createServer((request, response) => {
     route(request, response).catch((error: unknown) => {
       if (error instanceof HttpError) return sendJson(response, error.status, { error: error.message })
       const failure = error instanceof Error ? error : new Error(String(error))
@@ -133,4 +153,9 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
       if (!response.headersSent) sendJson(response, 500, { error: 'внутренняя ошибка' })
     })
   })
+  // Молчащие разговоры закрываются сами; таймер не держит процесс и уходит вместе с сервером.
+  const sweeper = setInterval(() => conversations.finishIdle(), 60_000)
+  sweeper.unref()
+  server.on('close', () => clearInterval(sweeper))
+  return server
 }

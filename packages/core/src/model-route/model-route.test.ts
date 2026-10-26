@@ -60,7 +60,7 @@ describe('createModelRoute', () => {
   })
 
   it('идентификаторы моделей — по одной константе на путь', () => {
-    expect(PRIMARY_MODEL).toBe('deepseek-4.1-flash')
+    expect(PRIMARY_MODEL).toBe('deepseek-flash')
     expect(FALLBACK_MODEL).toBe('deepseek/deepseek-v4.1-flash-1017')
   })
 

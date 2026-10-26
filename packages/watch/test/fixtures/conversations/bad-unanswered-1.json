@@ -1,0 +1,16 @@
+{
+  "id": "bad-unanswered-1",
+  "label": "bad",
+  "category": "unanswered_question",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Сколько стоит тариф Про?"
+    },
+    {
+      "role": "assistant",
+      "content": "Здравствуйте! Я бот сервиса «Пациент». Рад познакомиться и помогать вам каждый день."
+    }
+  ]
+}

@@ -1,14 +1,25 @@
+import { join } from 'node:path'
 import {
   createIncidentEvent,
   whereFromStack,
+  type BadAnswer,
   type IncidentContext,
   type IncidentEvent,
   type IncidentKind,
 } from '@ykurilov/remontnik-core/incident'
+import { createModelRoute, type ModelRoute, type ModelRouteOptions } from '@ykurilov/remontnik-core/model-route'
 import { signBody } from '@ykurilov/remontnik-core/signed-http'
 import { createTelegramClient, type TelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { createIncidentNotifier, formatIncidentAlert } from '../notify/index.js'
 import { openOutbox, type Outbox, type OutboxEntry, type OutboxStats } from '../outbox/index.js'
+import {
+  BAD_ANSWER_LABELS,
+  createConversationReviewer,
+  type ConversationReviewer,
+  type FinishedConversation,
+  type ReviewQueueStats,
+  type ReviewedFinding,
+} from '../review/index.js'
 
 // Сторож внутри приложения. Горячий путь — только синхронная запись в очередь на диске;
 // доставка врачу и тревога в Telegram идут позже, в фоне. Ошибки сторожа не роняют приложение:
@@ -31,6 +42,20 @@ export interface WatchOptions {
   }
   /** Корень приложения: от него считаются места в следах. По умолчанию — текущая папка. */
   appRoot?: string
+  /** Путь к модели для чтения разговоров (DeepSeek, запасной — OpenRouter). */
+  model?: ModelRouteOptions
+  /** Чтение законченных разговоров. Нужны и `review`, и `model`. */
+  review?: {
+    /** Что бот должен делать и чего не должен: по этому описанию модель судит ответы. */
+    botDescription: string
+    usdPerDay: number
+    /** Отметки с меньшей уверенностью случаями не становятся; по умолчанию 0.7. */
+    minConfidence?: number
+    /** Пояс для границы суток бюджета; по умолчанию UTC. */
+    timeZone?: string
+    /** Через сколько после первого отложенного разговора слать сводку «отложено N»; по умолчанию 5 минут. */
+    summaryDelayMs?: number
+  }
   /** Дополнительная вычистка личных данных приложения, поверх встроенной. */
   redact?: (text: string) => string
   /** Текущая версия приложения для отметки в событии; функция вызывается один раз при старте. */
@@ -54,6 +79,8 @@ export interface WatchStats {
   ownErrors: number
   /** Сколько разных отпечатков сторож помнит для склейки тревог. */
   fingerprints: number
+  /** Чтение разговоров; `null` — не настроено. */
+  review: ReviewQueueStats | null
 }
 
 /** Каталог моделей Agent Chat SDK в той мере, в какой он нужен сторожу. */
@@ -68,6 +95,11 @@ export interface Watch {
   installProcessHandlers(): void
   /** Тот же каталог моделей, но ошибки обращений к моделям становятся случаями `model_error`. */
   wrapModelCatalog<C extends ModelCatalogLike>(catalog: C): C
+  /**
+   * Ставит законченный разговор в очередь чтения. Не ждёт сети и не бросает: модель вызывается в фоне,
+   * в пределах суточного бюджета. Плохие ответы становятся случаями `bad_answer`.
+   */
+  conversationFinished(conversation: FinishedConversation): void
   /** Немедленно пробует доставить всё ожидающее. `true` — очередь пуста и тревоги отправлены. */
   flush(timeoutMs: number): Promise<boolean>
   stats(): WatchStats
@@ -86,6 +118,10 @@ const EMPTY_QUEUE_STATS: OutboxStats = {
   lost: 0,
   oldestPendingAt: null,
   nextAttemptAt: null,
+}
+
+function safeName(processName: string): string {
+  return processName.replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 64) || 'process'
 }
 
 /** Отмена запроса (пользователь нажал «Стоп») — не сбой. */
@@ -308,20 +344,28 @@ export function createWatch(options: WatchOptions): Watch {
     }
   }
 
-  function capture(error: unknown, captureOptions: CaptureOptions = {}): string {
+  /** Записывает событие в очередь и откладывает тревогу и доставку. Возвращает номер события; не бросает. */
+  function recordIncident(input: {
+    kind: IncidentKind
+    where: string
+    message: string
+    stack?: string
+    context?: IncidentContext
+    badAnswer?: BadAnswer
+  }): string {
     try {
-      const { message, stack } = errorParts(error)
-      const context: IncidentContext = { processName: options.processName, ...captureOptions.context }
+      const context: IncidentContext = { processName: options.processName, ...input.context }
       if (release !== undefined) context.release = release
       const event = createIncidentEvent(
         {
           appName: options.appName,
-          kind: captureOptions.kind ?? 'manual',
-          where: captureOptions.where ?? whereFromStack(stack, appRoot),
-          message,
-          stack,
+          kind: input.kind,
+          where: input.where,
+          message: input.message,
+          stack: input.stack ?? '',
           context,
           occurredAt: new Date(now()),
+          ...(input.badAnswer ? { badAnswer: input.badAnswer } : {}),
         },
         { knownSecrets, ...(options.redact ? { redact: options.redact } : {}) },
       )
@@ -346,6 +390,87 @@ export function createWatch(options: WatchOptions): Watch {
     } catch (captureError) {
       ownError('сбой не записан', captureError)
       return ''
+    }
+  }
+
+  function capture(error: unknown, captureOptions: CaptureOptions = {}): string {
+    try {
+      const { message, stack } = errorParts(error)
+      return recordIncident({
+        kind: captureOptions.kind ?? 'manual',
+        where: captureOptions.where ?? whereFromStack(stack, appRoot),
+        message,
+        stack,
+        ...(captureOptions.context ? { context: captureOptions.context } : {}),
+      })
+    } catch (captureError) {
+      ownError('сбой не записан', captureError)
+      return ''
+    }
+  }
+
+  /** Плохой ответ бота, найденный при чтении разговора. Отпечаток — вид нарушения и место в описании бота. */
+  function recordBadAnswer({ conversationId, meta, finding }: ReviewedFinding): void {
+    const chatId = typeof meta.chatId === 'string' ? meta.chatId : undefined
+    recordIncident({
+      kind: 'bad_answer',
+      where: finding.place,
+      message: `${BAD_ANSWER_LABELS[finding.category]}: ${finding.place}`,
+      ...(chatId === undefined ? {} : { context: { chatId } }),
+      badAnswer: {
+        conversationId,
+        messageIndex: finding.messageIndex,
+        category: finding.category,
+        excerpt: finding.excerpt,
+        explanation: finding.explanation,
+        confidence: finding.confidence,
+      },
+    })
+  }
+
+  /** Сообщение владельцу не про случай, а про работу сторожа (например, «отложено N»). */
+  function notifyOwner(text: string): void {
+    if (closed) return
+    const sending = (async () => {
+      try {
+        const chatId = await resolveChatId()
+        if (chatId !== null) await telegram.sendMessage(chatId, text)
+      } catch (error) {
+        ownError('сообщение владельцу не ушло', error)
+      }
+    })()
+    notifications.add(sending)
+    void sending.finally(() => notifications.delete(sending))
+  }
+
+  let reviewer: ConversationReviewer | null = null
+  let reviewMisconfigured = false
+  if (options.review) {
+    if (!options.model) {
+      reviewMisconfigured = true
+    } else {
+      try {
+        const route: ModelRoute = createModelRoute({ ...options.model, ...(options.model.fetch ? {} : { fetch: fetchImpl }) })
+        reviewer = createConversationReviewer({
+          botDescription: options.review.botDescription,
+          usdPerDay: options.review.usdPerDay,
+          ...(options.review.minConfidence === undefined ? {} : { minConfidence: options.review.minConfidence }),
+          ...(options.review.timeZone === undefined ? {} : { timeZone: options.review.timeZone }),
+          ...(options.review.summaryDelayMs === undefined ? {} : { summaryDelayMs: options.review.summaryDelayMs }),
+          model: route,
+          stateFile: join(options.dir, `review-${safeName(options.processName)}.json`),
+          now,
+          ...(options.redact ? { redact: options.redact } : {}),
+          onFinding: recordBadAnswer,
+          onDeferredSummary: (summary) =>
+            notifyOwner(
+              `🟡 ${options.appName}: чтение разговоров, отложено ${summary.deferred}. Суточный бюджет (${summary.usdPerDay} $) на сегодня исчерпан, остальные разговоры прочитаю завтра.`,
+            ),
+          onError: ownError,
+        })
+      } catch (error) {
+        ownError('чтение разговоров не запущено', error)
+      }
     }
   }
 
@@ -508,6 +633,17 @@ export function createWatch(options: WatchOptions): Watch {
         },
       })
     },
+    conversationFinished(conversation) {
+      try {
+        if (reviewer) reviewer.conversationFinished(conversation)
+        else if (reviewMisconfigured) {
+          reviewMisconfigured = false
+          ownError('чтение разговоров не работает: в настройке есть review, но нет model')
+        }
+      } catch (error) {
+        ownError('разговор не принят на чтение', error)
+      }
+    },
     async flush(timeoutMs) {
       try {
         const deadline = Date.now() + timeoutMs
@@ -538,10 +674,11 @@ export function createWatch(options: WatchOptions): Watch {
       } catch (error) {
         ownError('очередь не читается', error)
       }
-      return { queue, ownErrors, fingerprints: notifier.size() }
+      return { queue, ownErrors, fingerprints: notifier.size(), review: reviewer?.stats() ?? null }
     },
     close() {
       closed = true
+      reviewer?.close()
       if (deliveryTimer) clearTimeout(deliveryTimer)
       deliveryTimer = null
       for (const remove of removeProcessHandlers.splice(0)) remove()

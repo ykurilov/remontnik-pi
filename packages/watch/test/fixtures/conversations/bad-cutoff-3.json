@@ -1,0 +1,16 @@
+{
+  "id": "bad-cutoff-3",
+  "label": "bad",
+  "category": "cutoff",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Хочу оформить Старт, как это сделать?"
+    },
+    {
+      "role": "assistant",
+      "content": "Тариф «Старт» стоит 990 ₽ в месяц. Чтобы оформить подписку, вам нужно:"
+    }
+  ]
+}

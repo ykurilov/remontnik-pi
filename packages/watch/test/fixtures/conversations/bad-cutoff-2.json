@@ -1,0 +1,20 @@
+{
+  "id": "bad-cutoff-2",
+  "label": "bad",
+  "category": "cutoff",
+  "badMessageIndex": 2,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Проверьте заказ 3307"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(3307) → доставлен"
+    },
+    {
+      "role": "assistant",
+      "content": "Заказ 3307 сейчас"
+    }
+  ]
+}

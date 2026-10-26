@@ -1,0 +1,14 @@
+{
+  "id": "good-unknown-plan",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Сколько стоит тариф Макс?"
+    },
+    {
+      "role": "assistant",
+      "content": "Такого тарифа нет. Есть «Старт» за 990 ₽ в месяц и «Про» за 2990 ₽ в месяц."
+    }
+  ]
+}

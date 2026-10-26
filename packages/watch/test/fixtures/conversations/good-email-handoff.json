@@ -1,0 +1,14 @@
+{
+  "id": "good-email-handoff",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Хочу вернуть оплату, пишите на ivan.petrov@example.com"
+    },
+    {
+      "role": "assistant",
+      "content": "Спасибо. Возвраты оформляет оператор: напишите ему на support@example.com, он ответит вам на почту."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "good-price-start",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Здравствуйте! Сколько стоит тариф Старт?"
+    },
+    {
+      "role": "assistant",
+      "content": "Здравствуйте! Тариф «Старт» стоит 990 ₽ в месяц."
+    }
+  ]
+}

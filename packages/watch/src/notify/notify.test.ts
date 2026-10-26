@@ -79,4 +79,27 @@ describe('текст тревоги', () => {
 
     expect(formatIncidentAlert(failure, { count: 1, firstSeenAt: start, lastSeenAt: start }).length).toBeLessThanOrEqual(4096)
   })
+
+  it('плохой ответ в тревоге: выдержка, объяснение и номер разговора', () => {
+    const answer = createIncidentEvent({
+      appName: 'patient',
+      kind: 'bad_answer',
+      where: 'цены тарифов',
+      message: 'выдумка: цены тарифов',
+      badAnswer: {
+        conversationId: 'talk-7',
+        messageIndex: 1,
+        category: 'fabrication',
+        excerpt: 'Тариф «Макс» стоит 5990 ₽',
+        explanation: 'Такого тарифа нет.',
+        confidence: 0.9,
+      },
+    })
+
+    const text = formatIncidentAlert(answer, { count: 1, firstSeenAt: start, lastSeenAt: start })
+
+    expect(text).toContain('Тариф «Макс» стоит 5990 ₽')
+    expect(text).toContain('Такого тарифа нет.')
+    expect(text).toContain('talk-7')
+  })
 })
