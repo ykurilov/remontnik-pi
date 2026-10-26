@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdirSync, mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -31,12 +31,24 @@ export interface RunResult {
   /** Хвост общего вывода. */
   output: string
   spawnError?: string
+  /** Команду убить не удалось: она, возможно, ещё пишет в копию. Копия испорчена (`CommandRunner.spoiled`). */
+  stillRunning?: boolean
 }
 
 export interface CommandRunner {
   /** `container` — команда видит только свою копию; `none` — процесс на этой машине с правами врача. */
   readonly isolation: 'container' | 'none'
   run(command: string | readonly string[], options: RunOptions): Promise<RunResult>
+  /** В копии осталась неубитая команда: доверять копии нельзя, коммитить из неё и запускать в ней — тоже. */
+  spoiled(copyDir: string): boolean
+}
+
+/** Копия испорчена неубитой командой: случай останавливается, нужен человек. */
+export class SpoiledCopyError extends Error {
+  constructor(readonly copyDir: string) {
+    super(`команда в копии ${copyDir} не остановлена: копия испорчена`)
+    this.name = 'SpoiledCopyError'
+  }
 }
 
 const OUTPUT_TAIL_BYTES = 64 * 1024
@@ -48,12 +60,14 @@ interface SpawnSpec {
   env: Record<string, string>
 }
 
-function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0, onKill?: () => void): Promise<RunResult> {
+/** `onKill` — дополнительная остановка (контейнер по имени); итог ждёт её, `false` — команда, возможно, ещё идёт. */
+function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0, onKill?: () => Promise<boolean>): Promise<RunResult> {
   return new Promise((resolve) => {
     let output = ''
     let timedOut = false
     let aborted = false
     let settled = false
+    let killing: Promise<boolean> | undefined
     const append = (text: string, stream: 'stdout' | 'stderr') => {
       output += text
       if (output.length > OUTPUT_TAIL_BYTES * 2) output = output.slice(-OUTPUT_TAIL_BYTES)
@@ -70,7 +84,7 @@ function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0,
 
     const child = spawn(spec.file, spec.args, { cwd: spec.cwd, env: spec.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const kill = () => {
-      onKill?.()
+      killing ??= onKill?.()
       try {
         process.kill(-child.pid!, 'SIGKILL')
       } catch {
@@ -88,8 +102,9 @@ function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0,
     options.signal?.addEventListener('abort', onAbort, { once: true })
     child.stdout.setEncoding('utf8').on('data', (text: string) => append(text, 'stdout'))
     child.stderr.setEncoding('utf8').on('data', (text: string) => append(text, 'stderr'))
-    child.on('error', (error) => finish({ exitCode: null, timedOut, aborted, output, spawnError: error.message }))
-    child.on('close', (code) => finish({ exitCode: timedOut || aborted ? null : code, timedOut, aborted, output }))
+    const stopped = async (): Promise<Pick<RunResult, 'stillRunning'>> => ((await (killing ?? true)) ? {} : { stillRunning: true })
+    child.on('error', (error) => void stopped().then((still) => finish({ exitCode: null, timedOut, aborted, output, spawnError: error.message, ...still })))
+    child.on('close', (code) => void stopped().then((still) => finish({ exitCode: timedOut || aborted ? null : code, timedOut, aborted, output, ...still })))
   })
 }
 
@@ -128,6 +143,8 @@ export function createLocalRunner(runnerOptions: LocalRunnerOptions = {}): Comma
         options,
       )
     },
+    // Группа процессов убивается сигналом сразу: неубитой команды у локального исполнителя не бывает.
+    spoiled: () => false,
   }
 }
 
@@ -139,9 +156,12 @@ export interface DockerRunSpec {
   home: string
   workdir: string
   writableDirs: readonly string[]
-  env: Record<string, string>
   network: string
   user?: string
+  /** Файл переменных (`--env-file`): значения не видны в `ps` и аргументах клиента. */
+  envFile: string
+  memory: string
+  cpus: string
   command: string
 }
 
@@ -152,11 +172,23 @@ function bindMount(source: string, target: string): string[] {
   return ['--mount', `type=bind,source=${source},target=${target}`]
 }
 
-/** Аргументы `docker run` для одной команды: контейнер без прав, только копия, её HOME и разрешённые папки. */
-export function dockerRunArgs(spec: DockerRunSpec): string[] {
-  const env = Object.entries({ ...spec.env, HOME: CONTAINER_HOME }).flatMap(([name, value]) => ['-e', `${name}=${value}`])
+/** Содержимое файла переменных; перевод строки в значении он не передаст — такое значение отклоняется. */
+export function envFileText(env: Record<string, string>): string {
+  return Object.entries({ ...env, HOME: CONTAINER_HOME })
+    .map(([name, value]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || /[\r\n\0]/.test(value)) throw new Error(`переменную ${name} нельзя передать файлом окружения`)
+      return `${name}=${value}\n`
+    })
+    .join('')
+}
+
+/**
+ * Аргументы `docker create` для одной команды: контейнер без прав, с лимитами памяти и процессора, корневая система
+ * только для чтения; писать можно в копию, её HOME, разрешённые папки и `/tmp`.
+ */
+export function dockerCreateArgs(spec: DockerRunSpec): string[] {
   return [
-    'run',
+    'create',
     '--rm',
     '--name', spec.name,
     '--label', 'remontnik.workbench=1',
@@ -165,11 +197,16 @@ export function dockerRunArgs(spec: DockerRunSpec): string[] {
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--pids-limit', '1024',
+    '--memory', spec.memory,
+    '--memory-swap', spec.memory,
+    '--cpus', spec.cpus,
+    '--read-only',
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
     ...bindMount(spec.copyDir, spec.copyDir),
     ...bindMount(spec.home, CONTAINER_HOME),
     ...spec.writableDirs.flatMap((dir) => bindMount(dir, dir)),
     '-w', spec.workdir,
-    ...env,
+    '--env-file', spec.envFile,
     spec.image,
     'sh', '-c', spec.command,
   ]
@@ -188,13 +225,22 @@ export interface DockerRunnerOptions {
   network?: string
   /** Пользователь в контейнере; по умолчанию — тот же, что у врача, чтобы файлы копии оставались его. */
   user?: string
+  /** Лимит памяти контейнера (без подкачки). По умолчанию `4g`. */
+  memory?: string
+  /** Лимит процессора. По умолчанию `2`. */
+  cpus?: string
   docker?: string
 }
 
+const DOCKER_STEP_TIMEOUT_SECONDS = 120
+const DOCKER_KILL_TIMEOUT_SECONDS = 30
+
 /**
- * Исполнитель в контейнере: на каждую команду — `docker run --rm` с одной копией. Основного репозитория,
+ * Исполнитель в контейнере: на каждую команду — свой контейнер с одной копией. Основного репозитория,
  * его gitdir (указатель `.git` копии ведёт в никуда), окружения и файлов врача в контейнере нет.
- * По тайм-ауту контейнер убивается по имени (`docker kill`), а не только клиент `docker`.
+ * Контейнер создаётся (`docker create`) с файлом переменных 0600, файл сразу удаляется, затем `docker start --attach`.
+ * По тайм-ауту или отмене контейнер убивается по имени, и итог ждёт `docker kill`. Не убился — копия помечается
+ * испорченной (отметка рядом с её HOME переживает перезапуск врача), и команд в ней больше нет.
  */
 export function createDockerRunner(options: DockerRunnerOptions): CommandRunner {
   const docker = options.docker ?? 'docker'
@@ -204,36 +250,61 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
     ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
   }
+  const spoiledMark = (copyDir: string) => `${homeOf(options.homesDir, copyDir)}.spoiled`
+  const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
+  const dockerStep = (args: string[], cwd: string, timeoutSeconds: number, signal?: AbortSignal) =>
+    spawnWithTimeout({ file: docker, args, cwd, env: clientEnv }, { cwd, timeoutSeconds, ...(signal ? { signal } : {}) })
+
+  /** Убивает контейнер и проверяет, что он не идёт: `true` — остановлен или его уже нет. */
+  async function killContainer(name: string, cwd: string): Promise<boolean> {
+    await dockerStep(['kill', name], cwd, DOCKER_KILL_TIMEOUT_SECONDS)
+    const inspected = await dockerStep(['inspect', '--format', '{{.State.Running}}', name], cwd, DOCKER_KILL_TIMEOUT_SECONDS)
+    if (inspected.exitCode === 0) return inspected.output.trim() === 'false'
+    return inspected.exitCode !== null && /no such (object|container)/i.test(inspected.output)
+  }
+
   return {
     isolation: 'container',
-    run(command, runOptions) {
+    spoiled: (copyDir) => existsSync(spoiledMark(resolve(copyDir))),
+    async run(command, runOptions) {
       const copyDir = resolve(runOptions.copyDir ?? runOptions.cwd)
       const inCopy = relative(copyDir, resolve(runOptions.cwd))
-      if (inCopy.startsWith('..') || isAbsolute(inCopy)) {
-        return Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError: `папка ${runOptions.cwd} вне копии ${copyDir}` })
-      }
+      if (inCopy.startsWith('..') || isAbsolute(inCopy)) return failed(`папка ${runOptions.cwd} вне копии ${copyDir}`)
+      if (existsSync(spoiledMark(copyDir))) return failed(new SpoiledCopyError(copyDir).message)
       const name = `remontnik-${randomBytes(6).toString('hex')}`
-      let args: string[]
+      const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
+      const envFile = join(envDir, 'env')
+      let created: RunResult
       try {
-        args = dockerRunArgs({
+        writeFileSync(envFile, envFileText(runOptions.env ?? {}), { mode: 0o600 })
+        const args = dockerCreateArgs({
           name,
           image: options.image,
           copyDir,
           home: homeOf(options.homesDir, copyDir),
           workdir: resolve(runOptions.cwd),
           writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
-          env: runOptions.env ?? {},
           network: options.network ?? 'bridge',
           ...(user ? { user } : {}),
+          envFile,
+          memory: options.memory ?? '4g',
+          cpus: options.cpus ?? '2',
           command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
         })
+        created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
       } catch (error) {
-        return Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError: (error as Error).message })
+        return failed((error as Error).message)
+      } finally {
+        rmSync(envDir, { recursive: true, force: true })
       }
-      const killContainer = () => {
-        spawn(docker, ['kill', name], { env: clientEnv, stdio: 'ignore', detached: true }).on('error', () => {}).unref()
+      if (created.exitCode !== 0) {
+        return { ...created, exitCode: null, spawnError: created.spawnError ?? `контейнер не создан: ${created.output.trim().slice(-500)}` }
       }
-      return spawnWithTimeout({ file: docker, args, cwd: copyDir, env: clientEnv }, runOptions, 0, killContainer)
+      const result = await spawnWithTimeout({ file: docker, args: ['start', '--attach', name], cwd: copyDir, env: clientEnv }, runOptions, 0, () =>
+        killContainer(name, copyDir),
+      )
+      if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
+      return result
     },
   }
 }

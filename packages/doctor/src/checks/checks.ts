@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
-import type { CommandRunner, RunResult } from '../workbench/index.js'
+import { SpoiledCopyError, type CommandRunner, type RunResult } from '../workbench/index.js'
 import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 
 // Проверки правки (R5): установка, проверка типов, тесты и eval — обычным кодом, командами из настройки,
@@ -161,9 +161,11 @@ export function createChecks(options: ChecksOptions) {
     return redactSecrets(output, { knownSecrets: evalSecrets }).slice(-OUTPUT_TAIL_CHARS)
   }
 
-  /** Команда в копии `cwd`; писать вне копии можно только в `writableDirs`. */
-  function run(command: string, cwd: string, extra: { env?: Record<string, string>; writableDirs?: string[]; signal?: AbortSignal } = {}): Promise<RunResult> {
-    return options.runner.run(command, { cwd, copyDir: cwd, env: extra.env ?? {}, timeoutSeconds: options.timeoutSeconds, ...(extra.writableDirs ? { writableDirs: extra.writableDirs } : {}), ...(extra.signal ? { signal: extra.signal } : {}) })
+  /** Команда в копии `cwd`; писать вне копии можно только в `writableDirs`. Неубитая команда — копии и итогам не верим. */
+  async function run(command: string, cwd: string, extra: { env?: Record<string, string>; writableDirs?: string[]; signal?: AbortSignal } = {}): Promise<RunResult> {
+    const result = await options.runner.run(command, { cwd, copyDir: cwd, env: extra.env ?? {}, timeoutSeconds: options.timeoutSeconds, ...(extra.writableDirs ? { writableDirs: extra.writableDirs } : {}), ...(extra.signal ? { signal: extra.signal } : {}) })
+    if (result.stillRunning) throw new SpoiledCopyError(cwd)
+    return result
   }
 
   function readCostUsd(file: string): number | undefined {

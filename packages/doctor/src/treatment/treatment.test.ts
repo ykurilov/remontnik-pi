@@ -10,7 +10,7 @@ import { createGitGuard, type GitGuard } from '../git-guard/index.js'
 import { startDoctorService, type DoctorService, type DoctorTreatmentOptions } from '../service/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { callTool, callTools, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
-import { createLocalRunner } from '../workbench/index.js'
+import { createLocalRunner, type CommandRunner } from '../workbench/index.js'
 import { DOCTOR_TOOL_NAMES } from './index.js'
 
 // Лечение целиком на маленьком репозитории: модель по сценарию, локальный исполнитель, настоящий git.
@@ -394,6 +394,45 @@ describe('лечение: задача remontnik.treatment', () => {
     const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
     expect(report?.type).toBe('needs_human')
     expect(report?.short).toContain('верстак')
+  }, 60_000)
+
+  it('команду модели не удалось убить → копия испорчена: коммита нет, случай остановлен, нужен человек', async () => {
+    const r = repo()
+    const local = createLocalRunner()
+    const spoiled = new Set<string>()
+    const runner: CommandRunner = {
+      isolation: 'none',
+      spoiled: (copyDir) => spoiled.has(copyDir),
+      async run(command, options) {
+        if (String(command).includes('zombie')) {
+          spoiled.add(options.copyDir ?? options.cwd)
+          return { exitCode: null, timedOut: true, aborted: false, output: '', stillRunning: true }
+        }
+        return local.run(command, options)
+      },
+    }
+    let commits = 0
+    const model = createScriptedModel()
+    model.script(
+      ...diagnosisSteps(),
+      callTool('write', { path: 'src/price.mjs', content: FIXED }),
+      callTool('bash', { command: 'zombie --forever' }),
+      callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: [] }),
+    )
+    const doctor = await startDoctor(r, model, {
+      treatment: { runner },
+      wrapGuard: (guard) => ({ ...guard, commitAll: (...args) => ((commits += 1), guard.commitAll(...args)) }),
+    })
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('needs_human')
+    expect(commits).toBe(0)
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*')).toBe('')
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('needs_human')
+    expect(report?.short).toContain('не остановлена')
   }, 60_000)
 
   it('коммит правки есть, а commitAll вернул пусто (сбой между коммитом и памятью) → правка не теряется', async () => {

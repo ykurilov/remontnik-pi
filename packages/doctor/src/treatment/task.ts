@@ -23,7 +23,7 @@ import type { RecordStore, RecordTransaction } from '../records/index.js'
 import type { ReportType, Reports } from '../reports/index.js'
 import { causeFoundReport, fixReadyReport, needsHumanReport, noCauseFoundReport, standBrokenReport, type ReportText } from '../reports/texts.js'
 import { durableTxOf, recordFamilyOf, recordTransactionOver } from '../service/harness.js'
-import { createWorkbench, type CommandRunner } from '../workbench/index.js'
+import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
 import { findProtectedChanges } from './protected-changes.js'
 import { emptySpendDay, evalSpentUsd, modelSpentUsd, spendDayKey, type CaseSpend, type SpendDay } from './spend.js'
@@ -67,7 +67,7 @@ export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
   /** Почему нужен человек. */
-  why?: 'protected_paths' | 'escape' | 'eval_worse'
+  why?: 'protected_paths' | 'escape' | 'spoiled' | 'eval_worse'
   reportId: number
   branch?: string
   fixCommit?: string
@@ -83,6 +83,8 @@ export interface TreatmentDeps {
   /** Коммит рабочей версии (`deploy.commands.current`); `undefined` — узнать не удалось. */
   currentVersion(config: RemontnikConfig): Promise<string | undefined>
   model: { provider: string; modelId: string }
+  /** Исполнитель команд модели: знает, испорчена ли копия неубитой командой. */
+  workbenchRunner: Pick<CommandRunner, 'spoiled'>
   /** Исполнитель проверок (тесты, eval). */
   checksRunner: CommandRunner
   worktreesDir: string
@@ -283,16 +285,29 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     }, context)
   }
 
-  /** Git-замок нашёл подменённую копию: лечение останавливается, нужен человек. Остальные ошибки летят дальше. */
-  async function stopOnEscape(runtime: Runtime, caseId: number, treating: Treating, context: Context, work: () => Promise<void>): Promise<void> {
+  /**
+   * Верстаку больше нельзя верить: git-замок нашёл подменённую копию (`escape`) или команду не удалось убить
+   * (`SpoiledCopyError`). Лечение останавливается, нужен человек. Остальные ошибки летят дальше.
+   */
+  async function stopOnBrokenWorkbench(runtime: Runtime, caseId: number, treating: Treating, context: Context, work: () => Promise<void>): Promise<void> {
     try {
       await work()
     } catch (error) {
-      if (!(error instanceof GitGuardError && error.code === 'escape')) throw error
+      const reason =
+        error instanceof GitGuardError && error.code === 'escape'
+          ? ({ kind: 'escape', detail: error.message } as const)
+          : error instanceof SpoiledCopyError
+            ? ({ kind: 'spoiled', detail: error.message } as const)
+            : undefined
+      if (!reason) throw error
       const doc = await treatmentDoc(runtime, treating.conversationId, context)
-      const text = needsHumanReport({ case: doc.case, ...(doc.diagnosis ? { diagnosis: doc.diagnosis } : {}), reason: { kind: 'escape', detail: error.message } })
-      await finish(runtime, caseId, 'needs_human', 'needs_human', text, { outcome: 'needs_human', why: 'escape' }, context, treating.baseRunning)
+      const text = needsHumanReport({ case: doc.case, ...(doc.diagnosis ? { diagnosis: doc.diagnosis } : {}), reason })
+      await finish(runtime, caseId, 'needs_human', 'needs_human', text, { outcome: 'needs_human', why: reason.kind }, context, treating.baseRunning)
     }
+  }
+
+  function assertWorkbenchIntact(treating: Treating): void {
+    if (deps.workbenchRunner.spoiled(treating.worktreePath)) throw new SpoiledCopyError(treating.worktreePath)
   }
 
   const task = defineTask<TreatmentInput, TreatmentState, TreatmentResult>({
@@ -384,14 +399,17 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       fixing: async (task, runtime, context) => {
         const { caseId } = task.input
         const { diagnosis, phase: _phase, ...treating } = task.state.checkpoint
-        let doc = await treatmentDoc(runtime, treating.conversationId, context)
-        let run: { status: ConverseStatus } | undefined
-        if (!doc.fix) {
-          run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis), context)
-          doc = await treatmentDoc(runtime, treating.conversationId, context)
-        }
-        const fix = doc.fix
-        await stopOnEscape(runtime, caseId, treating, context, async () => {
+        await stopOnBrokenWorkbench(runtime, caseId, treating, context, async () => {
+          // Копия, испорченная ещё при диагнозе, — не работаем в ней дальше; испорченная правкой — не коммитим.
+          assertWorkbenchIntact(treating)
+          let doc = await treatmentDoc(runtime, treating.conversationId, context)
+          let run: { status: ConverseStatus } | undefined
+          if (!doc.fix) {
+            run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis), context)
+            doc = await treatmentDoc(runtime, treating.conversationId, context)
+          }
+          const fix = doc.fix
+          assertWorkbenchIntact(treating)
           let fixCommit: string | undefined
           if (fix) {
             // Сбой между коммитом и памятью: при повторе коммитить нечего, но коммит правки уже в ветке.
@@ -428,7 +446,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const config = await deps.loadConfig()
 
         let checks = (await runtime.memo<JsonValue>('checks', context)) as ChecksResult | undefined
-        if (!checks) {
+        if (!checks) await stopOnBrokenWorkbench(runtime, caseId, checkpoint, context, async () => {
           const reservation = await reserveEval(runtime, caseId, config, context)
           // Проверки идут в своих копиях на закоммиченной правке и на основе: мусор модели в верстаке им не мешает.
           const closed = (await deps.guard.listFiles(checkpoint.baseCommit)).filter((file) => matchesAnyMask(config.closedPaths, file))
@@ -458,7 +476,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             await deps.guard.removeWorktree(candidateDir).catch(() => {})
             await deps.guard.removeWorktree(baseDir).catch(() => {})
           }
-        }
+        })
+        // Копия проверки испорчена: отчёт уже записан.
+        if (!checks) return
 
         let pushed = true
         try {

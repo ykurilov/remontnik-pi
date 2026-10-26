@@ -175,6 +175,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       loadConfig: treatmentOptions.loadConfig,
       currentVersion: treatmentOptions.currentVersion ?? createCurrentVersionReader(treatmentOptions.guard.repoDir),
       model: treatmentOptions.model,
+      workbenchRunner: runners.runner,
       checksRunner: runners.checksRunner,
       worktreesDir: treatmentOptions.worktreesDir,
       checksDir: join(options.stateDir, 'checks'),

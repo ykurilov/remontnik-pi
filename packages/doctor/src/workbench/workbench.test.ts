@@ -206,13 +206,32 @@ describe('HOME команд', () => {
   })
 })
 
-/** Подставной `docker`: записывает аргументы и печатает их, ничего не запуская. `sleep` в команде — висит. */
+/**
+ * Подставной `docker`: записывает аргументы, ничего не запуская. `create` запоминает команду и копирует себе
+ * файл окружения (права и содержимое), `start` висит, если в команде есть `sleep`. Файл `kill-fails` —
+ * контейнер не убивается: `kill` падает, `inspect` говорит, что он ещё идёт.
+ */
 function fakeDocker(root: string) {
   const log = join(root, 'docker.log')
+  const envLog = join(root, 'env-file.log')
   const docker = join(root, 'docker')
   writeFileSync(
     docker,
-    `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done >> '${log}'\nprintf '%s\\n' '--end--' >> '${log}'\ncase "$*" in *sleep*) sleep 30;; esac\nexit 0\n`,
+    [
+      '#!/bin/sh',
+      `for a in "$@"; do printf '%s\\n' "$a"; done >> '${log}'`,
+      `printf '%s\\n' '--end--' >> '${log}'`,
+      'prev=""',
+      `for a in "$@"; do if [ "$prev" = "--env-file" ]; then ls -l "$a" | cut -c1-10 >> '${envLog}'; cat "$a" >> '${envLog}'; fi; prev="$a"; done`,
+      'case "$1" in',
+      `  create) for a in "$@"; do last="$a"; done; printf '%s' "$last" > '${root}/last-command'; echo created;;`,
+      `  start) case "$(cat '${root}/last-command')" in *sleep*) sleep 30;; esac;;`,
+      `  kill) [ -e '${root}/kill-fails' ] && exit 1; sleep 0.3; touch '${root}/killed';;`,
+      `  inspect) if [ -e '${root}/kill-fails' ]; then echo true; else echo 'Error: No such object' >&2; exit 1; fi;;`,
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n'),
     { mode: 0o755 },
   )
   const calls = () =>
@@ -220,11 +239,17 @@ function fakeDocker(root: string) {
       .split('--end--\n')
       .filter(Boolean)
       .map((call) => call.split('\n').filter((line) => line !== ''))
-  return { docker, calls }
+  const envFile = () => (existsSync(envLog) ? readFileSync(envLog, 'utf8') : '')
+  return { docker, calls, envFile, killFails: () => writeFileSync(join(root, 'kill-fails'), ''), killed: () => existsSync(join(root, 'killed')) }
 }
 
 function mountSources(args: string[]): string[] {
   return args.flatMap((arg, index) => (args[index - 1] === '--mount' ? [/source=([^,]+)/.exec(arg)![1]!] : []))
+}
+
+function flagValue(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag)
+  return index < 0 ? undefined : args[index + 1]
 }
 
 describe('исполнитель в контейнере', () => {
@@ -241,8 +266,8 @@ describe('исполнитель в контейнере', () => {
     } finally {
       delete process.env.DEEPSEEK_API_KEY
     }
-    const [args] = fake.calls()
-    expect(args!.slice(0, 2)).toEqual(['run', '--rm'])
+    const [args, start] = fake.calls()
+    expect(args!.slice(0, 2)).toEqual(['create', '--rm'])
     expect(args).toEqual(expect.arrayContaining(['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']))
     const sources = mountSources(args!)
     expect(sources).toHaveLength(2)
@@ -250,8 +275,60 @@ describe('исполнитель в контейнере', () => {
     expect(sources[1]!.startsWith(homesDir)).toBe(true)
     expect(args!.join('\n')).not.toContain(b.repoDir + '/.git')
     expect(args!.join('\n')).not.toContain('test-secret-should-not-leak')
+    expect(fake.envFile()).not.toContain('test-secret-should-not-leak')
     expect(args!.slice(-4)).toEqual(['example.test/app-dev:1', 'sh', '-c', 'pnpm test'])
     expect(args![args!.indexOf('-w') + 1]).toBe(join(b.workbench.path, 'src'))
+    expect(start).toEqual(['start', '--attach', flagValue(args!, '--name')])
+  })
+
+  it('контейнер ограничен: память, процессор, корневая система только для чтения, запись — копия, HOME и /tmp', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, memory: '3g', cpus: '1.5' })
+    const outDir = join(b.root, 'eval-out')
+    mkdirSync(outDir)
+    await runner.run('pnpm eval', { cwd: b.workbench.path, copyDir: b.workbench.path, writableDirs: [outDir], timeoutSeconds: 5 })
+    const [args] = fake.calls()
+    expect(flagValue(args!, '--memory')).toBe('3g')
+    expect(flagValue(args!, '--memory-swap')).toBe('3g')
+    expect(flagValue(args!, '--cpus')).toBe('1.5')
+    expect(args).toContain('--read-only')
+    expect(flagValue(args!, '--tmpfs')).toMatch(/^\/tmp:/)
+    expect(mountSources(args!)).toEqual([b.workbench.path, expect.stringContaining(join(b.root, 'homes')), outDir])
+  })
+
+  it('по умолчанию лимиты тоже есть', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run('ls', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    const [args] = fake.calls()
+    expect(flagValue(args!, '--memory')).toBeDefined()
+    expect(flagValue(args!, '--cpus')).toBeDefined()
+  })
+
+  it('переменные — файлом 0600, который удаляется сразу после создания контейнера; в аргументах значений нет', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run('pnpm eval', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { RUN_TOKEN: 'run-token-example' }, timeoutSeconds: 5 })
+    const [args] = fake.calls()
+    expect(args).not.toContain('-e')
+    expect(args!.join('\n')).not.toContain('run-token-example')
+    const envFile = flagValue(args!, '--env-file')!
+    expect(fake.envFile()).toContain('-rw-------')
+    expect(fake.envFile()).toContain('RUN_TOKEN=run-token-example')
+    expect(fake.envFile()).toContain('HOME=/home/remontnik')
+    expect(existsSync(envFile)).toBe(false)
+  })
+
+  it('перевод строки в значении переменной — отказ: файл окружения его не передаст', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    const result = await runner.run('ls', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { X: 'a\nB=1' }, timeoutSeconds: 5 })
+    expect(result.spawnError).toBeDefined()
+    expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
   })
 
   it('папка вне копии не монтируется: команда не запускается', async () => {
@@ -262,18 +339,46 @@ describe('исполнитель в контейнере', () => {
     expect(result.spawnError).toBeDefined()
   })
 
-  it('по тайм-ауту контейнер убивается по имени', async () => {
+  it('по тайм-ауту контейнер убивается по имени, и итог приходит только после docker kill', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
     const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
     const started = Date.now()
     const result = await runner.run('sleep 100', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 1 })
     expect(result.timedOut).toBe(true)
+    expect(result.stillRunning).toBeFalsy()
+    expect(fake.killed()).toBe(true)
     expect(Date.now() - started).toBeLessThan(10_000)
-    await vi.waitFor(() => expect(fake.calls()).toHaveLength(2))
-    const [run, kill] = fake.calls()
-    const name = run![run!.indexOf('--name') + 1]
-    expect(kill).toEqual(['kill', name])
+    const [create, , kill] = fake.calls()
+    expect(kill).toEqual(['kill', flagValue(create!, '--name')])
+    expect(runner.spoiled(b.workbench.path)).toBe(false)
+  })
+
+  it('контейнер не убился → итог «ещё идёт», копия испорчена: новых команд в ней нет', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    fake.killFails()
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    const result = await runner.run('sleep 100', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 1 })
+    expect(result.stillRunning).toBe(true)
+    expect(runner.spoiled(b.workbench.path)).toBe(true)
+    const calls = fake.calls().length
+    const next = await runner.run('ls', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    expect(next.spawnError).toMatch(/испорчена/)
+    expect(fake.calls()).toHaveLength(calls)
+    // Отметка переживает перезапуск врача: новый исполнитель над той же папкой HOME видит её же.
+    const again = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    expect(again.spoiled(b.workbench.path)).toBe(true)
+  })
+
+  it('команда модели в испорченной копии — ошибка с объяснением', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    fake.killFails()
+    const env = envFor(b.workbench.path, { runner: createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker }) })
+    const result = await env.exec('sleep 100', { timeout: 1 }, BACKGROUND_CONTEXT)
+    expect(result.ok).toBe(false)
+    expect(!result.ok && result.error.message).toMatch(/не остановлен/)
   })
 
   it.each(['"git" push origin +main', '\\git log --all -p', 'g""it show HEAD', 'sh -c "g\\it status"', 'python3 -c "import subprocess; subprocess.run([\'git\', \'log\'])"'])(

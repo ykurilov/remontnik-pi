@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { testRemontnikConfig } from '../testing/index.js'
-import type { CommandRunner, RunOptions, RunResult } from '../workbench/index.js'
+import { SpoiledCopyError, type CommandRunner, type RunOptions, type RunResult } from '../workbench/index.js'
 import { createChecks, createMemoryEvalBaseCache, parseFailedTests, type EvalBaseCache } from './checks.js'
 
 const dirs: string[] = []
@@ -49,6 +49,8 @@ interface FakeOptions {
   evalHangsAtCostUsd?: number
   /** Вывод установки. */
   installOutput?: { exitCode: number; output: string }
+  /** Тесты убить не удалось. */
+  testsStillRunning?: boolean
 }
 
 function fakeRunner(options: FakeOptions) {
@@ -56,9 +58,11 @@ function fakeRunner(options: FakeOptions) {
   const tests = [...(options.tests ?? [{ exitCode: 0 }])]
   const runner: CommandRunner = {
     isolation: 'none',
+    spoiled: () => false,
     async run(command, runOptions): Promise<RunResult> {
       const text = typeof command === 'string' ? command : command.join(' ')
       calls.push({ command: text, options: runOptions })
+      if (text === 'pnpm test' && options.testsStillRunning) return { exitCode: null, timedOut: true, aborted: false, output: '', stillRunning: true }
       if (text === 'pnpm test') {
         const next = tests.length > 1 ? tests.shift()! : tests[0]!
         return { exitCode: next.exitCode, timedOut: false, aborted: false, output: next.output ?? '' }
@@ -127,6 +131,13 @@ function runInput(overrides: Partial<Parameters<ReturnType<typeof createChecks>[
     ...overrides,
   }
 }
+
+describe('неубитая команда проверки', () => {
+  it('копия испорчена → проверки останавливаются ошибкой, итогам не верим', async () => {
+    const fake = fakeRunner({ testsStillRunning: true })
+    await expect(checksWith(fake).run(runInput())).rejects.toBeInstanceOf(SpoiledCopyError)
+  })
+})
 
 describe('разбор упавших тестов', () => {
   it('REMONTNIK_FAILED в выводе', () => {

@@ -145,6 +145,7 @@ export function standBrokenReport(input: { case: ReportCase; branch: string; che
 export type NeedsHumanReason =
   | { kind: 'protected_paths'; changes: readonly ProtectedChange[]; branch: string }
   | { kind: 'escape'; detail: string }
+  | { kind: 'spoiled'; detail: string }
   | { kind: 'eval_worse'; branch: string; checks: ChecksResult }
 
 /** Врач остановился и ничего не выкатит: правку должен посмотреть человек. */
@@ -156,6 +157,8 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
         return `правка задевает защищённые пути (${reason.changes.map((change) => change.path).join(', ')}): я её не проверял и не отправлял`
       case 'escape':
         return 'модель пыталась выбраться из верстака: копия подменена, лечение остановлено'
+      case 'spoiled':
+        return 'команда в копии не остановлена, копия испорчена: я ничего не коммитил, лечение остановлено'
       case 'eval_worse':
         return `правка в ветке ${reason.branch} проходит тесты, но ${evalShort(reason.checks.eval)}`
     }
@@ -169,6 +172,7 @@ export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosi
     ...(input.fix ? [`Правка: ${input.fix.summary}`] : []),
     ...(reason.kind === 'protected_paths' ? ['Защищённые пути:', ...reason.changes.map((change) => `- ${change.path}: ${change.why}`), `Ветка (только у врача): ${reason.branch}`] : []),
     ...(reason.kind === 'escape' ? [`Что нашёл git-замок: ${reason.detail}`] : []),
+    ...(reason.kind === 'spoiled' ? [`Что случилось: ${reason.detail}. Контейнер надо остановить вручную, копию — удалить.`] : []),
     ...(reason.kind === 'eval_worse' ? checksLines(reason.checks) : []),
   ].join('\n')
   return { short, full }

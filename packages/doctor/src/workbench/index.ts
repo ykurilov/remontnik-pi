@@ -258,6 +258,7 @@ export class ContainerExecutionEnv implements ExecutionEnv {
       ...(context.abortSignal ? { signal: context.abortSignal } : {}),
       onOutput: (text, stream) => options?.onOutput?.(text, context, { stream }),
     })
+    if (result.stillRunning) return err(new ExecutionError('spawn_error', 'команда не остановлена: копия испорчена, лечение будет остановлено'))
     if (result.timedOut) return err(new ExecutionError('timeout', `команда не уложилась в ${timeoutSeconds} с`))
     if (result.aborted) return err(new ExecutionError('aborted', 'команда отменена'))
     if (result.spawnError !== undefined || result.exitCode === null) {
