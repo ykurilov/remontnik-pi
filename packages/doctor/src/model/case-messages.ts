@@ -23,3 +23,8 @@ export function fixMessage(diagnosis: Diagnosis, info: TreatmentCaseInfo): strin
       : ['Причина найдена. Исправь её небольшой правкой и добавь тест, который ловит этот сбой.', 'Прогони тесты, затем заверши этап вызовом finish_fix.']
   return [...task, '', `Причина: ${diagnosis.cause}`, ...(diagnosis.fixPlan ? [`План: ${diagnosis.fixPlan}`] : [])].join('\n')
 }
+
+/** Работа над этапом прервалась на потолке расходов, наступили новые сутки. */
+export function resumeMessage(): string {
+  return 'Работа прерывалась: кончился дневной бюджет. Продолжи этап с того места, где остановился, и заверши его тем же вызовом.'
+}

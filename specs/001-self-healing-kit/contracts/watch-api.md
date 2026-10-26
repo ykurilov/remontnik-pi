@@ -20,7 +20,8 @@ const watch = createWatch({
   review?: {
     botDescription: string;
     places?: string[];                  // места бота, к которым относятся нарушения; без набора место всегда «общее»
-    usdPerDay: number;                  // общий на приложение: все процессы с одной папкой `dir` делят его
+    limits: { watchModelUsdPerDay: number }; // config.limits из remontnik.config; потолок сторожа в сутки,
+                                        // общий на приложение: все процессы с одной папкой `dir` делят его
     maxReviewsPerHour?: number;         // 100
     maxReviewsPerDay?: number;          // 1000
     minConfidence?: number;

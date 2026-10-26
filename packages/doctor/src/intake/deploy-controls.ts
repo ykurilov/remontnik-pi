@@ -1,6 +1,6 @@
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import type { Controls } from '../ledgers/controls.js'
-import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { assertOwnerSecrets, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Стоп-кран по HTTP (contracts/doctor-api.md): `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`.
 // Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан `signRequest` с разовой меткой.
@@ -45,10 +45,7 @@ function parseCommand(body: string): ControlCommand | undefined {
 }
 
 export function createDeployControlsHandler(options: DeployControlsOptions): IntakeHandler {
-  if (options.secret === '') throw new Error('[remontnik] общий секрет пуст')
-  if (options.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
-  // Общий секрет знают сторож и кнопки Telegram: равный ему секрет владельца ничего не защищает.
-  if (options.controlSecret === options.secret) throw new Error('[remontnik] секрет владельца совпадает с общим секретом')
+  assertOwnerSecrets(options)
   const replayGuard = options.replayGuard ?? new ReplayGuard()
   const now = options.now ?? Date.now
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */

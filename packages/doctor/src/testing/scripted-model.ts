@@ -26,7 +26,18 @@ export type ScriptStep = AssistantMessage | ((context: TranscriptContext, signal
 export interface ScriptedModelOptions {
   /** Сколько долларов записывать на каждый ответ. По умолчанию 0. */
   costPerResponseUsd?: number
+  /**
+   * Наибольшая цена ответа по цене модели — столько врач бронирует перед запросом. По умолчанию `costPerResponseUsd`,
+   * а при бесплатных ответах — доля цента: модель без цены врач не зовёт. Вход бесплатный, поэтому бронь от длины
+   * разговора не зависит.
+   */
+  maxResponseUsd?: number
 }
+
+/** Предел длины ответа модели по сценарию: из него и цены выхода складывается наибольшая цена ответа. */
+const SCRIPTED_MAX_TOKENS = 1_000
+/** Наибольшая цена ответа, когда ответы бесплатны. */
+const SCRIPTED_FREE_MAX_RESPONSE_USD = 0.000_1
 
 export interface ScriptedModel {
   models: MutableModels
@@ -64,16 +75,20 @@ export const hang: ScriptStep = (_context, signal) =>
   })
 
 export function createScriptedModel(options: ScriptedModelOptions = {}): ScriptedModel {
-  const faux = fauxProvider({ provider: SCRIPTED_PROVIDER, models: [{ id: SCRIPTED_MODEL, contextWindow: 200_000 }] })
-  const requests: TranscriptContext[] = []
   const cost = options.costPerResponseUsd ?? 0
+  const maxResponseUsd = options.maxResponseUsd ?? (cost || SCRIPTED_FREE_MAX_RESPONSE_USD)
+  const outputUsdPerMtok = (maxResponseUsd * 1_000_000) / SCRIPTED_MAX_TOKENS
+  const faux = fauxProvider({
+    provider: SCRIPTED_PROVIDER,
+    models: [{ id: SCRIPTED_MODEL, contextWindow: 200_000, maxTokens: SCRIPTED_MAX_TOKENS, cost: { input: 0, output: outputUsdPerMtok, cacheRead: 0, cacheWrite: 0 } }],
+  })
+  const requests: TranscriptContext[] = []
 
   const withCost = (message: AssistantMessage) => {
-    if (cost === 0) return
     message.usage = { ...message.usage, cost: { ...message.usage.cost, total: cost, output: cost } }
   }
 
-  // faux пересчитывает расход сам и ставит цену 0, поэтому цена дописывается в уже готовый поток.
+  // faux пересчитывает расход сам по цене модели, поэтому цена ответа дописывается в уже готовый поток.
   const priced = (inner: AssistantMessageEventStream): AssistantMessageEventStream => {
     const out = createAssistantMessageEventStream()
     void (async () => {

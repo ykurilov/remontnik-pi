@@ -51,6 +51,12 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   spend: recordFamily('remontnik.spend'),
   /** Сколько расхода модели по случаю уже записано в дни. */
   'spend-case': recordFamily('remontnik.spend-case'),
+  /** Дни, в которых могут быть открытые брони запросов к модели: новая бронь подметает и их. */
+  'spend-holds': recordFamily('remontnik.spend-holds'),
+  /** Случаи, которые ждут eval: остаток дня делится между ними. */
+  'eval-queue': recordFamily('remontnik.eval-queue'),
+  /** Учёт выкаток по отпечатку: пределы в сутки и «нужен человек» после отката. */
+  ledger: recordFamily('remontnik.ledger'),
   /** Ошибки приложения по часам: уровень до выкатки и рост после неё. */
   'error-hour': recordFamily('remontnik.error-hour'),
   /** Какие часы ошибок приложения записаны: по нему удаляются старые. */
