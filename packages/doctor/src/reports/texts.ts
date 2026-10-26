@@ -1,0 +1,186 @@
+import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
+import type { ChecksResult, EvalOutcome } from '../checks/index.js'
+import type { Diagnosis, FixSummary } from '../treatment/doc.js'
+import type { SuspiciousFinding } from '../diff-inspector/index.js'
+import type { ProtectedChange } from '../treatment/protected-changes.js'
+
+// Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
+
+export interface ReportText {
+  short: string
+  full: string
+}
+
+export interface ReportCase {
+  caseId: number
+  appName: string
+  kind: IncidentKind
+  where: string
+  message: string
+}
+
+const usd = (value: number) => `$${value.toFixed(2)}`
+
+function head(sick: ReportCase): string {
+  return `Случай ${sick.caseId} (${sick.appName})`
+}
+
+function caseLines(sick: ReportCase): string[] {
+  return [`Сбой: ${sick.kind} в ${sick.where || 'неизвестном месте'} — ${sick.message}`]
+}
+
+function diagnosisLines(diagnosis: Diagnosis | undefined): string[] {
+  if (!diagnosis) return []
+  return [
+    `Причина: ${diagnosis.cause}`,
+    `Уверенность: ${diagnosis.confidence}`,
+    ...(diagnosis.evidence.length > 0 ? ['Улики:', ...diagnosis.evidence.map((item) => `- ${item}`)] : []),
+    ...(diagnosis.fixPlan ? [`План правки: ${diagnosis.fixPlan}`] : []),
+  ]
+}
+
+function worseScenarios(outcome: EvalOutcome): string[] {
+  return outcome.scenarios.filter((scenario) => scenario.candidatePass < scenario.basePass).map((scenario) => scenario.id)
+}
+
+function evalShort(outcome: EvalOutcome): string {
+  switch (outcome.status) {
+    case 'not_needed':
+      return 'eval не нужен'
+    case 'not_worse':
+      return 'eval не хуже'
+    case 'worse':
+      return `eval хуже: ${worseScenarios(outcome).join(', ')}`
+    case 'stand_broken':
+      return 'стенд eval сломан'
+    case 'not_run':
+      return `eval не запускался${outcome.note ? ` (${outcome.note})` : ''}`
+  }
+}
+
+function checksLines(checks: ChecksResult): string[] {
+  const { tests } = checks
+  return [
+    `Тесты: ${tests.status}${tests.failed.length > 0 ? `, упали: ${tests.failed.join(', ')}` : ''} (${Math.round(tests.durationMs / 1000)} с)`,
+    ...(tests.outputTail ? ['Хвост вывода:', tests.outputTail] : []),
+    `Eval: ${checks.eval.status}${checks.eval.truncated ? ', не все сценарии (предел maxScenarios)' : ''}, расход ${usd(checks.eval.costUsd)}`,
+    ...checks.eval.scenarios.map((scenario) => `- ${scenario.id}: ${scenario.basePass}/${scenario.repeats} → ${scenario.candidatePass}/${scenario.repeats}`),
+    ...(checks.eval.note ? [`Заметка: ${checks.eval.note}`] : []),
+  ]
+}
+
+export function fixReadyReport(input: {
+  case: ReportCase
+  diagnosis: Diagnosis
+  fix: FixSummary
+  branch: string
+  commit: string
+  checks: ChecksResult
+  pushed: boolean
+}): ReportText {
+  const tests = input.checks.tests.status === 'flaky' ? 'тесты зелёные со второго раза (нестабильный тест)' : 'тесты зелёные'
+  const short = [
+    `${head(input.case)}: правка готова в ветке ${input.branch}, ${tests}, ${evalShort(input.checks.eval)}.`,
+    input.pushed ? '' : ' Ветка не отправлена в origin.',
+    ' Я её не выкатывал.',
+    ` Причина: ${input.diagnosis.cause}`,
+  ].join('')
+  const full = [
+    short,
+    '',
+    ...caseLines(input.case),
+    ...diagnosisLines(input.diagnosis),
+    `Правка: ${input.fix.summary}`,
+    `Тесты в правке: ${input.fix.testsAdded.join(', ') || 'нет'}`,
+    ...(input.fix.notes ? [`Заметки: ${input.fix.notes}`] : []),
+    `Ветка: ${input.branch}, коммит ${input.commit.slice(0, 12)}`,
+    ...checksLines(input.checks),
+  ].join('\n')
+  return { short, full }
+}
+
+export function noCauseFoundReport(input: {
+  case: ReportCase
+  reason: 'budget' | 'day_budget' | 'not_found' | 'no_answer'
+  spentUsd: number
+  limitUsd: number
+  diagnosis?: Diagnosis
+}): ReportText {
+  const why = {
+    budget: `кончился бюджет (${usd(input.spentUsd)} из ${usd(input.limitUsd)})`,
+    day_budget: `кончился дневной бюджет модели (${usd(input.limitUsd)} в день), на случай потрачено ${usd(input.spentUsd)}`,
+    not_found: 'модель не нашла причину',
+    no_answer: 'модель не дала диагноза',
+  }[input.reason]
+  const short = `${head(input.case)}: причину не нашёл — ${why}.${input.diagnosis?.cause ? ` Что понял: ${input.diagnosis.cause}` : ''}`
+  const full = [short, '', ...caseLines(input.case), `Почему остановился: ${why}`, `Потрачено на модель: ${usd(input.spentUsd)}`, ...diagnosisLines(input.diagnosis)].join('\n')
+  return { short, full }
+}
+
+export function causeFoundReport(input: {
+  case: ReportCase
+  diagnosis: Diagnosis
+  reason: 'budget' | 'day_budget' | 'no_answer' | 'no_changes' | 'checks_red'
+  branch?: string
+  checks?: ChecksResult
+}): ReportText {
+  const failed = input.checks?.tests.failed ?? []
+  const what = {
+    budget: 'правку не сделал: кончился бюджет',
+    day_budget: 'правку не сделал: кончился дневной бюджет модели',
+    no_answer: 'правку не сделал: модель не закончила',
+    no_changes: 'правку не сделал: модель ничего не изменила',
+    checks_red: `правка в ветке ${input.branch ?? '—'} не прошла тесты${failed.length > 0 ? `: ${failed.join(', ')}` : ''}`,
+  }[input.reason]
+  const short = `${head(input.case)}: причину нашёл, ${what}. Причина: ${input.diagnosis.cause}`
+  const full = [short, '', ...caseLines(input.case), ...diagnosisLines(input.diagnosis), ...(input.checks ? checksLines(input.checks) : [])].join('\n')
+  return { short, full }
+}
+
+export function standBrokenReport(input: { case: ReportCase; branch: string; checks: ChecksResult }): ReportText {
+  const short = `${head(input.case)}: стенд проверки сломан, правку в ветке ${input.branch} оценить не смог. Нужен человек.`
+  const full = [short, '', ...caseLines(input.case), ...checksLines(input.checks)].join('\n')
+  return { short, full }
+}
+
+export type NeedsHumanReason =
+  | { kind: 'protected_paths'; changes: readonly ProtectedChange[]; branch: string }
+  | { kind: 'escape'; detail: string }
+  | { kind: 'spoiled'; detail: string }
+  | { kind: 'suspicious'; findings: readonly SuspiciousFinding[]; branch: string }
+  | { kind: 'eval_worse'; branch: string; checks: ChecksResult }
+
+/** Врач остановился и ничего не выкатит: правку должен посмотреть человек. */
+export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosis; fix?: FixSummary; reason: NeedsHumanReason }): ReportText {
+  const { reason } = input
+  const what = (() => {
+    switch (reason.kind) {
+      case 'protected_paths':
+        return `правка задевает защищённые пути (${reason.changes.map((change) => change.path).join(', ')}): я её не проверял и не отправлял`
+      case 'escape':
+        return 'модель пыталась выбраться из верстака: копия подменена, лечение остановлено'
+      case 'spoiled':
+        return 'команда в копии не остановлена, копия испорчена: я ничего не коммитил, лечение остановлено'
+      case 'suspicious':
+        return `в правке подозрительный код (${[...new Set(reason.findings.map((finding) => finding.path))].join(', ')}): я её не проверял и не отправлял`
+      case 'eval_worse':
+        return `правка в ветке ${reason.branch} проходит тесты, но ${evalShort(reason.checks.eval)}`
+    }
+  })()
+  const short = `${head(input.case)}: ${what}. Нужен человек.`
+  const full = [
+    short,
+    '',
+    ...caseLines(input.case),
+    ...diagnosisLines(input.diagnosis),
+    ...(input.fix ? [`Правка: ${input.fix.summary}`] : []),
+    ...(reason.kind === 'protected_paths' ? ['Защищённые пути:', ...reason.changes.map((change) => `- ${change.path}: ${change.why}`), `Ветка (только у врача): ${reason.branch}`] : []),
+    ...(reason.kind === 'escape' ? [`Что нашёл git-замок: ${reason.detail}`] : []),
+    ...(reason.kind === 'suspicious'
+      ? ['Подозрительное:', ...reason.findings.map((finding) => `- ${finding.path}: ${finding.signal}${finding.line ? ` — ${finding.line.trim().slice(0, 200)}` : ''}`), `Ветка (только у врача): ${reason.branch}`]
+      : []),
+    ...(reason.kind === 'spoiled' ? [`Что случилось: ${reason.detail}. Контейнер надо остановить вручную, копию — удалить.`] : []),
+    ...(reason.kind === 'eval_worse' ? checksLines(reason.checks) : []),
+  ].join('\n')
+  return { short, full }
+}

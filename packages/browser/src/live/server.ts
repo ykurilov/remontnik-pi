@@ -2,8 +2,8 @@
 // куки HttpOnly + SameSite=Strict, кадры и ввод по WebSocket. Без REMONTNIK_BROWSER_LIVE_LISTEN не включается.
 import { randomBytes } from 'node:crypto'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
-import { isIP } from 'node:net'
 import type { Duplex } from 'node:stream'
+import { isPrivateAddress } from '@ykurilov/remontnik-core/private-address'
 import { WebSocketServer, type WebSocket } from 'ws'
 import type { ServiceLog } from '../log.js'
 import { createAttemptLimiter } from '../attempts.js'
@@ -21,18 +21,6 @@ const PROFILE = /^[a-z0-9][a-z0-9_-]{0,63}$/i
 export interface LiveAddress {
   host: string
   port: number
-}
-
-function isPrivateAddress(host: string): boolean {
-  if (isIP(host) === 4) {
-    const [a = 0, b = 0] = host.split('.').map(Number)
-    return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)
-  }
-  if (isIP(host) === 6) {
-    const lower = host.toLowerCase()
-    return lower === '::1' || /^f[cd][0-9a-f]{2}:/.test(lower)
-  }
-  return false
 }
 
 /** `адрес:порт` частной сети (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, петля). «Все адреса» и публичные — нельзя. */

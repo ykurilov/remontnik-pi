@@ -1,7 +1,9 @@
 import { posix } from 'node:path'
 
 // Маски путей вида glob: `**` — любая глубина, `*` и `?` — внутри одной папки, `[..]`, `{a,b}`.
-// Маска считается от корня репозитория, регистр не важен, точки в именах — обычные символы.
+// Маска считается от корня репозитория, точки в именах — обычные символы. Для запретов регистр не важен
+// (лишний запрет безопаснее); для белого списка (`matchesAllowMask`) важен, а путь с `\` не подходит вовсе:
+// на Linux `SRC/` и `src\x.ts` — не то же самое, что `src/`.
 // Маска, подошедшая к папке, охватывает и всё внутри неё: `migrations` закрывает `migrations/001.sql`.
 // Расширенные шаблоны (`@(a|b)`, `!(a)`, `+(a)`, `?(a)`, `*(a)`) и отрицание (`!маска`) не поддерживаются:
 // такая маска — ошибка настройки, а не тихое несовпадение.
@@ -34,17 +36,20 @@ function assertSupported(mask: string): void {
   let depth = 0
   for (const char of mask) {
     if (char === '{') depth += 1
-    else if (char === '}' && depth > 0) depth -= 1
+    else if (char === '}') {
+      if (depth === 0) throw new PathMaskError(mask, 'лишняя скобка "}"')
+      depth -= 1
+    }
   }
   if (depth !== 0) throw new PathMaskError(mask, 'не закрыта скобка "{"')
 }
 
 /** Бросает `PathMaskError`, если маску нельзя разобрать. */
 export function assertValidMask(mask: string): void {
-  assertSupported(normalizeMask(mask))
+  compile(normalizeMask(mask), false)
 }
 
-function globToRegExp(mask: string): RegExp {
+function globToRegExp(mask: string, caseSensitive: boolean): RegExp {
   assertSupported(mask)
   let source = ''
   for (let index = 0; index < mask.length; index += 1) {
@@ -78,26 +83,34 @@ function globToRegExp(mask: string): RegExp {
       source += char.replace(/[.+^$()|\\/]/g, '\\$&')
     }
   }
-  return new RegExp(`^${source}$`, 'is')
+  try {
+    return new RegExp(`^${source}$`, caseSensitive ? 's' : 'is')
+  } catch (error) {
+    throw new PathMaskError(mask, error instanceof Error ? error.message : String(error))
+  }
 }
 
-function compile(mask: string): RegExp {
-  let pattern = compiled.get(mask)
+function compile(mask: string, caseSensitive: boolean): RegExp {
+  const key = `${caseSensitive ? 'A' : 'a'}${mask}`
+  let pattern = compiled.get(key)
   if (!pattern) {
-    pattern = globToRegExp(mask)
-    compiled.set(mask, pattern)
+    pattern = globToRegExp(mask, caseSensitive)
+    compiled.set(key, pattern)
   }
   return pattern
 }
 
-/** Подходит ли путь под маску — сам или любая из его папок. */
-export function matchesMask(mask: string, path: string): boolean {
-  const pattern = compile(normalizeMask(mask))
+function matchesNormalized(pattern: RegExp, path: string): boolean {
   const segments = normalizeRepoPath(path).split('/')
   for (let length = segments.length; length > 0; length -= 1) {
     if (pattern.test(segments.slice(0, length).join('/'))) return true
   }
   return false
+}
+
+/** Подходит ли путь под маску — сам или любая из его папок. */
+export function matchesMask(mask: string, path: string): boolean {
+  return matchesNormalized(compile(normalizeMask(mask), false), path)
 }
 
 /** Первая подошедшая маска или `undefined`. */
@@ -107,4 +120,10 @@ export function firstMatchingMask(masks: readonly string[], path: string): strin
 
 export function matchesAnyMask(masks: readonly string[], path: string): boolean {
   return firstMatchingMask(masks, path) !== undefined
+}
+
+/** Белый список: регистр важен, путь с `\\` не подходит ни под одну маску. */
+export function matchesAllowMask(masks: readonly string[], path: string): boolean {
+  if (path.includes('\\')) return false
+  return masks.some((mask) => matchesNormalized(compile(normalizeMask(mask), true), path))
 }

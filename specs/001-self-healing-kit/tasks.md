@@ -97,24 +97,24 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T037 [P] [US2] Тест обёртки-поставщика `packages/doctor/src/model/provider-fallback.test.ts`: переходы DeepSeek → OpenRouter поверх pi-ai (подставные поставщики)
-- [ ] T038 [P] [US2] Тест системного промпта `packages/doctor/src/model/system-prompt.test.ts`: постоянный порядок секций; нет времени и номера случая; одинаковые байты для одной основы (кэш)
-- [ ] T039 [P] [US2] Тест верстака `packages/doctor/src/workbench/workbench.test.ts`: копия от `baseCommit`; `closedPaths` физически отсутствуют; тайм-аут команды; в окружении нет секретов (локальный исполнитель вместо Docker)
-- [ ] T040 [P] [US2] Тест выбора сценариев `packages/doctor/src/checks/eval-scope.test.ts`: карта путей; предел `maxScenarios`; закрытые сценарии не передаются; правка вне карты → `not_needed`
-- [ ] T041 [P] [US2] Тест проверок `packages/doctor/src/checks/checks.test.ts`: повтор упавших тестов, разный итог → `flaky`; eval `not_worse`/`worse`/`stand_broken`; кэш основы по паре (коммит, сценарий); потолок денег
-- [ ] T042 [P] [US2] Тест git-замка `packages/doctor/src/git-guard/git-guard.test.ts` на локальном пустом репозитории: только разрешённые операции; ветка `remontnik/<caseId>-<slug>`; `--force` отклонён; запись в основную ветку — только при `mainline: "merge"` и без `--force`
+- [X] T037 [P] [US2] Тест обёртки-поставщика `packages/doctor/src/model/provider-fallback.test.ts`: переходы DeepSeek → OpenRouter поверх pi-ai (подставные поставщики)
+- [X] T038 [P] [US2] Тест системного промпта `packages/doctor/src/model/system-prompt.test.ts`: постоянный порядок секций; нет времени и номера случая; одинаковые байты для одной основы (кэш)
+- [X] T039 [P] [US2] Тест верстака `packages/doctor/src/workbench/workbench.test.ts`: копия от `baseCommit`; `closedPaths` физически отсутствуют; тайм-аут команды; в окружении нет секретов (локальный исполнитель вместо Docker)
+- [X] T040 [P] [US2] Тест выбора сценариев `packages/doctor/src/checks/eval-scope.test.ts`: карта путей; предел `maxScenarios`; закрытые сценарии не передаются; правка вне карты → `not_needed`
+- [X] T041 [P] [US2] Тест проверок `packages/doctor/src/checks/checks.test.ts`: повтор упавших тестов, разный итог → `flaky`; eval `not_worse`/`worse`/`stand_broken`; кэш основы по паре (коммит, сценарий); потолок денег
+- [X] T042 [P] [US2] Тест git-замка `packages/doctor/src/git-guard/git-guard.test.ts` на локальном пустом репозитории: только разрешённые операции; ветка `remontnik/<caseId>-<slug>`; `--force` отклонён; запись в основную ветку — только при `mainline: "merge"` и без `--force`
 
 ### Реализация
 
-- [ ] T043 [P] [US2] Обёртка-поставщик с запасным путём и сборщик системного промпта в `packages/doctor/src/model/`
-- [ ] T044 [P] [US2] Верстак: `ContainerExecutionEnv` (`docker exec`, тайм-аут) и локальный исполнитель для тестов, `git worktree` и sparse checkout в `packages/doctor/src/workbench/`; проверить интерфейс окружения выполнения pi-durable 1.4.0 и записать в `packages/doctor/README.md`
-- [ ] T045 [P] [US2] Git-замок в `packages/doctor/src/git-guard/`
-- [ ] T046 [US2] Проверки в проверочном контейнере: запуск тестов, разбор JUnit / `REMONTNIK_FAILED`, запуск eval по шаблону, кэш основы в `packages/doctor/src/checks/`
-- [ ] T047 [US2] Инструменты модели `case_info`, `finish_diagnosis`, `finish_fix`; постоянный набор; `beforeTool` с обязательным тайм-аутом bash в `packages/doctor/src/treatment/tools.ts`
-- [ ] T048 [US2] Задача pi-durable `remontnik.treatment`: фазы `triage` → `diagnosing` → `fixing` → `verifying` с чекпойнтами; потолок `diagnoseUsdPerCase` → `no_cause_found` в `packages/doctor/src/treatment/`
-- [ ] T049 [US2] Тексты отчётов `cause_found`, `fix_ready`, `no_cause_found`, `stand_broken` в `packages/doctor/src/reports/texts.ts`
-- [ ] T050 [US2] Модель по сценарию для тестов в `packages/doctor/src/testing/scripted-model.ts` (на основе `pi-durable/testing`, если подходит)
-- [ ] T051 [US2] Интеграционный тест `apps/patient/test/cycle/us2-fix.test.ts`: падение → ветка, коммит, тест, зелёные проверки, отчёт, основная ветка не тронута; eval хуже → отчёт; бюджет исчерпан → `no_cause_found`
+- [X] T043 [P] [US2] Обёртка-поставщик с запасным путём и сборщик системного промпта в `packages/doctor/src/model/`
+- [X] T044 [P] [US2] Верстак: `ContainerExecutionEnv` (`docker exec`, тайм-аут) и локальный исполнитель для тестов, `git worktree` и sparse checkout в `packages/doctor/src/workbench/`; проверить интерфейс окружения выполнения pi-durable 1.4.0 и записать в `packages/doctor/README.md`
+- [X] T045 [P] [US2] Git-замок в `packages/doctor/src/git-guard/`
+- [X] T046 [US2] Проверки в проверочном контейнере: запуск тестов, разбор JUnit / `REMONTNIK_FAILED`, запуск eval по шаблону, кэш основы в `packages/doctor/src/checks/`
+- [X] T047 [US2] Инструменты модели `case_info`, `finish_diagnosis`, `finish_fix`; постоянный набор; `beforeTool` с обязательным тайм-аутом bash в `packages/doctor/src/treatment/tools.ts`
+- [X] T048 [US2] Задача pi-durable `remontnik.treatment`: фазы `triage` → `diagnosing` → `fixing` → `verifying` с чекпойнтами; потолок `diagnoseUsdPerCase` → `no_cause_found` в `packages/doctor/src/treatment/`
+- [X] T049 [US2] Тексты отчётов `cause_found`, `fix_ready`, `no_cause_found`, `stand_broken` в `packages/doctor/src/reports/texts.ts`
+- [X] T050 [US2] Модель по сценарию для тестов в `packages/doctor/src/testing/scripted-model.ts` (на основе `pi-durable/testing`, если подходит)
+- [X] T051 [US2] Интеграционный тест `apps/patient/test/cycle/us2-fix.test.ts`: падение → ветка, коммит, тест, зелёные проверки, отчёт, основная ветка не тронута; eval хуже → отчёт; бюджет исчерпан → `no_cause_found`
 
 **Контрольная точка**: истории 1 и 2 вместе — полезный «врач-советчик».
 

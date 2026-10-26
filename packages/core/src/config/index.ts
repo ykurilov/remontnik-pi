@@ -21,8 +21,8 @@ export const BUILT_IN_FORBIDDEN = deepFreeze({
     'patches/@ykurilov__agent-chat-*',
     'patches/@ykurilov+agent-chat-*',
   ],
-  /** Сам Ремонтник: его настройку правит только человек. */
-  remontnikMasks: ['remontnik.config.*', '**/remontnik.config.*'],
+  /** Сам Ремонтник: его настройку и служебные файлы правит только человек. */
+  remontnikMasks: ['remontnik.config.*', '**/remontnik.config.*', '.remontnik*', '**/.remontnik*', '.remontnik*/**', '**/.remontnik*/**'],
   /** Пакеты, чьи версии и патчи (`pnpm.patchedDependencies`) менять нельзя даже при `allowDependencyChanges`. */
   protectedPackages: ['@ykurilov/agent-chat-*', '@ykurilov/remontnik-*'],
   /** Признаки изменения схемы базы в диффе файлов `schemaSignalFiles`. */
@@ -67,13 +67,56 @@ const timeZone = z.string().refine((value) => {
   }
 }, 'неизвестный часовой пояс')
 
-const evalSchema = z.strictObject({
-  run: command,
-  resultFile: z.string().min(1),
-  repeat: positiveInt.default(3),
-  maxScenarios: positiveInt.default(3),
-  env: z.array(envName),
+// Ключи провайдеров модели остаются у врача: eval ходит к модели через его прокси (адрес в `baseUrlEnv`,
+// токен прогона вместо ключа в `keyEnv`). Поэтому в `env` — только несекретные переменные. Фильтр по имени —
+// подсказка против ошибки, а не гарантия: секрет под невинным именем он не узнает.
+const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|COOKIE|SESSION/
+
+/** Цена модели в долларах за миллион токенов. */
+const modelPriceSchema = z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() })
+
+const evalProviderSchema = z.strictObject({
+  name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'строчные латинские буквы, цифры и дефис: имя идёт в адрес прокси'),
+  baseUrlEnv: envName,
+  keyEnv: envName,
+  upstream: z.url(),
+  authHeader: z.enum(['authorization', 'x-api-key']).default('authorization'),
+  /** Белый список моделей с ценами: модель выбирает код правки, поэтому цена — по модели, чужая модель — отказ. */
+  models: z.record(z.string().min(1), modelPriceSchema).refine((models) => Object.keys(models).length > 0, 'хотя бы одна модель с ценой'),
 })
+
+/** Пределы прокси eval на один прогон: память врача и бронь запросов в пути. */
+const evalProxyLimitsSchema = z
+  .strictObject({
+    maxRequestBytes: positiveInt.default(2 * 1024 * 1024),
+    maxResponseBytes: positiveInt.default(8 * 1024 * 1024),
+    maxConcurrentRequests: positiveInt.default(4),
+    /** Подставляется в запрос без предела ответа: без него наибольшую цену запроса не посчитать. */
+    maxOutputTokens: positiveInt.default(4096),
+  })
+  .prefault({})
+
+const evalSchema = z
+  .strictObject({
+    run: command,
+    resultFile: z.string().min(1),
+    repeat: positiveInt.default(3),
+    maxScenarios: positiveInt.default(3),
+    env: z.array(envName),
+    providers: z.array(evalProviderSchema).default([]),
+    tokenEnv: envName.default('REMONTNIK_EVAL_TOKEN'),
+    proxy: evalProxyLimitsSchema,
+  })
+  .superRefine((evalConfig, context) => {
+    const proxyNames = new Set([evalConfig.tokenEnv, ...evalConfig.providers.flatMap((provider) => [provider.keyEnv, provider.baseUrlEnv])])
+    evalConfig.env.forEach((name, index) => {
+      if (SECRET_LIKE_ENV.test(name) || proxyNames.has(name)) {
+        context.addIssue({ code: 'custom', path: ['env', index], message: 'секрет в eval не передаётся: ключи модели — через providers и прокси врача' })
+      }
+    })
+    const names = evalConfig.providers.map((provider) => provider.name)
+    if (new Set(names).size !== names.length) context.addIssue({ code: 'custom', path: ['providers'], message: 'имена провайдеров повторяются' })
+  })
 
 const paseoSchema = z.strictObject({
   bridgeUrlEnv: envName,
@@ -131,6 +174,8 @@ export const remontnikConfigSchema = z.strictObject({
     }),
   ),
   closedPaths: z.array(z.string().min(1)),
+  /** Где правка врача может менять код; всё остальное, кроме новых тестов, — только человек. */
+  fixablePaths: z.array(z.string().trim().min(1)).min(1, 'хотя бы одна маска; по умолчанию ["src/**"]').default(['src/**']),
   forbidden: z.strictObject({
     schema: masks,
     money: masks,
@@ -163,6 +208,8 @@ export const remontnikConfigSchema = z.strictObject({
     .strictObject({
       modelUsdPerDay: z.number().nonnegative().default(5),
       evalUsdPerDay: z.number().nonnegative().default(5),
+      /** Доля дневного бюджета eval на один случай: столько бронирует проверка правки. */
+      evalUsdPerCase: z.number().nonnegative().default(1),
       autoDeploysPerFingerprintPerDay: z.number().int().nonnegative().default(2),
       autoDeploysPerDay: z.number().int().nonnegative().default(5),
       maxDiffLines: positiveInt.default(300),

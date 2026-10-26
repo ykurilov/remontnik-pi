@@ -72,9 +72,15 @@ describe('defineRemontnikConfig', () => {
     expect(config.handoff).toEqual({ mode: 'self' })
   })
 
+  it('fixablePaths: по умолчанию src/**, можно свои, пустой список — ошибка', () => {
+    expect(defineRemontnikConfig(minimalConfig()).fixablePaths).toEqual(['src/**'])
+    expect(defineRemontnikConfig({ ...minimalConfig(), fixablePaths: ['app/**', 'lib/**'] }).fixablePaths).toEqual(['app/**', 'lib/**'])
+    expect(errorOf(() => defineRemontnikConfig({ ...minimalConfig(), fixablePaths: [] })).issues.some((issue) => issue.startsWith('fixablePaths'))).toBe(true)
+  })
+
   it('подставляет значения по умолчанию для eval, review и Paseo', () => {
     const input = minimalConfig()
-    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: ['EVAL_KEY'] }
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: ['EVAL_MODE'] }
     input.review = { botDescription: 'бот помогает с тарифами' }
     input.handoff = {
       mode: 'paseo-first',
@@ -83,9 +89,49 @@ describe('defineRemontnikConfig', () => {
 
     const config = defineRemontnikConfig(input)
 
-    expect(config.checks.eval).toMatchObject({ repeat: 3, maxScenarios: 3 })
+    expect(config.checks.eval).toMatchObject({
+      repeat: 3,
+      maxScenarios: 3,
+      providers: [],
+      tokenEnv: 'REMONTNIK_EVAL_TOKEN',
+      proxy: { maxRequestBytes: 2 * 1024 * 1024, maxResponseBytes: 8 * 1024 * 1024, maxConcurrentRequests: 4, maxOutputTokens: 4096 },
+    })
+    expect(config.limits.evalUsdPerCase).toBe(1)
     expect(config.review?.minConfidence).toBe(0.7)
     expect(config.handoff.paseo).toMatchObject({ acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 })
+  })
+
+  it('провайдеры модели для eval: ключ — имя переменной у врача, в контейнер идут адрес прокси и токен', () => {
+    const input = minimalConfig()
+    input.checks.eval = {
+      run: 'eval {scenarios}',
+      resultFile: 'result.json',
+      env: ['EVAL_MODE'],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: { 'chat-small': { input: 0.5, output: 2 } } }],
+    }
+    const config = defineRemontnikConfig(input)
+    expect(config.checks.eval?.providers[0]).toMatchObject({ name: 'chat', authHeader: 'authorization', models: { 'chat-small': { input: 0.5, output: 2 } } })
+  })
+
+  it.each([
+    ['ключ в eval.env', { env: ['EVAL_API_KEY'] }],
+    ['токен в eval.env', { env: ['BOT_TOKEN'] }],
+    ['пароль в eval.env', { env: ['DB_PASSWORD'] }],
+    ['секрет в eval.env', { env: ['APP_SECRET'] }],
+    ['адрес базы в eval.env', { env: ['DATABASE_URL'] }],
+    ['DSN в eval.env', { env: ['SENTRY_DSN'] }],
+    ['куки в eval.env', { env: ['ADMIN_COOKIE'] }],
+    ['сессия в eval.env', { env: ['USER_SESSION'] }],
+    ['пароль PASS в eval.env', { env: ['SMTP_PASS'] }],
+    ['переменная ключа провайдера в eval.env', { env: ['CHAT_KEY_NAME'], providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_KEY_NAME', upstream: 'https://api.example.com/v1', models: { m: { input: 1, output: 1 } } }] }],
+    ['имя провайдера не для адреса', { env: [], providers: [{ name: 'Chat/../x', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: { m: { input: 1, output: 1 } } }] }],
+    ['провайдер без моделей', { env: [], providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: {} }] }],
+    ['цена одна на поставщика', { env: [], providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 1, output: 1 } }] }],
+    ['нулевой предел запросов прокси', { env: [], proxy: { maxConcurrentRequests: 0 } }],
+  ])('отклоняет %s: секреты eval идут только через прокси', (_what, extra) => {
+    const input = minimalConfig()
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', ...extra } as NonNullable<RemontnikConfigInput['checks']['eval']>
+    expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval'))).toBe(true)
   })
 
   it('принимает все разделы контракта, включая браузер с живым экраном', () => {
@@ -133,7 +179,7 @@ describe('defineRemontnikConfig', () => {
       expect.arrayContaining(['**/.env*', '**/*.env', '**/*.pem', '**/*.key', '**/*secret*', '**/*credential*']),
     )
     expect(BUILT_IN_FORBIDDEN.agentChatSdkMasks.length).toBeGreaterThan(0)
-    expect(BUILT_IN_FORBIDDEN.remontnikMasks).toEqual(expect.arrayContaining(['**/remontnik.config.*']))
+    expect(BUILT_IN_FORBIDDEN.remontnikMasks).toEqual(expect.arrayContaining(['**/remontnik.config.*', '**/.remontnik*', '**/.remontnik*/**']))
     expect(BUILT_IN_FORBIDDEN.protectedPackages).toEqual(
       expect.arrayContaining(['@ykurilov/agent-chat-*', '@ykurilov/remontnik-*']),
     )

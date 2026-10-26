@@ -1,11 +1,19 @@
+import { join } from 'node:path'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
+import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import type { Models } from '@earendil-works/pi-ai'
 import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
-import { assertPrivateAddress } from '../intake/private-address.js'
+import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
+import type { GitGuard } from '../git-guard/index.js'
+import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createReports, type Reports } from '../reports/index.js'
+import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
+import type { CommandRunner } from '../workbench/index.js'
+import { createCurrentVersionReader } from './current-version.js'
 import { openDoctorHarness } from './harness.js'
 
 // Каркас врача: хранилище pi-durable, приём событий, книга случаев, отчёты и Telegram.
@@ -28,6 +36,34 @@ export interface DoctorServiceOptions {
   /** Для проверок: подменить хранилище. */
   wrapStorage?: (storage: Storage) => Storage
   now?: () => number
+  /** Лечение случаев; без него врач только принимает случаи и сообщает о них. */
+  treatment?: DoctorTreatmentOptions
+}
+
+export interface DoctorTreatmentOptions {
+  guard: GitGuard
+  /** Настройка приложения из основной ветки. */
+  loadConfig(): Promise<RemontnikConfig>
+  worktreesDir: string
+  models: Models
+  model: { provider: string; modelId: string }
+  /** Где идут команды модели: контейнер (`createDockerRunner`). Без него врач не лечит. */
+  runner?: CommandRunner
+  /** Где идут проверки; по умолчанию — тот же, что у модели. */
+  checksRunner?: CommandRunner
+  /** Только для тестов: разрешить исполнитель без изоляции (`createLocalRunner`). */
+  allowUnisolatedRunner?: boolean
+  /** Коммит рабочей версии; по умолчанию — команда `deploy.commands.current` в основной копии репозитория. */
+  currentVersion?: (config: RemontnikConfig) => Promise<string | undefined>
+  /** Окружение, из которого eval берёт свои переменные, а прокси — ключи модели; по умолчанию — окружение врача. */
+  evalEnv?: Readonly<Record<string, string | undefined>>
+  /**
+   * Прокси модели для eval (`eval-proxy`): слушает там, где его видит внутренняя сеть проверок, `publicUrl` — его адрес
+   * из контейнера. Не задан — eval с провайдерами (`checks.eval.providers`) не запускается.
+   */
+  evalProxy?: { listen: { host: string; port: number }; publicUrl?: string }
+  appDescription?: string
+  budgetPollMs?: number
 }
 
 export interface DoctorService {
@@ -38,15 +74,31 @@ export interface DoctorService {
   reports: Reports
   /** Отчёты pi-durable о сбоях, не роняющих вызов: припаркованная или упавшая задача и т. п. */
   handleHarnessReport(error: unknown, info: ReportInfo): void
+  /** То же, что приём по сети: события сторожа → случаи, отчёты и лечение. */
+  receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }>
   close(): Promise<void>
 }
 
 const REPORT_PUMP_INTERVAL_MS = 5_000
+const BUDGET_POLL_MS = 1_000
 const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
   task_parked: 'остановлена после повторных сбоев',
   task_faulted: 'упала',
   migration_failed: 'не перенесена на новую версию',
   task_outdated: 'не может продолжиться: её код сменился',
+}
+
+/** Модель и проверки идут только в контейнере; локальный исполнитель — лишь по явному разрешению тестов. */
+function isolatedRunners(options: DoctorTreatmentOptions): { runner: CommandRunner; checksRunner: CommandRunner } {
+  const { runner } = options
+  const checksRunner = options.checksRunner ?? runner
+  if (!runner || !checksRunner) throw new Error('врач лечит только в контейнере: задайте treatment.runner (createDockerRunner)')
+  for (const candidate of [runner, checksRunner]) {
+    if (candidate.isolation !== 'container' && options.allowUnisolatedRunner !== true) {
+      throw new Error('исполнитель без изоляции: врач лечит только в контейнере (createDockerRunner); локальный — только для тестов')
+    }
+  }
+  return { runner, checksRunner }
 }
 
 function describeError(error: unknown): string {
@@ -102,13 +154,15 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       .then(pump, () => sendDirect(short))
   }
 
+  const treatmentOptions = options.treatment
+  const runners = treatmentOptions ? isolatedRunners(treatmentOptions) : undefined
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
+    ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
-  opened.harness.resume()
 
   const caseBook = createCaseBook(opened.records)
   const reports = createReports({
@@ -118,6 +172,41 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     onSendError: (error, report) => log(`[врач] отчёт ${report.reportId} не ушёл в Telegram: ${describeError(error)}`),
   })
   reportsRef = reports
+
+  let evalProxy: EvalProxy | undefined
+  if (treatmentOptions?.evalProxy) {
+    try {
+      evalProxy = await createEvalProxy(treatmentOptions.evalProxy)
+    } catch (error) {
+      await opened.close().catch(() => {})
+      throw error
+    }
+  }
+
+  let treatment: Treatment | undefined
+  if (treatmentOptions && runners) {
+    treatment = createTreatment({
+      reports,
+      guard: treatmentOptions.guard,
+      loadConfig: treatmentOptions.loadConfig,
+      currentVersion: treatmentOptions.currentVersion ?? createCurrentVersionReader(treatmentOptions.guard.repoDir),
+      model: treatmentOptions.model,
+      workbenchRunner: runners.runner,
+      checksRunner: runners.checksRunner,
+      worktreesDir: treatmentOptions.worktreesDir,
+      checksDir: join(options.stateDir, 'checks'),
+      evalEnv: treatmentOptions.evalEnv ?? process.env,
+      ...(evalProxy ? { evalProxy } : {}),
+      evalBaseCache: createRecordEvalBaseCache(opened.records),
+      ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
+      budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
+      onReport: pump,
+      now,
+    })
+    // До resume(): прерванные перезапуском задачи лечения продолжаются со своих чекпойнтов.
+    opened.registry.install(treatment.extension)
+  }
+  opened.harness.resume()
 
   void opened.closed.then(async (end) => {
     if (end.reason !== 'failed') {
@@ -144,6 +233,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           telegram: 'not_needed',
         })
         opened.reportIds.push(report.reportId)
+        await treatment?.startIn(tx, opened)
       },
     })
     return { accepted }
@@ -164,6 +254,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       onError: (error) => log(`[врач] сбой приёма событий: ${describeError(error)}`),
     })
   } catch (error) {
+    await evalProxy?.close()
     await opened.close().catch(() => {})
     throw error
   }
@@ -179,6 +270,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       })
     } catch (error) {
       await intake.close()
+      await evalProxy?.close()
       await opened.close().catch(() => {})
       throw error
     }
@@ -194,12 +286,14 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     caseBook,
     reports,
     handleHarnessReport,
+    receiveEvents,
     async close() {
       closing = true
       clearInterval(pumpTimer)
       await intake.close()
       await bridgeIntake?.close()
       if (harnessState === 'open') await opened.close().catch((error: unknown) => log(`[врач] Harness не закрылся: ${describeError(error)}`))
+      await evalProxy?.close()
     },
   }
 }

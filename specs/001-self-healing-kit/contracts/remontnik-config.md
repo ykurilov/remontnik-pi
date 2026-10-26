@@ -28,11 +28,29 @@ export default defineRemontnikConfig({
       resultFile: string,             // путь к итогу в {outDir}, формат — deploy-commands.md
       repeat: number,                 // по умолчанию 3
       maxScenarios: number,           // по умолчанию 3
-      env: string[],                  // имена переменных окружения для eval (отдельные ключи с лимитом)
+      env: string[],                  // имена обычных переменных для eval; имена с KEY, TOKEN, SECRET, PASS, AUTH, CREDENTIAL,
+                                      // PRIVATE, URL, DSN, COOKIE, SESSION — отказ (подсказка от ошибки, не гарантия)
+      providers?: Array<{             // модели, к которым eval ходит через прокси врача; по умолчанию []
+        name: string,                 // латиница, цифры, дефис; без повторов
+        baseUrlEnv: string,           // переменная, в которой eval получит адрес прокси
+        keyEnv: string,               // переменная с настоящим ключом у врача; eval получает в ней разовый пропуск
+        upstream: string,             // настоящий адрес API модели
+        authHeader?: "authorization" | "x-api-key", // по умолчанию "authorization"
+        models: Record<string, { input: number, output: number }>, // белый список моделей с ценой за 1 млн токенов, $;
+                                      // не пустой; модели нет в списке — прокси отвечает 403
+      }>,
+      tokenEnv?: string,              // переменная с разовым пропуском; по умолчанию REMONTNIK_EVAL_TOKEN
+      proxy?: {                       // пределы прокси модели на прогон eval
+        maxRequestBytes?: number,     // 2 МБ; больше — 413
+        maxResponseBytes?: number,    // 8 МБ; ответ читается потоком и обрывается на пределе
+        maxConcurrentRequests?: number, // 4; лишние — 429
+        maxOutputTokens?: number,     // 4096; вставляется в запрос без предела ответа и идёт в бронь запроса
+      },
     },
   },
   evalScope: Array<{ paths: string[]; scenarios: string[] | "all" }>,
   closedPaths: string[],              // не попадают в рабочую копию врача, не запускаются
+  fixablePaths?: string[],            // где правка врача может менять код; по умолчанию ["src/**"]
   forbidden: {
     schema: string[],                 // маски путей
     money: string[],
@@ -58,6 +76,7 @@ export default defineRemontnikConfig({
   limits?: {
     modelUsdPerDay?: number,          // 5 (сторож + врач)
     evalUsdPerDay?: number,           // 5
+    evalUsdPerCase?: number,          // 1; доля одного случая, больше прокси не пропустит
     autoDeploysPerFingerprintPerDay?: number, // 2
     autoDeploysPerDay?: number,       // 5
     maxDiffLines?: number,            // 300
@@ -109,3 +128,4 @@ export default defineRemontnikConfig({
 - Маски `forbidden.*` пустыми быть не могут: приложение обязано явно сказать, где у него схема, деньги и доступы. Если чего-то нет — пишется `["<нет>"]` с комментарием.
 - Всегда добавляются встроенные запреты (R7), их нельзя убрать.
 - Адреса в `allowedOrigins` и `pagesToCheck` в открытых примерах — только `https://app.example.com`.
+- `fixablePaths` — белый список правки. Врач проверяет и отправляет правку, только если она меняет код по этим маскам и добавляет новые тесты по маскам тестов (`*.test.*`, `*.spec.*`, `*_test.*`, `*-test.*`, `test_*.py`, папки `test/`, `tests/`, `__tests__/`). Новый тест — только файл по маске файла теста; другой новый файл в `test/`, `tests/`, `__tests__/`, `e2e/` и новые файлы в `__mocks__/`, `__fixtures__/`, `fixtures/`, `__snapshots__/` — не новый тест. Обвязка тестов внутри `src` (`setupTests.*`, `test-utils.*`, `mocks/**`, `testing/**`, `globalSetup.*`) и конфиги сборки (`next.config.*`, `webpack.*`, `rollup.*`, `tsup.*`, `vite.*`, `.swcrc`, `.babelrc*`) защищены и внутри `fixablePaths`. Маски различают регистр, путь с `\` не проходит; непонятная маска — ошибка при загрузке настройки. Всё остальное — «нужен человек» со списком файлов: существующие тесты, настройки запуска тестов и eval, `package.json`, файлы-замки, `.npmrc`, `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `tsconfig*`, `.env*`, сборка, выкатка, сам Ремонтник. Настройки установки, компилятора и окружения защищены и внутри `fixablePaths`. Флаги `allow*` эту защиту не снимают.

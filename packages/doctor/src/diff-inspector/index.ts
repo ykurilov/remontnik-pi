@@ -17,6 +17,10 @@ export type SuspiciousSignal =
   | 'outside_project'
   | 'special_file_mode'
   | 'patch_unavailable'
+  /** Запись, удаление, переименование файлов: правка могла бы подделать итог проверки. */
+  | 'file_write'
+  /** Переменные `REMONTNIK*`, папка итога eval (`outDir`) или сам файл итога. */
+  | 'remontnik_access'
 
 export interface SuspiciousFinding {
   path: string
@@ -46,18 +50,12 @@ export interface DiffLimits {
 export interface InspectDiffOptions {
   /** Хосты или полные адреса, которые приложению уже известны (например, `browser.allowedOrigins`): новыми не считаются. */
   knownHosts?: readonly string[]
+  /** Имя файла итога eval (`checks.eval.resultFile`): упоминание в правке — обращение к итогу eval. */
+  evalResultFile?: string
 }
 
-const TEST_AND_EVAL_MASKS = [
-  '**/*.test.*',
-  '**/*.spec.*',
-  '**/test/**',
-  '**/tests/**',
-  '**/__tests__/**',
-  '**/__snapshots__/**',
-  '**/__mocks__/**',
-  '**/fixtures/**',
-  '**/e2e/**',
+// Настройки запуска тестов и eval: их нельзя ни менять, ни добавлять заново.
+const RUNNER_CONFIG_AND_EVAL_MASKS = [
   '**/vite.config.*',
   '**/vitest.config.*',
   '**/vitest.workspace.*',
@@ -65,11 +63,33 @@ const TEST_AND_EVAL_MASKS = [
   '**/jest.config.*',
   '**/jest.setup.*',
   '**/playwright.config.*',
+  '**/.mocharc*',
+  '**/babel.config.*',
+  '**/.babelrc*',
+  '**/bunfig.toml',
+  '**/conftest.py',
+  '**/pytest.ini',
   '**/eval/**',
   '**/evals/**',
   '**/scenarios/**',
   '**/*rubric*',
   '**/*judge*',
+]
+
+/** Файлы тестов по имени. Новый файл по этим маскам — новый тест; всё прочее в папках тестов — нет. */
+export const TEST_FILE_MASKS = ['**/*.test.*', '**/*.spec.*', '**/*_test.*', '**/*-test.*', '**/test_*.py']
+
+const TEST_AND_EVAL_MASKS = [
+  ...TEST_FILE_MASKS,
+  '**/test/**',
+  '**/tests/**',
+  '**/__tests__/**',
+  '**/__snapshots__/**',
+  '**/__mocks__/**',
+  '**/__fixtures__/**',
+  '**/fixtures/**',
+  '**/e2e/**',
+  ...RUNNER_CONFIG_AND_EVAL_MASKS,
 ]
 
 const BLOCK_COMMENT = /\/\*.*?\*\//g
@@ -80,22 +100,34 @@ const SCHEME_RELATIVE_HOST = /(?<=['"`])\/\/([a-z0-9][^\s/'"`?#)]*\.[^\s/'"`?#)]
 const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g
 const LOCAL_HOSTS = new Set(['localhost', '[::1]'])
 
-const ENVIRONMENT_ACCESS = /\bprocess\s*(?:\.\s*env\b|\[\s*['"`]env['"`]\s*\])|\bimport\.meta\.env\b/
+const ENVIRONMENT_ACCESS =
+  /\bprocess\s*(?:\.\s*env\b|\[\s*['"`]env['"`]\s*\])|\bimport\.meta\.env\b|\{[^}]*\benv\b[^}]*\}\s*=\s*(?:globalThis\s*\.\s*)?process\b|\b(?:Deno|Bun)\s*\.\s*env\b/
 const PROCESS_SPAWN =
-  /\bchild_process\b|\bBun\.spawn\b|\bDeno\.Command\b|(?<![.\w])(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\.(?:execSync|execFileSync|execFile|spawn|spawnSync)\s*\(/
+  /\bchild_process\b|\bBun\.spawn\b|\bDeno\.(?:Command|run)\b|\bnew\s+Worker\s*\(|(?<![.\w])(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\.(?:execSync|execFileSync|execFile|spawn|spawnSync)\s*\(/
 const DYNAMIC_CODE =
-  /(?<![\w./-])eval(?![\w./-])(?!\s*:)|\b(?:globalThis|window|self|global)\.eval\b|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]/
+  /(?<![\w./-])eval(?![\w./-])(?!\s*:)|\b(?:globalThis|window|self|global)\.eval\b|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]|\b(?:globalThis|global|window|self)\s*\[|\b(?:require|import)\s*\(\s*(?!['"`][^'"`$+]*['"`]\s*[,)])|\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\b/
 const SYSTEM_PATH_LITERAL = /['"`](?:\/(?:etc|root|proc|usr|Users|Volumes|home|var|opt|mnt|sys)\/|~\/|[A-Za-z]:\\)/
 const HOME_DIRECTORY = /\bhomedir\s*\(/
 const FILE_CALL_WITH_PARENT_PATH =
   /\b(?:readFile|writeFile|appendFile|readdir|readFileSync|writeFileSync|appendFileSync|readdirSync|createReadStream|createWriteStream|unlink|unlinkSync|rm|rmSync|rmdir|copyFile|rename|mkdir|mkdirSync|open|openSync|stat|existsSync)\s*\(\s*['"`]\.\.[/\\]/
 const SUBMODULE_IN_PATCH = /^Subproject commit\b/
+const FILE_WRITE =
+  /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|rename|renameSync|copyFile|copyFileSync|cpSync|writeSync|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|symlink|symlinkSync|chmod|chmodSync|cp|link|linkSync|utimes|utimesSync|mkdir|mkdirSync|mkdtemp|mkdtempSync)\s*\(|\bBun\.write\s*\(|\bfs\.write\s*\(|\bDeno\.(?:write|remove|rename|create|truncate|symlink|link|chmod|chown|copyFile|mkdir|makeTemp|utime)\w*\s*\(|\.writer\s*\(|\bopen(?:Sync)?\s*\([^)]*,\s*['"`](?:[wa]|r\+)/
+// Импорт записи из `fs` под другим именем: `import { writeFile as w }` — дальше вызов `w(...)` уже не узнать.
+const FS_MODULE = /(?:\bfrom\s*|\brequire\s*\(\s*)['"`](?:node:)?fs(?:\/promises)?['"`]/
+const FS_WRITE_NAME = /\b(?:writeFile|appendFile|createWriteStream|rename|copyFile|cp|rm|rmdir|unlink|symlink|link|chmod|chown|truncate|mkdir|mkdtemp|utimes|write)\w*\b/
+const REMONTNIK_ACCESS = /\bREMONTNIK\w*|\boutDir\b|eval-result/
 
 const LINK_AND_SUBMODULE_MODES = new Set(['120000', '160000'])
 const EXECUTABLE_MODE = '100755'
 
 export function isTestOrEvalPath(path: string): boolean {
   return matchesAnyMask(TEST_AND_EVAL_MASKS, path)
+}
+
+/** Настройка запуска тестов, сценарий, рубрика или судья eval. */
+export function isRunnerConfigOrEvalPath(path: string): boolean {
+  return matchesAnyMask(RUNNER_CONFIG_AND_EVAL_MASKS, path)
 }
 
 function isOutsideProject(path: string): boolean {
@@ -154,7 +186,7 @@ function hostsAlreadyInFile(patch: string): Set<string> {
   return known
 }
 
-function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: ReadonlySet<string>): SuspiciousFinding[] {
+function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: ReadonlySet<string>, evalResultFile: string | undefined): SuspiciousFinding[] {
   const findings: SuspiciousFinding[] = []
   const hostsInFile = hostsAlreadyInFile(patch)
   const report = (signal: SuspiciousSignal, line: string) => findings.push({ path: file.path, signal, line })
@@ -172,6 +204,8 @@ function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: Read
       (host) => !isLocalHost(host) && !knownHosts.has(host) && !hostsInFile.has(host),
     )
     if (isNewExternal) report('new_external_address', line)
+    if (FILE_WRITE.test(line) || (FS_MODULE.test(line) && FS_WRITE_NAME.test(line.replace(FS_MODULE, '')))) report('file_write', line)
+    if (REMONTNIK_ACCESS.test(line) || (evalResultFile && line.includes(evalResultFile))) report('remontnik_access', line)
   }
   return findings
 }
@@ -187,7 +221,7 @@ function isPureRename(file: ChangedFile): boolean {
   return file.status === 'renamed' && file.added === 0 && file.removed === 0
 }
 
-function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySet<string>): SuspiciousFinding[] {
+function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySet<string>, evalResultFile: string | undefined): SuspiciousFinding[] {
   const findings: SuspiciousFinding[] = []
   for (const file of files) {
     if (isOutsideProject(file.path) || (file.previousPath && isOutsideProject(file.previousPath))) {
@@ -203,7 +237,7 @@ function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySe
       if (file.status !== 'deleted' && !isPureRename(file)) findings.push({ path: file.path, signal: 'patch_unavailable', line: '' })
       continue
     }
-    findings.push(...findingsInAddedLines(file, file.patch, knownHosts))
+    findings.push(...findingsInAddedLines(file, file.patch, knownHosts, evalResultFile))
   }
   return findings
 }
@@ -238,7 +272,7 @@ export function inspectDiff(files: readonly ChangedFile[], limits: DiffLimits, o
   const knownHosts = new Set((options.knownHosts ?? []).map(hostOf))
   return {
     existingTestChanges: inspectExistingTests(files),
-    suspicious: inspectSuspicious(files, knownHosts),
+    suspicious: inspectSuspicious(files, knownHosts, options.evalResultFile),
     size: inspectSize(files, limits),
   }
 }

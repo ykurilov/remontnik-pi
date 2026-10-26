@@ -33,6 +33,10 @@
       "types": "./dist/signed-http/index.d.ts",
       "import": "./dist/signed-http/index.js"
     },
+    "./private-address": {
+      "types": "./dist/private-address/index.d.ts",
+      "import": "./dist/private-address/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"

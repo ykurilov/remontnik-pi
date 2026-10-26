@@ -127,9 +127,74 @@ describe('inspectDiff: подозрительное в добавленных с
     expect(signalsOf(withAddedLines('src/a.ts', 'const score = evaluate(answer)'))).toEqual([])
   })
 
+  it('запись, удаление и переименование файлов', () => {
+    for (const line of [
+      "await writeFile('cache.json', data)",
+      'fs.appendFileSync(logPath, line)',
+      'const out = createWriteStream(target)',
+      'await fs.promises.rename(from, to)',
+      'copyFileSync(a, b)',
+      'fs.writeSync(fd, text)',
+      "const handle = await open(path, 'w')",
+      "fs.openSync(path, 'a+')",
+      'await Bun.write(path, text)',
+      'await rm(dir, { recursive: true })',
+      'unlinkSync(path)',
+    ]) {
+      expect(signalsOf(withAddedLines('src/a.ts', line)), line).toEqual(['file_write'])
+    }
+  })
+
+  it.each([
+    ['const { env } = process', 'environment_access'],
+    ['const { argv, env: vars } = globalThis.process', 'environment_access'],
+    ['const port = Deno.env.get(name)', 'environment_access'],
+    ['const all = Bun.env', 'environment_access'],
+    ["const p = globalThis['pro' + 'cess']", 'dynamic_code'],
+    ["const fs = require('f' + 's')", 'dynamic_code'],
+    ["const fs = await import('f' + 's')", 'dynamic_code'],
+    ['const mod = await import(name)', 'dynamic_code'],
+    ['const mod = require(`./${name}`)', 'dynamic_code'],
+    ["const raw = process.binding('fs')", 'dynamic_code'],
+    ['const worker = new Worker(url)', 'process_spawn'],
+    ["Deno.run({ cmd: ['ls'] })", 'process_spawn'],
+    ["import { writeFile as w } from 'node:fs/promises'", 'file_write'],
+    ["const { appendFileSync: log } = require('fs')", 'file_write'],
+    ['await Deno.writeTextFile(path, text)', 'file_write'],
+    ['const writer = Bun.file(path).writer()', 'file_write'],
+    ['await fs.promises.cp(from, to, { recursive: true })', 'file_write'],
+    ['fs.linkSync(a, b)', 'file_write'],
+    ['fs.utimesSync(path, now, now)', 'file_write'],
+    ['fs.mkdirSync(dir)', 'file_write'],
+  ])('обходная форма: %s → %s', (line, signal) => {
+    expect(signalsOf(withAddedLines('src/a.ts', line))).toContain(signal)
+  })
+
+  it('обычные импорты и чтение — без тревоги', () => {
+    expect(signalsOf(withAddedLines('src/a.ts', "import { readFile } from 'node:fs/promises'"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', "const { join } = require('node:path')"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', "const page = await import('./page.js')"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', 'const { price } = plan'))).toEqual([])
+  })
+
+  it('чтение файлов и запись в поток ответа — не запись в файлы', () => {
+    expect(signalsOf(withAddedLines('src/a.ts', "const text = await readFile('data.json', 'utf8')"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', 'response.write(chunk)'))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', "const handle = await open(path, 'r')"))).toEqual([])
+  })
+
+  it('обращение к Ремонтнику и итогу eval', () => {
+    expect(signalsOf(withAddedLines('src/a.ts', "const token = env['REMONTNIK_EVAL_TOKEN']"))).toEqual(['remontnik_access'])
+    expect(signalsOf(withAddedLines('src/a.ts', 'const dir = options.outDir'))).toEqual(['remontnik_access'])
+    expect(signalsOf(withAddedLines('src/a.ts', "const name = 'eval-result.json'"))).toEqual(['remontnik_access'])
+    expect(inspectDiff([withAddedLines('src/a.ts', "const name = 'verdict.json'")], limits, { evalResultFile: 'verdict.json' }).suspicious.map((finding) => finding.signal)).toEqual([
+      'remontnik_access',
+    ])
+  })
+
   it('работа с файлами вне проекта', () => {
     expect(signalsOf(withAddedLines('src/a.ts', "const text = await readFile('/etc/passwd', 'utf8')"))).toEqual(['outside_project'])
-    expect(signalsOf(withAddedLines('src/a.ts', "await writeFile('~/.ssh/authorized_keys', data)"))).toEqual(['outside_project'])
+    expect(signalsOf(withAddedLines('src/a.ts', "await writeFile('~/.ssh/authorized_keys', data)"))).toEqual(['outside_project', 'file_write'])
     expect(signalsOf(withAddedLines('src/a.ts', "await readFile('../../other-app/.env')"))).toEqual(['outside_project'])
     expect(signalsOf(withAddedLines('src/a.ts', 'const home = os.homedir()'))).toEqual(['outside_project'])
   })

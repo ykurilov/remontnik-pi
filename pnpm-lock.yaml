@@ -35,6 +35,9 @@ importers:
 
   packages/browser:
     dependencies:
+      '@ykurilov/remontnik-core':
+        specifier: workspace:*
+        version: link:../core
       playwright-core:
         specifier: 1.64.1
         version: 1.64.1

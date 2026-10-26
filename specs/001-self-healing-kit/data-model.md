@@ -143,6 +143,8 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 `{ day, modelUsd, evalUsd, limits: { modelUsd, evalUsd } }`. Перед каждым обращением к модели и перед каждым прогоном eval — проверка; учёт с запасом 10% (R1).
 
+Бронь eval случая: `{ reservedUsd, actualUsd?, observedUsd?, inFlightUsd? }`. Бронируется доля случая (`limits.evalUsdPerCase`, не больше остатка дня) прямо перед запуском команды eval. `observedUsd` (факт) и `inFlightUsd` (брони запросов в пути) пишет прокси врача по ходу прогона; бронь запроса записывается до его отправки поставщику. Обрыв или перезапуск закрывают бронь суммой `observedUsd + inFlightUsd`; ничего не записано — нулём.
+
 ### Controls (документ `remontnik.controls`)
 
 `{ autoDeploy: "on" | "stopped", stoppedBy?, stoppedAt? }`.
