@@ -4,6 +4,7 @@ import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case
 import { createCaseServices, type CaseServices } from '../case-services/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
+import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
 import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
@@ -98,7 +99,7 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const sharedSecret = required(env, 'REMONTNIK_SHARED_SECRET')
   // Секрет владельца снимает стоп-кран выкаток: утечка общего секрета не должна давать того же.
   const controlSecret = env.REMONTNIK_CONTROL_SECRET?.trim() || undefined
-  if (controlSecret === sharedSecret) throw new Error('REMONTNIK_CONTROL_SECRET совпадает с REMONTNIK_SHARED_SECRET: нужен отдельный секрет владельца')
+  assertOwnerSecrets({ secret: sharedSecret, controlSecret })
 
   return {
     listen,

@@ -7,6 +7,7 @@ import {
   type IncidentEvent,
   type IncidentKind,
 } from '@ykurilov/remontnik-core/incident'
+import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { createModelRoute, type ModelRoute, type ModelRouteOptions } from '@ykurilov/remontnik-core/model-route'
 import { signBody } from '@ykurilov/remontnik-core/signed-http'
 import { createTelegramClient, type TelegramClient } from '@ykurilov/remontnik-core/telegram'
@@ -48,7 +49,11 @@ export interface WatchOptions {
   review?: {
     /** Что бот должен делать и чего не должен: по этому описанию модель судит ответы. */
     botDescription: string
-    usdPerDay: number
+    /**
+     * Пределы из `remontnik.config.ts` (`config.limits`): сторож тратит на модель не больше `watchModelUsdPerDay`
+     * в сутки. Это свой потолок сторожа; у врача — свой (`doctorModelUsdPerDay`), общего счётчика нет.
+     */
+    limits: Pick<RemontnikConfig['limits'], 'watchModelUsdPerDay'>
     /** Отметки с меньшей уверенностью случаями не становятся; по умолчанию 0.7. */
     minConfidence?: number
     /** Пояс для границы суток бюджета; по умолчанию UTC. */
@@ -459,7 +464,7 @@ export function createWatch(options: WatchOptions): Watch {
         const route: ModelRoute = createModelRoute({ ...options.model, ...(options.model.fetch ? {} : { fetch: fetchImpl }) })
         reviewer = createConversationReviewer({
           botDescription: options.review.botDescription,
-          usdPerDay: options.review.usdPerDay,
+          usdPerDay: options.review.limits.watchModelUsdPerDay,
           ...(options.review.minConfidence === undefined ? {} : { minConfidence: options.review.minConfidence }),
           ...(options.review.timeZone === undefined ? {} : { timeZone: options.review.timeZone }),
           ...(options.review.summaryDelayMs === undefined ? {} : { summaryDelayMs: options.review.summaryDelayMs }),

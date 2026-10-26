@@ -79,7 +79,8 @@ export default defineRemontnikConfig({
     newFingerprintsToRollback?: number, // 3
   },
   limits?: {
-    modelUsdPerDay?: number,          // 5 (сторож + врач)
+    watchModelUsdPerDay?: number,     // 1; потолок модели сторожа (чтение разговоров), свой
+    doctorModelUsdPerDay?: number,    // 4; потолок модели врача, свой; вместе со сторожем $5, общего счётчика нет
     evalUsdPerDay?: number,           // 5
     evalUsdPerCase?: number,          // 1; доля одного случая, больше прокси не пропустит
     autoDeploysPerFingerprintPerDay?: number, // 2
@@ -108,8 +109,7 @@ export default defineRemontnikConfig({
     },
   },
   review?: {                          // чтение законченных разговоров
-    botDescription: string,           // что бот должен делать, для рубрики
-    usdPerDay?: number,
+    botDescription: string,           // что бот должен делать, для рубрики; потолок — limits.watchModelUsdPerDay
     minConfidence?: number,           // 0.7
   },
   browser?: {

@@ -223,7 +223,10 @@ export const remontnikConfigSchema = z.strictObject({
     .prefault({}),
   limits: z
     .strictObject({
-      modelUsdPerDay: z.number().nonnegative().default(5),
+      /** Потолок модели сторожа в сутки (чтение разговоров); свой, с врачом не делится. */
+      watchModelUsdPerDay: z.number().nonnegative().default(1),
+      /** Потолок модели врача в сутки; свой, со сторожем не делится. Вместе со сторожем по умолчанию $5. */
+      doctorModelUsdPerDay: z.number().nonnegative().default(4),
       evalUsdPerDay: z.number().nonnegative().default(5),
       /** Доля дневного бюджета eval на один случай: столько бронирует проверка правки. */
       evalUsdPerCase: z.number().nonnegative().default(1),
@@ -246,7 +249,6 @@ export const remontnikConfigSchema = z.strictObject({
   review: z
     .strictObject({
       botDescription: z.string().trim().min(1),
-      usdPerDay: z.number().nonnegative().optional(),
       minConfidence: z.number().min(0).max(1).default(0.7),
     })
     .optional(),

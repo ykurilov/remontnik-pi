@@ -102,7 +102,6 @@ async function startDoctor(r: Repo, model: ScriptedModel, evalScope: RemontnikCo
       models: model.models,
       model: model.model,
       evalEnv: {},
-      budgetPollMs: 10,
       runner: createLocalRunner(),
       allowUnisolatedRunner: true,
     },

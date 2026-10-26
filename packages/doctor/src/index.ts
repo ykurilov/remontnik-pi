@@ -19,6 +19,18 @@ export {
   type TreatmentResult,
 } from './treatment/index.js'
 export {
+  LEDGER,
+  admitAutoDeployIn,
+  deployAttemptsOf,
+  readDeployAttempts,
+  recordRollbackIn,
+  releaseFingerprint,
+  type AutoDeployAdmission,
+  type DeployAttemptLimits,
+  type FingerprintLedger,
+} from './ledgers/fingerprint-ledger.js'
+export { emptySpendDay, nextDayStartMs, spendDayKey, type SpendDay } from './ledgers/spend-ledger.js'
+export {
   createServerDeployer,
   readDeployment,
   type Deployer,
