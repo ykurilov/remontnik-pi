@@ -10,6 +10,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@ykurilov/remontnik-core": "workspace:*",
     "@ykurilov/remontnik-watch": "workspace:*"
   }
 }

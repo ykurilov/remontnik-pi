@@ -1,24 +1,38 @@
-// Образец команд выкатки для врача: build | promote | confirm | rollback | current | health (и start для перезапускателя).
+// Образец команд выкатки для врача: build | promote | confirm | rollback | current | health.
+// Вне договора с врачом: start (поднять упавшее приложение) и deploy <sha> (ручная выкатка под общим замком).
+// ВАЖНО: образец запускает приложение процессом `node` рядом со скриптом. Так годится только для стенда и теста.
+// В бою приложение запускают и перезапускают через `docker compose` (или systemd на хосте): замените startApp,
+// stopApp и проверку pid в runVersion на вызовы compose, а `start` не нужен, его работу делает сам Docker.
 // Положите файл в репозиторий приложения (например, deploy/remontnik-deploy.mjs) и укажите в remontnik.config:
 //   deploy.commands = { build: 'node deploy/remontnik-deploy.mjs build', promote: '… promote', … }
 // Всё состояние лежит в папке выкаток APP_DEPLOY_DIR (вне репозитория):
 //   releases/<sha>, ссылка current, state.json, app.env (переменные приложения, строки ИМЯ=значение),
-//   settings.json: { "healthUrl": "http://127.0.0.1:3000", "entry": "src/main.js" }.
+//   settings.json: { "healthUrl": "http://127.0.0.1:3000", "entry": "src/main.js", "lockFile": "<путь>", "startupTimeoutMs": 30000 }.
+// APP_DEPLOY_DIR обязателен: без него скрипт отказывает. Папка должна быть доступна на запись тому, кто запускает команды
+// (врач работает от uid 10001) и смонтирована в контейнер врача по тому же пути, что на хосте.
 // Приложение должно отвечать на GET /health (код 200) и GET /version (JSON { "version": "<sha>" }).
 // Только node: этого хватает врачу. Если сборка приложению нужна, добавьте её в build (шаг «подготовка» ниже).
 import { spawn } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, openSync } from 'node:fs'
+import { closeSync, cpSync, existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, openSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const deployDir = process.env.APP_DEPLOY_DIR ?? '/srv/app-deploy'
+const deployDir = process.env.APP_DEPLOY_DIR
+if (!deployDir) {
+  console.error('не задана переменная APP_DEPLOY_DIR: путь к папке выкаток (она должна быть смонтирована в контейнер врача и доступна ему на запись)')
+  process.exit(2)
+}
 const releasesDir = join(deployDir, 'releases')
 const currentLink = join(deployDir, 'current')
 const statePath = join(deployDir, 'state.json')
 const settings = existsSync(join(deployDir, 'settings.json')) ? JSON.parse(readFileSync(join(deployDir, 'settings.json'), 'utf8')) : {}
 const healthUrl = settings.healthUrl ?? 'http://127.0.0.1:3000'
 const entry = settings.entry ?? 'src/main.js'
+const startupTimeoutMs = settings.startupTimeoutMs ?? 30_000
+// Замок выкатки, общий с врачом (deploy.lockFile в настройке). Врач сам держит его на время своей выкатки и команды под ним не берут;
+// замок берёт только ручная выкатка `deploy`. Путь по умолчанию — как в настройке образца, от рабочей папки.
+const lockFile = settings.lockFile ?? join(process.cwd(), '.remontnik/deploy.lock')
 const SHA = /^[0-9a-f]{40}$/
 
 const readState = () => (existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : { version: null, previous: null, unconfirmed: false, pid: null })
@@ -91,7 +105,7 @@ async function runVersion(version) {
   switchLink(version)
   const pid = startApp(version)
   writeState({ ...state, pid })
-  for (let i = 0; i < 100; i += 1) {
+  for (let i = 0; i < Math.ceil(startupTimeoutMs / 300); i += 1) {
     if ((await runningVersion()) === version) return true
     await sleep(300)
   }
@@ -118,7 +132,8 @@ const commands = {
     const state = readState()
     const version = state.candidate ?? ''
     if (!SHA.test(version) || !existsSync(join(releasesDir, version))) throw new Error('нет собранного кандидата')
-    writeState({ ...state, previous: state.version, version, unconfirmed: true })
+    // Повтор promote (врач перезапустился): прежняя сборка остаётся той же, её нельзя заменить кандидатом.
+    writeState({ ...state, previous: state.version === version ? state.previous : state.version, version, unconfirmed: true })
     if (!(await runVersion(version))) throw new Error('кандидат не отвечает')
   },
   async confirm() {
@@ -127,16 +142,18 @@ const commands = {
   async rollback() {
     const state = readState()
     if (!state.previous) throw new Error('прежней сборки нет')
-    writeState({ ...state, version: state.previous, previous: null, unconfirmed: false })
+    // previous обнуляется только после успешного запуска: неудавшийся rollback можно повторить.
+    writeState({ ...state, version: state.previous, unconfirmed: false })
     if (!(await runVersion(state.previous))) throw new Error('прежняя сборка не отвечает')
+    writeState({ ...readState(), previous: null })
   },
   async current() {
     const state = readState()
     const version = (await runningVersion()) ?? (existsSync(currentLink) ? readlinkSync(currentLink).split('/').pop() : null)
     console.log(JSON.stringify({ version: SHA.test(version ?? '') ? version : null, previous: state.previous }))
   },
-  // Не часть договора с врачом: роль перезапускателя (restart: unless-stopped, systemd). Сторож доставляет сбой, когда процесс поднимается снова,
-  // поэтому после падения приложение должно подняться само: например, systemd вызывает `node deploy/remontnik-deploy.mjs start`.
+  // Не часть договора с врачом, только для стенда и теста: заменяет перезапускатель, которого у процесса `node` нет.
+  // Сторож доставляет сбой, когда процесс поднимается снова. В бою эту роль играет Docker (`restart: unless-stopped`) или systemd.
   async start() {
     const state = readState()
     if (!state.version) throw new Error('нечего запускать')
@@ -148,6 +165,28 @@ const commands = {
     }
     writeState({ ...state, pid: startApp(state.version) })
   },
+  // Ручная выкатка: node deploy/remontnik-deploy.mjs deploy <полный sha>. Берёт тот же замок, что и врач, и снимает его в конце.
+  async deploy() {
+    const version = process.argv[3] ?? ''
+    if (!SHA.test(version)) throw new Error('использование: deploy <полный sha>')
+    mkdirSync(dirname(lockFile), { recursive: true })
+    let descriptor
+    try {
+      descriptor = openSync(lockFile, 'wx') // создаётся только если замка нет
+    } catch (error) {
+      if (error.code === 'EEXIST') throw new Error('замок выкатки занят: идёт другая выкатка (врача или ручная)')
+      throw error
+    }
+    closeSync(descriptor)
+    try {
+      process.env.REMONTNIK_VERSION = version
+      await commands.build()
+      await commands.promote()
+      await commands.confirm()
+    } finally {
+      rmSync(lockFile, { force: true })
+    }
+  },
   async health() {
     const response = await fetch(`${healthUrl}/health`, { signal: AbortSignal.timeout(10_000) })
     if (!response.ok) throw new Error(`health ${response.status}`)
@@ -156,7 +195,7 @@ const commands = {
 
 const name = process.argv[2]
 if (!commands[name]) {
-  console.error('команда: build | promote | confirm | rollback | current | health | start')
+  console.error('команда: build | promote | confirm | rollback | current | health | start | deploy <sha>')
   process.exit(2)
 }
 commands[name]().catch((error) => {
