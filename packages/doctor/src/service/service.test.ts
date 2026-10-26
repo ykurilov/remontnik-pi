@@ -5,6 +5,7 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { signBody, signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { GitGuardError } from '../git-guard/index.js'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions } from './index.js'
 
 const secret = 'shared-test-secret'
@@ -120,6 +121,25 @@ describe('каркас врача', () => {
 
     await until(() => telegram.messages.length === 1)
     expect(telegram.messages[0]?.text).toContain('remontnik.treatment')
+  })
+
+  it('doctor_problem не выносит текст git, адреса и пути origin: сбой git — причина по коду, остальное — без адресов', async () => {
+    const lines: string[] = []
+    const service = await start({ log: (line) => lines.push(line) })
+    const task = { id: 'task-1' as never, kind: 'remontnik.treatment', conversationId: 'conv-1' as never }
+    const stderr = 'fatal: unable to access https://owner:pass@git.example.com/owner/app.git/: 403; also git@git.example.com:owner/app.git and /srv/git/app.git'
+
+    service.handleHarnessReport(new Error('шаг выкатки', { cause: new GitGuardError('failed', `git worktree add: ${stderr}`) }), { type: 'task_parked', task })
+    service.handleHarnessReport(new Error(`push не прошёл: ${stderr}`), { type: 'task_parked', task })
+
+    await until(() => telegram.messages.length === 2)
+    for (const message of telegram.messages) {
+      expect(message.text).not.toMatch(/example\.com|app\.git|pass|owner\//)
+    }
+    expect(telegram.messages[0]?.text).toContain('origin отказал')
+    expect(telegram.messages[1]?.text).toContain('push не прошёл')
+    // Полный текст остаётся в журнале врача.
+    expect(lines.join('\n')).toContain('git.example.com')
   })
 
   it('отказ хранилища закрывает Harness — тревога и выход с ненулевым кодом', async () => {

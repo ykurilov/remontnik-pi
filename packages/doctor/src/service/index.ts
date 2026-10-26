@@ -1,18 +1,19 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { Models } from '@earendil-works/pi-ai'
-import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
+import type { ReportInfo, Storage, Wake } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createModelBudget } from '../ledgers/model-budget.js'
-import type { GitGuard } from '../git-guard/index.js'
+import { GIT_GUARD_REASONS, GitGuardError, type GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
-import { confirmAbandonedVersion } from '../deployer/index.js'
+import { confirmAbandonedVersion, type Deployer } from '../deployer/index.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { assertOwnerSecrets } from '../intake/http-kit.js'
@@ -46,6 +47,8 @@ export interface DoctorServiceOptions {
   /** Для проверок: подменить хранилище. */
   wrapStorage?: (storage: Storage) => Storage
   now?: () => number
+  /** Для проверок с подменёнными часами: будить спящие задачи самим (`resume`), а не таймером. */
+  onWake?: (wake: Wake, resume: () => void) => void
   /** Лечение случаев; без него врач только принимает случаи и сообщает о них. */
   treatment?: DoctorTreatmentOptions
 }
@@ -76,6 +79,8 @@ export interface DoctorTreatmentOptions {
   /** Службы для тестов (`checks.services`) в сети проверок случая; без них такие проверки не запускаются. */
   services?: Pick<CaseServices, 'up'>
   appDescription?: string
+  /** Выкатчик приложения (`createServerDeployer`). Не задан — врач правку не выкатывает, а сообщает «правка готова». */
+  deployer?: Deployer
 }
 
 export interface DoctorService {
@@ -123,6 +128,22 @@ function describeError(error: unknown): string {
   return parts.join(' ← ')
 }
 
+/** Адрес с протоколом, адрес вида `user@host:path` и путь к репозиторию `….git`. */
+const ADDRESS = /\b[a-z][a-z0-9+.-]*:\/\/\S+|[\w.-]+@[\w.-]+:[^\s]+|(?:\/[\w.-]+)+\.git\b\S*/gi
+
+/**
+ * Причина для отчёта `doctor_problem` (Telegram, Paseo). Сбой git — только по коду ошибки: текст git несёт адрес
+ * и пути origin. В остальном адреса и секреты вырезаны. Полный текст — только в журнале врача.
+ */
+function problemReason(error: unknown): string {
+  let current: unknown = error
+  for (let depth = 0; current instanceof Error && depth < 4; depth += 1) {
+    if (current instanceof GitGuardError) return `сбой git: ${GIT_GUARD_REASONS[current.code]}`
+    current = current.cause
+  }
+  return redactSecrets(describeError(error).replace(ADDRESS, '<адрес>'))
+}
+
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
@@ -157,7 +178,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     log(`[врач] pi-durable: ${info.type}: ${describeError(error)}`)
     const what = TASK_REPORTS[info.type]
     if (!what || !('task' in info) || !info.task) return
-    const short = `Врач: задача ${info.task.kind} (${info.task.id}) ${what}: ${describeError(error)}`
+    const short = `Врач: задача ${info.task.kind} (${info.task.id}) ${what}: ${problemReason(error)}`
     if (!reportsRef || harnessState !== 'open') {
       void sendDirect(short)
       return
@@ -169,6 +190,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
 
   const treatmentOptions = options.treatment
   const runners = treatmentOptions ? isolatedRunners(treatmentOptions) : undefined
+  const onWake = options.onWake
   // Свой у каждого запуска: брони модели и eval мёртвого запуска врача закрываются при следующих.
   const boot = randomUUID()
   const modelBudget = treatmentOptions
@@ -179,6 +201,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
+    ...(onWake ? { onWake: (wake: Wake) => onWake(wake, () => harnessState === 'open' && opened.harness.resume()) } : {}),
     ...(modelBudget && runners ? { models: modelBudget.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
@@ -223,6 +246,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       ...(treatmentOptions.services ? { checksServices: treatmentOptions.services } : {}),
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
+      ...(treatmentOptions.deployer ? { deployer: treatmentOptions.deployer } : {}),
       modelBudget,
       boot,
       onReport: pump,

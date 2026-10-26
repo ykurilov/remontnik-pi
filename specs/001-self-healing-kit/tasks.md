@@ -165,9 +165,9 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T067 [P] [US3] Запуск команд приложения и файл-замок в `packages/doctor/src/deployer/`
 - [X] T068 [US3] Наблюдение с `runtime.sleepUntil` и уровнем ошибок до выкатки из книги случаев в `packages/doctor/src/deployer/observer.ts`
 - [X] T069 [US3] Стоп-кран: документ `remontnik.controls`, `POST /v1/control/deploys`, команды `deploys stop|resume` в `packages/doctor/src/ledgers/controls.ts`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
-- [ ] T070 [US3] Фазы `deploying` → `observing` → `healed` | `rolled_back` | `not_helped`; после окна — слияние в основную ветку или запрос на слияние по `repo.mainline` через git-замок, в `packages/doctor/src/treatment/`
+- [X] T070 [US3] Фазы `deploying` → `observing` → `healed` | `rolled_back` | `not_helped`; после окна — слияние в основную ветку или запрос на слияние по `repo.mainline` через git-замок, в `packages/doctor/src/treatment/`
 - [X] T071 [US3] Отчёты `deployed`, `rolled_back`, `not_helped` (поле снимков экрана) в `packages/doctor/src/reports/texts.ts`
-- [ ] T072 [US3] Интеграционный тест `apps/patient/test/cycle/us3-deploy.test.ts`: crash до `healed` с меткой и прежней сборкой; worse → откат меньше чем за минуту; no-git; stop
+- [X] T072 [US3] Интеграционный тест `apps/patient/test/cycle/us3-deploy.test.ts`: crash до `healed` с меткой и прежней сборкой; worse → откат меньше чем за минуту; no-git; stop
 
 **Контрольная точка**: P1 закрыт — самолечение работает целиком на «Пациенте».
 
@@ -259,7 +259,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 - [X] T110 [P] [US7] Тест `packages/doctor/src/ledgers/fingerprint-ledger.test.ts`: 2 выкатки на отпечаток в сутки, 5 на приложение, «нужен человек» после отката, снятие командой
 - [X] T111 [P] [US7] Тест `packages/doctor/src/ledgers/spend-ledger.test.ts`: граница суток по поясу; запас 10%; блок обращения к модели; блок eval
-- [X] T112 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/` (допуск `admitAutoDeployIn` — проверить и записать одной транзакцией; **к выкатке пока не подключён и её не ограничивает**, подключается в T070)
+- [X] T112 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/` (допуск `admitAutoDeployIn` — проверить и записать одной транзакцией; подключён в T070: допуск — в фазе `gated`, `recordRollbackIn` — после отката)
 - [X] T113 [US7] Учёт расходов через хуки `beforeRequest`/`afterResponse` и стоимость eval; `deferred_budget` с продолжением на следующие сутки через `sleepUntil` в `packages/doctor/src/ledgers/spend-ledger.ts`
 - [X] T114 [US7] Интеграционный тест `apps/patient/test/cycle/us7-loop.test.ts`: сценарии loop и budget (budget и допуск по учёту выкаток готовы; живой цикл «выкатка → откат» — после этапа выкатки)
 

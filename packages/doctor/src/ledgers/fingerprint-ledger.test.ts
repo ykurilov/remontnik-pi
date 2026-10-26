@@ -1,10 +1,15 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { decideDeploy } from '../deploy-gate/index.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
+import { openDoctorHarness } from '../service/harness.js'
 import {
   admitAutoDeployIn,
   readDeployAttempts,
   recordRollbackIn,
+  refundAutoDeployIn,
   releaseFingerprint,
   type DeployAttemptLimits,
 } from './fingerprint-ledger.js'
@@ -45,6 +50,18 @@ describe('учёт попыток выкатки', () => {
     expect(gateCodes(facts)).toContain('attempts_exhausted')
     // Другой отпечаток не задет.
     expect(gateCodes(await attempts(store, 'fp-b', noon))).not.toContain('attempts_exhausted')
+  })
+
+  it('записи pi-durable: первая выкатка нового отпечатка сохраняется в учёте', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'remontnik-ledger-'))
+    const opened = await openDoctorHarness({ stateDir, onReport: () => {} })
+    try {
+      await deploy(opened.records, 'fp-a', 1, noon - HOUR)
+      expect((await attempts(opened.records, 'fp-a', noon)).autoDeploysForFingerprint).toBe(1)
+    } finally {
+      await opened.close()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
   })
 
   it('5 выкаток на приложение в сутки по всем отпечаткам', async () => {
@@ -134,6 +151,22 @@ describe('допуск автовыкатки: проверить и запис�
     await store.transaction((tx) => recordRollbackIn(tx, { fingerprint: 'fp-a', deploymentId: 2, at: noon }))
     expect(await admit('fp-a', 3)).toEqual({ admitted: false, reasons: ['attempts_exhausted', 'needs_human_after_rollback'] })
     expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 2, autoDeploysToday: 2 })
+  })
+
+  it('выкатка не началась → допуск возвращается: попытка и место дня свободны; повторный возврат ничего не меняет', async () => {
+    const store = createMemoryRecordStore()
+    await deploy(store, 'fp-a', 1, noon - HOUR)
+    await deploy(store, 'fp-a', 2, noon - HOUR)
+    await deploy(store, 'fp-b', 3, noon - HOUR)
+    const refund = () => store.transaction((tx) => refundAutoDeployIn(tx, { fingerprint: 'fp-a', deploymentId: 2, timeZone: 'UTC' }))
+    await refund()
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    await refund()
+    expect(await attempts(store, 'fp-a', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    // Незнакомая выкатка или отпечаток — ничего не меняется и не создаётся.
+    await store.transaction((tx) => refundAutoDeployIn(tx, { fingerprint: 'fp-x', deploymentId: 9, timeZone: 'UTC' }))
+    expect(await attempts(store, 'fp-b', noon)).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 2 })
+    await deploy(store, 'fp-a', 4, noon)
   })
 
   it('повтор той же выкатки после перезапуска пропускается, даже когда предел уже выбран', async () => {

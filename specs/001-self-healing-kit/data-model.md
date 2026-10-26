@@ -65,7 +65,7 @@
 received → triage → diagnosing → fixing → verifying → gated
 gated → deploying → observing → healed
 gated → report_only            (решение «только отчёт»)
-observing → rolled_back → needs_human
+observing → rolled_back         (случай закрыт; отпечаток в учёте выкаток — «нужен человек»)
 observing → not_helped         (тот же отпечаток повторился без ухудшения)
 diagnosing → no_cause_found    (бюджет исчерпан)
 любое → deferred_budget        (потолок расходов; продолжится завтра)
@@ -79,7 +79,7 @@ paseo_working → healed_by_paseo                   (агент сделал б�
 handed_off | paseo_working → reclaimed → triage    (срок вышел, «не смог», мост пропал)
 ```
 
-Закрыты только `healed` и `healed_by_paseo`: после них тот же отпечаток открывает новый случай. Повторы после `report_only`, `needs_human` и других итогов без лечения склеиваются в открытый случай — владелец уже знает о сбое, второй случай был бы шумом.
+Закрыты `healed`, `healed_by_paseo` и `rolled_back`: после них тот же отпечаток открывает новый случай. После отката новое лечение готовит правку, но автовыкатки по отпечатку нет до решения человека (FingerprintLedger). Повторы после `report_only`, `needs_human` и других итогов без лечения склеиваются в открытый случай — владелец уже знает о сбое, второй случай был бы шумом.
 
 Отчёт `case_received` пишется в той же транзакции, что и новый случай.
 
@@ -161,7 +161,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 
-`{ fingerprints: { [fingerprint]: { autoDeploys: { at, deploymentId }[], rolledBackAt?, needsHuman: boolean, releasedBy?, releasedAt? } }, deploysToday: { day, count } }`, ключ `main`. Сутки — в поясе приложения; в `autoDeploys` хранятся только последние двое суток. Перед автовыкаткой выкатка спрашивает `admitAutoDeployIn`: проверка пределов и запись попытки — одной транзакцией, отказ приходит с причинами (`attempts_exhausted`, `needs_human_after_rollback`) и ничего не пишет; повтор того же `deploymentId` допускается без второй записи. После отката — `recordRollbackIn`. Решение о выкатке читает факты `attempts` из этого документа. К выкатке учёт пока не подключён и её не ограничивает: подключается в T070. Снятие `needsHuman` — только командой владельца (`fingerprint <fp> release`, секрет владельца).
+`{ fingerprints: { [fingerprint]: { autoDeploys: { at, deploymentId }[], rolledBackAt?, needsHuman: boolean, releasedBy?, releasedAt? } }, deploysToday: { day, count } }`, ключ `main`. Сутки — в поясе приложения; в `autoDeploys` хранятся только последние двое суток. Перед автовыкаткой выкатка спрашивает `admitAutoDeployIn`: проверка пределов и запись попытки — одной транзакцией, отказ приходит с причинами (`attempts_exhausted`, `needs_human_after_rollback`) и ничего не пишет; повтор того же `deploymentId` допускается без второй записи. После отката — `recordRollbackIn`. Фаза `gated` читает документ, решает о выкатке и при решении «выкатывать» берёт допуск `admitAutoDeployIn` с номером будущей выкатки — одной фиксацией с переходом случая в `deploying`; повтор фазы после перезапуска ничего не пересчитывает. Отказ учёта закрывает случай отчётом по решению (`attempts_exhausted` → «правка готова», `needs_human_after_rollback` → «нужен человек»). Итог выкатки `rolled_back` или `rollback_failed` пишет `recordRollbackIn` той же фиксацией, что отчёт. Итог `refused` (выкатка не началась, рабочая версия не тронута) возвращает допуск `refundAutoDeployIn` той же фиксацией: попытка и место дня снова свободны; повторный возврат ничего не меняет. Снятие `needsHuman` — только командой владельца (`fingerprint <fp> release`, секрет владельца).
 
 ### SpendLedger (документ `remontnik.spend`)
 

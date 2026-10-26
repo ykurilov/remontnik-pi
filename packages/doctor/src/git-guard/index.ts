@@ -18,7 +18,17 @@ export const TREATMENT_BRANCH_PREFIX = 'remontnik/'
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
-export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape'
+/** `diverged` — основная ветка origin ушла вперёд мимо правки: влить её вперёд нельзя. */
+export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape' | 'diverged'
+
+/** Причина сбоя git-замка для человека — по коду ошибки, без текста git: в нём адрес и пути origin. */
+export const GIT_GUARD_REASONS: Record<GitGuardErrorCode, string> = {
+  diverged: 'основная ветка ушла вперёд',
+  failed: 'origin отказал',
+  timeout: 'origin не ответил вовремя',
+  forbidden: 'git-замок не разрешил',
+  escape: 'git-замок не разрешил',
+}
 
 export class GitGuardError extends Error {
   readonly code: GitGuardErrorCode
@@ -82,8 +92,13 @@ export interface GitGuard {
    * Повтор с тем же коммитом безопасен (перезапуск врача); та же метка на другом коммите — отказ.
    */
   tagPreDeploy(name: string, commit: string): Promise<void>
-  /** Влить ветку врача в основную вперёд (`--ff-only`). Только при `mainline: "merge"`. */
-  mergeIntoMain(branch: string): Promise<void>
+  /**
+   * Отправить проверенную ревизию `commit` ветки врача в основную ветку origin: только вперёд, без merge-коммита и
+   * без `--force`. Только при `mainline: "merge"` и только если ветка всё ещё на `commit`. Правка уже в основной ветке
+   * (повтор после перезапуска врача) — ничего не делает; основная ветка ушла вперёд мимо правки — `diverged`.
+   * Рабочую копию основной ветки не трогает: её держат выкатки, и смена копии посреди чужой выкатки — её отказ.
+   */
+  mergeIntoMain(branch: string, commit: string): Promise<void>
 }
 
 const TRANSLIT: Record<string, string> = {
@@ -206,11 +221,6 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
         return isMainRef(destination, policy) ? 'в основную ветку врач пишет только при mainline: "merge"' : `ветка ${destination} чужая`
       }
       return undefined
-    }
-    case 'merge': {
-      if (policy.mainline !== 'merge') return 'вливать в основную ветку можно только при mainline: "merge"'
-      if (!inMainCheckout) return 'вливать можно только в рабочей копии основной ветки'
-      return rest.length === 2 && rest[0] === '--ff-only' && isTreatmentRef(rest[1]!) ? undefined : 'merge только --ff-only своей ветки'
     }
     case 'tag':
       if (!isTreatmentRef(rest[0] ?? '')) return 'метки только remontnik/…'
@@ -391,6 +401,17 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     return exec(args, cwd, input, copy)
   }
 
+  /** Оба коммита уже проверены `rev-parse`: отказ `merge-base --is-ancestor` значит «не предок». */
+  async function isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    try {
+      await run(['merge-base', '--is-ancestor', ancestor, descendant])
+      return true
+    } catch (error) {
+      if (error instanceof GitGuardError && error.code === 'failed') return false
+      throw error
+    }
+  }
+
   async function tagExists(name: string): Promise<boolean> {
     try {
       await run(['rev-parse', '--verify', '--quiet', `refs/tags/${name}`])
@@ -539,9 +560,18 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       await run(['push', remote, `refs/tags/${name}:refs/tags/${name}`])
     },
 
-    async mergeIntoMain(branch) {
+    async mergeIntoMain(branch, commit) {
       if (options.mainline !== 'merge') throw new GitGuardError('forbidden', 'git-замок: вливать в основную ветку можно только при mainline: "merge"')
-      await run(['merge', '--ff-only', branch])
+      if (!isTreatmentRef(branch) || branch.startsWith('refs/')) throw new GitGuardError('forbidden', 'git-замок: вливать можно только свою ветку remontnik/…')
+      if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: вливать можно только ревизию по её полному id')
+      const head = (await run(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`])).trim()
+      if (head !== commit) throw new GitGuardError('forbidden', `git-замок: ветка ${branch} ушла с проверенной ревизии`)
+      await run(['fetch', remote])
+      const mainline = (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
+      if (await isAncestor(commit, mainline)) return
+      if (!(await isAncestor(mainline, commit))) throw new GitGuardError('diverged', `git-замок: основная ветка ${options.mainBranch} ушла вперёд мимо правки`)
+      // Обычный push без `+`: origin примет его, только если основная ветка всё ещё предок правки.
+      await run(['push', remote, `${commit}:refs/heads/${options.mainBranch}`])
     },
   }
 }

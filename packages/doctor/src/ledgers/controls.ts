@@ -1,7 +1,8 @@
 import type { RecordStore } from '../records/index.js'
 
 // Стоп-кран выкаток (FR-012): документ `remontnik.controls`. Стоп не прерывает идущую выкатку с её откатом,
-// но новая выкатка не начнётся, а выкатка до `promote` остановится (см. deployer).
+// но новая выкатка не начнётся, выкатка до `promote` остановится (см. deployer), а правку после окна наблюдения
+// врач не вольёт в основную ветку (см. treatment/task.ts).
 
 export const CONTROLS = { collection: 'controls', key: 'main' } as const
 

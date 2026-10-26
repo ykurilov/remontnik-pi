@@ -177,7 +177,7 @@ interface DeploymentIndex {
   abandonedVersions?: string[]
 }
 
-const requestKey = (request: DeployRequest) => `${request.caseId}:${request.candidateVersion}`
+const requestKey = (request: Pick<DeployRequest, 'caseId' | 'candidateVersion'>) => `${request.caseId}:${request.candidateVersion}`
 const clip = (text: string) => text.slice(-DETAIL_LIMIT)
 
 export function preDeployTagName(caseId: number, deploymentId: number, at: Date): string {
@@ -205,6 +205,26 @@ export async function confirmAbandonedVersion(store: RecordStore, version: strin
   })
 }
 
+/**
+ * Номер выкатки правки случая — тот же, что потом откроет `step`. `reserve()` записывает его в индекс; без него
+ * номер только узнан: так учёт выкаток получает номер в той же транзакции, где решается, быть ли выкатке.
+ */
+export async function deploymentIdIn(
+  tx: RecordTransaction,
+  request: Pick<DeployRequest, 'caseId' | 'candidateVersion'>,
+): Promise<{ deploymentId: number; reserve(): void }> {
+  const index = await tx.doc<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY, { nextId: 1, byRequest: {} })
+  const key = requestKey(request)
+  const deploymentId = index.byRequest[key] ?? index.nextId
+  return {
+    deploymentId,
+    reserve() {
+      if (deploymentId === index.nextId) index.nextId += 1
+      index.byRequest[key] = deploymentId
+    },
+  }
+}
+
 async function openDeployment(store: RecordStore, request: DeployRequest, now: Date): Promise<Deployment> {
   const index = await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY)
   const known = index?.byRequest[requestKey(request)]
@@ -213,10 +233,8 @@ async function openDeployment(store: RecordStore, request: DeployRequest, now: D
     if (found) return found
   }
   return store.transaction(async (tx) => {
-    const draft = await tx.doc<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY, { nextId: 1, byRequest: {} })
-    const deploymentId = draft.byRequest[requestKey(request)] ?? draft.nextId
-    if (deploymentId === draft.nextId) draft.nextId += 1
-    draft.byRequest[requestKey(request)] = deploymentId
+    const { deploymentId, reserve } = await deploymentIdIn(tx, request)
+    reserve()
     const deployment = await tx.doc<Deployment>(DEPLOYMENT_COLLECTION, String(deploymentId), {
       deploymentId,
       caseId: request.caseId,

@@ -158,14 +158,15 @@ export function taskRecordStore<I, S, R, H extends object>(runtime: TaskRuntime<
 
 /**
  * Выкатка из фазы задачи лечения — одной строкой: шаг выкатки, а когда ей надо ждать (замок, тик наблюдения), задача
- * засыпает на `checkpoint` и фаза должна сразу вернуться. На `done` фаза сама фиксирует следующий чекпойнт или итог.
+ * засыпает на `checkpoint` и фаза должна сразу вернуться. `checkpoint` может зависеть от шага: `undefined` — не спать,
+ * фаза сама фиксирует переход (например, к наблюдению). На `done` фаза сама фиксирует следующий чекпойнт или итог.
  * Повтор фазы после перезапуска безопасен: выкатка продолжает свою запись `deployment/<id>`.
  */
 export async function runDeploymentInTask<I, S, R, H extends object>(
   runtime: TaskRuntime<I, S, R, H>,
   deployer: Deployer,
   request: DeployRequest,
-  checkpoint: S,
+  checkpoint: S | ((step: Extract<DeployStep, { kind: 'sleep' }>) => S | undefined),
   context: Context,
 ): Promise<DeployStep> {
   const step = await deployer.step(request, {
@@ -177,7 +178,9 @@ export async function runDeploymentInTask<I, S, R, H extends object>(
       return task !== undefined && task.state.status !== 'completing' && task.state.status !== 'terminal'
     },
   })
-  if (step.kind === 'sleep') await runtime.sleepUntil(step.until, checkpoint, context)
+  if (step.kind !== 'sleep') return step
+  const sleepingAt = typeof checkpoint === 'function' ? (checkpoint as (step: Extract<DeployStep, { kind: 'sleep' }>) => S | undefined)(step) : checkpoint
+  if (sleepingAt !== undefined) await runtime.sleepUntil(step.until, sleepingAt, context)
   return step
 }
 
