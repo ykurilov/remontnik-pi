@@ -5,7 +5,8 @@
 // Модель — бронью до каждого запроса (`holdModelIn`): наибольшая цена запроса при длине ответа до предела модели.
 // Денег на бронь нет — запрос не уходит. После ответа бронь заменяется настоящей ценой (`settleModelHoldIn`).
 // Бронь прошлого запуска врача (упал посреди запроса) списывается целиком: ответ мог быть оплачен. Так же —
-// бронь этого запуска старше `MODEL_HOLD_STALE_MS`: запрос завис или его итог не записался.
+// бронь этого запуска старше `MODEL_HOLD_STALE_MS`: запрос завис или его итог не записался. Брони живут в дне,
+// когда их сделали; дни с открытыми бронями записаны в `spend-holds/open`, и новая бронь подметает и их.
 // Eval — бронью до запуска и фактом после. Бронь — доля случая (`evalUsdPerCase`), не больше остатка дня, и остаток
 // делится поровну с другими случаями, которые сейчас ждут eval (`eval-queue`); ставится прямо перед запуском eval.
 // Факт даёт прокси модели: до отправки каждого запроса к поставщику он ждёт записи его брони, после ответа —
@@ -44,6 +45,11 @@ export interface EvalReservation {
   observedUsd?: number
   /** Брони запросов к модели, которые ещё шли при последней записи. */
   inFlightUsd?: number
+}
+
+/** Дни, в документах которых могут быть открытые брони запросов к модели (`spend-holds/open`). */
+export interface OpenHoldDays {
+  days: string[]
 }
 
 /** Расход модели по случаю за всё лечение. */
@@ -157,7 +163,36 @@ export async function holdModelIn(
     limits: { doctorModelUsdPerDay: number }
   },
 ): Promise<{ held: true } | { held: false; block: ModelBlock }> {
+  const open = await tx.doc<OpenHoldDays>('spend-holds', 'open', { days: [] })
+  // Брони прошлых суток: брошенные списываются в свой день, живые держат потолок случая, пока не закроются.
+  let pastCaseHeldUsd = 0
+  for (const pastKey of [...open.days]) {
+    if (pastKey === input.dayKey) continue
+    const past = await tx.doc<SpendDay>('spend', pastKey, emptySpendDay())
+    const left = await sweepModelHoldsIn(tx, past, input)
+    if (left.length === 0) open.days = open.days.filter((key) => key !== pastKey)
+    for (const item of left) if (item.caseKey === input.caseKey) pastCaseHeldUsd += item.usd
+  }
   const day = await tx.doc<SpendDay>('spend', input.dayKey, emptySpendDay())
+  await sweepModelHoldsIn(tx, day, input)
+  const holds = day.modelHolds!
+  const heldUsd = (caseKey?: string) => Object.values(holds).reduce((sum, item) => sum + (caseKey === undefined || item.caseKey === caseKey ? item.usd : 0), 0)
+  let block: ModelBlock | undefined
+  if (exceeds(modelSpentUsd(day) + heldUsd(), input.maxUsd, usableUsd(input.limits.doctorModelUsdPerDay))) block = 'day_budget'
+  const spend = input.caseKey === undefined ? undefined : await caseSpendIn(tx, input.caseKey)
+  if (!block && spend && exceeds(spend.modelUsd + heldUsd(input.caseKey) + pastCaseHeldUsd, input.maxUsd, input.caseLimitUsd)) block = 'budget'
+  if (block) {
+    if (spend) spend.refused = block
+    return { held: false, block }
+  }
+  if (spend) delete spend.refused
+  holds[input.holdId] = { caseKey: input.caseKey ?? '', usd: input.maxUsd, boot: input.boot, at: input.now }
+  if (!open.days.includes(input.dayKey)) open.days.push(input.dayKey)
+  return { held: true }
+}
+
+/** Брони прошлого запуска и слишком старые списываются целиком в свой день. Возвращает оставшиеся брони. */
+async function sweepModelHoldsIn(tx: RecordTransaction, day: SpendDay, input: { boot: string; now: number }): Promise<ModelHold[]> {
   day.modelHolds ??= {}
   // Черновик pi-durable: вложенное правится через документ — ссылка на только что присвоенный объект правок не запишет.
   const holds = day.modelHolds
@@ -166,18 +201,7 @@ export async function holdModelIn(
     await chargeModelIn(tx, day, stale.caseKey, stale.usd)
     delete holds[id]
   }
-  const heldUsd = (caseKey?: string) => Object.values(holds).reduce((sum, item) => sum + (caseKey === undefined || item.caseKey === caseKey ? item.usd : 0), 0)
-  let block: ModelBlock | undefined
-  if (exceeds(modelSpentUsd(day) + heldUsd(), input.maxUsd, usableUsd(input.limits.doctorModelUsdPerDay))) block = 'day_budget'
-  const spend = input.caseKey === undefined ? undefined : await caseSpendIn(tx, input.caseKey)
-  if (!block && spend && exceeds(spend.modelUsd + heldUsd(input.caseKey), input.maxUsd, input.caseLimitUsd)) block = 'budget'
-  if (block) {
-    if (spend) spend.refused = block
-    return { held: false, block }
-  }
-  if (spend) delete spend.refused
-  holds[input.holdId] = { caseKey: input.caseKey ?? '', usd: input.maxUsd, boot: input.boot, at: input.now }
-  return { held: true }
+  return Object.values(holds)
 }
 
 /** Ответ пришёл (или запрос оборвался): бронь заменяется настоящей ценой. */

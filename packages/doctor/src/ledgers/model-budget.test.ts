@@ -1,7 +1,8 @@
-import { fauxAssistantMessage, type AssistantMessage } from '@earendil-works/pi-ai'
+import { createModels, fauxAssistantMessage, fauxProvider, type AssistantMessage } from '@earendil-works/pi-ai'
 import { describe, expect, it } from 'vitest'
 import { createMemoryRecordStore } from '../records/index.js'
 import { createScriptedModel, say, testRemontnikConfig } from '../testing/index.js'
+import { createFallbackProvider, DOCTOR_MODEL_ID, DOCTOR_PROVIDER_ID } from '../model/provider-fallback.js'
 import { createModelBudget, maxRequestUsd } from './model-budget.js'
 import { modelSpentUsd, type CaseSpend, type SpendDay } from './spend-ledger.js'
 
@@ -158,6 +159,42 @@ describe('бронь перед запросом к модели', () => {
     const day = await records.read<SpendDay>('spend', DAY)
     expect(day?.model).toEqual({ '1': 0.4, '2': 0.4 })
     expect(day?.modelHolds).toEqual({})
+  })
+
+  it('поставщик отклонил запрос (код HTTP от 400) → в учёт его настоящий счёт, а не бронь', async () => {
+    const { scripted, records, ask } = setup({ costPerResponseUsd: 0.05, maxResponseUsd: 0.4, limits: { doctorModelUsdPerDay: 5 } })
+    scripted.script(fauxAssistantMessage('', { stopReason: 'error', errorMessage: '503 Service Unavailable' }), fauxAssistantMessage('', { stopReason: 'error', errorMessage: '400 status code (no body)' }))
+    await ask(1)
+    await ask(2)
+    expect((await records.read<SpendDay>('spend', DAY))?.model).toEqual({ '1': 0.05, '2': 0.05 })
+  })
+
+  it('оба пути модели врача ответили 5xx → потолок не тает', async () => {
+    const cost = { input: 0, output: 100, cacheRead: 0, cacheWrite: 0 }
+    const primary = fauxProvider({ provider: 'primary-test', models: [{ id: 'flash', maxTokens: 1_000, cost }] })
+    const fallback = fauxProvider({ provider: 'fallback-test', models: [{ id: 'flash-routed', maxTokens: 1_000, cost }] })
+    const inner = createModels()
+    inner.setProvider(createFallbackProvider({ primary: { provider: primary.provider, modelId: 'flash' }, fallback: { provider: fallback.provider, modelId: 'flash-routed' }, now: () => NOON }))
+    const records = createMemoryRecordStore()
+    const budget = createModelBudget({ models: inner, boot: 'boot-a', now: () => NOON })
+    budget.attach({ records, loadConfig: async () => testRemontnikConfig({ limits: { doctorModelUsdPerDay: 1 } }) })
+    const model = budget.models.getModel(DOCTOR_PROVIDER_ID, DOCTOR_MODEL_ID)!
+    const failed = () => fauxAssistantMessage('', { stopReason: 'error', errorMessage: '502 Bad Gateway' })
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      primary.setResponses([failed()])
+      fallback.setResponses([failed()])
+      // Бронь — 0.2 (выход 1000 токенов по 100 за миллион на каждом пути): без отказов влезает только 4 раза.
+      expect((await budget.models.completeSimple(model, { messages: [{ role: 'user', content: 'привет', timestamp: NOON }] })).errorMessage).toContain('502')
+    }
+    expect(modelSpentUsd(await records.read<SpendDay>('spend', DAY))).toBe(0)
+  })
+
+  it('предел ответа 0 у вызывающего → бронь по пределу модели, а не нулевая', async () => {
+    const { scripted, model, budget } = setup({ costPerResponseUsd: 0.05, maxResponseUsd: 0.4, limits: { doctorModelUsdPerDay: 0.4 } })
+    scripted.script(say('один'))
+    const answer = await budget.models.completeSimple(model, { messages: [{ role: 'user', content: 'привет', timestamp: NOON }] }, { maxTokens: 0 })
+    expect(answer.errorMessage).toContain('out of budget')
+    expect(scripted.requests).toHaveLength(0)
   })
 
   it('учёт не подключён или не отвечает → запрос не уходит', async () => {

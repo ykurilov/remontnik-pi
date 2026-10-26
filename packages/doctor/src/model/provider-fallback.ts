@@ -13,7 +13,7 @@ import {
 import { deepseekProvider } from '@earendil-works/pi-ai/providers/deepseek'
 import { openrouterProvider } from '@earendil-works/pi-ai/providers/openrouter'
 import { DEFAULT_RETRY_PRIMARY_AFTER_MS, FALLBACK_MODEL, PRIMARY_MODEL } from '@ykurilov/remontnik-core/model-route'
-import { maxRequestUsd, unknownPriceOf } from './request-price.js'
+import { mayHaveBeenPaid, maxRequestUsd, statusFromMessage, unknownPriceOf } from './request-price.js'
 
 // Модель врача для pi-durable: один поставщик pi-ai поверх двух путей (R2).
 // Основной — DeepSeek напрямую, запасной — OpenRouter. 429, 5xx, сбой сети или тайм-аут до начала ответа
@@ -60,11 +60,6 @@ export interface FallbackProvider extends Provider {
 
 export type FailureKind = 'fallback' | 'fatal' | 'aborted'
 
-function statusFromMessage(text: string | undefined): number | undefined {
-  const match = text?.match(/^\s*(\d{3})\b/) ?? text?.match(/\bstatus(?: code)?:? (\d{3})\b/i)
-  return match ? Number(match[1]) : undefined
-}
-
 /** Что делать с ответом-ошибкой основного пути. `status` — код HTTP, если его удалось подсмотреть. */
 export function failureKind(message: AssistantMessage, status?: number): FailureKind {
   if (message.stopReason === 'aborted') return 'aborted'
@@ -106,12 +101,6 @@ function bothPathsCost(models: Model<Api>[]): Model<Api>['cost'] {
   }
 }
 
-/** Ответ-ошибка с кодом HTTP — запрос отклонён и не оплачен; без кода (обрыв, тайм-аут) — мог быть оплачен. */
-function mayHaveBeenPaid(message: AssistantMessage, status: number | undefined): boolean {
-  const code = status ?? statusFromMessage(message.errorMessage)
-  return code === undefined || code < 400
-}
-
 /** К счёту ответа прибавлена цена прошлого пути. */
 function withExtraCost(event: StreamEvent, extraUsd: number): StreamEvent {
   const add = (message: AssistantMessage): AssistantMessage => ({ ...message, usage: { ...message.usage, cost: { ...message.usage.cost, total: message.usage.cost.total + extraUsd } } })
@@ -144,6 +133,9 @@ export function createFallbackProvider(options: FallbackProviderOptions): Fallba
     const fetchImpl = base?.fetch ?? globalThis.fetch
     return {
       ...base,
+      // Предел ответа уходит в запрос всегда и совпадает с бронью: пустой или 0 у вызывающего — предел модели врача
+      // (`DOCTOR_MAX_OUTPUT_TOKENS`), тот же, по которому бронирует учёт.
+      maxTokens: base?.maxTokens || publicModel.maxTokens,
       ...(target.apiKey === undefined ? {} : { apiKey: target.apiKey }),
       headers: { ...base?.headers, ...target.headers },
       fetch: async (input, init) => {
@@ -171,7 +163,7 @@ export function createFallbackProvider(options: FallbackProviderOptions): Fallba
           if (!started && event.type === 'error' && index < order.length - 1 && failureKind(event.error, seen.status) === 'fallback') {
             const reported = event.error.usage.cost.total
             // Путь без цены здесь не бывает под бронью: у модели врача тогда нулевая цена, и бронь отказывает.
-            const routeMaxUsd = unknownPriceOf(routes[route].model) ? 0 : maxRequestUsd(routes[route].model, context, base?.maxTokens)
+            const routeMaxUsd = unknownPriceOf(routes[route].model) ? 0 : maxRequestUsd(routes[route].model, context, base?.maxTokens || publicModel.maxTokens)
             paidBeforeUsd += mayHaveBeenPaid(event.error, seen.status) ? Math.max(reported, routeMaxUsd) : reported
             onFallbackSince = now()
             options.onSwitch?.({ to: 'fallback', reason: event.error.errorMessage ?? 'ошибка без текста' })

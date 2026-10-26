@@ -1,8 +1,9 @@
-import type { Api, Model } from '@earendil-works/pi-ai'
+import type { Api, AssistantMessage, Model } from '@earendil-works/pi-ai'
 
 // Наибольшая цена одного запроса к модели — из неё складывается бронь до запроса (FR-030).
 // Оценка нарочно с запасом: токен на каждые 2 байта разговора (обычно их 3–4), самая дорогая ставка входа
-// и выхода с учётом ступеней цены, выход — весь предел длины ответа.
+// и выхода с учётом ступеней цены, выход — весь предел длины ответа (нет предела или он 0 — предел модели).
+// Здесь же — оплачен ли запрос, который кончился ошибкой: от этого зависит, сколько списать.
 
 const BYTES_PER_TOKEN = 2
 const TOKENS_PER_MTOK = 1_000_000
@@ -24,5 +25,17 @@ export function maxRequestUsd(model: Model<Api>, context: unknown, maxTokens: nu
   const inputRate = Math.max(...rates.map((rate) => Math.max(rate.input, rate.cacheWrite, rate.cacheRead)))
   const outputRate = Math.max(...rates.map((rate) => rate.output))
   const inputTokens = Buffer.byteLength(JSON.stringify(context)) / BYTES_PER_TOKEN
-  return (inputTokens * inputRate + (maxTokens ?? model.maxTokens) * outputRate) / TOKENS_PER_MTOK
+  return (inputTokens * inputRate + (maxTokens || model.maxTokens) * outputRate) / TOKENS_PER_MTOK
+}
+
+/** Код HTTP из текста ошибки поставщика: «503 …» или «status code: 503». */
+export function statusFromMessage(text: string | undefined): number | undefined {
+  const match = text?.match(/^\s*(\d{3})\b/) ?? text?.match(/\bstatus(?: code)?:? (\d{3})\b/i)
+  return match ? Number(match[1]) : undefined
+}
+
+/** Ошибка с кодом HTTP от 400 — запрос отклонён и не оплачен; без кода (обрыв, тайм-аут) или ниже 400 — мог быть оплачен. */
+export function mayHaveBeenPaid(message: AssistantMessage, status?: number): boolean {
+  const code = status ?? statusFromMessage(message.errorMessage)
+  return code === undefined || code < 400
 }

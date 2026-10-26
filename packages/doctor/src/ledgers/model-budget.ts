@@ -9,7 +9,7 @@ import {
 } from '@earendil-works/pi-ai'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { RecordStore } from '../records/index.js'
-import { maxRequestUsd, unknownPriceOf } from '../model/request-price.js'
+import { mayHaveBeenPaid, maxRequestUsd, unknownPriceOf } from '../model/request-price.js'
 import { caseLimitUsdOf, holdModelIn, settleModelHoldIn, spendDayKey, type ModelBlock } from './spend-ledger.js'
 
 // Жёсткий потолок модели врача (FR-030), так же, как у прокси eval: перед каждым запросом к поставщику — бронь
@@ -51,11 +51,13 @@ function refusal(model: Model<Api>, why: string): AssistantMessage {
 }
 
 /**
- * Настоящая цена ушедшего запроса: ответ пришёл — счёт поставщика. Оборвался — частичный счёт занижен (поставщик
- * мог насчитать больше, чем успел сообщить), поэтому в учёт идёт вся бронь.
+ * Настоящая цена ушедшего запроса: ответ пришёл — счёт поставщика. Поставщик отклонил запрос (код HTTP от 400) —
+ * тоже его счёт: такой запрос не оплачивается. Оборвался без кода — частичный счёт занижен (поставщик мог насчитать
+ * больше, чем успел сообщить), поэтому в учёт идёт вся бронь.
  */
 function actualUsdOf(answer: AssistantMessage | undefined, maxUsd: number): number {
   if (answer && answer.stopReason !== 'error' && answer.stopReason !== 'aborted') return answer.usage.cost.total
+  if (answer && answer.stopReason === 'error' && !mayHaveBeenPaid(answer)) return answer.usage.cost.total
   return Math.max(answer?.usage.cost.total ?? 0, maxUsd)
 }
 

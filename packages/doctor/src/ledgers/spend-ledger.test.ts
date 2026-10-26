@@ -70,9 +70,9 @@ describe('бронь запроса к модели: потолок до зап�
   const dayKey = '2026-11-02'
   const now = Date.UTC(2026, 10, 2, 12)
 
-  function hold(store: RecordStore, input: { caseKey?: string; holdId: string; maxUsd: number; boot?: string; caseLimitUsd?: number; at?: number }) {
+  function hold(store: RecordStore, input: { caseKey?: string; holdId: string; maxUsd: number; boot?: string; caseLimitUsd?: number; at?: number; day?: string }) {
     return store.transaction((tx) =>
-      holdModelIn(tx, { dayKey, holdId: input.holdId, maxUsd: input.maxUsd, boot: input.boot ?? 'boot-a', now: input.at ?? now, limits, caseLimitUsd: input.caseLimitUsd ?? 5, ...(input.caseKey ? { caseKey: input.caseKey } : {}) }),
+      holdModelIn(tx, { dayKey: input.day ?? dayKey, holdId: input.holdId, maxUsd: input.maxUsd, boot: input.boot ?? 'boot-a', now: input.at ?? now, limits, caseLimitUsd: input.caseLimitUsd ?? 5, ...(input.caseKey ? { caseKey: input.caseKey } : {}) }),
     )
   }
 
@@ -126,6 +126,24 @@ describe('бронь запроса к модели: потолок до зап�
     expect(modelSpentUsd(day)).toBeCloseTo(0.5)
     expect(Object.keys(day?.modelHolds ?? {})).toEqual(['h2'])
     expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.4)
+  })
+
+  it('сменились сутки: брошенные брони вчерашнего дня списываются во вчерашний день и в случай, живые — держатся', async () => {
+    const store = createMemoryRecordStore()
+    const yesterday = '2026-11-01'
+    await hold(store, { caseKey: '1', holdId: 'h-dead', maxUsd: 0.3, boot: 'boot-old', day: yesterday, at: now - 13 * HOUR })
+    await hold(store, { caseKey: '1', holdId: 'h-live', maxUsd: 0.2, day: yesterday, at: now - 60_000 })
+    // Потолок случая 0.6: 0.3 списано, 0.2 ещё в пути вчерашним днём — бронь 0.2 уже не влезает.
+    expect(await hold(store, { caseKey: '1', holdId: 'h-today', maxUsd: 0.2, caseLimitUsd: 0.6 })).toEqual({ held: false, block: 'budget' })
+    const past = await store.read<SpendDay>('spend', yesterday)
+    expect(past?.model).toEqual({ '1': 0.3 })
+    expect(Object.keys(past?.modelHolds ?? {})).toEqual(['h-live'])
+    expect((await store.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.3)
+    // Живой запрос вчерашнего дня закрылся — его итог ложится во вчерашний день, и случай снова может работать.
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey: yesterday, holdId: 'h-live', actualUsd: 0.05 }))
+    expect(await hold(store, { caseKey: '1', holdId: 'h-today', maxUsd: 0.2, caseLimitUsd: 0.6 })).toEqual({ held: true })
+    expect((await store.read<SpendDay>('spend', yesterday))?.model).toEqual({ '1': 0.35 })
+    expect(modelSpentUsd(await store.read<SpendDay>('spend', dayKey))).toBe(0)
   })
 
   it('бронь этого же запуска старше часа (итог потерялся) тоже списывается целиком, свежая — держится', async () => {
