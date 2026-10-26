@@ -107,6 +107,11 @@ export function reportLetter(app: string, report: DoctorReport): string {
   ].join('\n')
 }
 
+/** Отчёт, который мост не смог принять: агенту только номер и где посмотреть, текст отчёта не пересылается. */
+export function skippedReportLetter(app: string, reportId: number): string {
+  return `Отчёт №${reportId} от Ремонтника по приложению «${app}» пропущен: мост не смог его принять. Посмотреть его можно командой remontnik-doctor reports pull --after ${reportId - 1} --limit 1.`
+}
+
 /** Вывод `remontnik-paseo case`: подробности случая от врача — целиком данные, с обрезкой. */
 export function caseDetailsText(caseId: number, details: unknown): string {
   return [

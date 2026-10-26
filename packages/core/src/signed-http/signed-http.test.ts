@@ -4,6 +4,7 @@ import {
   ReplayGuard,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
+  precheckSignedRequest,
   signBody,
   signRequest,
   signResponse,
@@ -146,5 +147,88 @@ describe('ReplayGuard', () => {
     expect(guard.firstSeen('sig-1', now + 500)).toBe(false)
     expect(guard.firstSeen('sig-2', now + 500)).toBe(true)
     expect(guard.firstSeen('sig-1', now + 1_001)).toBe(true)
+  })
+})
+
+describe('строгий вид подписи', () => {
+  const request = { method: 'POST', target: '/v1/reports/ack', body }
+  const variants = (signature: string) => [
+    signature.toUpperCase().replace('SHA256=', 'sha256='),
+    `${signature}zz`,
+    `${signature}00`,
+    signature.slice(0, -2),
+    ` ${signature}`,
+    `${signature}\n`,
+  ]
+
+  it('подпись запроса — ровно sha256= и 64 строчных hex-знака; переписанная подпись не проходит', () => {
+    const headers = signRequest({ ...request, secret, now })
+    for (const changed of variants(headers[SIGNATURE_HEADER])) {
+      expect(verifySignedRequest({ ...request, headers: { ...headers, [SIGNATURE_HEADER]: changed }, secret, now }), changed).toEqual({ ok: false, reason: 'bad_signature' })
+    }
+  })
+
+  it('то же для подписи тела и подписи ответа', () => {
+    const signed = signBody(body, secret, now)
+    for (const changed of variants(signed[SIGNATURE_HEADER])) {
+      expect(verifySignedBody({ body, headers: { ...signed, [SIGNATURE_HEADER]: changed }, secret, now }), changed).toEqual({ ok: false, reason: 'bad_signature' })
+    }
+    const ref = { method: 'GET', target: '/v1/reports', nonce: 'a'.repeat(32) }
+    const answer = signResponse({ request: ref, status: 200, body: '{}', secret, now })
+    for (const changed of variants(answer[SIGNATURE_HEADER])) {
+      expect(verifySignedResponse({ request: ref, status: 200, body: '{}', headers: { ...answer, [SIGNATURE_HEADER]: changed }, secret, now }), changed).toEqual({ ok: false, reason: 'bad_signature' })
+    }
+  })
+})
+
+describe('запрос старше запуска принимающей стороны', () => {
+  const request = { method: 'GET', target: '/v1/reports?after=0', body: '' }
+
+  it('отметка времени раньше секунды запуска — stale, даже если подпись верна и не старше 5 минут', () => {
+    const startedAt = now
+    const before = signRequest({ ...request, secret, now: now - 10_000 })
+    const sameSecond = signRequest({ ...request, secret, now: now + 300 })
+    const later = signRequest({ ...request, secret, now: now + 2_000 })
+
+    expect(verifySignedRequest({ ...request, headers: before, secret, now: now + 1_000, notBefore: startedAt })).toEqual({ ok: false, reason: 'stale' })
+    expect(verifySignedRequest({ ...request, headers: sameSecond, secret, now: now + 1_000, notBefore: startedAt })).toEqual({ ok: true })
+    expect(verifySignedRequest({ ...request, headers: later, secret, now: now + 2_000, notBefore: startedAt })).toEqual({ ok: true })
+  })
+
+  it('без notBefore поведение прежнее', () => {
+    const before = signRequest({ ...request, secret, now: now - 10_000 })
+    expect(verifySignedRequest({ ...request, headers: before, secret, now })).toEqual({ ok: true })
+  })
+})
+
+describe('ReplayGuard: проверка без записи', () => {
+  it('wasSeen только смотрит и ничего не запоминает', () => {
+    const guard = new ReplayGuard(1_000)
+    expect(guard.wasSeen('n-1', now)).toBe(false)
+    expect(guard.firstSeen('n-1', now)).toBe(true)
+    expect(guard.wasSeen('n-1', now + 500)).toBe(true)
+    expect(guard.wasSeen('n-1', now + 1_001)).toBe(false)
+  })
+})
+
+describe('precheckSignedRequest', () => {
+  const request = { method: 'POST', target: '/v1/reports/ack', body }
+  const headers = () => signRequest({ ...request, secret, now })
+
+  it('верные по виду и времени заголовки проходят без секрета и тела', () => {
+    expect(precheckSignedRequest({ headers: headers(), now })).toEqual({ ok: true })
+  })
+
+  it('нет заголовка — missing; нечитаемый вид подписи, отметки или метки — bad_signature', () => {
+    const good = headers()
+    expect(precheckSignedRequest({ headers: { ...good, [NONCE_HEADER]: undefined }, now })).toEqual({ ok: false, reason: 'missing' })
+    expect(precheckSignedRequest({ headers: { ...good, [SIGNATURE_HEADER]: good[SIGNATURE_HEADER].toUpperCase() }, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(precheckSignedRequest({ headers: { ...good, [TIMESTAMP_HEADER]: '12ab' }, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(precheckSignedRequest({ headers: { ...good, [NONCE_HEADER]: 'short' }, now })).toEqual({ ok: false, reason: 'bad_signature' })
+  })
+
+  it('старая отметка и отметка раньше notBefore — stale', () => {
+    expect(precheckSignedRequest({ headers: headers(), now: now + 10 * 60_000 })).toEqual({ ok: false, reason: 'stale' })
+    expect(precheckSignedRequest({ headers: headers(), now, notBefore: now + 5_000 })).toEqual({ ok: false, reason: 'stale' })
   })
 })

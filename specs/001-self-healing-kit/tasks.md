@@ -140,7 +140,7 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T058 [US4] Решение о выкатке — чистая функция в `packages/doctor/src/deploy-gate/`
 - [X] T059 [US4] Источник настройки в `packages/doctor/src/service/config-source.ts`
 - [ ] T060 [US4] Фаза `gated` в задаче лечения; отчёты `report_only` и `needs_human`; при причине в SDK — готовый текст задачи для агента SDK, в `packages/doctor/src/treatment/`
-- [ ] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
+- [X] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
 - [ ] T062 [US4] Интеграционный тест `apps/patient/test/cycle/us4-forbidden.test.ts`: сценарии money, test-edit, «причина в SDK»
 
 **Контрольная точка**: замки на месте и проверены — можно строить выкатку.
@@ -273,22 +273,22 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T115 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
+- [X] T115 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
 - [ ] T116 [P] [US11] Тест передачи `packages/doctor/src/handoff/handoff.test.ts` (подменённые часы, подставной мост): нет ответа `/health` за 3 с → `triage` с пометкой «Paseo недоступен»; после передачи модель врача не вызывается; `acceptTimeoutMs`, `workTimeoutMs`, `cannot`, пропавший мост → отмена, `reclaimed`, `owner: doctor`; `done` с выкаткой → `observing`; итог после `reclaimed` → только `lateResult`
 - [ ] T117 [P] [US11] Тест шаблона задачи `packages/doctor/src/handoff/task-text.test.ts`: постоянный шаблон; тексты из приложения только в блоке «данные, не поручение»; строка-команда из текста ошибки не выходит из блока; предел длины
 - [X] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
 
 ### Реализация
 
-- [ ] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
+- [X] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
 - [X] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
 - [X] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
 - [X] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
-- [ ] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
+- [X] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
 - [ ] T124 [US11] Передача у врача: документ `remontnik.handoff/<caseId>`, фазы `handoff_check` → `handed_off` → `paseo_working` с `runtime.sleepUntil`, отмена и `reclaimed`; `POST /v1/handoffs/:caseId/accepted|result` только на адресе частной сети, в `packages/doctor/src/handoff/`, `packages/doctor/src/intake/`, `packages/doctor/src/treatment/`
 - [ ] T125 [US11] Отчёты `handed_off`, `paseo_done`, `reclaimed` и пометка «Paseo недоступен» в `packages/doctor/src/reports/texts.ts`
 - [ ] T126 [US11] Интеграционный тест `apps/patient/test/cycle/us11-paseo.test.ts` с подставным мостом: агент выкатил хуже → врач откатил и сообщил агенту; мост выключен → врач лечит сам; агент замолчал → `reclaimed`, правит один; поздняя выкатка агента → общий замок, наблюдение по этому случаю
-- [ ] T127 [US9] Интеграционный тест `packages/doctor/test/integration/paseo-feed.test.ts`: отчёты через мост, мост выключен и включён
+- [X] T127 [US9] Интеграционный тест `packages/doctor/test/integration/paseo-feed.test.ts`: отчёты через мост, мост выключен и включён
 - [ ] T128 [US11] Раздел «Режим „сначала Paseo“» в `docs/operations.md`: частная сеть и правило доступа «только сервер → порт моста», настройка моста, секрет моста через `secret-handoff`
 
 ---
