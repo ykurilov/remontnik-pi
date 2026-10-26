@@ -299,7 +299,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 **Независимая проверка**: свежий агент по `docs/getting-started.md` подключает набор к копии «Пациента», первый случай проходит весь цикл.
 
-- [ ] T129 [P] [US10] Шаблон `deploy/compose.remontnik.yml` и `deploy/doctor.Dockerfile`: врач с сокетом Docker, верстак без сокета, без секретов и без сети приложения, тома состояния
+- [X] T129 [P] [US10] Шаблон `deploy/compose.remontnik.yml` и `deploy/doctor.Dockerfile`: врач с сокетом Docker, верстак без сокета, без секретов и без сети приложения, тома состояния
 - [ ] T130 [P] [US10] `docs/getting-started.md` по contracts/app-integration.md: пакеты, сторож, настройка, команды, окружение через `secret-handoff`, по желанию — режим «сначала Paseo», правила GitHub через `gh api`, вход браузера через `logins add --password-stdin`
 - [ ] T131 [P] [US10] `docs/configuration.md`, `docs/security.md` (модель паролей и остаток риска, верстак, ключи eval), обновить `README.md`
 - [ ] T132 [US10] Команда `remontnik-doctor check-config` с тестом в `packages/doctor/src/cli/check-config.ts`

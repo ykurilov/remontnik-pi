@@ -1,6 +1,7 @@
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 import { deploysCommand, DEPLOYS_USAGE } from './deploys-commands.js'
 import { reportsCommand, REPORTS_USAGE } from './reports-commands.js'
+import { SERVICE_USAGE, startCommand } from './service-commands.js'
 
 // Консольная `remontnik-doctor`: разбор команды и вызов нужной. Каждая группа команд — свой файл со своей справкой.
 
@@ -10,10 +11,12 @@ type CommandGroup = (args: string[], io: DoctorCommandIo) => Promise<number>
 
 const COMMAND_GROUPS: Readonly<Record<string, CommandGroup>> = {
   reports: reportsCommand,
+  start: startCommand,
   deploys: deploysCommand,
 }
 
-const USAGE = `Использование:\n${REPORTS_USAGE}${DEPLOYS_USAGE}`
+const USAGE = `Использование:
+${SERVICE_USAGE}${REPORTS_USAGE}${DEPLOYS_USAGE}`
 
 export async function runDoctorCommand(argv: string[], io: DoctorCommandIo): Promise<number> {
   const [group, ...args] = argv

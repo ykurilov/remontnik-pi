@@ -152,6 +152,16 @@ describe('loadMainBranchConfig: ошибки', () => {
     await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'ambiguous' })
   })
 
+  it('файл служб для тестов попадает в fixablePaths — отказ с понятным текстом', async () => {
+    const config = { ...configObject({ fixablePaths: ['src/**', 'ci/**'] }), checks: { test: 'pnpm test', services: 'ci/services.yml' } }
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(config))
+    commitAll(mainCheckout, 'services in fixable')
+    const error = await loadMain(mainCheckout).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(ConfigSourceError)
+    expect((error as ConfigSourceError).code).toBe('services_fixable')
+    expect((error as Error).message).toMatch(/checks\.services.*ci\/services\.yml.*fixablePaths.*ci\/\*\*/)
+  })
+
   it('настройка с ошибками — понятная ошибка проверки', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText({ app: { name: 'demo' } }))
     commitAll(mainCheckout, 'broken')

@@ -14,6 +14,7 @@ import {
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
+import type { CaseServices } from '../case-services/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
@@ -144,6 +145,8 @@ export interface TreatmentDeps {
   evalEnv: Readonly<Record<string, string | undefined>>
   /** Прокси модели для eval; без него eval с провайдерами не запускается. */
   evalProxy?: Pick<EvalProxy, 'openRun'>
+  /** Службы для тестов (`checks.services`). */
+  checksServices?: Pick<CaseServices, 'up'>
   evalBaseCache: EvalBaseCache
   /** Стоп-кран, учёт выкаток, перенос на свежий main. Нет — выкаток ещё не было (`noDeploysYet`). */
   deployControls?: DeployControls
@@ -672,6 +675,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               config,
               evalEnv: deps.evalEnv,
               ...(deps.evalProxy ? { evalProxy: deps.evalProxy } : {}),
+              ...(deps.checksServices ? { services: deps.checksServices } : {}),
               baseCache: deps.evalBaseCache,
               workDir: deps.checksDir,
               timeoutSeconds: Math.max(1, Math.ceil(config.workbench.bashTimeoutMs / 1000)),

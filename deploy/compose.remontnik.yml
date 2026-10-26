@@ -1,0 +1,111 @@
+# Ремонтник на сервере приложения: врач и (по желанию) браузер.
+# Шаблон: скопируйте к себе, задайте переменные ниже и запускайте из корня репозитория Ремонтника
+#   docker compose -f deploy/compose.remontnik.yml up -d --build
+#   docker compose -f deploy/compose.remontnik.yml --profile browser up -d --build   # с браузером
+#
+# Переменные (в оболочке или в файле .env рядом с этим файлом; секретов среди них нет):
+#   REMONTNIK_APP_DIR      рабочая копия основной ветки приложения на сервере (абсолютный путь)
+#   REMONTNIK_STATE_DIR    состояние врача: хранилище, копии случаев, HOME копий (абсолютный путь)
+#   REMONTNIK_ENV_FILE     файл окружения врача с секретами (вне репозитория, права 0600)
+#   REMONTNIK_APP_NETWORK  сеть Docker приложения: в ней сторож шлёт события врачу (http://remontnik-doctor:7800)
+#   DOCKER_GID             группа сокета Docker на сервере: stat -c %g /var/run/docker.sock
+#   REMONTNIK_UID/GID      владелец папок выше (по умолчанию 10001)
+#   REMONTNIK_DOCTOR_MEMORY предел памяти врача (по умолчанию 2g): зеркало реестра и прокси eval держат ответы в ней
+#   REMONTNIK_CASE_SUBNETS пул подсетей для сетей случая (по умолчанию 10.213.0.0/16; не должен пересекаться
+#                          с сетями сервера — занятые подсети врач пропускает сам)
+#
+# Секреты (общий секрет сторожа, секрет владельца REMONTNIK_CONTROL_SECRET, ключи моделей, токен бота, ключ git) — только в REMONTNIK_ENV_FILE,
+# который кладёт на сервер secret-handoff. В этот файл, образы и репозиторий они не попадают.
+#
+# Пути. Врач создаёт контейнеры верстака через сокет хоста, и Docker монтирует в них папки по путям ХОСТА.
+# Поэтому папка приложения и состояние врача смонтированы в контейнер врача по тем же путям, что на хосте.
+#
+# Сети в этом файле:
+#   outside — обычная: врачу к моделям, реестру пакетов, Telegram и GitHub; браузеру — к сайту.
+#   app     — сеть приложения (внешняя): врач принимает события сторожа и слушает порт 7800 только на своём
+#             адресе в ней. Контейнеров верстака в ней нет.
+# Сети случая врач создаёт сам, по две на каждую копию случая: верстак (команды модели, установка зависимостей)
+# и проверки (тесты, проверка типов, eval). Обе закрытые (internal, у моста нет адреса на хосте): ни интернета,
+# ни локальной сети, ни адреса метаданных облака, ни соседних случаев. В сети верстака врач слушает только зеркало
+# реестра пакетов, в сети проверок — только прокси eval; после случая сети удаляются. Поэтому статических
+# закрытых сетей, ip_range и aux_addresses в этом файле нет: адрес врача в сети случая (.2) лежит вне диапазона,
+# из которого Docker выдаёт адреса контейнерам, и врач подключается раньше любого контейнера.
+#
+# Службы тестов приложения (checks.services, например временная база) врач поднимает сам отдельным проектом
+# compose в сети проверок случая: без портов, томов и секретов; после проверок убирает.
+
+name: remontnik
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+
+services:
+  doctor:
+    <<: *hardening
+    image: remontnik-doctor:${REMONTNIK_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/doctor.Dockerfile
+    container_name: remontnik-doctor
+    command: [start]
+    user: ${REMONTNIK_UID:-10001}:${REMONTNIK_GID:-10001}
+    # Предел памяти врача: чужой код в контейнерах случая не съест память сервера через зеркало и прокси.
+    mem_limit: ${REMONTNIK_DOCTOR_MEMORY:-2g}
+    memswap_limit: ${REMONTNIK_DOCTOR_MEMORY:-2g}
+    pids_limit: 512
+    # Сокет Docker даёт врачу права root на хосте. Поэтому врач — отдельный контейнер без секретов приложения,
+    # а модель и проверки идут в контейнерах верстака, где сокета нет.
+    group_add: ["${DOCKER_GID:?DOCKER_GID — группа сокета Docker на сервере}"]
+    env_file:
+      - ${REMONTNIK_ENV_FILE:?REMONTNIK_ENV_FILE — файл окружения врача с секретами}
+    environment:
+      HOME: /tmp
+      REMONTNIK_CONFIG_REPO_DIR: ${REMONTNIK_APP_DIR:?REMONTNIK_APP_DIR — рабочая копия основной ветки приложения}
+      REMONTNIK_STATE_DIR: ${REMONTNIK_STATE_DIR:?REMONTNIK_STATE_DIR — папка состояния врача}
+      # Приём событий — только на адресе врача в сети приложения, не на всех адресах.
+      REMONTNIK_LISTEN_NETWORK: ${REMONTNIK_APP_NETWORK}
+      # Имя контейнера врача: врач подключает себя к сетям случая.
+      REMONTNIK_GATEWAY_CONTAINER: remontnik-doctor
+      REMONTNIK_CASE_SUBNETS: ${REMONTNIK_CASE_SUBNETS:-10.213.0.0/16}
+      REMONTNIK_BROWSER_URL: http://remontnik-browser:7700
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${REMONTNIK_APP_DIR}:${REMONTNIK_APP_DIR}
+      - ${REMONTNIK_STATE_DIR}:${REMONTNIK_STATE_DIR}
+    networks:
+      outside: {}
+      app: {}
+
+  # По желанию: docker compose --profile browser up -d. Адрес для врача — http://remontnik-browser:7700,
+  # порт наружу не публикуется. Ключи браузера — в своём файле окружения (REMONTNIK_BROWSER_ENV_FILE).
+  browser:
+    profiles: [browser]
+    image: remontnik-browser:${REMONTNIK_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/browser.Dockerfile
+    container_name: remontnik-browser
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    env_file:
+      - ${REMONTNIK_BROWSER_ENV_FILE:-/dev/null}
+    volumes:
+      - browser-data:/data
+      - ${REMONTNIK_BROWSER_POLICY:-./browser-policy.json}:/config/browser-policy.json:ro
+    networks:
+      outside: {}
+
+volumes:
+  browser-data:
+
+networks:
+  outside:
+    name: remontnik-outside
+  app:
+    name: ${REMONTNIK_APP_NETWORK:?REMONTNIK_APP_NETWORK — сеть Docker приложения}
+    external: true

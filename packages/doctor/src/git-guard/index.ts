@@ -368,7 +368,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
         if (code !== 0) return reject(new GitGuardError('failed', clean(`git ${args.join(' ')}: ${stderr.trim().slice(-2000)}`)))
         resolvePromise(stdout)
       })
-      // git мог выйти, не дочитав ввод (EPIPE): итог команды всё равно приходит в `close`, врач от этого не падает.
+      // git может выйти, не дочитав вход (EPIPE): исход решает его код выхода, а не запись, — иначе врач упал бы.
       child.stdin.on('error', () => {})
       child.stdin.end(input ?? '')
     })
