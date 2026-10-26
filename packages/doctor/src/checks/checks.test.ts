@@ -265,6 +265,35 @@ describe('проверки', () => {
     expect(fake.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
   })
 
+  it('eval обязателен (плохой ответ), а карта для правки пуста → not_run: проверять нечем', async () => {
+    const fake = fakeRunner({})
+    const result = await checksWith(fake).run(runInput({ changedPaths: ['README.md'], evalRequired: true }))
+    expect(result.eval.status).toBe('not_run')
+    expect(result.eval.note).toContain('evalScope')
+    expect(fake.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
+  })
+
+  it('eval обязателен, а в настройке его нет → not_run', async () => {
+    const fake = fakeRunner({})
+    const { eval: _eval, ...withoutEval } = config.checks
+    const result = await createChecks({
+      runner: fake.runner,
+      config: { ...config, checks: withoutEval },
+      evalEnv: {},
+      baseCache: createMemoryEvalBaseCache(),
+      workDir: tempDir(),
+      timeoutSeconds: 60,
+    }).run(runInput({ evalRequired: true }))
+    expect(result.eval.status).toBe('not_run')
+  })
+
+  it('eval обязателен и карта накрывает правку → сценарии по карте', async () => {
+    const fake = fakeRunner({})
+    const result = await checksWith(fake).run(runInput({ evalRequired: true }))
+    expect(result.eval.status).toBe('not_worse')
+    expect(result.eval.scenarios.map((scenario) => scenario.id)).toEqual(['price-named-plan', 'greeting'])
+  })
+
   it('итог основы кэшируется по паре (коммит, сценарий)', async () => {
     const cache = createMemoryEvalBaseCache()
     const fake = fakeRunner({})
