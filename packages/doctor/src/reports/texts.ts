@@ -11,6 +11,8 @@ export interface ReportText {
   full: string
   /** Пути к снимкам экрана браузера врача. */
   screenshots?: string[]
+  /** Отчёт сам говорит, что выкатки нет из-за стоп-крана: приписка о нём при отправке не нужна. */
+  stopSwitch?: true
 }
 
 export interface ReportCase {
@@ -268,7 +270,13 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
     }
   })()
   const full = [short, '', ...caseLines(input.case), ...deploymentLines(deployment)].join('\n')
-  return { type, short, full, ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: [...input.screenshots] } : {}) }
+  return {
+    type,
+    short,
+    full,
+    ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: [...input.screenshots] } : {}),
+    ...(deployment.outcome === 'refused' && deployment.refusal === 'stop_switch' ? { stopSwitch: true as const } : {}),
+  }
 }
 
 /** Чужая выкатка брошена: её задача умерла, замок снят. Сама она уже никому не доложит. */

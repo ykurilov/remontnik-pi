@@ -156,13 +156,16 @@ describe('кнопка стоп-крана под отчётами', () => {
   it('стоп-кран включён — кнопки нет, в тексте сказано, что он включён', async () => {
     const reports = reportsWithTelegram(createMemoryRecordStore(), async () => 'stopped')
     await reports.add({ type: 'deployed', caseId: 1, short: 'Случай 1: правка выкачена.', telegram: 'pending' })
-    await reports.add({ type: 'fix_ready', caseId: 2, short: 'Случай 2: включён стоп-кран, правку не выкатывал.', telegram: 'pending' })
+    await reports.add({ type: 'fix_ready', caseId: 2, short: 'Случай 2: не выкатывал.', telegram: 'pending', stopSwitch: true })
+    // Слово в тексте ничего не решает: решает признак отчёта.
+    await reports.add({ type: 'fix_ready', caseId: 3, short: 'Случай 3: стоп-кран был, но снят.', telegram: 'pending' })
 
     await reports.pump()
 
     expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([
       ['Случай 1: правка выкачена.\n\nСтоп-кран включён: новые выкатки не начнутся.', undefined],
-      ['Случай 2: включён стоп-кран, правку не выкатывал.', undefined],
+      ['Случай 2: не выкатывал.', undefined],
+      ['Случай 3: стоп-кран был, но снят.\n\nСтоп-кран включён: новые выкатки не начнутся.', undefined],
     ])
   })
 
@@ -175,6 +178,18 @@ describe('кнопка стоп-крана под отчётами', () => {
     await reports.pump()
 
     expect(telegram.messages[0]?.replyMarkup).toBeUndefined()
+  })
+
+  it('состояние стоп-крана не прочиталось — отчёт уходит без кнопки и приписки, повторы не тратятся', async () => {
+    const reports = reportsWithTelegram(createMemoryRecordStore(), async () => {
+      throw new Error('хранилище недоступно')
+    })
+    const added = await reports.add({ type: 'deployed', caseId: 1, short: 'выкачена', telegram: 'pending' })
+
+    await reports.pump()
+
+    expect(telegram.messages.map((item) => [item.text, item.replyMarkup])).toEqual([['выкачена', undefined]])
+    expect((await reports.get(added.reportId))?.telegram).toEqual({ state: 'sent', attempts: 1, messageId: 1 })
   })
 
   it('без сведений о стоп-кране кнопки нет', async () => {

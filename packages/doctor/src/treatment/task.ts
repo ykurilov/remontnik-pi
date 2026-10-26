@@ -235,7 +235,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       const records = recordTransactionOver(tx)
       const opened = await caseIn(records, caseId)
       opened.state = state
-      const report = await deps.reports.addIn(records, { type, caseId, short, full, telegram: 'pending' })
+      const report = await deps.reports.addIn(records, { type, caseId, short, full, telegram: 'pending', ...(text.stopSwitch ? { stopSwitch: true } : {}) })
       opened.reportIds.push(report.reportId)
       return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId: report.reportId } } }
     }, context)

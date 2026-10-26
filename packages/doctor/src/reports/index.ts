@@ -52,6 +52,8 @@ export interface Report {
   createdAt: string
   /** Пути к снимкам экрана браузера врача. */
   screenshots?: string[]
+  /** Текст сам говорит, что выкатки нет из-за стоп-крана. */
+  stopSwitch?: true
 }
 
 export interface AddReportInput {
@@ -61,6 +63,7 @@ export interface AddReportInput {
   full?: string
   telegram: 'pending' | 'not_needed'
   screenshots?: string[]
+  stopSwitch?: true
 }
 
 export interface Reports {
@@ -137,11 +140,20 @@ export function createReports(options: CreateReportsOptions): Reports {
     })
   }
 
-  /** Включён стоп-кран — кнопки нет, а в тексте сказано, что он включён (если отчёт сам об этом не говорит). */
+  /**
+   * Включён стоп-кран — кнопки нет, а в тексте сказано, что он включён (если отчёт сам об этом не говорит).
+   * Состояние не прочиталось — отчёт уходит как есть: это не сбой отправки и не повод тратить повторы.
+   */
   async function telegramMessage(report: Report): Promise<{ text: string; replyMarkup?: unknown }> {
     if (!options.autoDeploy || !STOP_BUTTON_REPORTS.has(report.type)) return { text: report.short }
-    if ((await options.autoDeploy()) === 'on') return { text: report.short, replyMarkup: stopDeploysKeyboard() }
-    return { text: /стоп-кран/i.test(report.short) ? report.short : `${report.short}\n\n${STOPPED_NOTE}` }
+    let autoDeploy: 'on' | 'stopped'
+    try {
+      autoDeploy = await options.autoDeploy()
+    } catch {
+      return { text: report.short }
+    }
+    if (autoDeploy === 'on') return { text: report.short, replyMarkup: stopDeploysKeyboard() }
+    return { text: report.stopSwitch ? report.short : `${report.short}\n\n${STOPPED_NOTE}` }
   }
 
   async function pumpOnce(): Promise<void> {
@@ -174,6 +186,7 @@ export function createReports(options: CreateReportsOptions): Reports {
           telegram: input.telegram === 'pending' ? { state: 'pending', attempts: 0, nextAttemptAt: 0 } : { state: 'not_needed', attempts: 0 },
           createdAt: new Date(now()).toISOString(),
           ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: input.screenshots.slice(0, REPORT_SCREENSHOTS_LIMIT) } : {}),
+          ...(input.stopSwitch ? { stopSwitch: true as const } : {}),
         }
         if (input.telegram === 'pending') index.pending.push(reportId)
         return copyRecord(await tx.doc<Report>('report', reportKey(reportId), report))
