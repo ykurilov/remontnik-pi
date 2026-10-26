@@ -188,8 +188,8 @@ export function createBrowserActions(options: {
     const human = await findHumanCheck(page, snapshot.text)
     if (human.needsHuman) humanChecks.set(session.name, { reason: human.reason, releases: control.releases(session.name) })
     else humanChecks.delete(session.name)
-    // Чужой фрейм просто не загружен и скрыт из снимка — само действие на странице прошло.
-    const blocked = session.takeBlocked().filter((request) => request.code !== 'refused_frame')
+    // Чужой фрейм и подресурс с внутреннего адреса просто не загружены — само действие на странице прошло.
+    const blocked = session.takeBlocked().filter((request) => request.code !== 'refused_frame' && request.code !== 'refused_internal')
     if (blocked.length > 0) {
       return fail(blocked[0]!.code, `заблокировано замком: ${blocked.map((request) => request.reason).join('; ')}`)
     }
@@ -232,6 +232,7 @@ export function createBrowserActions(options: {
       return fail('refused_origin', `поле не на сайте входа ${site} (нужен точно этот адрес и https): пароль не вписан`)
     }
     await session.fields.mark(handle, 'filled')
+    session.passwordFilled()
     await handle.fill(password, { timeout: ACTION_TIMEOUT_MS })
     return outcome(session)
   }

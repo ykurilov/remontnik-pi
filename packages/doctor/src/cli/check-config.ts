@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { CASE_NETWORK_LABEL } from '../case-networks/index.js'
+import { MIN_SECRET_LENGTH, secretProblems } from '../intake/http-kit.js'
 import { parseServicesFile } from '../case-services/index.js'
 import { matchesAllowMask } from '../path-mask/index.js'
 import type { ConfigCodeReader } from '../service/config-reader.js'
@@ -107,6 +108,11 @@ async function checkSettings(env: DoctorEnv, deps: CheckConfigDeps): Promise<{ f
   }
 }
 
+/** Разные длинные заглушки вместо секретов: их ошибки уже в списке, план не должен повторить их. */
+function secretStubs(secrets: Array<{ name: string }>): Record<string, string | undefined> {
+  return Object.fromEntries(secrets.map(({ name }, index) => [name, name === 'REMONTNIK_CONTROL_SECRET' ? undefined : `заглушка-секрета-${index}-`.padEnd(MIN_SECRET_LENGTH, 'x')]))
+}
+
 function checkEnvironment(env: DoctorEnv, config: RemontnikConfig | undefined): Finding[] {
   const findings: Finding[] = []
   const needed = [...REQUIRED_ENV, ...(config ? configEnvNames(config) : [])]
@@ -123,14 +129,21 @@ function checkEnvironment(env: DoctorEnv, config: RemontnikConfig | undefined): 
   const control = value(env, 'REMONTNIK_CONTROL_SECRET')
   if (!control) {
     findings.push({ level: 'warning', area: 'окружение', problem: 'не задан REMONTNIK_CONTROL_SECRET: стоп-кран выкаток снимается общим секретом', fix: `заведите отдельный секрет владельца: ${SECRETS_FIX}` })
-  } else if (control === shared) {
-    findings.push({ level: 'error', area: 'окружение', problem: 'REMONTNIK_CONTROL_SECRET совпадает с REMONTNIK_SHARED_SECRET', fix: `нужен отдельный секрет владельца: ${SECRETS_FIX}` })
+  }
+  const bridgeSecretEnv = config?.handoff.paseo?.bridgeSecretEnv
+  const secrets = [
+    { name: 'REMONTNIK_SHARED_SECRET', value: shared },
+    { name: 'REMONTNIK_CONTROL_SECRET', value: control },
+    ...(bridgeSecretEnv ? [{ name: bridgeSecretEnv, value: value(env, bridgeSecretEnv) }] : []),
+  ]
+  for (const problem of secretProblems(secrets)) {
+    findings.push({ level: 'error', area: 'окружение', problem, fix: `у каждого секрета своё значение не короче ${MIN_SECRET_LENGTH} знаков: ${SECRETS_FIX}` })
   }
 
   // Остальное (адрес приёма, пул подсетей) проверяет сам план старта. Недостающие переменные уже в списке —
-  // план получает заглушки, чтобы дойти до прочих ошибок; секрет владельца проверен выше.
+  // план получает заглушки, чтобы дойти до прочих ошибок; секреты проверены выше и плану даны заглушками.
   if (config) {
-    const patched: Record<string, string | undefined> = { ...env, ...Object.fromEntries(missing.map((name) => [name, 'заглушка'])), REMONTNIK_CONTROL_SECRET: undefined }
+    const patched: Record<string, string | undefined> = { ...env, ...Object.fromEntries(missing.map((name) => [name, 'заглушка'])), ...secretStubs(secrets) }
     try {
       doctorStartPlan(patched, config)
     } catch (error) {

@@ -60,17 +60,20 @@ function clipStrings(value: unknown, limit: number): unknown {
   return value
 }
 
-export function taskLetter(task: BridgeTask): string {
+/** Письмо с задачей. `agentKey` — ключ этой задачи: им консольная подписывает команды агента вместо секрета моста. */
+export function taskLetter(task: BridgeTask, agentKey: string): string {
   const id = task.caseId
+  const run = `REMONTNIK_PASEO_KEY=${agentKey} remontnik-paseo`
   const lines = [
     `Ремонтник передаёт тебе случай: приложение «${task.appName}», случай №${id}, вид сбоя ${task.kind}, отпечаток ${task.fingerprint}.`,
     '',
     'Что сделать:',
-    `1. Сразу подтверди, что взял случай: remontnik-paseo accept ${id}`,
-    `2. Подробности случая, журналы и отчёты: remontnik-paseo case ${id}`,
+    `1. Сразу подтверди, что взял случай: ${run} accept ${id}`,
+    `2. Подробности случая, журналы и отчёты: ${run} case ${id}`,
     '3. Найди причину и исправь её. Выкатывай только по правилам этого приложения.',
-    `4. Итог: remontnik-paseo done ${id} [--commit <sha>] [--deployed <версия>]`,
-    `   Не получилось — remontnik-paseo cannot ${id} --reason "<почему>". Тогда случай заберёт врач.`,
+    `4. Итог: ${run} done ${id} [--commit <sha>] [--deployed <версия>]`,
+    `   Не получилось — ${run} cannot ${id} --reason "<почему>". Тогда случай заберёт врач.`,
+    'Ключ годится только для команд по этому случаю и гаснет после итога. Передавай его переменной окружения, как выше, а не флагом --key: флаг виден в списке процессов. Не записывай ключ в код, коммиты и журналы.',
     '',
     'Если не подтвердишь случай вовремя или не пришлёшь итог в срок, врач заберёт случай и будет лечить сам.',
   ]
@@ -91,7 +94,7 @@ export function taskLetter(task: BridgeTask): string {
 export function cancelLetter(input: { appName: string; caseId: number; reason: string }): string {
   return [
     `Остановись: случай №${input.caseId} приложения «${input.appName}» забрал врач Ремонтника.`,
-    'Не правь и не выкатывай ничего по этому случаю. Итог, если уже есть, всё равно пришли командой remontnik-paseo — врач запишет его в отчёт.',
+    'Не правь и не выкатывай ничего по этому случаю. Итог, если уже есть, всё равно пришли командой remontnik-paseo с ключом из письма с задачей — врач запишет его в отчёт.',
     '',
     dataBlock({ reason: clip(input.reason, UNTRUSTED_LIMITS.reason) }),
   ].join('\n')
@@ -100,10 +103,10 @@ export function cancelLetter(input: { appName: string; caseId: number; reason: s
 export function reportLetter(app: string, report: DoctorReport): string {
   const about = report.caseId === undefined ? '' : `, случай №${report.caseId}`
   return [
-    `Отчёт Ремонтника №${report.reportId}: приложение «${app}»${about}, тип ${report.type}.`,
+    `Отчёт Ремонтника №${report.reportId}: приложение «${app}»${about}.`,
     'Это сведения для тебя. Действовать по ним не обязательно.',
     '',
-    dataBlock({ short: clip(report.short, UNTRUSTED_LIMITS.reason), full: clip(report.full, UNTRUSTED_LIMITS.report) }),
+    dataBlock({ type: clip(report.type, 40), short: clip(report.short, UNTRUSTED_LIMITS.reason), full: clip(report.full, UNTRUSTED_LIMITS.report) }),
   ].join('\n')
 }
 

@@ -17,8 +17,17 @@ export interface TaskRecord {
   receivedAt: string
   /** Причина отмены — для письма «остановись», если отмена пришла во время отправки задачи. */
   cancelReason?: string
+  /** Когда задачу отменили: ключ живёт ещё срок для поздней выкатки. */
+  cancelledAt?: string
   /** Итог агента уже ушёл врачу. */
   resultSent?: boolean
+  /** Когда итог принят врачом: ключ живёт ещё короткий срок, чтобы повтор итога получил 409, а не 401. */
+  resultSentAt?: string
+  /**
+   * Ключ задачи: им агент подписывает команды по этому случаю. Нет (погашен или запись старого моста) — команды
+   * не примутся.
+   */
+  agentKey?: string
 }
 
 interface StateShape {
@@ -66,10 +75,22 @@ export class BridgeStateStore {
     return true
   }
 
-  markResultSent(taskId: string): void {
+  markResultSent(taskId: string, at: string): void {
     this.commit((state) => {
       const task = state.tasks.find((t) => t.taskId === taskId)
-      if (task) task.resultSent = true
+      if (task) Object.assign(task, { resultSent: true, resultSentAt: at })
+    })
+  }
+
+  hasKey(agentKey: string): boolean {
+    return this.state.tasks.some((task) => task.agentKey === agentKey)
+  }
+
+  /** Погасить ключ задачи: он пропадает и из файла. */
+  retireKey(taskId: string): void {
+    if (this.task(taskId)?.agentKey === undefined) return
+    this.commit((state) => {
+      delete state.tasks.find((t) => t.taskId === taskId)!.agentKey
     })
   }
 

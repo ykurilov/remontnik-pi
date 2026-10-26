@@ -9,7 +9,9 @@ import {
   startBridgeServer,
   type AgentState,
   type BridgeConfig,
+  type BridgeServerLimits,
   type PaseoAgentsPort,
+  type PaseoBridgeOptions,
 } from '../server/index.js'
 
 // Подставной Paseo, подставной врач и запуск моста на 127.0.0.1 для тестов.
@@ -158,7 +160,14 @@ export function freshStateFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'remontnik-bridge-')), 'state.json')
 }
 
-export async function startBridge(options: { config: BridgeConfig; paseo: FakePaseo; stateFile?: string }) {
+export async function startBridge(options: {
+  config: BridgeConfig
+  paseo: FakePaseo
+  stateFile?: string
+  limits?: Partial<BridgeServerLimits>
+  /** Сроки и квоты ключей задач, часы моста. */
+  keys?: Pick<PaseoBridgeOptions, 'agentNoncesPerKey' | 'cancelledKeyTtlMs' | 'caseReadTtlMs' | 'resultKeyTailMs' | 'now'>
+}) {
   const journal: Record<string, unknown>[] = []
   const log = (entry: Record<string, unknown>) => void journal.push(entry)
   const bridge = createPaseoBridge({
@@ -168,8 +177,9 @@ export async function startBridge(options: { config: BridgeConfig; paseo: FakePa
     idlePollMs: 10,
     deliveryTimeoutMs: 2_000,
     log,
+    ...options.keys,
   })
-  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler, log })
+  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler, log, ...(options.limits ? { limits: options.limits } : {}) })
   return {
     bridge,
     server,
@@ -228,4 +238,11 @@ export async function until(condition: () => boolean, timeoutMs = 2_000): Promis
     if (Date.now() - started > timeoutMs) throw new Error('условие не наступило')
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
+}
+
+/** Ключ задачи из письма агенту: им агент подписывает свои команды вместо секрета моста. */
+export function taskKeyFrom(letter: string): string {
+  const match = /REMONTNIK_PASEO_KEY=([0-9a-f]{64})/.exec(letter)
+  if (!match) throw new Error('в письме нет ключа задачи')
+  return match[1]!
 }

@@ -67,6 +67,17 @@ describe('сетевой замок', () => {
     expect(decideRequest(frame('about:blank'), policy)).toEqual({ allow: true })
   })
 
+  it('пока на странице вписан пароль, любой запрос на сайт вне allowedOrigins закрыт — и GET картинки или скрипта', () => {
+    const request = (method: string, url: string) => ({ method, url, isNavigation: false, isMainFrame: false, passwordOnPage: true })
+    expect(decideRequest(request('GET', 'https://cdn.example.com/pixel.gif?p=secret'), policy)).toMatchObject({ allow: false, code: 'refused_leak' })
+    expect(decideRequest(request('HEAD', 'https://cdn.example.com/x'), policy)).toMatchObject({ allow: false, code: 'refused_leak' })
+    expect(decideRequest(request('GET', 'data:image/gif;base64,R0lGOD'), policy)).toEqual({ allow: true })
+    expect(decideRequest(request('GET', 'https://app.example.com/app.js'), policy)).toEqual({ allow: true })
+    expect(decideRequest(request('POST', 'https://app.example.com/login'), policy)).toEqual({ allow: true })
+    // Пароля на странице нет — подресурсы с других сайтов (CDN, шрифты) по-прежнему грузятся.
+    expect(decideRequest({ ...request('GET', 'https://cdn.example.com/app.js'), passwordOnPage: false }, policy)).toEqual({ allow: true })
+  })
+
   it('фрейм виден врачу, только если он и все его родители — с разрешённых сайтов', () => {
     const origins = policy.allowedOrigins
     expect(isAllowedFrameUrl(['https://app.example.com/frame', 'https://app.example.com/'], origins)).toBe(true)

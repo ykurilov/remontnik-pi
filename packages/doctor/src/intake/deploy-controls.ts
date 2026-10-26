@@ -1,6 +1,6 @@
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import type { Controls } from '../ledgers/controls.js'
-import { assertOwnerSecrets, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { assertOwnerSecrets, claimNonce, headerValue, RATE_LIMITED, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Стоп-кран по HTTP (contracts/doctor-api.md): `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`.
 // Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан `signRequest` с разовой меткой.
@@ -51,24 +51,27 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */
   const startedAt = now()
 
-  return async (request, response) => {
+  return async (request, response, foreignAllowed = () => true) => {
     if (request.method !== 'POST') {
       sendJson(response, 404, { error: 'not_found' })
       return
     }
     const early = precheckSignedRequest({ headers: request.headers, now: now(), notBefore: startedAt })
     if (!early.ok) {
-      refuse(request, response, 401, { error: early.reason })
+      if (foreignAllowed()) refuse(request, response, 401, { error: early.reason })
+      else refuse(request, response, 429, RATE_LIMITED)
       return
     }
     const nonce = headerValue(request, NONCE_HEADER)!
     if (replayGuard.wasSeen(nonce, now())) {
-      refuse(request, response, 401, { error: 'replayed' })
+      if (foreignAllowed()) refuse(request, response, 401, { error: 'replayed' })
+      else refuse(request, response, 429, RATE_LIMITED)
       return
     }
     const read = await readLimitedBody(request, BODY_LIMIT_BYTES, options.bodyTimeoutMs ?? BODY_TIMEOUT_MS)
     if (!read.ok) {
-      if (read.reason === 'too_large') refuse(request, response, 413, { error: 'too_large' })
+      if (!foreignAllowed()) refuse(request, response, 429, RATE_LIMITED)
+      else if (read.reason === 'too_large') refuse(request, response, 413, { error: 'too_large' })
       else if (read.reason === 'timeout') refuse(request, response, 408, { error: 'body_timeout' })
       else request.destroy()
       return
@@ -77,12 +80,13 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
       verifySignedRequest({ method: 'POST', target: request.url ?? '/', body: read.body, headers: request.headers, secret, now: now(), notBefore: startedAt })
     const byOwner = options.controlSecret !== undefined && verify(options.controlSecret).ok
     const check = byOwner ? { ok: true as const } : verify(options.secret)
-    if (!check.ok) {
-      sendJson(response, 401, { error: check.reason })
+    // Предел — только для чужих: поток приложения или мусора с того же адреса команду владельца не тормозит.
+    if (!byOwner && !foreignAllowed()) {
+      sendJson(response, 429, RATE_LIMITED)
       return
     }
-    if (!replayGuard.firstSeen(nonce, now())) {
-      sendJson(response, 401, { error: 'replayed' })
+    if (!check.ok) {
+      sendJson(response, 401, { error: check.reason })
       return
     }
     const command = parseCommand(read.body)
@@ -92,6 +96,12 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
     }
     if (command.action !== 'stop' && !byOwner) {
       sendJson(response, 403, { error: 'control_secret_required' })
+      return
+    }
+    // Метка занимается только запросом, который исполнится: отказ по роли память повторов не заполняет.
+    const claimed = claimNonce(replayGuard, nonce, now())
+    if (claimed) {
+      sendJson(response, claimed.status, claimed.body)
       return
     }
     if (command.action === 'confirm_version') {

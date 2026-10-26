@@ -22,6 +22,8 @@ export interface BrowserServiceOptions {
   live: { listen: LiveAddress; ownerToken: string } | null
   log?: LogSink
   env?: NodeJS.ProcessEnv
+  /** Только для тестов: внутренние `ip:port`, куда прокси браузера всё же пускает (например, страница теста на петле). */
+  reachableInternal?: readonly string[]
 }
 
 export interface RunningBrowserService {
@@ -38,7 +40,13 @@ export async function startBrowserService(options: BrowserServiceOptions): Promi
   const filter = createOutputFilter(() => vault.knownPasswords())
   const log = createServiceLog(sink, filter)
   const control = createControlLock()
-  const profiles = createProfiles({ dataDir: options.dataDir, policy: options.policy, log, ...(options.env ? { env: options.env } : {}) })
+  const profiles = createProfiles({
+    dataDir: options.dataDir,
+    policy: options.policy,
+    log,
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
+  })
   const runner = createBrowserActions({ profiles, vault, policy: options.policy, shotsDir: join(options.dataDir, 'shots'), control, log })
 
   const server = createBrowserHttpServer({ token: options.token, runner, filter, log: sink })

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { testRemontnikConfig } from '../testing/config.js'
+import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { startDoctorService } from './index.js'
 import { caseWorkbenchEnv, doctorStartPlan, parseListen, startDoctorFromEnv, type DoctorEnv } from './start.js'
 
@@ -21,11 +22,16 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
+// Выдуманные секреты нужной длины: у каждого своё значение.
+const SHARED_TEST_SECRET = 'shared-'.padEnd(36, 's')
+const OWNER_TEST_SECRET = 'owner-'.padEnd(36, 'o')
+const BRIDGE_TEST_SECRET = 'bridge-'.padEnd(36, 'b')
+
 function serverEnv(overrides: Record<string, string | undefined> = {}): DoctorEnv {
   return {
     REMONTNIK_CONFIG_REPO_DIR: '/srv/remontnik/app',
     REMONTNIK_STATE_DIR: '/srv/remontnik/state',
-    REMONTNIK_SHARED_SECRET: 'shared-test-secret',
+    REMONTNIK_SHARED_SECRET: SHARED_TEST_SECRET,
     REMONTNIK_GATEWAY_CONTAINER: 'remontnik-doctor',
     REMONTNIK_LISTEN_NETWORK: 'remontnik-app',
     DEEPSEEK_API_KEY: 'test-deepseek',
@@ -50,22 +56,38 @@ describe('настройка запуска из окружения', () => {
   })
 
   it('секрет владельца — из REMONTNIK_CONTROL_SECRET; не задан — его нет; совпадает с общим — отказ', () => {
-    expect(doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: ' owner-test-secret ' }), testRemontnikConfig()).service.controlSecret).toBe('owner-test-secret')
+    expect(doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: ` ${OWNER_TEST_SECRET} ` }), testRemontnikConfig()).service.controlSecret).toBe(OWNER_TEST_SECRET)
     expect(doctorStartPlan(serverEnv(), testRemontnikConfig()).service.controlSecret).toBeUndefined()
-    expect(() => doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: 'shared-test-secret' }), testRemontnikConfig())).toThrow(/REMONTNIK_CONTROL_SECRET/)
+    expect(() => doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: SHARED_TEST_SECRET }), testRemontnikConfig())).toThrow(/REMONTNIK_CONTROL_SECRET/)
+  })
+
+  it('три секрета попарно разные и не короче 32 знаков: иначе врач не стартует', () => {
+    const paseo = { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 }
+    const config = testRemontnikConfig({ handoff: { mode: 'paseo-first', paseo } })
+    const bridgeEnv = (overrides: Record<string, string | undefined>) =>
+      serverEnv({ TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_LISTEN: '10.0.0.1:7820', TEST_BRIDGE_SECRET: BRIDGE_TEST_SECRET, REMONTNIK_CONTROL_SECRET: OWNER_TEST_SECRET, ...overrides })
+    expect(() => doctorStartPlan(bridgeEnv({}), config)).not.toThrow()
+    expect(() => doctorStartPlan(bridgeEnv({ TEST_BRIDGE_SECRET: SHARED_TEST_SECRET }), config)).toThrow(/TEST_BRIDGE_SECRET совпадает с REMONTNIK_SHARED_SECRET/)
+    expect(() => doctorStartPlan(bridgeEnv({ TEST_BRIDGE_SECRET: OWNER_TEST_SECRET }), config)).toThrow(/TEST_BRIDGE_SECRET совпадает с REMONTNIK_CONTROL_SECRET/)
+    for (const name of ['REMONTNIK_SHARED_SECRET', 'REMONTNIK_CONTROL_SECRET', 'TEST_BRIDGE_SECRET']) {
+      expect(() => doctorStartPlan(bridgeEnv({ [name]: 'short-secret-31-characters-long' }), config), name).toThrow(new RegExp(`${name} короче 32 знаков`))
+    }
+    // Служба проверяет то же попарное несовпадение: секрет моста, равный общему, дал бы приложению права моста.
+    expect(() => assertOwnerSecrets({ secret: 'same-secret', bridgeSecret: 'same-secret' })).toThrow(/секрет моста/)
+    expect(() => assertOwnerSecrets({ secret: 'shared', controlSecret: 'same-secret', bridgeSecret: 'same-secret' })).toThrow(/секрет моста/)
   })
 
   it('режим «сначала Paseo»: адрес для моста, его секрет и адрес моста — из переменных, названных в настройке', () => {
     const paseo = { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 }
     const config = testRemontnikConfig({ handoff: { mode: 'paseo-first', paseo } })
-    const env = serverEnv({ REMONTNIK_REPORTS_TOKEN: 'reports-test-token', TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_SECRET: 'bridge-test-secret', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' })
+    const env = serverEnv({ REMONTNIK_REPORTS_TOKEN: 'reports-test-token', TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_SECRET: BRIDGE_TEST_SECRET, TEST_BRIDGE_LISTEN: '10.0.0.1:7820' })
     const { service } = doctorStartPlan(env, config)
-    expect(service.reportsFeed).toEqual({ token: 'reports-test-token', bridge: { listen: { host: '10.0.0.1', port: 7820 }, secret: 'bridge-test-secret', appName: config.app.name } })
+    expect(service.reportsFeed).toEqual({ token: 'reports-test-token', bridge: { listen: { host: '10.0.0.1', port: 7820 }, secret: BRIDGE_TEST_SECRET, appName: config.app.name } })
     expect(service.paseoBridge).toEqual({ url: 'http://10.0.0.2:7900' })
     // Режим «сам»: лента для моста есть, а случаи мосту не уходят.
     expect(doctorStartPlan(env, testRemontnikConfig({ handoff: { mode: 'self', paseo } })).service.paseoBridge).toBeUndefined()
     expect(() => doctorStartPlan(serverEnv({ TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' }), config)).toThrow(/TEST_BRIDGE_SECRET/)
-    expect(() => doctorStartPlan(serverEnv({ TEST_BRIDGE_SECRET: 'bridge-test-secret', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' }), config)).toThrow(/TEST_BRIDGE_URL/)
+    expect(() => doctorStartPlan(serverEnv({ TEST_BRIDGE_SECRET: BRIDGE_TEST_SECRET, TEST_BRIDGE_LISTEN: '10.0.0.1:7820' }), config)).toThrow(/TEST_BRIDGE_URL/)
   })
 
   it('приём событий на явном адресе', () => {

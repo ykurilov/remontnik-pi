@@ -1,7 +1,8 @@
+import { randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { INCIDENT_KINDS } from '@ykurilov/remontnik-core/incident'
-import { NONCE_HEADER, ReplayGuard, SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
+import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import { AgentPost, type PaseoAgentsPort } from './agent-post.js'
 import type { BridgeApp, BridgeConfig } from './bridge-config.js'
 import { BridgeStateStore, type TaskRecord } from './bridge-state.js'
@@ -10,9 +11,11 @@ import { assertPrivateAddress, hostForUrl, type ListenAddress } from './private-
 import { ReportRelay, errorText, type BridgeLog } from './report-relay.js'
 import { cancelLetter, taskLetter, UNTRUSTED_LIMITS, type BridgeTask } from './task-text.js'
 
-// HTTP моста (contracts/paseo-bridge.md). Порядок проверок: заголовки подписи → приложение из настройки →
-// подпись запроса (метод, путь, тело) секретом этого приложения → повтор подписи → содержимое.
-// Неизвестное приложение отвечает так же, как неверная подпись: имена приложений не перебрать.
+// HTTP моста (contracts/paseo-bridge.md). Порядок проверок: заголовки подписи (вид, время, повтор метки) — до
+// чтения тела → приложение из настройки → подпись запроса (метод, путь, тело) → метка занята → содержимое.
+// Запросы врача подписаны секретом приложения, команды агента — ключом его задачи (письмо моста): секрет моста
+// агенту не нужен, а ключ одной задачи не годится ни для другого случая, ни для путей врача.
+// Неизвестное приложение или случай без задачи отвечают так же, как неверная подпись: их не перебрать.
 // Агенту пишется только агент приложения из настройки моста.
 
 export const BRIDGE_MAX_BODY_BYTES = 256 * 1024
@@ -44,7 +47,22 @@ export interface PaseoBridgeOptions {
   idlePollMs?: number
   deliveryTimeoutMs?: number
   fetch?: FetchLike
+  /** Сколько разовых меток помнит ключ одной задачи (на срок памяти повторов); сверх — 503 этому ключу. */
+  agentNoncesPerKey?: number
+  /** Сколько ключ живёт после отмены задачи: агент успевает прислать позднюю выкатку («сделано»). */
+  cancelledKeyTtlMs?: number
+  /** Сколько после получения задачи агент может читать подробности случая (`case`). */
+  caseReadTtlMs?: number
+  /** Сколько ключ живёт после принятого итога: повтор итога, чей ответ потерялся, получает 409, а не 401. */
+  resultKeyTailMs?: number
+  /** Часы для сроков ключей; подписи проверяются по настоящим. */
+  now?: () => number
 }
+
+const DEFAULT_AGENT_NONCES_PER_KEY = 200
+const DEFAULT_CANCELLED_KEY_TTL_MS = 24 * 60 * 60_000
+const DEFAULT_CASE_READ_TTL_MS = 6 * 60 * 60_000
+const DEFAULT_RESULT_KEY_TAIL_MS = 15 * 60_000
 
 class Refusal {
   constructor(
@@ -64,6 +82,12 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 function headerValue(request: IncomingMessage, name: string): string | undefined {
   const value = request.headers[name.toLowerCase()]
   return Array.isArray(value) ? value[0] : value
+}
+
+/** Отказ до чтения тела: остаток выбрасываем, а если клиент всё пишет — через секунду рвём соединение. */
+function dropBody(request: IncomingMessage): void {
+  setTimeout(() => request.destroy(), 1_000).unref()
+  request.resume()
 }
 
 function readBody(request: IncomingMessage): Promise<string> {
@@ -168,7 +192,14 @@ function parseResult(body: Json, taskId: string): Json {
 export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   const { config, log } = options
   const state = new BridgeStateStore(options.stateFile, log)
+  /** Память повторов путей врача. Пути агента — своя память на каждый ключ: агент не забьёт память врача. */
   const replays = new ReplayGuard()
+  const agentReplays = new Map<string, ReplayGuard>()
+  const agentNoncesPerKey = options.agentNoncesPerKey ?? DEFAULT_AGENT_NONCES_PER_KEY
+  const cancelledKeyTtlMs = options.cancelledKeyTtlMs ?? DEFAULT_CANCELLED_KEY_TTL_MS
+  const caseReadTtlMs = options.caseReadTtlMs ?? DEFAULT_CASE_READ_TTL_MS
+  const resultKeyTailMs = options.resultKeyTailMs ?? DEFAULT_RESULT_KEY_TAIL_MS
+  const clock = options.now ?? Date.now
   /** Запросы, подписанные до запуска моста, не принимаются: память повторов после перезапуска пуста. */
   const startedAt = Date.now()
   /** Задачи, которые сейчас принимаются: повтор того же `taskId` ждёт первый приём, а не пишет второе письмо. */
@@ -200,7 +231,7 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const stillWanted = () => state.task(record.taskId)?.status === 'queued'
     track(
       post
-        .deliver(record.agentId, taskLetter(task), stillWanted)
+        .deliver(record.agentId, taskLetter(task, record.agentKey!), stillWanted)
         .then((outcome) => {
           log({ event: 'task_delivery', app: record.appName, caseId: record.caseId, taskId: record.taskId, outcome })
           if (outcome !== 'sent' || state.moveTask(record.taskId, 'queued', 'delivered')) return
@@ -258,9 +289,13 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       caseId: task.caseId,
       agentId: entry.agentId,
       status: 'queued',
-      receivedAt: new Date().toISOString(),
+      receivedAt: new Date(clock()).toISOString(),
+      agentKey: randomBytes(32).toString('hex'),
     }
+    // Новая задача того же случая гасит ключ прежней.
+    const previous = state.taskForCase(app, task.caseId)
     state.addTask(record)
+    if (previous) retireKey(previous)
     log({ event: 'task_received', app, caseId: task.caseId, taskId: task.taskId })
     deliverTask(task, record)
     return { queued: true }
@@ -276,17 +311,10 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const wasDelivered = record.status === 'delivered'
     // Задача ещё в очереди: письмо либо не уйдёт (проверка перед отправкой), либо уже уходит —
     // тогда «остановись» отправит доставка задачи, когда Paseo закончит отправку.
-    state.moveTask(record.taskId, record.status, 'cancelled', { cancelReason: body.reason as string })
+    state.moveTask(record.taskId, record.status, 'cancelled', { cancelReason: body.reason as string, cancelledAt: new Date(clock()).toISOString() })
     log({ event: 'task_cancelled', app, caseId: record.caseId, taskId: record.taskId, wasDelivered })
     if (wasDelivered) deliverCancel(record, body.reason as string)
     return { ok: true }
-  }
-
-  function taskForAgentCommand(app: string, body: Json): TaskRecord {
-    if (!isCaseId(body.caseId)) badRequest()
-    const record = state.taskForCase(app, body.caseId)
-    if (!record) throw new Refusal(404, 'unknown_task')
-    return record
   }
 
   async function forwardResult(app: string, record: TaskRecord, body: Json): Promise<DoctorAnswer> {
@@ -298,7 +326,9 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     try {
       log({ event: 'agent_result', app, caseId: record.caseId, taskId: record.taskId, kind: result.kind as string })
       const answer = await askDoctor(app, (client) => client.post(`/v1/handoffs/${record.caseId}/result`, result))
-      if (answer.status >= 200 && answer.status < 300) state.markResultSent(record.taskId)
+      if (answer.status >= 200 && answer.status < 300) {
+        state.markResultSent(record.taskId, new Date(clock()).toISOString())
+      }
       return answer
     } finally {
       resultsInFlight.delete(record.taskId)
@@ -319,18 +349,27 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const url = new URL(target, 'http://bridge.invalid')
     const method = request.method ?? 'GET'
 
-    if (!headerValue(request, SIGNATURE_HEADER) || !headerValue(request, TIMESTAMP_HEADER)) {
-      request.resume()
-      throw new Refusal(401, 'missing')
+    const early = precheckSignedRequest({ headers: request.headers, notBefore: startedAt })
+    if (!early.ok) {
+      dropBody(request)
+      throw new Refusal(401, early.reason)
+    }
+    const agentPath = url.pathname.startsWith('/v1/agent/')
+    if (!agentPath && replays.wasSeen(headerValue(request, NONCE_HEADER)!)) {
+      dropBody(request)
+      throw new Refusal(401, 'replayed')
     }
 
     if (method === 'GET' && url.pathname === '/health') {
       request.resume()
       const entry = config.apps.get(url.searchParams.get('app') ?? '')
-      verify(request, method, target, '', entry)
+      verify(request, method, target, '', entry?.secret, replays)
       return { status: 200, body: await health(entry!) }
     }
-    if (method !== 'POST') throw new Refusal(404, 'not_found')
+    if (method !== 'POST') {
+      dropBody(request)
+      throw new Refusal(404, 'not_found')
+    }
 
     const raw = await readBody(request)
     let body: unknown
@@ -342,39 +381,86 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     if (!isObject(body) || typeof body['app'] !== 'string') badRequest()
     const app = body['app']
     const entry = config.apps.get(app)
-    verify(request, method, target, raw, entry)
-    if (!entry) throw new Refusal(401, 'bad_signature')
+
+    if (agentPath) {
+      // Команда агента: ключ задачи этого случая, секрет моста здесь не годится.
+      const record = isCaseId(body.caseId) && entry ? state.taskForCase(app, body.caseId) : undefined
+      const key = record && liveKey(record)
+      verify(request, method, target, raw, key, key ? agentReplaysFor(key) : replays)
+      return agentCommand(app, url.pathname, record!, body)
+    }
+    verify(request, method, target, raw, entry?.secret, replays)
 
     const cancel = /^\/v1\/tasks\/([^/]+)\/cancel$/.exec(url.pathname)
-    if (url.pathname === '/v1/tasks') return { status: 200, body: await receiveTask(app, entry, body) }
+    if (url.pathname === '/v1/tasks') return { status: 200, body: await receiveTask(app, entry!, body) }
     if (cancel) return { status: 200, body: cancelTask(app, decodeURIComponent(cancel[1]!), body) }
     if (url.pathname === '/v1/reports/notify') {
       void relay.pull(app)
       return { status: 200, body: { ok: true } }
     }
-    if (url.pathname === '/v1/agent/accepted') {
-      const record = taskForAgentCommand(app, body)
+    throw new Refusal(404, 'not_found')
+  }
+
+  async function agentCommand(app: string, path: string, record: TaskRecord, body: Json): Promise<DoctorAnswer> {
+    // Итог уже принят: ключ ещё в хвосте — агент узнаёт, что дело сделано, а не что ключ неверен.
+    if (record.resultSent) throw new Refusal(409, 'result_already_sent')
+    if (path === '/v1/agent/accepted') {
       if (record.status === 'cancelled') throw new Refusal(409, 'task_cancelled')
       log({ event: 'agent_accepted', app, caseId: record.caseId, taskId: record.taskId })
       return askDoctor(app, (client) =>
         client.post(`/v1/handoffs/${record.caseId}/accepted`, { taskId: record.taskId, agent: record.agentId }),
       )
     }
-    if (url.pathname === '/v1/agent/result') {
-      return forwardResult(app, taskForAgentCommand(app, body), body)
-    }
-    if (url.pathname === '/v1/agent/case') {
-      const record = taskForAgentCommand(app, body)
+    if (path === '/v1/agent/result') return forwardResult(app, record, body)
+    if (path === '/v1/agent/case') {
+      if (record.status === 'cancelled') throw new Refusal(409, 'task_cancelled')
+      if (clock() - Date.parse(record.receivedAt) > caseReadTtlMs) throw new Refusal(403, 'case_read_expired')
       return askDoctor(app, (client) => client.get(`/v1/cases/${record.caseId}`))
     }
     throw new Refusal(404, 'not_found')
   }
 
-  function verify(request: IncomingMessage, method: string, target: string, body: string, entry: BridgeApp | undefined): void {
-    if (!entry) throw new Refusal(401, 'bad_signature')
-    const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: entry.secret, notBefore: startedAt })
+  /**
+   * Ключ задачи, если он ещё жив: после принятого итога — короткий хвост, после отмены — до срока. Истёкший срок
+   * гасит ключ и в файле. Итог без отметки времени — запись старого моста: ключ гаснет сразу.
+   */
+  function liveKey(record: TaskRecord): string | undefined {
+    const resultTailOver = record.resultSent && !(record.resultSentAt && clock() - Date.parse(record.resultSentAt) <= resultKeyTailMs)
+    const cancelOver = record.status === 'cancelled' && record.cancelledAt && clock() - Date.parse(record.cancelledAt) > cancelledKeyTtlMs
+    if (resultTailOver || cancelOver) {
+      retireKey(record)
+      return undefined
+    }
+    return record.agentKey
+  }
+
+  function retireKey(record: TaskRecord): void {
+    if (record.agentKey) agentReplays.delete(record.agentKey)
+    state.retireKey(record.taskId)
+  }
+
+  function agentReplaysFor(key: string): ReplayGuard {
+    let guard = agentReplays.get(key)
+    if (!guard) {
+      // Память ключей, которых в состоянии больше нет (задачи вытеснены), не копится.
+      for (const old of agentReplays.keys()) if (!state.hasKey(old)) agentReplays.delete(old)
+      guard = new ReplayGuard(undefined, agentNoncesPerKey)
+      agentReplays.set(key, guard)
+    }
+    return guard
+  }
+
+  /**
+   * Подпись ключом `key` (секрет приложения или ключ задачи); нет ключа — как неверная подпись. Затем метка занята
+   * в памяти `guard`.
+   */
+  function verify(request: IncomingMessage, method: string, target: string, body: string, key: string | undefined, guard: ReplayGuard): void {
+    if (!key) throw new Refusal(401, 'bad_signature')
+    const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: key, notBefore: startedAt })
     if (!check.ok) throw new Refusal(401, check.reason)
-    if (!replays.firstSeen(headerValue(request, NONCE_HEADER)!)) throw new Refusal(401, 'replayed')
+    const seen = guard.remember(headerValue(request, NONCE_HEADER)!)
+    if (seen === 'replayed') throw new Refusal(401, 'replayed')
+    if (seen === 'full') throw new Refusal(503, 'replay_memory_full')
   }
 
   const handler: BridgeHandler = async (request, response) => {
@@ -413,19 +499,75 @@ export interface BridgeServer {
   close(): Promise<void>
 }
 
+export interface BridgeServerLimits {
+  /** Всего соединений. */
+  maxConnections: number
+  /** Соединений с одного адреса: один клиент сети не забирает все места. */
+  maxConnectionsPerClient: number
+  /** Сколько ждать заголовков запроса. */
+  headersTimeoutMs: number
+  /** Сколько ждать запроса целиком. */
+  requestTimeoutMs: number
+  /** Сколько держать соединение без запросов. */
+  idleTimeoutMs: number
+}
+
+export const DEFAULT_BRIDGE_SERVER_LIMITS: BridgeServerLimits = {
+  maxConnections: 128,
+  maxConnectionsPerClient: 32,
+  headersTimeoutMs: 10_000,
+  requestTimeoutMs: 30_000,
+  idleTimeoutMs: 5_000,
+}
+
 /**
  * Слушать только заданный адрес частной сети. Публичный адрес, «все адреса» и имя хоста — ошибка до запуска.
+ * Соединения ограничены числом (всего и с одного адреса) и сроками — как у врача.
  * Ошибки сервера после запуска (например, `EMFILE`) пишутся в журнал: без обработчика они уронили бы процесс плагина.
  */
 export async function startBridgeServer(options: {
   listen: ListenAddress
   handler: BridgeHandler
   log?: BridgeLog
+  limits?: Partial<BridgeServerLimits>
 }): Promise<BridgeServer> {
   assertPrivateAddress(options.listen.host, 'адрес моста')
-  const server = createServer((request, response) => {
-    void options.handler(request, response)
+  const limits = { ...DEFAULT_BRIDGE_SERVER_LIMITS, ...options.limits }
+  const server = createServer(
+    {
+      headersTimeout: limits.headersTimeoutMs,
+      requestTimeout: Math.max(limits.requestTimeoutMs, limits.headersTimeoutMs),
+      keepAliveTimeout: limits.idleTimeoutMs,
+      connectionsCheckingInterval: Math.min(1_000, limits.headersTimeoutMs),
+    },
+    (request, response) => {
+      void options.handler(request, response)
+    },
+  )
+  const perClient = new Map<string, number>()
+  let total = 0
+  server.on('connection', (socket: Socket) => {
+    const client = socket.remoteAddress ?? ''
+    const mine = perClient.get(client) ?? 0
+    if (total >= limits.maxConnections || mine >= limits.maxConnectionsPerClient) {
+      socket.destroy()
+      return
+    }
+    total += 1
+    perClient.set(client, mine + 1)
+    // Срок до первого байта: `headersTimeout` Node проверяет лишь раз в `connectionsCheckingInterval`.
+    const timer = setTimeout(() => socket.destroy(), limits.headersTimeoutMs)
+    timer.unref()
+    socket.once('data', () => clearTimeout(timer))
+    socket.once('close', () => {
+      clearTimeout(timer)
+      total -= 1
+      const left = (perClient.get(client) ?? 1) - 1
+      if (left > 0) perClient.set(client, left)
+      else perClient.delete(client)
+    })
   })
+  server.on('clientError', (_error, socket) => socket.destroy())
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(options.listen.port, options.listen.host, () => {
