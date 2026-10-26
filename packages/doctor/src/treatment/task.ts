@@ -20,6 +20,7 @@ import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
+import { configFilesOfFix } from '../config-files/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { ATTEMPT_REFUSALS, decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
@@ -1047,7 +1048,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           }
           const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
           const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
-          const inspection = inspectFix(await deps.loadConfig(), files, doc.case)
+          // Файлы настройки — по git на основе и на самой правке, а не по прошлому чтению настройки.
+          const configFiles = await configFilesOfFix(deps.guard, treating.baseCommit, fixCommit)
+          const inspection = inspectFix(await deps.loadConfig(), files, doc.case, configFiles)
           const fixed = { diagnosis, fix, fixCommit, changedPaths, inspection }
           // Правке нельзя доверить собственную проверку: без проверок и без отправки — сразу к решению.
           const next = fixCanBeChecked(inspection) ? ({ phase: 'verifying', ...fixed } as const) : ({ phase: 'gated', ...fixed, pushed: false } as const)

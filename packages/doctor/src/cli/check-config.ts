@@ -5,9 +5,10 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { CASE_NETWORK_LABEL } from '../case-networks/index.js'
 import { parseServicesFile } from '../case-services/index.js'
-import { findForbiddenZones } from '../forbidden-zones/index.js'
+import { matchesAllowMask } from '../path-mask/index.js'
+import type { ConfigCodeReader } from '../service/config-reader.js'
 import { loadMainBranchConfig } from '../service/config-source.js'
-import { doctorStartPlan, type DoctorEnv } from '../service/start.js'
+import { configReaderFromEnv, doctorStartPlan, type DoctorEnv } from '../service/start.js'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 
 // `remontnik-doctor check-config`: всё, на чём споткнётся старт врача, — одним списком и до старта.
@@ -28,6 +29,8 @@ export interface Finding {
 export interface CheckConfigDeps {
   docker?: string
   gh?: string
+  /** Где выполняется код настройки; по умолчанию — как при старте врача, в контейнере из его образа. */
+  configReader?: ConfigCodeReader
 }
 
 const COMMAND_TIMEOUT_MS = 30_000
@@ -68,24 +71,27 @@ function configEnvNames(config: RemontnikConfig): string[] {
   return names
 }
 
-/** Файл, который подключает настройка, врач может поправить так же, как любой другой, — и тем изменить саму настройку. */
-function importsOutsideForbiddenZones(config: RemontnikConfig, localImports: string[]): Finding[] {
-  const outside = localImports.filter((path) => findForbiddenZones(config, [{ path, status: 'modified', added: 0, removed: 0 }]).length === 0)
-  return outside.map((path) => ({
+/**
+ * Файлы, которые подключает настройка, врач не правит никогда (шлюз правки, `config-files`). Если такой файл в `fixablePaths`,
+ * владелец, скорее всего, ждёт, что врач его чинит, — предупреждаем. Это не дыра в защите, поэтому не ошибка.
+ */
+function importsInFixablePaths(config: RemontnikConfig, localImports: string[]): Finding[] {
+  return localImports.filter((path) => matchesAllowMask(config.fixablePaths, path)).map((path) => ({
     level: 'warning',
     area: 'настройка',
-    problem: `настройка подключает файл ${path}, а он вне запретных зон: врач может его изменить и этим изменить настройку`,
-    fix: `держите файлы настройки в запретных зонах: назовите его remontnik.config.<имя>.ts или добавьте ${path} в forbidden.extra`,
+    problem: `настройка подключает файл ${path} из fixablePaths: врач его не правит, правка в нём — только отчёт человеку`,
+    fix: `если врач должен чинить ${path}, уберите его из импортов настройки; общий с настройкой текст держите в remontnik.config.<имя>.ts`,
   }))
 }
 
-async function checkSettings(env: DoctorEnv): Promise<{ findings: Finding[]; config?: RemontnikConfig }> {
+async function checkSettings(env: DoctorEnv, deps: CheckConfigDeps): Promise<{ findings: Finding[]; config?: RemontnikConfig }> {
   const repoDir = value(env, 'REMONTNIK_CONFIG_REPO_DIR')
   if (!repoDir) return { findings: [] }
   const mainBranch = value(env, 'REMONTNIK_MAIN_BRANCH') ?? 'main'
   try {
-    const { config, localImports } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
-    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }, ...importsOutsideForbiddenZones(config, localImports)] }
+    const reader = deps.configReader ?? configReaderFromEnv(env, deps.docker ? { docker: deps.docker } : {})
+    const { config, localImports } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch, reader })
+    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }, ...importsInFixablePaths(config, localImports)] }
   } catch (error) {
     const issues = (error as { issues?: unknown }).issues
     if (Array.isArray(issues)) {
@@ -279,7 +285,7 @@ async function checkGithub(env: DoctorEnv, gh: string, config: RemontnikConfig |
 
 /** Все проверки подряд; ни одна не меняет сервер, репозиторий или GitHub. */
 export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = {}): Promise<Finding[]> {
-  const { config, findings: settings } = await checkSettings(env)
+  const { config, findings: settings } = await checkSettings(env, deps)
   return [
     ...settings,
     ...checkEnvironment(env, config),

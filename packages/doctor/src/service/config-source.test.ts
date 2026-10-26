@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RemontnikConfigError } from '@ykurilov/remontnik-core/config'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { localConfigReader } from './config-reader.js'
 import { ConfigSourceError, loadMainBranchConfig } from './config-source.js'
 
 function configObject(overrides: { timeoutMs?: number; moneyMask?: string; mainBranch?: string; fixablePaths?: string[] } = {}) {
@@ -36,7 +37,7 @@ function git(directory: string, ...args: string[]): void {
 }
 
 function loadMain(directory: string, mainBranch = 'main') {
-  return loadMainBranchConfig({ mainCheckoutDirectory: directory, mainBranch })
+  return loadMainBranchConfig({ mainCheckoutDirectory: directory, mainBranch, reader: localConfigReader({ scratchDir: join(root, 'scratch') }) })
 }
 
 let root: string
@@ -378,5 +379,71 @@ describe('loadMainBranchConfig: импорты из настройки', () => {
 
     expect(failure).toMatchObject({ code: 'unreadable' })
     expect((failure as Error).message).toContain('импорт stranger не поддерживается')
+  })
+
+  it('импорт с вычисляемым путём не выполняется: его нет в списке файлов настройки', async () => {
+    mkdirSync(join(mainCheckout, 'src'))
+    writeFileSync(join(mainCheckout, 'src/hidden.mjs'), `export const NAME = 'hidden'\n`)
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `const path = './src/' + 'hidden.mjs'\nconst { NAME } = await import(path)\nexport default { ...${JSON.stringify(configObject())}, app: { name: NAME } }\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('не строкой в кавычках')
+  })
+
+  it('код настройки видит только файлы настройки: остальное рабочей копии в копию для чтения не попадает', async () => {
+    writeFileSync(join(mainCheckout, 'notes.txt'), 'внутреннее\n')
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { readFileSync } from 'node:fs'\nconst notes = readFileSync(new URL('./notes.txt', import.meta.url), 'utf8')\nexport default { ...${JSON.stringify(configObject())}, app: { name: notes } }\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('ENOENT')
+  })
+
+  it('импорт за пределы рабочей копии — понятная ошибка до выполнения', async () => {
+    writeFileSync(join(root, 'outside.mjs'), `export const NAME = 'outside'\n`)
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import { NAME } from '../outside.mjs'\nexport default { ...${JSON.stringify(configObject())}, app: { name: NAME } }\n`)
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('импорт ../outside.mjs ведёт за пределы репозитория')
+  })
+
+  it('окружения врача код настройки не видит, копия после чтения удаляется', async () => {
+    process.env.REMONTNIK_TEST_DOCTOR_SECRET = 'doctor-only-value'
+    try {
+      writeFileSync(
+        join(mainCheckout, 'remontnik.config.mjs'),
+        `export default { ...${JSON.stringify(configObject())}, app: { name: process.env.REMONTNIK_TEST_DOCTOR_SECRET ?? 'clean' } }\n`,
+      )
+      commitAll(mainCheckout, 'config')
+
+      expect((await loadMain(mainCheckout)).config.app.name).toBe('clean')
+      expect(readdirSync(join(root, 'scratch'))).toEqual([])
+    } finally {
+      delete process.env.REMONTNIK_TEST_DOCTOR_SECRET
+    }
+  })
+
+  it('настройка печатает метку ответа сама — врач всё равно берёт настоящий ответ', async () => {
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + '{"config":{}}')\nexport default ${JSON.stringify(configObject())}\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    expect((await loadMain(mainCheckout)).config.app.name).toBe('demo')
   })
 })

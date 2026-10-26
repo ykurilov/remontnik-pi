@@ -6,7 +6,7 @@ import { startDoctorService, type DoctorService } from '@ykurilov/remontnik-doct
 import { startFakeModel, startFakeTelegram, type FakeModelServer, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { createWatch, type Watch } from '@ykurilov/remontnik-watch'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { BOT_DESCRIPTION, BOT_PLACES } from '../../src/bot/description.ts'
+import patientConfig from '../../remontnik.config.ts'
 import type { PatientBug } from '../../src/bugs.ts'
 import { createPatientServer } from '../../src/server.ts'
 import { reportToWatch, sendConversationsToWatch } from './watch-glue.ts'
@@ -15,6 +15,8 @@ import { reportToWatch, sendConversationsToWatch } from './watch-glue.ts'
 // событие bad_answer дошло до врача → случай записан, владелец получил одно сообщение.
 
 const secret = 'shared-test-secret'
+/** Места, к которым сторож относит нарушения бота: отпечаток случая строится от них. */
+const BOT_PLACES = ['цены тарифов', 'статус заказа', 'тон ответа', 'выход за задачи бота']
 const botToken = '123456:test-bot-token'
 
 let telegram: FakeTelegramServer
@@ -47,7 +49,7 @@ function openWatch(doctorUrl: string, usdPerDay = 1): Watch {
       primary: { baseUrl: model.baseUrl, apiKey: 'test-primary-key', model: 'deepseek-flash' },
       fallback: { baseUrl: model.baseUrl, apiKey: 'test-fallback-key', model: 'deepseek/deepseek-v4.1-flash-1017' },
     },
-    review: { botDescription: BOT_DESCRIPTION, places: BOT_PLACES, limits: { watchModelUsdPerDay: usdPerDay }, summaryDelayMs: 150 },
+    review: { botDescription: patientConfig.review!.botDescription, places: BOT_PLACES, limits: { watchModelUsdPerDay: usdPerDay }, summaryDelayMs: 150 },
   })
   cleanups.push(() => watch.close())
   return watch

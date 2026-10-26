@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { localConfigReader } from '../service/config-reader.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { checkDoctorConfig, formatFindings } from './check-config.js'
 import { runDoctorCommand } from './run-doctor-command.js'
@@ -257,7 +258,7 @@ describe('check-config: настройка', () => {
     expect(problems.length).toBeGreaterThanOrEqual(3)
   })
 
-  it('настройка подключает файл вне запретных зон — предупреждение; файл в зоне — нет', async () => {
+  it('настройка подключает файл из fixablePaths — предупреждение: врач его не правит; файл вне fixablePaths — нет', async () => {
     const config = testRemontnikConfig()
     const data = { ...config, forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access } }
     const repoDir = join(tempDir(), 'app')
@@ -273,12 +274,26 @@ describe('check-config: настройка', () => {
     git(repoDir, 'add', '-A')
     git(repoDir, 'commit', '--quiet', '-m', 'настройка')
 
-    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS), configReader: localConfigReader() })
 
     expect(errors(findings)).toEqual([])
     expect(warnings(findings)).toHaveLength(1)
     expect(warnings(findings)[0]).toContain('src/shared-names.mjs')
-    expect(warnings(findings)[0]).toContain('вне запретных зон')
+    expect(warnings(findings)[0]).toContain('fixablePaths')
+    expect(warnings(findings)[0]).toContain('только отчёт человеку')
+  })
+
+  it('код настройки без контейнера врача не выполняется: нет REMONTNIK_GATEWAY_CONTAINER — ошибка, а не чтение в процессе врача', async () => {
+    const repoDir = join(tempDir(), 'app')
+    mkdirSync(repoDir, { recursive: true })
+    git(repoDir, 'init', '--quiet', '--initial-branch=main')
+    writeFileSync(join(repoDir, 'remontnik.config.mjs'), `export default ${JSON.stringify(testRemontnikConfig())}\n`)
+    git(repoDir, 'add', '-A')
+    git(repoDir, 'commit', '--quiet', '-m', 'настройка')
+
+    const findings = await checkDoctorConfig(serverEnv(repoDir, { REMONTNIK_GATEWAY_CONTAINER: undefined }), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+
+    expect(errors(findings).join('\n')).toContain('только в контейнере')
   })
 
   it('файл служб в fixablePaths — ошибка чтения настройки', async () => {

@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
@@ -10,6 +11,7 @@ import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
 import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
 import { browserClientFromEnv } from '../browser-tools/index.js'
+import { containerConfigReader, type ConfigCodeReader } from './config-reader.js'
 import { loadMainBranchConfig } from './config-source.js'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions, type DoctorTreatmentOptions } from './index.js'
 
@@ -91,10 +93,24 @@ function paseoBridgeOf(env: DoctorEnv, config: RemontnikConfig): Pick<DoctorServ
 }
 
 /**
+ * Чтение настройки на сервере: в контейнере из образа врача, копия файлов — в папке состояния (её путь общий с хостом).
+ * Без контейнера врача и папки состояния код настройки не выполняется вовсе; JSON-настройка читается и так (`check-config`).
+ */
+export function configReaderFromEnv(env: DoctorEnv, options: { docker?: string } = {}): ConfigCodeReader {
+  const gatewayContainer = env.REMONTNIK_GATEWAY_CONTAINER?.trim()
+  const stateDir = env.REMONTNIK_STATE_DIR?.trim()
+  if (!gatewayContainer || !stateDir) {
+    const missing = new Error('код настройки врач выполняет только в контейнере: нужны REMONTNIK_GATEWAY_CONTAINER и REMONTNIK_STATE_DIR')
+    return { isolation: 'container', scratchDir: tmpdir(), run: () => Promise.reject(missing) }
+  }
+  return containerConfigReader({ gatewayContainer, scratchDir: join(stateDir, 'config-read'), ...(options.docker ? { docker: options.docker } : {}) })
+}
+
+/**
  * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
  * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
-export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): DoctorStartPlan {
+export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options: { docker?: string } = {}): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
   const worktreesDir = env.REMONTNIK_WORKTREES_DIR?.trim() || join(stateDir, 'worktrees')
@@ -125,7 +141,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
     author: { name: env.REMONTNIK_GIT_AUTHOR_NAME?.trim() || 'Ремонтник', email: env.REMONTNIK_GIT_AUTHOR_EMAIL?.trim() || 'remontnik@example.invalid' },
     env: gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()),
   })
-  const loadConfig = async () => (await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch: config.repo.mainBranch })).config
+  const reader = configReaderFromEnv(env, options)
+  const loadConfig = async () => (await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch: config.repo.mainBranch, reader })).config
 
   return {
     listen,
@@ -207,8 +224,8 @@ export async function createCaseGateway(plan: DoctorStartPlan, options: { docker
 export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string } = {}): Promise<DoctorService> {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
-  const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
-  const plan = doctorStartPlan(env, config)
+  const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch, reader: configReaderFromEnv(env, options) })
+  const plan = doctorStartPlan(env, config, options)
   const listen = 'network' in plan.listen
     ? { host: await containerAddress(plan.gateway.container, plan.listen.network, options.docker), port: plan.listen.port }
     : plan.listen

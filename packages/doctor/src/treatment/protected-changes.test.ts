@@ -13,8 +13,8 @@ function file(path: string, status: ChangedFile['status'] = 'modified'): Changed
 const config = testRemontnikConfig()
 const allowAll = testRemontnikConfig({ forbidden: { schema: ['db/**'], money: ['pay/**'], access: ['auth/**'], allowDependencyChanges: true, allowBuildAndDeployChanges: true } })
 
-function paths(files: ChangedFile[], from = config): string[] {
-  return findProtectedChanges(from, files).map((change) => change.path)
+function paths(files: ChangedFile[], from = config, configFiles: string[] = []): string[] {
+  return findProtectedChanges(from, files, configFiles).map((change) => change.path)
 }
 
 describe('защищённые пути правки', () => {
@@ -114,8 +114,18 @@ describe('защищённые пути правки', () => {
     expect(paths([file('test/default-plan.test.mjs', 'added'), file('src/price.mjs')])).toEqual([])
   })
 
+  it('файл, который подключает настройка, защищён и внутри fixablePaths: правка, переименование, удаление', () => {
+    const configFiles = ['remontnik.config.ts', 'src/bot/description.ts']
+    expect(paths([file('src/bot/description.ts')], config, configFiles)).toEqual(['src/bot/description.ts'])
+    expect(paths([file('src/bot/description.ts', 'deleted')], config, configFiles)).toEqual(['src/bot/description.ts'])
+    expect(paths([{ ...file('src/bot/text.ts', 'renamed'), previousPath: 'src/bot/description.ts' }], config, configFiles)).toEqual(['src/bot/text.ts'])
+    expect(paths([file('src/bot/bot.ts')], config, configFiles)).toEqual([])
+    const [change] = findProtectedChanges(config, [file('src/bot/description.ts')], configFiles)
+    expect(change?.why).toMatch(/настройка Ремонтника/)
+  })
+
   it('у каждого отказа есть причина', () => {
-    const [change] = findProtectedChanges(config, [file('test/price.test.mjs')])
+    const [change] = findProtectedChanges(config, [file('test/price.test.mjs')], [])
     expect(change?.why).toMatch(/тест/)
   })
 })
