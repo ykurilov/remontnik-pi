@@ -72,12 +72,12 @@ const handoffs = () =>
   doctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((request) => [request.path, JSON.parse(request.body)])
 
 describe('remontnik-paseo', () => {
-  it('accept и done доходят до врача через мост; итог по задаче — один (после него ключ погашен)', async () => {
+  it('accept и done доходят до врача через мост; итог по задаче — один (повтор — 409)', async () => {
     expect((await run(['accept', '7', '--key', key()])).code).toBe(0)
     expect((await run(['done', '7', '--key', key(), '--commit', 'abc1234', '--deployed', 'v12'])).code).toBe(0)
     const again = await run(['cannot', '7', '--key', key(), '--reason', 'нужна схема базы'])
     expect(again.code).toBe(1)
-    expect(again.stderr).toContain('bad_signature')
+    expect(again.stderr).toContain('result_already_sent')
     const taskId = shopTask().taskId
     expect(handoffs()).toEqual([
       ['/v1/handoffs/7/accepted', { taskId, agent: SHOP_AGENT }],

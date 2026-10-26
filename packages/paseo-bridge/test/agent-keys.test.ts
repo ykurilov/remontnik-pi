@@ -57,9 +57,15 @@ describe('память повторов путей агента', () => {
 })
 
 describe('срок ключа задачи', () => {
-  it('итог принят врачом — ключ гаснет: и повтор итога, и case — 401; ключа нет и в файле состояния', async () => {
-    const { url, key, stateFile } = await bridgeWithTask()
+  it('итог принят врачом — повтор в коротком хвосте получает 409, после хвоста ключ гаснет: 401, ключа нет и в файле', async () => {
+    const { url, key, stateFile } = await bridgeWithTask({ resultKeyTailMs: 10 * 60_000 })
     expect(await ask(url, '/v1/agent/result', { kind: 'done', version: 'v2' }, key)).toEqual({ status: 200, body: { ok: true } })
+    // Ответ потерялся, агент повторяет: узнаёт, что итог уже у врача, а не что ключ неверен.
+    expect(await ask(url, '/v1/agent/result', { kind: 'done', version: 'v2' }, key)).toEqual({ status: 409, body: { error: 'result_already_sent' } })
+    expect(await ask(url, '/v1/agent/case', {}, key)).toEqual({ status: 409, body: { error: 'result_already_sent' } })
+    expect(readFileSync(stateFile, 'utf8')).toContain(key)
+
+    clock += 10 * 60_000 + 1
     expect(await ask(url, '/v1/agent/result', { kind: 'done', version: 'v2' }, key)).toEqual({ status: 401, body: { error: 'bad_signature' } })
     expect(await ask(url, '/v1/agent/case', {}, key)).toEqual({ status: 401, body: { error: 'bad_signature' } })
     expect(readFileSync(stateFile, 'utf8')).not.toContain(key)

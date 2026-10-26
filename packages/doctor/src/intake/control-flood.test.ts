@@ -1,5 +1,6 @@
+import { connect, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ReplayGuard, signRequest } from '@ykurilov/remontnik-core/signed-http'
+import { NONCE_HEADER, ReplayGuard, SIGNATURE_HEADER, TIMESTAMP_HEADER, signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { createMemoryRecordStore } from '../records/index.js'
 import { createControls } from '../ledgers/controls.js'
 import { createCaseRetryHandler } from './case-retry.js'
@@ -128,5 +129,43 @@ describe('предел запросов с одного адреса на пут
     const retry = await fetch(`${url}/v1/control/cases`, signedPost('/v1/control/cases', JSON.stringify({ caseId: 3, action: 'retry', by: 'owner' }), CONTROL_SECRET))
     expect(retry.status).toBe(200)
     expect(retried).toEqual([3])
+  })
+})
+
+describe('медленные тела на путях управления', () => {
+  /** Заголовки с годной на вид подписью и началом тела: тело не дописывается, соединение висит. */
+  function slowBody(url: string, target: string): Promise<Socket> {
+    const { port } = new URL(url)
+    return new Promise((resolve) => {
+      const socket = connect(Number(port), '127.0.0.1', () => {
+        const headers = signRequest({ method: 'POST', target, body: '{"action":"stop"}', secret: SECRET })
+        socket.write(
+          `POST ${target} HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n` +
+            `${SIGNATURE_HEADER}: ${headers[SIGNATURE_HEADER]}\r\n${TIMESTAMP_HEADER}: ${headers[TIMESTAMP_HEADER]}\r\n${NONCE_HEADER}: ${headers[NONCE_HEADER]}\r\n\r\n{`,
+        )
+        resolve(socket)
+      })
+      socket.on('error', () => {})
+    })
+  }
+  const closed = (socket: Socket) => socket.destroyed || socket.readableEnded
+
+  it('с одного адреса одновременно читается не больше предела тел: лишнее вытесняет самое старое, команда владельца проходит', async () => {
+    const controls = createControls(createMemoryRecordStore(), () => new Date())
+    const url = await serve({
+      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
+      controlBodyReads: { perAddress: 2, total: 10 },
+    })
+    const target = '/v1/control/deploys'
+    const sockets: Socket[] = []
+    for (let index = 0; index < 5; index += 1) {
+      sockets.push(await slowBody(url, target))
+      await new Promise((resolve) => setTimeout(resolve, 30))
+    }
+    await expect.poll(() => sockets.filter((socket) => !closed(socket)).length).toBe(2)
+
+    const owner = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
+    expect(owner.status).toBe(200)
+    for (const socket of sockets) socket.destroy()
   })
 })

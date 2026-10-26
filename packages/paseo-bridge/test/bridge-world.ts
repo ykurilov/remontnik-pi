@@ -166,7 +166,7 @@ export async function startBridge(options: {
   stateFile?: string
   limits?: Partial<BridgeServerLimits>
   /** Сроки и квоты ключей задач, часы моста. */
-  keys?: Pick<PaseoBridgeOptions, 'agentNoncesPerKey' | 'cancelledKeyTtlMs' | 'caseReadTtlMs' | 'now'>
+  keys?: Pick<PaseoBridgeOptions, 'agentNoncesPerKey' | 'cancelledKeyTtlMs' | 'caseReadTtlMs' | 'resultKeyTailMs' | 'now'>
 }) {
   const journal: Record<string, unknown>[] = []
   const log = (entry: Record<string, unknown>) => void journal.push(entry)

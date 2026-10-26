@@ -21,6 +21,8 @@ export interface TaskRecord {
   cancelledAt?: string
   /** Итог агента уже ушёл врачу. */
   resultSent?: boolean
+  /** Когда итог принят врачом: ключ живёт ещё короткий срок, чтобы повтор итога получил 409, а не 401. */
+  resultSentAt?: string
   /**
    * Ключ задачи: им агент подписывает команды по этому случаю. Нет (погашен или запись старого моста) — команды
    * не примутся.
@@ -73,10 +75,10 @@ export class BridgeStateStore {
     return true
   }
 
-  markResultSent(taskId: string): void {
+  markResultSent(taskId: string, at: string): void {
     this.commit((state) => {
       const task = state.tasks.find((t) => t.taskId === taskId)
-      if (task) task.resultSent = true
+      if (task) Object.assign(task, { resultSent: true, resultSentAt: at })
     })
   }
 

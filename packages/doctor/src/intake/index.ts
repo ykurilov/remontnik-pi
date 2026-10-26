@@ -4,6 +4,7 @@ import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/inc
 import { redactValue } from '@ykurilov/remontnik-core/redact'
 import { DEFAULT_MAX_SKEW_MS, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { createBodyReadSlots, DEFAULT_CONTROL_BODY_READS, type BodyReadSlotSettings } from './body-read-slots.js'
 import { createRateLimiter, DEFAULT_CONTROL_RATE_LIMIT, type RateLimitSettings } from './rate-limit.js'
 
 // Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health; рядом — лента отчётов и стоп-кран.
@@ -29,6 +30,8 @@ export interface IntakeHandlerOptions {
   caseRetry?: IntakeHandler
   /** Предел чужих запросов с одного адреса на `/v1/control/*` (подпись владельца его не тратит); по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
   controlRateLimit?: RateLimitSettings
+  /** Одновременные чтения тел на `/v1/control/*`: сверх предела вытесняется самое старое; по умолчанию `DEFAULT_CONTROL_BODY_READS`. */
+  controlBodyReads?: BodyReadSlotSettings
 }
 
 export type { IntakeHandler }
@@ -66,6 +69,7 @@ function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
 
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
   const controlAllowed = createRateLimiter(options.controlRateLimit ?? DEFAULT_CONTROL_RATE_LIMIT)
+  const enterBodyRead = createBodyReadSlots(options.controlBodyReads ?? DEFAULT_CONTROL_BODY_READS)
   return async (request, response) => {
     const path = (request.url ?? '/').split('?')[0]!
     if (request.method === 'GET' && path === '/health') {
@@ -74,6 +78,12 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
     // Команды владельца и стоп-кран: чужие запросы (без подписи владельца) упираются в предел с одного адреса.
     const foreignAllowed = () => controlAllowed(request.socket.remoteAddress ?? '')
+    if (path.startsWith('/v1/control/')) {
+      // Место занято, пока тело не дочитано или соединение не закрыто; вытесненное — обрываем.
+      const release = enterBodyRead(request.socket.remoteAddress ?? '', () => request.destroy())
+      request.once('end', release)
+      request.once('close', release)
+    }
     if (options.deployControls && path === '/v1/control/deploys') {
       await options.deployControls(request, response, foreignAllowed)
       return

@@ -54,6 +54,8 @@ export function createProfiles(options: {
       locale: 'ru-RU',
       serviceWorkers: 'block',
       acceptDownloads: false,
+      // Второй слой к замку каналов: WebRTC не ходит по UDP мимо прокси (сам WebRTC в страницах убран).
+      args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
       ...(proxy ? { proxy } : {}),
     })
     let blocked: BlockedRequest[] = []

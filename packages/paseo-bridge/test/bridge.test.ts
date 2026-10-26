@@ -492,10 +492,10 @@ describe('команды агента через мост', () => {
     ).toEqual({ status: 409, body: { error: 'task_cancelled' } })
     const done = { app: 'shop', caseId: 7, kind: 'done', version: 'v13' }
     expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({ status: 200, body: { ok: true } })
-    // Итог принят — ключ погашен: повтор уже не подписать.
+    // Итог принят: повтор врачу не уходит, агент узнаёт, что итог уже у врача.
     expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({
-      status: 401,
-      body: { error: 'bad_signature' },
+      status: 409,
+      body: { error: 'result_already_sent' },
     })
     expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((r) => r.path)).toEqual([
       '/v1/handoffs/7/result',

@@ -1,6 +1,6 @@
 // Замки браузера: опасные действия, разрешённые сайты, сетевой замок изменяющих запросов, признаки капчи и кодов.
 // Решения — чистые функции; установка на контекст Chromium — installNetworkGuard.
-import type { BrowserContext, Frame, Page, Request, Route, WebSocketRoute } from 'playwright-core'
+import type { BrowserContext, CDPSession, Frame, Page, Route, WebSocketRoute } from 'playwright-core'
 import type { SitePolicy } from '../policy/index.js'
 
 export const DANGER_KINDS = ['none', 'submit', 'send', 'pay', 'delete', 'publish'] as const
@@ -161,6 +161,37 @@ function webSocketSite(url: string): string {
   return url.replace(/^ws(s?):/i, 'http$1:')
 }
 
+/**
+ * Каналы мимо перехвата запросов: WebRTC (TURN-сервер с паролем в имени пользователя) и WebTransport (QUIC).
+ * Служебному браузеру они не нужны — их нет в каждом окне и фрейме с самого начала документа. Фоновые скрипты
+ * из `blob:` и `data:` (их пишет сам скрипт страницы) получают то же вступление и ту же обёртку для вложенных.
+ * Выполняется в странице: функция самодостаточна и ссылается на себя по имени.
+ */
+function sealNetworkChannels(): void {
+  const scope = globalThis as unknown as Record<string, unknown>
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'RTCIceTransport', 'RTCSctpTransport', 'RTCDtlsTransport', 'WebTransport']) {
+    try {
+      delete scope[name]
+    } catch {}
+  }
+  for (const name of ['Worker', 'SharedWorker']) {
+    const Original = scope[name] as (new (url: string | URL, options?: unknown) => object) | undefined
+    if (typeof Original !== 'function') continue
+    const Sealed = function (this: unknown, url: string | URL, options?: unknown) {
+      if (!new.target) throw new TypeError(`Failed to construct '${name}': Please use the 'new' operator`)
+      const target = String(url instanceof URL ? url.href : new URL(String(url), location.href).href)
+      if (!/^(blob|data):/i.test(target)) return new Original(url, options)
+      const isModule = typeof options === 'object' && options !== null && (options as { type?: unknown }).type === 'module'
+      const load = isModule ? `await import(${JSON.stringify(target)})` : `importScripts(${JSON.stringify(target)})`
+      const prelude = new Blob([`(${sealNetworkChannels.toString()})();\n${load}`], { type: 'text/javascript' })
+      return new Original(URL.createObjectURL(prelude), options)
+    } as unknown as { prototype: object }
+    Sealed.prototype = Original.prototype
+    Object.defineProperty(Original.prototype, 'constructor', { value: Sealed, writable: true, configurable: true })
+    Object.defineProperty(scope, name, { value: Sealed, writable: true, configurable: true })
+  }
+}
+
 /** Ставит сетевой замок на весь контекст: действует и для врача, и при ручном управлении владельца. */
 export async function installNetworkGuard(
   context: BrowserContext,
@@ -168,19 +199,14 @@ export async function installNetworkGuard(
   onBlocked: (blocked: BlockedRequest) => void,
 ): Promise<NetworkGuard> {
   /**
-   * Запертые страницы: в них вписан пароль или они жили рядом со страницей с паролем. Значение — с тех пор ушёл
-   * запрос нового документа верхнего фрейма.
+   * Запертые страницы: в них вписан пароль или они жили рядом со страницей с паролем. Значение — номер загрузки
+   * (loaderId) документа верхнего фрейма, при котором страницу заперли; пока не известен — `undefined`.
    */
-  const locked = new Map<Page, { newDocument: boolean }>()
-  const pageOf = (request: Request): Page | undefined => {
-    try {
-      return request.frame().page()
-    } catch {
-      return undefined
-    }
-  }
+  const locked = new Map<Page, { loaderId: string | undefined }>()
   // Замок — на весь контекст: окно того же сайта читает пароль у соседа и шлёт его само.
   const passwordOn = () => locked.size > 0
+
+  await context.addInitScript(sealNetworkChannels)
 
   await context.route('**/*', async (route: Route) => {
     const request = route.request()
@@ -191,18 +217,11 @@ export async function installNetworkGuard(
       // Запрос не из страницы (служебный работник): считаем верхним уровнем — строже.
       isMainFrame = true
     }
-    const page = pageOf(request)
     const decision = decideRequest(
       { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, passwordOnPage: passwordOn() },
       policy,
     )
-    if (decision.allow) {
-      if (page && isMainFrame && request.isNavigationRequest()) {
-        const lock = locked.get(page)
-        if (lock) lock.newDocument = true
-      }
-      return route.fallback()
-    }
+    if (decision.allow) return route.fallback()
     onBlocked({ code: decision.code, reason: decision.reason })
     if (request.isNavigationRequest()) return route.abort('blockedbyclient')
     return route.fulfill({
@@ -231,20 +250,38 @@ export async function installNetworkGuard(
     socket.connectToServer()
   })
 
+  // Новый документ виден по номеру загрузки верхнего фрейма в Chromium: он меняется, только когда документ
+  // действительно сменился. Ответ 204, скачивание, window.stop(), history API и смена hash его не меняют — пароль
+  // остаётся в DOM, и замок держится. Номер — из событий самого Chromium, скрипт страницы на него не влияет.
   const watched = new WeakSet<Page>()
+  const sessions = new WeakMap<Page, Promise<CDPSession | undefined>>()
   const lock = (page: Page) => {
-    locked.set(page, { newDocument: false })
-    if (watched.has(page)) return
-    watched.add(page)
-    // Новый документ снимает замок страницы, только если других запертых нет: иначе новый документ живёт рядом
-    // с паролем. Смена адреса внутри страницы (history API) запроса документа не шлёт — замок остаётся.
-    page.on('framenavigated', (frame) => {
-      const state = locked.get(page)
-      if (frame !== page.mainFrame() || !state?.newDocument) return
-      if (locked.size === 1) locked.delete(page)
-      else state.newDocument = false
+    const state: { loaderId: string | undefined } = { loaderId: undefined }
+    locked.set(page, state)
+    if (!watched.has(page)) {
+      watched.add(page)
+      page.on('close', () => locked.delete(page))
+      sessions.set(page, watchDocuments(page))
+    }
+    // Номер документа, при котором заперли. Сменился раньше ответа — заперто при новом: держится дольше, не короче.
+    void sessions.get(page)!.then(async (session) => {
+      const tree = await session?.send('Page.getFrameTree').catch(() => undefined)
+      if (tree && locked.get(page) === state) state.loaderId = tree.frameTree.frame.loaderId
     })
-    page.on('close', () => locked.delete(page))
+  }
+  const watchDocuments = async (page: Page): Promise<CDPSession | undefined> => {
+    const session = await context.newCDPSession(page).catch(() => undefined)
+    if (!session) return undefined
+    session.on('Page.frameNavigated', ({ frame, type }) => {
+      const state = locked.get(page)
+      // Восстановление из кэша «назад» возвращает прежний документ — с паролем: замок не снимается.
+      if (frame.parentId || type !== 'Navigation' || !state?.loaderId || frame.loaderId === state.loaderId) return
+      // Новый документ снимает замок страницы, только если других запертых нет: иначе он живёт рядом с паролем.
+      if (locked.size === 1) locked.delete(page)
+      else state.loaderId = frame.loaderId
+    })
+    await session.send('Page.enable').catch(() => {})
+    return session
   }
   context.on('page', (page) => {
     if (locked.size > 0) lock(page)

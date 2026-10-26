@@ -53,6 +53,8 @@ export interface PaseoBridgeOptions {
   cancelledKeyTtlMs?: number
   /** Сколько после получения задачи агент может читать подробности случая (`case`). */
   caseReadTtlMs?: number
+  /** Сколько ключ живёт после принятого итога: повтор итога, чей ответ потерялся, получает 409, а не 401. */
+  resultKeyTailMs?: number
   /** Часы для сроков ключей; подписи проверяются по настоящим. */
   now?: () => number
 }
@@ -60,6 +62,7 @@ export interface PaseoBridgeOptions {
 const DEFAULT_AGENT_NONCES_PER_KEY = 200
 const DEFAULT_CANCELLED_KEY_TTL_MS = 24 * 60 * 60_000
 const DEFAULT_CASE_READ_TTL_MS = 6 * 60 * 60_000
+const DEFAULT_RESULT_KEY_TAIL_MS = 15 * 60_000
 
 class Refusal {
   constructor(
@@ -195,6 +198,7 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   const agentNoncesPerKey = options.agentNoncesPerKey ?? DEFAULT_AGENT_NONCES_PER_KEY
   const cancelledKeyTtlMs = options.cancelledKeyTtlMs ?? DEFAULT_CANCELLED_KEY_TTL_MS
   const caseReadTtlMs = options.caseReadTtlMs ?? DEFAULT_CASE_READ_TTL_MS
+  const resultKeyTailMs = options.resultKeyTailMs ?? DEFAULT_RESULT_KEY_TAIL_MS
   const clock = options.now ?? Date.now
   /** Запросы, подписанные до запуска моста, не принимаются: память повторов после перезапуска пуста. */
   const startedAt = Date.now()
@@ -323,8 +327,7 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       log({ event: 'agent_result', app, caseId: record.caseId, taskId: record.taskId, kind: result.kind as string })
       const answer = await askDoctor(app, (client) => client.post(`/v1/handoffs/${record.caseId}/result`, result))
       if (answer.status >= 200 && answer.status < 300) {
-        state.markResultSent(record.taskId)
-        retireKey(record)
+        state.markResultSent(record.taskId, new Date(clock()).toISOString())
       }
       return answer
     } finally {
@@ -399,6 +402,8 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   }
 
   async function agentCommand(app: string, path: string, record: TaskRecord, body: Json): Promise<DoctorAnswer> {
+    // Итог уже принят: ключ ещё в хвосте — агент узнаёт, что дело сделано, а не что ключ неверен.
+    if (record.resultSent) throw new Refusal(409, 'result_already_sent')
     if (path === '/v1/agent/accepted') {
       if (record.status === 'cancelled') throw new Refusal(409, 'task_cancelled')
       log({ event: 'agent_accepted', app, caseId: record.caseId, taskId: record.taskId })
@@ -415,9 +420,14 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     throw new Refusal(404, 'not_found')
   }
 
-  /** Ключ задачи, если он ещё жив: после отмены — до срока; погашенный срок гасит ключ и в файле. */
+  /**
+   * Ключ задачи, если он ещё жив: после принятого итога — короткий хвост, после отмены — до срока. Истёкший срок
+   * гасит ключ и в файле. Итог без отметки времени — запись старого моста: ключ гаснет сразу.
+   */
   function liveKey(record: TaskRecord): string | undefined {
-    if (record.status === 'cancelled' && record.cancelledAt && clock() - Date.parse(record.cancelledAt) > cancelledKeyTtlMs) {
+    const resultTailOver = record.resultSent && !(record.resultSentAt && clock() - Date.parse(record.resultSentAt) <= resultKeyTailMs)
+    const cancelOver = record.status === 'cancelled' && record.cancelledAt && clock() - Date.parse(record.cancelledAt) > cancelledKeyTtlMs
+    if (resultTailOver || cancelOver) {
       retireKey(record)
       return undefined
     }
