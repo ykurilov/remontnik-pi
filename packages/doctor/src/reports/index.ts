@@ -6,6 +6,8 @@ import { copyRecord, type RecordStore, type RecordTransaction } from '../records
 
 export const REPORT_RETRY_DELAYS_MS = Object.freeze([5_000, 30_000, 120_000, 600_000]) as readonly number[]
 export const REPORT_SHORT_LIMIT = 1000
+/** Мост Paseo не принимает текст отчёта длиннее 64 КиБ; пределом с запасом отсекаем это при записи. */
+export const REPORT_FULL_LIMIT = 32_000
 
 export type ReportType =
   | 'case_received'
@@ -57,6 +59,15 @@ export interface Reports {
   addIn(tx: RecordTransaction, input: AddReportInput): Promise<Report>
   get(reportId: number): Promise<Report | undefined>
   list(query: { after: number; limit: number }): Promise<Report[]>
+  /** Номер последнего записанного отчёта; 0 — отчётов ещё нет. */
+  lastReportId(): Promise<number>
+  /** До какого номера Paseo подтвердил доставку; 0 — ничего. */
+  paseoAcked(): Promise<number>
+  /**
+   * Запоминает подтверждение Paseo и возвращает итоговый номер. Подтверждение только растёт:
+   * меньший номер ничего не меняет. Номер больше последнего отчёта — `RangeError`.
+   */
+  ackPaseo(upTo: number): Promise<number>
   /** Отправляет в Telegram отчёты, чья попытка подошла. Без настроенного Telegram ничего не делает. */
   pump(): Promise<void>
   /** Когда подойдёт ближайшая попытка; `null` — ждать нечего. */
@@ -73,6 +84,8 @@ export interface CreateReportsOptions {
 
 interface ReportIndex {
   nextReportId: number
+  /** Подтверждение Paseo; в индексах, записанных до ленты, поля нет. */
+  paseoAcked?: number
   /** Номера отчётов, ждущих отправки в Telegram. */
   pending: number[]
 }
@@ -137,7 +150,7 @@ export function createReports(options: CreateReportsOptions): Reports {
           ...(input.caseId === undefined ? {} : { caseId: input.caseId }),
           type: input.type,
           short: truncateText(input.short, REPORT_SHORT_LIMIT),
-          full: input.full ?? input.short,
+          full: truncateText(input.full ?? input.short, REPORT_FULL_LIMIT),
           telegram: input.telegram === 'pending' ? { state: 'pending', attempts: 0, nextAttemptAt: 0 } : { state: 'not_needed', attempts: 0 },
           createdAt: new Date(now()).toISOString(),
         }
@@ -161,6 +174,24 @@ export function createReports(options: CreateReportsOptions): Reports {
       }
       return reports
     },
+
+    async lastReportId() {
+      return ((await store.read<ReportIndex>(INDEX.collection, INDEX.key))?.nextReportId ?? 1) - 1
+    },
+
+    async paseoAcked() {
+      return (await store.read<ReportIndex>(INDEX.collection, INDEX.key))?.paseoAcked ?? 0
+    },
+
+    ackPaseo: (upTo) =>
+      store.transaction(async (tx) => {
+        const index = await tx.doc<ReportIndex>(INDEX.collection, INDEX.key, emptyIndex())
+        if (!Number.isSafeInteger(upTo) || upTo < 0 || upTo >= index.nextReportId) {
+          throw new RangeError(`подтверждать можно номера от 0 до ${index.nextReportId - 1}, получено ${upTo}`)
+        }
+        index.paseoAcked = Math.max(index.paseoAcked ?? 0, upTo)
+        return index.paseoAcked
+      }),
 
     async pump() {
       // Один проход за раз: параллельный вызов дождётся текущего, а не отправит то же второй раз.
