@@ -15,7 +15,7 @@ export {
   type PaseoBridge,
   type PaseoBridgeOptions,
 } from './bridge-http.js'
-export { DoctorClient, signedTarget } from './doctor-client.js'
+export { DOCTOR_MAX_ANSWER_BYTES, DoctorClient } from './doctor-client.js'
 export {
   paseoAgentsFromHooks,
   startPaseoBridgePlugin,
@@ -25,5 +25,5 @@ export {
 } from './plugin-runtime.js'
 export { isPrivateAddress, parseListenAddress, type ListenAddress } from './private-address.js'
 export type { BridgeLog } from './report-relay.js'
-export { cancelLetter, reportLetter, taskLetter, UNTRUSTED_LIMITS, type BridgeTask, type DoctorReport } from './task-text.js'
+export { cancelLetter, caseDetailsText, reportLetter, taskLetter, UNTRUSTED_LIMITS, type BridgeTask, type DoctorReport } from './task-text.js'
 export { runPaseoCommand, type PaseoCommandIo } from './cli/run-paseo-command.js'

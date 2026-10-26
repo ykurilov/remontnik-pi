@@ -1,7 +1,8 @@
 import { parseArgs } from 'node:util'
-import { signBody } from '@ykurilov/remontnik-core/signed-http'
+import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { DEFAULT_CONFIG_PATH, loadBridgeConfig } from '../bridge-config.js'
 import { hostForUrl } from '../private-address.js'
+import { caseDetailsText } from '../task-text.js'
 
 // Консольная `remontnik-paseo`: агент приложения отчитывается врачу через мост на своём компьютере.
 
@@ -67,11 +68,13 @@ export async function runPaseoCommand(argv: string[], io: PaseoCommandIo): Promi
     if (!entry) throw new UsageError(`приложения «${app}» нет в настройке моста`)
 
     const body = JSON.stringify({ app, ...buildPayload(command as Command, caseId, values) })
-    const url = `http://${hostForUrl(config.listen.host)}:${config.listen.port}${PATHS[command as Command]}`
+    const path = PATHS[command as Command]
+    const url = `http://${hostForUrl(config.listen.host)}:${config.listen.port}${path}`
     const response = await (io.fetch ?? fetch)(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...signBody(body, entry.secret) },
+      headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: path, body, secret: entry.secret }) },
       body,
+      redirect: 'manual',
       signal: AbortSignal.timeout(30_000),
     })
     const text = await response.text()
@@ -83,7 +86,8 @@ export async function runPaseoCommand(argv: string[], io: PaseoCommandIo): Promi
       io.stderr(`remontnik-paseo: отказ (${response.status} ${code})\n`)
       return 1
     }
-    io.stdout(command === 'case' ? `${JSON.stringify(JSON.parse(text), null, 2)}\n` : `${text}\n`)
+    // Подробности случая содержат тексты пользователей приложения — агенту они идут только блоком данных.
+    io.stdout(command === 'case' ? `${caseDetailsText(caseId, JSON.parse(text))}\n` : `${text}\n`)
     return 0
   } catch (error) {
     if (error instanceof UsageError || (error as { code?: string }).code?.startsWith('ERR_PARSE_ARGS')) {

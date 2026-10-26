@@ -1,17 +1,19 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS } from '@ykurilov/remontnik-core/incident'
-import { SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { ReplayGuard, SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import { AgentPost, type PaseoAgentsPort } from './agent-post.js'
 import type { BridgeApp, BridgeConfig } from './bridge-config.js'
 import { BridgeStateStore, type TaskRecord } from './bridge-state.js'
-import { DoctorClient, signedTarget, type DoctorAnswer, type FetchLike } from './doctor-client.js'
+import { DoctorClient, type DoctorAnswer, type FetchLike } from './doctor-client.js'
 import { assertPrivateAddress, hostForUrl, type ListenAddress } from './private-address.js'
 import { ReportRelay, errorText, type BridgeLog } from './report-relay.js'
 import { cancelLetter, taskLetter, UNTRUSTED_LIMITS, type BridgeTask } from './task-text.js'
 
 // HTTP моста (contracts/paseo-bridge.md). Порядок проверок: заголовки подписи → приложение из настройки →
-// подпись секретом этого приложения → содержимое. Агенту пишется только агент приложения из настройки моста.
+// подпись запроса (метод, путь, тело) секретом этого приложения → повтор подписи → содержимое.
+// Неизвестное приложение отвечает так же, как неверная подпись: имена приложений не перебрать.
+// Агенту пишется только агент приложения из настройки моста.
 
 export const BRIDGE_MAX_BODY_BYTES = 256 * 1024
 const BODY_TIMEOUT_MS = 10_000
@@ -165,7 +167,12 @@ function parseResult(body: Json, taskId: string): Json {
 
 export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
   const { config, log } = options
-  const state = new BridgeStateStore(options.stateFile)
+  const state = new BridgeStateStore(options.stateFile, log)
+  const replays = new ReplayGuard()
+  /** Задачи, которые сейчас принимаются: повтор того же `taskId` ждёт первый приём, а не пишет второе письмо. */
+  const receiving = new Map<string, Promise<Json>>()
+  /** Итоги, которые сейчас уходят врачу. */
+  const resultsInFlight = new Set<string>()
   const post = new AgentPost(options.paseo, {
     idlePollMs: options.idlePollMs ?? 15_000,
     deliveryTimeoutMs: options.deliveryTimeoutMs ?? 10 * 60_000,
@@ -193,8 +200,11 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       post
         .deliver(record.agentId, taskLetter(task), stillWanted)
         .then((outcome) => {
-          if (outcome === 'sent') state.setTaskStatus(record.taskId, 'delivered')
           log({ event: 'task_delivery', app: record.appName, caseId: record.caseId, taskId: record.taskId, outcome })
+          if (outcome !== 'sent' || state.moveTask(record.taskId, 'queued', 'delivered')) return
+          // Отмена пришла, пока Paseo отправлял задачу: агент её уже получил — сказать ему остановиться.
+          const now = state.task(record.taskId)
+          if (now?.status === 'cancelled') deliverCancel(now, now.cancelReason ?? '')
         })
         .catch((error: unknown) =>
           log({ event: 'task_delivery', app: record.appName, caseId: record.caseId, taskId: record.taskId, outcome: 'failed', reason: errorText(error) }),
@@ -226,6 +236,18 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
       if (known.appName !== app) badRequest()
       return { queued: true }
     }
+    const pending = receiving.get(task.taskId)
+    if (pending) return pending
+    const work = acceptTask(app, entry, task)
+    receiving.set(task.taskId, work)
+    try {
+      return await work
+    } finally {
+      receiving.delete(task.taskId)
+    }
+  }
+
+  async function acceptTask(app: string, entry: BridgeApp, task: BridgeTask): Promise<Json> {
     const agentState = await post.state(entry.agentId)
     if (agentState === 'missing' || agentState === 'not_ready') throw new Refusal(503, 'agent_missing')
     const record: TaskRecord = {
@@ -250,7 +272,9 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     if (!record || record.appName !== app) throw new Refusal(404, 'unknown_task')
     if (record.status === 'cancelled') return { ok: true }
     const wasDelivered = record.status === 'delivered'
-    state.setTaskStatus(record.taskId, 'cancelled')
+    // Задача ещё в очереди: письмо либо не уйдёт (проверка перед отправкой), либо уже уходит —
+    // тогда «остановись» отправит доставка задачи, когда Paseo закончит отправку.
+    state.moveTask(record.taskId, record.status, 'cancelled', { cancelReason: body.reason as string })
     log({ event: 'task_cancelled', app, caseId: record.caseId, taskId: record.taskId, wasDelivered })
     if (wasDelivered) deliverCancel(record, body.reason as string)
     return { ok: true }
@@ -261,6 +285,22 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     const record = state.taskForCase(app, body.caseId)
     if (!record) throw new Refusal(404, 'unknown_task')
     return record
+  }
+
+  async function forwardResult(app: string, record: TaskRecord, body: Json): Promise<DoctorAnswer> {
+    const result = parseResult(body, record.taskId)
+    if (record.resultSent || resultsInFlight.has(record.taskId)) throw new Refusal(409, 'result_already_sent')
+    // После отмены врач ждёт только позднюю выкатку («сделано»), «не смог» ему уже не нужен.
+    if (record.status === 'cancelled' && result.kind !== 'done') throw new Refusal(409, 'task_cancelled')
+    resultsInFlight.add(record.taskId)
+    try {
+      log({ event: 'agent_result', app, caseId: record.caseId, taskId: record.taskId, kind: result.kind as string })
+      const answer = await askDoctor(app, (client) => client.post(`/v1/handoffs/${record.caseId}/result`, result))
+      if (answer.status >= 200 && answer.status < 300) state.markResultSent(record.taskId)
+      return answer
+    } finally {
+      resultsInFlight.delete(record.taskId)
+    }
   }
 
   async function askDoctor(app: string, work: (client: DoctorClient) => Promise<DoctorAnswer>): Promise<DoctorAnswer> {
@@ -284,11 +324,9 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
 
     if (method === 'GET' && url.pathname === '/health') {
       request.resume()
-      const app = url.searchParams.get('app') ?? ''
-      const entry = config.apps.get(app)
-      if (!entry) throw new Refusal(403, 'unknown_app')
-      verify(signedTarget('GET', target), request, entry)
-      return { status: 200, body: await health(entry) }
+      const entry = config.apps.get(url.searchParams.get('app') ?? '')
+      verify(request, method, target, '', entry)
+      return { status: 200, body: await health(entry!) }
     }
     if (method !== 'POST') throw new Refusal(404, 'not_found')
 
@@ -302,8 +340,8 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     if (!isObject(body) || typeof body['app'] !== 'string') badRequest()
     const app = body['app']
     const entry = config.apps.get(app)
-    if (!entry) throw new Refusal(403, 'unknown_app')
-    verify(raw, request, entry)
+    verify(request, method, target, raw, entry)
+    if (!entry) throw new Refusal(401, 'bad_signature')
 
     const cancel = /^\/v1\/tasks\/([^/]+)\/cancel$/.exec(url.pathname)
     if (url.pathname === '/v1/tasks') return { status: 200, body: await receiveTask(app, entry, body) }
@@ -314,16 +352,14 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     }
     if (url.pathname === '/v1/agent/accepted') {
       const record = taskForAgentCommand(app, body)
+      if (record.status === 'cancelled') throw new Refusal(409, 'task_cancelled')
       log({ event: 'agent_accepted', app, caseId: record.caseId, taskId: record.taskId })
       return askDoctor(app, (client) =>
         client.post(`/v1/handoffs/${record.caseId}/accepted`, { taskId: record.taskId, agent: record.agentId }),
       )
     }
     if (url.pathname === '/v1/agent/result') {
-      const record = taskForAgentCommand(app, body)
-      const result = parseResult(body, record.taskId)
-      log({ event: 'agent_result', app, caseId: record.caseId, taskId: record.taskId, kind: result.kind as string })
-      return askDoctor(app, (client) => client.post(`/v1/handoffs/${record.caseId}/result`, result))
+      return forwardResult(app, taskForAgentCommand(app, body), body)
     }
     if (url.pathname === '/v1/agent/case') {
       const record = taskForAgentCommand(app, body)
@@ -332,9 +368,11 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
     throw new Refusal(404, 'not_found')
   }
 
-  function verify(signed: string, request: IncomingMessage, entry: BridgeApp): void {
-    const check = verifySignedBody({ body: signed, headers: request.headers, secret: entry.secret })
+  function verify(request: IncomingMessage, method: string, target: string, body: string, entry: BridgeApp | undefined): void {
+    if (!entry) throw new Refusal(401, 'bad_signature')
+    const check = verifySignedRequest({ method, target, body, headers: request.headers, secret: entry.secret })
     if (!check.ok) throw new Refusal(401, check.reason)
+    if (!replays.firstSeen(headerValue(request, SIGNATURE_HEADER)!)) throw new Refusal(401, 'replayed')
   }
 
   const handler: BridgeHandler = async (request, response) => {
@@ -368,11 +406,20 @@ export function createPaseoBridge(options: PaseoBridgeOptions): PaseoBridge {
 
 export interface BridgeServer {
   url: string
+  /** Сам сервер Node — для проверок. */
+  node: Server
   close(): Promise<void>
 }
 
-/** Слушать только заданный адрес частной сети. Публичный адрес, «все адреса» и имя хоста — ошибка до запуска. */
-export async function startBridgeServer(options: { listen: ListenAddress; handler: BridgeHandler }): Promise<BridgeServer> {
+/**
+ * Слушать только заданный адрес частной сети. Публичный адрес, «все адреса» и имя хоста — ошибка до запуска.
+ * Ошибки сервера после запуска (например, `EMFILE`) пишутся в журнал: без обработчика они уронили бы процесс плагина.
+ */
+export async function startBridgeServer(options: {
+  listen: ListenAddress
+  handler: BridgeHandler
+  log?: BridgeLog
+}): Promise<BridgeServer> {
   assertPrivateAddress(options.listen.host, 'адрес моста')
   const server = createServer((request, response) => {
     void options.handler(request, response)
@@ -384,9 +431,11 @@ export async function startBridgeServer(options: { listen: ListenAddress; handle
       resolve()
     })
   })
+  server.on('error', (error) => options.log?.({ event: 'server_error', reason: errorText(error) }))
   const { address, port } = server.address() as AddressInfo
   return {
     url: `http://${hostForUrl(address)}:${port}`,
+    node: server,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections()

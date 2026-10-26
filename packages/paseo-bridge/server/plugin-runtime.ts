@@ -125,7 +125,7 @@ export function startPaseoBridgePlugin(server: PluginHooks, places: PluginPlaces
     const listen = async () => {
       if (stopped) return
       try {
-        const started = await startBridgeServer({ listen: config.listen, handler: activeBridge.handler })
+        const started = await startBridgeServer({ listen: config.listen, handler: activeBridge.handler, log })
         if (stopped) {
           await started.close()
           return

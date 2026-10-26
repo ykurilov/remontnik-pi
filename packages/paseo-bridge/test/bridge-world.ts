@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { signBody, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { NONCE_HEADER, signRequest, signResponse, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import {
   createPaseoBridge,
   startBridgeServer,
@@ -23,12 +23,19 @@ export class FakePaseo implements PaseoAgentsPort {
   states = new Map<string, AgentState>()
   letters: { agentId: string; text: string }[] = []
   failNextSend = false
+  /** Пока не выполнен — отправка висит (Paseo ещё доставляет письмо). */
+  sendGate: Promise<void> | null = null
+  sendsStarted = 0
+  stateDelayMs = 0
 
   async state(agentId: string): Promise<AgentState> {
+    if (this.stateDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.stateDelayMs))
     return this.states.get(agentId) ?? 'missing'
   }
 
   async send(agentId: string, text: string): Promise<void> {
+    this.sendsStarted += 1
+    if (this.sendGate) await this.sendGate
     if (this.failNextSend) {
       this.failNextSend = false
       throw new Error('send failed')
@@ -39,6 +46,13 @@ export class FakePaseo implements PaseoAgentsPort {
   lettersTo(agentId: string): string[] {
     return this.letters.filter((letter) => letter.agentId === agentId).map((letter) => letter.text)
   }
+}
+
+export interface DoctorAnswerPlan {
+  status: number
+  body?: unknown
+  raw?: string
+  headers?: Record<string, string>
 }
 
 export interface DoctorRequest {
@@ -53,6 +67,10 @@ export class FakeDoctor {
   requests: DoctorRequest[] = []
   reports: { reportId: number; caseId?: number; type: string; short: string; full: string; createdAt: string }[] = []
   acked: number[] = []
+  /** Чем подписывать ответы: своим секретом, чужим или не подписывать. */
+  answerSigning: 'own' | 'foreign' | 'none' = 'own'
+  /** Свой ответ на запрос вместо обычного. */
+  override: ((method: string, path: string) => DoctorAnswerPlan | undefined) | null = null
   private server: Server | null = null
   url = ''
 
@@ -60,9 +78,20 @@ export class FakeDoctor {
 
   async start(): Promise<void> {
     this.server = createServer((request, response) => {
-      void this.handle(request).then(({ status, body }) => {
-        response.writeHead(status, { 'content-type': 'application/json' })
-        response.end(JSON.stringify(body))
+      void this.handle(request).then((plan) => {
+        const raw = plan.raw ?? JSON.stringify(plan.body)
+        const nonce = String(request.headers[NONCE_HEADER.toLowerCase()] ?? '')
+        const signature =
+          this.answerSigning === 'none'
+            ? {}
+            : signResponse({
+                request: { method: request.method ?? 'GET', target: request.url ?? '/', nonce },
+                status: plan.status,
+                body: raw,
+                secret: this.answerSigning === 'own' ? this.secret : 'foreign-secret',
+              })
+        response.writeHead(plan.status, { 'content-type': 'application/json', ...signature, ...plan.headers })
+        response.end(raw)
       })
     })
     await new Promise<void>((resolve) => this.server!.listen(0, '127.0.0.1', resolve))
@@ -75,16 +104,17 @@ export class FakeDoctor {
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve())
   }
 
-  private async handle(request: IncomingMessage): Promise<{ status: number; body: unknown }> {
+  private async handle(request: IncomingMessage): Promise<DoctorAnswerPlan> {
     const chunks: Buffer[] = []
     for await (const chunk of request) chunks.push(chunk as Buffer)
     const body = Buffer.concat(chunks).toString('utf8')
     const method = request.method ?? 'GET'
     const path = request.url ?? '/'
-    const signed = method === 'GET' ? `GET ${path}` : body
-    const signatureOk = verifySignedBody({ body: signed, headers: request.headers, secret: this.secret }).ok
+    const signatureOk = verifySignedRequest({ method, target: path, body, headers: request.headers, secret: this.secret }).ok
     this.requests.push({ method, path, body, signatureOk })
     if (!signatureOk) return { status: 401, body: { error: 'bad_signature' } }
+    const planned = this.override?.(method, path)
+    if (planned) return planned
 
     const url = new URL(path, 'http://doctor.invalid')
     if (method === 'GET' && url.pathname === '/v1/reports') {
@@ -122,18 +152,21 @@ export function freshStateFile(): string {
 }
 
 export async function startBridge(options: { config: BridgeConfig; paseo: FakePaseo; stateFile?: string }) {
+  const journal: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => void journal.push(entry)
   const bridge = createPaseoBridge({
     config: options.config,
     paseo: options.paseo,
     stateFile: options.stateFile ?? freshStateFile(),
     idlePollMs: 10,
     deliveryTimeoutMs: 2_000,
-    log: () => {},
+    log,
   })
-  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler })
+  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler, log })
   return {
     bridge,
     server,
+    journal,
     async close() {
       await server.close()
       await bridge.dispose()
@@ -141,19 +174,30 @@ export async function startBridge(options: { config: BridgeConfig; paseo: FakePa
   }
 }
 
-export async function signedPost(url: string, payload: unknown, secret: string) {
+/** Подписанный POST как от врача. `signedFor` — подписать для другого пути (проверка подмены адреса). */
+export function signedPostRequest(url: string, payload: unknown, secret: string, signedFor?: string) {
   const body = JSON.stringify(payload)
-  const response = await fetch(url, {
+  const { pathname, search } = new URL(url)
+  return {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...signBody(body, secret) },
+    headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: signedFor ?? `${pathname}${search}`, body, secret }) },
     body,
-  })
+  }
+}
+
+export async function send(url: string, init: RequestInit) {
+  const response = await fetch(url, init)
   return { status: response.status, body: (await response.json()) as Record<string, unknown> }
 }
 
+export async function signedPost(url: string, payload: unknown, secret: string, signedFor?: string) {
+  return send(url, signedPostRequest(url, payload, secret, signedFor))
+}
+
 export async function signedGet(baseUrl: string, pathWithQuery: string, secret: string) {
-  const response = await fetch(`${baseUrl}${pathWithQuery}`, { headers: signBody(`GET ${pathWithQuery}`, secret) })
-  return { status: response.status, body: (await response.json()) as Record<string, unknown> }
+  return send(`${baseUrl}${pathWithQuery}`, {
+    headers: signRequest({ method: 'GET', target: pathWithQuery, body: '', secret }),
+  })
 }
 
 export function shopTask(overrides: Record<string, unknown> = {}) {

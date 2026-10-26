@@ -1,3 +1,5 @@
+import { chmodSync, readdirSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { startBridgeServer } from '../server/index.js'
 import {
@@ -9,9 +11,11 @@ import {
   SHOP_SECRET,
   freshStateFile,
   makeConfig,
+  send,
   shopTask,
   signedGet,
   signedPost,
+  signedPostRequest,
   startBridge,
   until,
 } from './bridge-world.js'
@@ -64,20 +68,21 @@ describe('подпись и приложение', () => {
     expect(paseo.letters).toEqual([])
   })
 
-  it('приложение не из настройки моста — отказ', async () => {
+  it('приложение не из настройки моста — тот же отказ, что и при неверной подписи (имена не перебрать)', async () => {
     const { server } = await bridgeFor()
     const result = await signedPost(`${server.url}/v1/tasks`, shopTask({ app: 'stranger' }), SHOP_SECRET)
-    expect(result).toEqual({ status: 403, body: { error: 'unknown_app' } })
+    expect(result).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect((await signedGet(server.url, '/health?app=stranger', SHOP_SECRET)).status).toBe(401)
     expect(paseo.letters).toEqual([])
   })
 
   it('подпись устарела — отказ', async () => {
     const { server } = await bridgeFor()
     const body = JSON.stringify(shopTask())
-    const { signBody } = await import('@ykurilov/remontnik-core/signed-http')
+    const { signRequest } = await import('@ykurilov/remontnik-core/signed-http')
     const response = await fetch(`${server.url}/v1/tasks`, {
       method: 'POST',
-      headers: signBody(body, SHOP_SECRET, Date.now() - 60 * 60 * 1000),
+      headers: signRequest({ method: 'POST', target: '/v1/tasks', body, secret: SHOP_SECRET, now: Date.now() - 60 * 60 * 1000 }),
       body,
     })
     expect(response.status).toBe(401)
@@ -219,10 +224,11 @@ describe('здоровье', () => {
 
     expect((await fetch(`${server.url}/health?app=shop`)).status).toBe(401)
     // Подпись от запроса про другое приложение к этому не подходит.
-    const { signBody } = await import('@ykurilov/remontnik-core/signed-http')
-    const replay = await fetch(`${server.url}/health?app=blog`, { headers: signBody('GET /health?app=shop', BLOG_SECRET) })
+    const { signRequest } = await import('@ykurilov/remontnik-core/signed-http')
+    const replay = await fetch(`${server.url}/health?app=blog`, {
+      headers: signRequest({ method: 'GET', target: '/health?app=shop', body: '', secret: BLOG_SECRET }),
+    })
     expect(replay.status).toBe(401)
-    expect((await signedGet(server.url, '/health?app=stranger', SHOP_SECRET)).status).toBe(403)
   })
 })
 
@@ -281,6 +287,63 @@ describe('отчёты', () => {
     expect(reportNumbers()).toEqual([1, 2, 3])
   })
 
+  it('отчёт с огромным номером или caseId: null не пересылается и курсор не портит', async () => {
+    addReports(1)
+    shopDoctor.reports.push(
+      { reportId: Number.MAX_SAFE_INTEGER, caseId: 7, type: 'deployed', short: 'x', full: 'x', createdAt: '2026-10-26T10:00:00.000Z' },
+      { reportId: 2, caseId: null as unknown as number, type: 'deployed', short: 'x', full: 'x', createdAt: '2026-10-26T10:00:00.000Z' },
+    )
+    const { bridge } = await bridgeFor()
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1])
+    shopDoctor.reports = shopDoctor.reports.filter((report) => report.reportId === 1)
+    addReports(3)
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1, 3])
+  })
+
+  it('ответ врача без верной подписи — отчёты не пересылаются', async () => {
+    addReports(1, 2)
+    const { bridge } = await bridgeFor()
+    shopDoctor.answerSigning = 'foreign'
+    await bridge.pullReports('shop')
+    shopDoctor.answerSigning = 'none'
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([])
+    shopDoctor.answerSigning = 'own'
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1, 2])
+  })
+
+  it('не удалось записать курсор — отчёт не теряется', async () => {
+    addReports(1)
+    const stateFile = freshStateFile()
+    const { bridge } = await bridgeFor(stateFile)
+    chmodSync(dirname(stateFile), 0o500)
+    try {
+      await bridge.pullReports('shop')
+    } finally {
+      chmodSync(dirname(stateFile), 0o700)
+    }
+    expect(reportNumbers()).toEqual([])
+    await bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([1])
+  })
+
+  it('испорченный файл состояния — откладывается в .corrupt, старые отчёты лавиной не уходят', async () => {
+    addReports(1, 2, 3)
+    const stateFile = freshStateFile()
+    writeFileSync(stateFile, '{"tasks": [ обрыв')
+    const started = await bridgeFor(stateFile)
+    await started.bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([])
+    expect(readdirSync(dirname(stateFile)).some((name) => name.includes('.corrupt'))).toBe(true)
+    expect(started.journal).toContainEqual(expect.objectContaining({ event: 'state_corrupt' }))
+    addReports(4)
+    await started.bridge.pullReports('shop')
+    expect(reportNumbers()).toEqual([4])
+  })
+
   it('письмо не ушло — курсор возвращается, отчёт уходит позже ровно один раз', async () => {
     addReports(1, 2)
     const { bridge } = await bridgeFor()
@@ -322,6 +385,29 @@ describe('команды агента через мост', () => {
     expect(blogDoctor.requests).toEqual([])
   })
 
+  it('по отменённой задаче: accept и cannot — отказ, done — один раз (поздняя выкатка), повтор итога — отказ', async () => {
+    const { server } = await bridgeWithTask()
+    const taskId = shopTask().taskId
+    await signedPost(`${server.url}/v1/tasks/${taskId}/cancel`, { app: 'shop', taskId, reason: 'work_timeout' }, SHOP_SECRET)
+
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+      status: 409,
+      body: { error: 'task_cancelled' },
+    })
+    expect(
+      await signedPost(`${server.url}/v1/agent/result`, { app: 'shop', caseId: 7, kind: 'cannot', reason: 'x' }, SHOP_SECRET),
+    ).toEqual({ status: 409, body: { error: 'task_cancelled' } })
+    const done = { app: 'shop', caseId: 7, kind: 'done', version: 'v13' }
+    expect(await signedPost(`${server.url}/v1/agent/result`, done, SHOP_SECRET)).toEqual({ status: 200, body: { ok: true } })
+    expect(await signedPost(`${server.url}/v1/agent/result`, done, SHOP_SECRET)).toEqual({
+      status: 409,
+      body: { error: 'result_already_sent' },
+    })
+    expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((r) => r.path)).toEqual([
+      '/v1/handoffs/7/result',
+    ])
+  })
+
   it('по случаю без задачи у моста — отказ; неверная подпись — отказ; врачу ничего', async () => {
     const { server } = await bridgeWithTask()
     expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 99 }, SHOP_SECRET)).toEqual({
@@ -347,6 +433,16 @@ describe('команды агента через мост', () => {
 
     const details = await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)
     expect(details).toEqual({ status: 200, body: { case: { id: 7 } } })
+  })
+
+  it('слишком большой ответ врача о случае — отказ, агенту не уходит', async () => {
+    const { server } = await bridgeWithTask()
+    shopDoctor.override = (method, path) =>
+      method === 'GET' && path === '/v1/cases/7' ? { status: 200, body: { case: { id: 7, log: 'x'.repeat(300 * 1024) } } } : undefined
+    expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+      status: 502,
+      body: { error: 'doctor_unreachable' },
+    })
   })
 })
 
@@ -392,5 +488,100 @@ describe('секрет', () => {
       await server.close()
       await bridge.dispose()
     }
+  })
+})
+
+describe('подпись запроса и повторы', () => {
+  it('подпись привязана к пути: подпись для одного адреса на другом не проходит', async () => {
+    const { server } = await bridgeFor()
+    await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
+    await until(() => paseo.letters.length === 1)
+    const moved = await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET, '/v1/agent/case')
+    expect(moved).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/'))).toEqual([])
+  })
+
+  it('тот же подписанный запрос второй раз — отказ replayed', async () => {
+    const { server } = await bridgeFor()
+    const url = `${server.url}/v1/agent/accepted`
+    await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
+    await until(() => paseo.letters.length === 1)
+    const request = signedPostRequest(url, { app: 'shop', caseId: 7 }, SHOP_SECRET)
+    expect(await send(url, request)).toEqual({ status: 200, body: { ok: true } })
+    expect(await send(url, request)).toEqual({ status: 401, body: { error: 'replayed' } })
+    expect(shopDoctor.requests.filter((r) => r.path === '/v1/handoffs/7/accepted')).toHaveLength(1)
+  })
+
+  it('мост подписывает запросы к врачу методом и путём и не верит неподписанным ответам', async () => {
+    const { server } = await bridgeFor()
+    await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
+    await until(() => paseo.letters.length === 1)
+    shopDoctor.answerSigning = 'none'
+    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(502)
+    shopDoctor.answerSigning = 'foreign'
+    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(502)
+    expect(shopDoctor.requests.every((request) => request.signatureOk)).toBe(true)
+  })
+
+  it('врач отвечает перенаправлением — мост не идёт по нему с подписью', async () => {
+    const elsewhere = new FakeDoctor(SHOP_SECRET)
+    await elsewhere.start()
+    try {
+      const { server } = await bridgeFor()
+      await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
+      await until(() => paseo.letters.length === 1)
+      shopDoctor.override = () => ({ status: 307, body: {}, headers: { location: `${elsewhere.url}/v1/cases/7` } })
+      expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+        status: 502,
+        body: { error: 'doctor_unreachable' },
+      })
+      expect(elsewhere.requests).toEqual([])
+    } finally {
+      await elsewhere.stop()
+    }
+  })
+})
+
+describe('гонки', () => {
+  it('отмена, пока Paseo отправляет задачу: после отправки агенту уходит письмо «остановись»', async () => {
+    let release!: () => void
+    paseo.sendGate = new Promise((resolve) => (release = resolve))
+    const { server } = await bridgeFor()
+    await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
+    await until(() => paseo.sendsStarted === 1)
+
+    const taskId = shopTask().taskId
+    await signedPost(`${server.url}/v1/tasks/${taskId}/cancel`, { app: 'shop', taskId, reason: 'accept_timeout' }, SHOP_SECRET)
+    paseo.sendGate = null
+    release()
+
+    await until(() => paseo.letters.length === 2)
+    expect(paseo.letters[0]!.text).toContain('передаёт тебе случай')
+    expect(paseo.letters[1]!.text).toContain('Остановись')
+    expect((await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(409)
+  })
+
+  it('одна задача двумя запросами сразу — одно письмо', async () => {
+    paseo.stateDelayMs = 30
+    const { server } = await bridgeFor()
+    const results = await Promise.all([
+      signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET),
+      signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET),
+    ])
+    expect(results).toEqual([
+      { status: 200, body: { queued: true } },
+      { status: 200, body: { queued: true } },
+    ])
+    await until(() => paseo.letters.length >= 1)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(paseo.letters).toHaveLength(1)
+  })
+})
+
+describe('устойчивость', () => {
+  it('ошибка сервера после запуска пишется в журнал и не роняет процесс', async () => {
+    const started = await bridgeFor()
+    expect(() => started.server.node.emit('error', Object.assign(new Error('too many open files'), { code: 'EMFILE' }))).not.toThrow()
+    expect(started.journal).toContainEqual(expect.objectContaining({ event: 'server_error', reason: 'too many open files' }))
   })
 })
