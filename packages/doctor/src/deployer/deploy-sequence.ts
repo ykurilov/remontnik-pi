@@ -61,6 +61,8 @@ export type DeployRefusal =
   | 'lock_lost'
   /** Работает кандидат брошенной выкатки: прежней версии, от которой можно откатиться, никто не подтверждал. */
   | 'unconfirmed_version'
+  /** Чужая выкатка (`adopt`): работает не та версия, о которой сообщили. */
+  | 'claimed_version_not_running'
 export type RollbackCause = RollbackReason | 'promote_failed' | 'main_copy_changed'
 
 export interface Deployment {
@@ -136,6 +138,12 @@ export interface DeployRequest {
   candidateVersion: string
   /** Копия кода правки: здесь идёт `build`. */
   candidateDir: string
+  /**
+   * Выкатку уже сделал другой (агент Paseo по правилам выкатки приложения): врач берёт замок, метит прежнюю версию,
+   * без `build` и `promote` наблюдает окно и откатывает, если стало хуже. `since` — когда она закончилась:
+   * с этой минуты считаются ошибки новой версии. Рабочая копия берётся как есть — выкатка могла её изменить.
+   */
+  adopt?: { since: number }
 }
 
 export interface DeployIo {
@@ -408,7 +416,8 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             return { kind: 'done', deployment }
 
           case 'starting': {
-            if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
+            // Стоп-кран останавливает выкатки врача; чужую выкатку врач всё равно наблюдает и откатывает, если стало хуже.
+            if (!request.adopt && (await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
             const attempt = await acquireLock()
             if (!attempt.acquired && attempt.leftover) {
               const { leftover, content } = attempt
@@ -454,14 +463,20 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             if (!(await holdsLock())) break
             const snapshot = await mainCopy.snapshot()
             // В начале копия чистая: дальше новые изменённые файлы видны по сравнению с этим снимком.
-            if (Object.keys(snapshot.dirty).length > 0) return refuse('main_copy_changed', mainCopyChange({ ...snapshot, dirty: {} }, snapshot))
+            if (!request.adopt && Object.keys(snapshot.dirty).length > 0) return refuse('main_copy_changed', mainCopyChange({ ...snapshot, dirty: {} }, snapshot))
             const current = await commands.current()
             if (!current.ok) return refuse('current_unavailable', current.reason)
             if (current.version === null) return refuse('no_previous_build')
-            const abandoned = (await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY))?.abandonedVersions ?? []
-            if (abandoned.includes(current.version)) return refuse('unconfirmed_version', `работает ${current.version} — кандидат брошенной выкатки`)
-            if (current.version === request.candidateVersion) return refuse('already_running')
-            const previousVersion = current.version
+            let previousVersion = current.version
+            if (request.adopt) {
+              if (current.version !== request.candidateVersion) return refuse('claimed_version_not_running', `работает ${current.version}, а не ${request.candidateVersion}`)
+              if (current.previous === null) return refuse('no_previous_build')
+              previousVersion = current.previous
+            } else {
+              const abandoned = (await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY))?.abandonedVersions ?? []
+              if (abandoned.includes(current.version)) return refuse('unconfirmed_version', `работает ${current.version} — кандидат брошенной выкатки`)
+              if (current.version === request.candidateVersion) return refuse('already_running')
+            }
             await save((draft) => {
               draft.mainCopy = snapshot
               draft.previousVersion = previousVersion
@@ -483,6 +498,23 @@ export function createDeployer(deps: DeployerDeps): Deployer {
 
           case 'building': {
             if (!(await holdsLock())) break
+            if (request.adopt) {
+              // Чужая выкатка уже прошла: окно наблюдения — от этой минуты, ошибки новой версии — с её конца.
+              const since = new Date(request.adopt.since)
+              const baseline = await readErrorBaseline(store, request.appName, since)
+              await save((draft) => {
+                draft.baseline = baseline
+                draft.promoteRequested = true
+                draft.promoteLaunched = true
+                draft.promoteReturnedAt = since.toISOString()
+                draft.stage = 'observing'
+                draft.promotedAt = now().toISOString()
+                draft.observeUntil = new Date(io.now() + windowMs).toISOString()
+                draft.observation = startObservation()
+                draft.nextTickAt = now().toISOString()
+              })
+              break
+            }
             const built = await commands.build(request.candidateDir, request.candidateVersion)
             if (!built.ok) return refuse('build_failed', built.output)
             const baseline = await readErrorBaseline(store, request.appName, now())

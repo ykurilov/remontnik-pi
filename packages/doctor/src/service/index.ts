@@ -21,6 +21,9 @@ import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
+import { createHandoffsHandler } from '../intake/handoffs.js'
+import { ReplayGuard } from '@ykurilov/remontnik-core/signed-http'
+import { createPaseoBridgeClient, HANDOFF_COLLECTION, handoffKey, type Handoff, type PaseoBridgeClient } from '../handoff/index.js'
 import { createControls, readControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
 import type { RecordStore } from '../records/index.js'
@@ -49,6 +52,12 @@ export interface DoctorServiceOptions {
     /** Мост Paseo: отдельный адрес только в частной сети, подпись секретом моста. `appName` — имя приложения этого врача. */
     bridge?: { listen: { host: string; port: number }; secret: string; appName: string }
   }
+  /**
+   * Мост Paseo для режима «сначала Paseo» (`handoff.mode: paseo-first`): его адрес в частной сети. Подпись — секретом
+   * моста из `reportsFeed.bridge`, команды агента (`/v1/handoffs/*`) приходят на тот же адрес для моста.
+   * Не задан — мост недоступен: врач лечит сам с пометкой «Paseo недоступен». Для проверок — свой клиент.
+   */
+  paseoBridge?: { url: string; pollMs?: number } | { client: PaseoBridgeClient; pollMs?: number }
   exit?: (code: number) => void
   log?: (line: string) => void
   /** Для проверок: подменить хранилище. */
@@ -103,6 +112,8 @@ export interface DoctorService {
   reports: Reports
   /** Отчёты pi-durable о сбоях, не роняющих вызов: припаркованная или упавшая задача и т. п. */
   handleHarnessReport(error: unknown, info: ReportInfo): void
+  /** Передача случая агенту Paseo; `undefined` — случай не передавался. */
+  handoffOf(caseId: number): Promise<Handoff | undefined>
   /** То же, что приём по сети: события сторожа → случаи, отчёты и лечение. */
   receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }>
   close(): Promise<void>
@@ -212,6 +223,14 @@ async function reportStorageFailure(stateDir: string, records: RecordStore, repo
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
+  const bridgeAccess = options.reportsFeed?.bridge
+  if (options.paseoBridge && !bridgeAccess) throw new Error('[remontnik] мост Paseo без адреса приёма для моста (reportsFeed.bridge)')
+  const paseoClient =
+    options.paseoBridge && bridgeAccess
+      ? 'client' in options.paseoBridge
+        ? options.paseoBridge.client
+        : createPaseoBridgeClient({ url: options.paseoBridge.url, secret: bridgeAccess.secret, appName: bridgeAccess.appName })
+      : undefined
   // До открытия хранилища: равные секреты — приложение получило бы права владельца.
   assertOwnerSecrets({ secret: options.sharedSecret, controlSecret: options.controlSecret })
   const log = options.log ?? ((line: string) => console.error(line))
@@ -349,6 +368,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       ...(treatmentOptions.deployer ? { deployer: treatmentOptions.deployer } : {}),
       ...(treatmentOptions.browser ? { browser: treatmentOptions.browser } : {}),
+      handoff: { ...(paseoClient ? { client: paseoClient } : {}), ...(options.paseoBridge?.pollMs ? { pollMs: options.paseoBridge.pollMs } : {}) },
       modelBudget,
       boot,
       onReport: pump,
@@ -446,8 +466,19 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   let bridgeIntake: IntakeServer | null = null
   if (feed?.bridge) {
     try {
+      // Одна память подписей на весь адрес для моста: подпись ленты не годится для команды агента и наоборот.
+      const replayGuard = new ReplayGuard()
+      const feedHandler = createReportsFeedHandler({ reports, access: { kind: 'bridge', secret: feed.bridge.secret, appName: feed.bridge.appName, replayGuard } })
+      const handoffsHandler = createHandoffsHandler({
+        records: opened.records,
+        secret: feed.bridge.secret,
+        appName: feed.bridge.appName,
+        replayGuard,
+        clock: now,
+        ...(treatment ? { adoptLateDeployIn: treatment.adoptLateDeployIn } : {}),
+      })
       bridgeIntake = await startIntakeServer({
-        handler: createReportsFeedHandler({ reports, access: { kind: 'bridge', secret: feed.bridge.secret, appName: feed.bridge.appName } }),
+        handler: (request, response) => (new URL(request.url ?? '/', 'http://doctor.invalid').pathname.startsWith('/v1/handoffs/') ? handoffsHandler : feedHandler)(request, response),
         host: feed.bridge.listen.host,
         port: feed.bridge.listen.port,
         onError: (error) => log(`[врач] сбой адреса для моста: ${describeError(error)}`),
@@ -471,6 +502,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     reports,
     handleHarnessReport,
     receiveEvents,
+    handoffOf: (caseId) => opened.records.read<Handoff>(HANDOFF_COLLECTION, handoffKey(caseId)),
     async close() {
       closing = true
       clearInterval(pumpTimer)

@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import type { ChecksResult } from '../checks/index.js'
 import type { Deployment } from '../deployer/deploy-sequence.js'
-import { abandonedDeploymentReport, causeFoundReport, deploymentReport, fixReadyReport, lostLockReport, noCauseFoundReport, standBrokenReport } from './texts.js'
+import {
+  abandonedDeploymentReport,
+  causeFoundReport,
+  deploymentReport,
+  fixReadyReport,
+  handedOffReport,
+  lostLockReport,
+  noCauseFoundReport,
+  PASEO_UNAVAILABLE_NOTE,
+  paseoDeploymentReport,
+  paseoDoneReport,
+  reclaimedReport,
+  standBrokenReport,
+} from './texts.js'
 
 const sick = { caseId: 7, appName: 'patient', kind: 'tool_error' as const, where: 'src/bot/tools.ts', message: 'orders storage timeout' }
 const diagnosis = {
@@ -226,5 +239,63 @@ describe('тексты отчётов выкатки', () => {
     expect(noBuild.type).toBe('needs_human')
     expect(noBuild.short).toContain('прежней сборки')
     expect(noBuild.stopSwitch).toBeUndefined()
+  })
+})
+
+describe('тексты режима «сначала Paseo»', () => {
+  const paseoDeployment = {
+    deploymentId: 4,
+    caseId: 7,
+    appName: 'patient',
+    fingerprint: 'fp',
+    candidateVersion: 'agent-v2',
+    candidateDir: '',
+    stage: 'done',
+    outcome: 'holding',
+    startedAt: '2026-10-27T10:00:00.000Z',
+    lockToken: 't',
+    previousVersion: 'v1-working',
+    observeUntil: '2026-10-27T10:10:00.000Z',
+  } satisfies Deployment
+
+  it('handed_off: передал агенту, сколько ждать, что будет потом; текста ошибки в коротком нет', () => {
+    const text = handedOffReport({ case: sick, acceptMinutes: 5 })
+    expect(text.short).toContain('Случай 7')
+    expect(text.short).toContain('агенту Paseo')
+    expect(text.short).toContain('5 мин')
+    expect(text.short).not.toContain('orders storage timeout')
+  })
+
+  it('paseo_done: правка агента без выкатки, с выкаткой — наблюдаю и откачу', () => {
+    expect(paseoDoneReport({ case: sick, result: { kind: 'done', commit: 'abc1234def0', deployed: false } }).short).toContain('abc1234def0'.slice(0, 12))
+    const watching = paseoDoneReport({ case: sick, result: { kind: 'done', deployed: true, version: 'agent-v2' } })
+    expect(watching.short).toContain('agent-v2')
+    expect(watching.short).toContain('откачу')
+  })
+
+  it('reclaimed: причина по коду; ответ агента — только в полном тексте, обрезан и как данные', () => {
+    const timeout = reclaimedReport({ case: sick, reason: 'accept_timeout', minutes: 5 })
+    expect(timeout.short).toContain('не взял')
+    expect(timeout.short).toContain('лечу сам')
+    expect(reclaimedReport({ case: sick, reason: 'work_timeout', minutes: 60 }).short).toContain('60 мин')
+    expect(reclaimedReport({ case: sick, reason: 'bridge_unreachable' }).short).toContain('мост Paseo')
+    const cannot = reclaimedReport({ case: sick, reason: 'cannot', agentSaid: `не нашёл ${'х'.repeat(5000)}` })
+    expect(cannot.short).not.toContain('не нашёл')
+    expect(cannot.full).toContain('не нашёл')
+    expect(cannot.full.length).toBeLessThan(2000)
+  })
+
+  it('выкатка агента: держится — paseo_done; откат — сказано, что откатил выкатку агента', () => {
+    const holding = paseoDeploymentReport({ case: sick, deployment: paseoDeployment })
+    expect(holding.type).toBe('paseo_done')
+    expect(holding.short).toContain('держится')
+    const rolled = paseoDeploymentReport({ case: sick, deployment: { ...paseoDeployment, outcome: 'rolled_back', rollbackCause: 'error_rate' } })
+    expect(rolled.type).toBe('rolled_back')
+    expect(rolled.short).toContain('агента Paseo')
+    expect(rolled.short).toContain('v1-working')
+  })
+
+  it('пометка «Paseo недоступен»', () => {
+    expect(PASEO_UNAVAILABLE_NOTE).toContain('Paseo недоступен')
   })
 })

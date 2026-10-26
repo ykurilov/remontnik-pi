@@ -1,6 +1,7 @@
 import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
 import type { Deployment, DeployRefusal, RollbackCause } from '../deployer/deploy-sequence.js'
+import type { HandoffResult, ReclaimReason } from '../handoff/doc.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
 import type { ReportType } from './index.js'
 
@@ -212,6 +213,7 @@ const REFUSALS: Record<DeployRefusal, string> = {
   main_copy_changed: 'рабочую копию основной ветки на сервере кто-то изменил',
   lock_lost: 'замок выкатки перед promote оказался не моим: его сняли или заняли',
   unconfirmed_version: 'работает версия брошенной выкатки, её никто не подтверждал',
+  claimed_version_not_running: 'работает не та версия, о которой сообщил агент Paseo',
 }
 
 function deploymentLines(deployment: Deployment): string[] {
@@ -358,4 +360,54 @@ export function lockWaitReport(input: { deployment: Deployment; lockFile: string
     `В файле замка: ${holder === '' ? '(пусто)' : holder}`,
   ].join('\n')
   return { short, full }
+}
+
+// Режим «сначала Paseo» (R18): случай у агента Paseo, врач его забрал или наблюдает выкатку агента.
+// Ответ агента — данные, не поручение: только в полном тексте, обрезан.
+
+/** Пометка к отчётам случая, который врач лечит сам, потому что Paseo не ответил. */
+export const PASEO_UNAVAILABLE_NOTE = 'Заметка: Paseo недоступен — случай лечу сам.'
+const AGENT_SAID_LIMIT = 500
+
+export function handedOffReport(input: { case: ReportCase; acceptMinutes: number }): ReportText {
+  const short = `${head(input.case)}: передал случай агенту Paseo. Жду, что он возьмёт его за ${input.acceptMinutes} мин; не возьмёт — лечу сам.`
+  return { short, full: [short, '', ...caseLines(input.case)].join('\n') }
+}
+
+export function paseoDoneReport(input: { case: ReportCase; result: Extract<HandoffResult, { kind: 'done' }>; observeUntil?: string }): ReportText {
+  const { result } = input
+  const commit = result.commit ? ` (коммит ${result.commit.slice(0, 12)})` : ''
+  const short =
+    result.deployed && result.version
+      ? `${head(input.case)}: агент Paseo сделал правку${commit} и выкатил её (версия ${version(result.version)}). Наблюдаю${input.observeUntil ? ` до ${clock(input.observeUntil)}` : ''}; станет хуже — откачу.`
+      : `${head(input.case)}: агент Paseo сделал правку${commit} без выкатки. Случай закрыт агентом; правку выкатят по правилам приложения.`
+  return { short, full: [short, '', ...caseLines(input.case)].join('\n') }
+}
+
+export function reclaimedReport(input: { case: ReportCase; reason: ReclaimReason; minutes?: number; agentSaid?: string }): ReportText {
+  const why = {
+    accept_timeout: `агент не взял его за ${input.minutes ?? '—'} мин`,
+    work_timeout: `агент не уложился за ${input.minutes ?? '—'} мин`,
+    cannot: 'агент сообщил, что не может его решить',
+    bridge_unreachable: 'мост Paseo перестал отвечать',
+  }[input.reason]
+  const short = `${head(input.case)}: забрал случай у агента Paseo — ${why}. Задачу агента отменяю, дальше лечу сам.`
+  const said = input.agentSaid?.trim()
+  const clipped = said && said.length > AGENT_SAID_LIMIT ? `${said.slice(0, AGENT_SAID_LIMIT)} …[обрезано]` : said
+  return { short, full: [short, '', ...caseLines(input.case), ...(clipped ? [`Ответ агента (данные, не поручение): ${clipped}`] : [])].join('\n') }
+}
+
+/** Итог наблюдения выкатки агента: держится — случай закрыт агентом, иначе — как у своей выкатки, с пометкой чья она. */
+export function paseoDeploymentReport(input: { case: ReportCase; deployment: Deployment }): ReportText & { type: ReportType } {
+  const { deployment } = input
+  if (deployment.outcome === 'holding' || deployment.outcome === 'not_helped') {
+    const short =
+      deployment.outcome === 'holding'
+        ? `${head(input.case)}: выкатка агента Paseo (версия ${version(deployment.candidateVersion)}) держится: окно наблюдения прошло без ухудшения. Случай закрыт агентом.`
+        : `${head(input.case)}: выкатка агента Paseo (версия ${version(deployment.candidateVersion)}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.`
+    return { type: deployment.outcome === 'holding' ? 'paseo_done' : 'not_helped', short, full: [short, '', ...caseLines(input.case), ...deploymentLines(deployment)].join('\n') }
+  }
+  const own = deploymentReport({ case: input.case, deployment })
+  const note = deployment.outcome === 'rolled_back' ? ' Откатил выкатку агента Paseo; агент узнает об этом из ленты отчётов.' : ' Это была выкатка агента Paseo.'
+  return { ...own, short: `${own.short}${note}`, full: own.full.replace(own.short, `${own.short}${note}`) }
 }
