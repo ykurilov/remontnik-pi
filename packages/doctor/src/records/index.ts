@@ -7,6 +7,8 @@ export type RecordValue = Record<string, unknown>
 export interface RecordTransaction {
   /** Документ коллекции; если его нет — создаётся из `initial`. Правки объекта записываются при успехе транзакции. */
   doc<T extends object>(collection: string, key: string, initial: T): Promise<T>
+  /** Удалить документ при успехе транзакции. */
+  retire(collection: string, key: string): Promise<void>
 }
 
 export interface RecordStore {
@@ -24,6 +26,7 @@ export function copyRecord<T>(value: T): T {
 export function createMemoryRecordStore(): RecordStore {
   const documents = new Map<string, unknown>()
   const id = (collection: string, key: string) => `${collection}\u0000${key}`
+  const RETIRED = Symbol('retired')
   let line: Promise<unknown> = Promise.resolve()
 
   return {
@@ -33,12 +36,20 @@ export function createMemoryRecordStore(): RecordStore {
         const tx: RecordTransaction = {
           async doc(collection, key, initial) {
             const address = id(collection, key)
-            if (!touched.has(address)) touched.set(address, copyRecord(documents.get(address) ?? initial))
+            const seen = touched.get(address)
+            if (seen === RETIRED) touched.set(address, copyRecord(initial))
+            else if (seen === undefined) touched.set(address, copyRecord(documents.get(address) ?? initial))
             return touched.get(address) as typeof initial
+          },
+          async retire(collection, key) {
+            touched.set(id(collection, key), RETIRED)
           },
         }
         const result = await change(tx)
-        for (const [address, value] of touched) documents.set(address, copyRecord(value))
+        for (const [address, value] of touched) {
+          if (value === RETIRED) documents.delete(address)
+          else documents.set(address, copyRecord(value))
+        }
         return result
       }
       const next = line.then(run, run)

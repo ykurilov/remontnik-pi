@@ -41,6 +41,7 @@ export const DEFAULT_FORBIDDEN = deepFreeze({
     '**/Dockerfile',
     '**/Dockerfile.*',
     '**/*.dockerfile',
+    '**/.dockerignore',
     '**/compose*.yml',
     '**/compose*.yaml',
     '**/docker-compose*.yml',
@@ -194,6 +195,20 @@ export const remontnikConfigSchema = z.strictObject({
       health: command,
     }),
     lockFile: z.string().min(1),
+    /**
+     * Какие переменные окружения врача видит `build`, кроме PATH, своего HOME и REMONTNIK_VERSION. `build` запускает код
+     * правки, поэтому остальное окружение ему не передаётся; переменные врача REMONTNIK_ — никогда.
+     */
+    buildEnv: z
+      .array(
+        z
+          .string()
+          .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'имя переменной окружения')
+          .refine((name) => !name.toUpperCase().startsWith('REMONTNIK_'), 'переменные врача REMONTNIK_ сборке не передаются'),
+      )
+      .default([]),
+    /** Сколько минут ждать занятый замок выкатки, прежде чем позвать человека; ждать врач продолжает. */
+    lockWaitReportMinutes: positiveInt.default(30),
   }),
   observe: z
     .strictObject({
@@ -202,6 +217,8 @@ export const remontnikConfigSchema = z.strictObject({
       errorRateFactor: positiveNumber.default(3),
       minErrorsToRollback: positiveInt.default(5),
       newFingerprintsToRollback: positiveInt.default(3),
+      /** Скользящее окно проверок здоровья: откат при `healthFailuresToRollback` сбоях из стольких последних. */
+      healthWindowTicks: positiveInt.default(5),
     })
     .prefault({}),
   limits: z

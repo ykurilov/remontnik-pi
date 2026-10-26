@@ -90,6 +90,14 @@ function sameValue(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
+/** Скрипты `package.json` запускает сборка: их правка — как правка Dockerfile. Без полного текста проверить нечем. */
+function manifestScriptsRule(file: ChangedFile): string | undefined {
+  const after = parseManifest(file.contentAfter)
+  const before = file.status === 'added' ? {} : parseManifest(file.contentBefore)
+  if (file.status === 'deleted' || !after || !before) return 'package.json: полный текст до и после недоступен, скрипты проверить нечем'
+  return sameValue(before.scripts, after.scripts) ? undefined : 'package.json: изменено «scripts»'
+}
+
 /** Когда приложение разрешило менять зависимости: менять можно только разделы зависимостей. Проверка — по полному тексту до и после. */
 function manifestViolation(config: ZoneConfig, file: ChangedFile): { zone: ForbiddenZone; rule: string } | undefined {
   const after = parseManifest(file.contentAfter)
@@ -98,6 +106,7 @@ function manifestViolation(config: ZoneConfig, file: ChangedFile): { zone: Forbi
     return { zone: 'dependencies', rule: 'package.json: полный текст до и после недоступен, проверить нечем' }
   }
   for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (key === 'scripts') continue
     if (DEPENDENCY_SECTIONS.has(key)) {
       const beforeSection = (before[key] ?? {}) as Record<string, unknown>
       const afterSection = (after[key] ?? {}) as Record<string, unknown>
@@ -211,6 +220,8 @@ export function findForbiddenZones(config: ZoneConfig, files: readonly ChangedFi
     }
 
     if (isManifest) {
+      const scriptsRule = forbidden.allowBuildAndDeployChanges ? undefined : manifestScriptsRule(file)
+      if (scriptsRule) add('build_and_deploy', scriptsRule)
       const violation = forbidden.allowDependencyChanges
         ? manifestViolation(config, file)
         : { zone: 'dependencies' as const, rule: 'package.json: любая правка запрещена' }
