@@ -11,7 +11,7 @@ import { seedDoctorRecords } from '../../src/testing/doctor-records.js'
 import { workbenchPath } from '../../src/workbench/index.js'
 import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
 import { startFakePaseoBridge, type FakePaseoBridge } from '../../src/testing/fake-paseo-bridge.js'
-import { BRIDGE_SECRET, BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState, type FakeBrowserState } from './world.js'
+import { BRIDGE_SECRET, BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState, type FakeBrowserState, writeJsonAtomically } from './world.js'
 
 // Стенд падений (T081): врач идёт отдельным процессом (`doctor-child.ts`), его убивают в заданной точке
 // (`REMONTNIK_TEST_CRASH_AT`) и запускают снова на тех же записях, git и приложении. Итог читается после остановки.
@@ -51,7 +51,7 @@ const readJson = <T>(path: string): T => JSON.parse(readFileSync(path, 'utf8')) 
 function editJson<T>(path: string, edit: (state: T) => void): void {
   const state = readJson<T>(path)
   edit(state)
-  writeFileSync(path, JSON.stringify(state))
+  writeJsonAtomically(path, state)
 }
 
 /** Репозиторий приложения с ошибкой, подставное приложение на прежней версии и подставной Telegram. */

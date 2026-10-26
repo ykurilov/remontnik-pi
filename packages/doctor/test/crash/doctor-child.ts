@@ -28,6 +28,7 @@ import {
   type CrashPoint,
   type FakeAppState,
   type FakeBrowserState,
+  writeJsonAtomically,
 } from './world.js'
 
 // Врач в отдельном процессе для проверок падений (T081). Всё, что должно пережить перезапуск, — на диске: записи
@@ -87,7 +88,7 @@ function fileBackedApp(): { commands: AppCommands; running: () => string | null;
   const change = (edit: (state: FakeAppState) => void): FakeAppState => {
     const state = read()
     edit(state)
-    writeFileSync(world.appStatePath, JSON.stringify(state))
+    writeJsonAtomically(world.appStatePath, state)
     return state
   }
   const done = (output: string): CommandOutcome => ({ ok: true, output })
@@ -153,7 +154,7 @@ function fileBackedBrowser(): BrowserClient {
   const change = (edit: (state: FakeBrowserState) => void): FakeBrowserState => {
     const state = JSON.parse(readFileSync(world.browserStatePath, 'utf8')) as FakeBrowserState
     edit(state)
-    writeFileSync(world.browserStatePath, JSON.stringify(state))
+    writeJsonAtomically(world.browserStatePath, state)
     return state
   }
   let statusCalls = 0

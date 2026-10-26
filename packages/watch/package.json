@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:live": "vitest run --config ../../vitest.live.config.ts",
+    "test:live": "vitest run --config ../../vitest.live.config.ts packages/watch",
     "bench": "pnpm --dir ../.. run bench packages/watch"
   },
   "dependencies": {

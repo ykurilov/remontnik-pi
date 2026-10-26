@@ -13,7 +13,7 @@ pnpm install
 pnpm verify          # тесты → сборка → типы → check-pins → check-public → check-history
 ```
 
-Ожидаемо: всё зелёное; `check-pins` подтверждает точные версии pi-durable и pi-ai; `check-public` и `gitleaks` находят 0 секретов и адресов; `check-history` подтверждает, что `.private/` не была ни в одном коммите и `gitleaks` чист по всей истории (`pnpm check-history --trees` дополнительно гонит `check-public` по дереву каждого коммита).
+Ожидаемо: всё зелёное; `check-pins` подтверждает точные версии pi-durable и pi-ai; `check-public` и `gitleaks` находят 0 секретов и адресов; `check-history` (нужна папка с историей git: в копии на iMac без `.git` он пропускается и честно об этом пишет — запускать на основном Mac) подтверждает, что `.private/` не была ни в одном коммите и `gitleaks` чист по всей истории (`pnpm check-history --trees` дополнительно гонит `check-public` по дереву каждого коммита).
 
 ## 2. Весь цикл на «Пациенте» без Docker и без сети
 
@@ -49,6 +49,7 @@ pnpm --filter @ykurilov/remontnik-doctor test:crash
 ## 4. Браузер
 
 ```bash
+pnpm build   # браузерные тесты берут пакеты из `dist`
 pnpm --filter @ykurilov/remontnik-browser test
 ```
 
@@ -62,7 +63,7 @@ pnpm --filter @ykurilov/remontnik-watch test:live     # настоящий DeepS
 pnpm --filter @ykurilov/remontnik-watch bench         # горячий путь: ошибка, ответ модели, конец разговора — не больше 1 мс на событие
 ```
 
-Ожидаемо (живая): найдено ≥ 80% плохих ответов, ложных отметок ≤ 10%; при отказе основного пути — ответ через запасной.
+Ожидаемо (живая): найдено ≥ 80% плохих ответов, ложных отметок ≤ 10%; при отказе основного пути — ответ через запасной (отдельный тест, нужен `OPENROUTER_API_KEY`). Зелёные тесты vitest ничего не печатает: отчёт качества и цену прогона смотреть так: `REMONTNIK_LIVE_REPORT=/tmp/report.txt pnpm --filter @ykurilov/remontnik-watch test:live` (последний прогон: 18 из 18, ложных 0 из 24, около 0,012 $).
 
 ## 6. Живая группа целиком
 
@@ -72,7 +73,7 @@ DEEPSEEK_API_KEY=… OPENROUTER_API_KEY=… pnpm test:live
 
 Docker-сборка врача, браузера и верстака; «Пациент» в контейнерах; настоящий DeepSeek. Ожидаемо: случай `crash` проходит от сбоя до `healed`, отчёты в подставном Telegram и в очереди Paseo (`remontnik-doctor reports pull`).
 
-Группа — все `packages/*/test/live/*.live.test.ts` (`vitest.live.config.ts`): шаблон compose на настоящем Docker, срок жизни верстака, качество чтения разговоров и цикл `crash` (`packages/doctor/test/live/crash-cycle.live.test.ts`). Нужна машина с Docker. Без Docker или ключей тесты пропускаются. В `pnpm verify` группа не входит: она платная. Потолок модели врача в настройке «Пациента» — $1 в сутки.
+Группа — все `packages/*/test/live/*.live.test.ts` (`vitest.live.config.ts`): шаблон compose на настоящем Docker, срок жизни верстака, качество чтения разговоров и цикл `crash` (`packages/doctor/test/live/crash-cycle.live.test.ts`). Нужна машина с Docker. Без Docker или ключей тесты пропускаются. В `pnpm verify` группа не входит: она платная. Потолок модели врача в настройке «Пациента» — $1 в сутки. Расход цикла `crash` тест пишет в `remontnik-crash-spend.json` во временной папке системы (около 0,005 $ за прогон). Вывод в консоль — `pnpm test:live --reporter=verbose --disable-console-intercept`. Вся группа — около 5–7 минут и меньше 0,02 $.
 
 ## 7. Подключение по инструкции
 
