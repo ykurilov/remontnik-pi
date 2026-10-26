@@ -9,6 +9,7 @@ import {
   startBridgeServer,
   type AgentState,
   type BridgeConfig,
+  type BridgeServerLimits,
   type PaseoAgentsPort,
 } from '../server/index.js'
 
@@ -158,7 +159,7 @@ export function freshStateFile(): string {
   return join(mkdtempSync(join(tmpdir(), 'remontnik-bridge-')), 'state.json')
 }
 
-export async function startBridge(options: { config: BridgeConfig; paseo: FakePaseo; stateFile?: string }) {
+export async function startBridge(options: { config: BridgeConfig; paseo: FakePaseo; stateFile?: string; limits?: Partial<BridgeServerLimits> }) {
   const journal: Record<string, unknown>[] = []
   const log = (entry: Record<string, unknown>) => void journal.push(entry)
   const bridge = createPaseoBridge({
@@ -169,7 +170,7 @@ export async function startBridge(options: { config: BridgeConfig; paseo: FakePa
     deliveryTimeoutMs: 2_000,
     log,
   })
-  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler, log })
+  const server = await startBridgeServer({ listen: options.config.listen, handler: bridge.handler, log, ...(options.limits ? { limits: options.limits } : {}) })
   return {
     bridge,
     server,
@@ -228,4 +229,11 @@ export async function until(condition: () => boolean, timeoutMs = 2_000): Promis
     if (Date.now() - started > timeoutMs) throw new Error('условие не наступило')
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
+}
+
+/** Ключ задачи из письма агенту: им агент подписывает свои команды вместо секрета моста. */
+export function taskKeyFrom(letter: string): string {
+  const match = /--key ([0-9a-f]{64})/.exec(letter)
+  if (!match) throw new Error('в письме нет ключа задачи')
+  return match[1]!
 }

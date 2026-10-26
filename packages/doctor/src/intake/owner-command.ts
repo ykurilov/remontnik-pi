@@ -1,5 +1,5 @@
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
-import { assertOwnerSecrets, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { assertOwnerSecrets, claimNonce, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Команда владельца по HTTP: подписанный `POST` только секретом владельца `REMONTNIK_CONTROL_SECRET`, общий секрет
 // есть у приложения. Подпись общим секретом узнаётся (403 `control_secret_required`), но не исполняется.
@@ -64,10 +64,6 @@ export function createOwnerCommandHandler<C>(options: OwnerCommandOptions<C>): I
       sendJson(response, 401, { error: check.reason })
       return
     }
-    if (!replayGuard.firstSeen(nonce, now())) {
-      sendJson(response, 401, { error: 'replayed' })
-      return
-    }
     let command: C | undefined
     try {
       command = options.parse(JSON.parse(read.body) as unknown)
@@ -80,6 +76,12 @@ export function createOwnerCommandHandler<C>(options: OwnerCommandOptions<C>): I
     }
     if (!byOwner) {
       sendJson(response, 403, { error: 'control_secret_required' })
+      return
+    }
+    // Метка занимается только запросом, который исполнится: отказ по роли память повторов не заполняет.
+    const claimed = claimNonce(replayGuard, nonce, now())
+    if (claimed) {
+      sendJson(response, claimed.status, claimed.body)
       return
     }
     const answer = await options.run(command)

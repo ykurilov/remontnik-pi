@@ -1,6 +1,6 @@
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import type { Controls } from '../ledgers/controls.js'
-import { assertOwnerSecrets, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { assertOwnerSecrets, claimNonce, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Стоп-кран по HTTP (contracts/doctor-api.md): `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`.
 // Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан `signRequest` с разовой меткой.
@@ -81,10 +81,6 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
       sendJson(response, 401, { error: check.reason })
       return
     }
-    if (!replayGuard.firstSeen(nonce, now())) {
-      sendJson(response, 401, { error: 'replayed' })
-      return
-    }
     const command = parseCommand(read.body)
     if (!command || (command.action === 'confirm_version' && !options.confirmVersion)) {
       sendJson(response, 400, { error: 'bad_request' })
@@ -92,6 +88,12 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
     }
     if (command.action !== 'stop' && !byOwner) {
       sendJson(response, 403, { error: 'control_secret_required' })
+      return
+    }
+    // Метка занимается только запросом, который исполнится: отказ по роли память повторов не заполняет.
+    const claimed = claimNonce(replayGuard, nonce, now())
+    if (claimed) {
+      sendJson(response, claimed.status, claimed.body)
       return
     }
     if (command.action === 'confirm_version') {

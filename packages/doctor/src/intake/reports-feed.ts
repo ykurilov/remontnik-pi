@@ -8,7 +8,7 @@ import {
   verifySignedRequest,
 } from '@ykurilov/remontnik-core/signed-http'
 import type { Report, Reports } from '../reports/index.js'
-import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { claimNonce, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Лента отчётов для Paseo (R13, contracts/doctor-api.md): `GET /v1/reports` и `POST /v1/reports/ack`.
 // Два вида доступа, оба закрытые:
@@ -188,8 +188,9 @@ export function createReportsFeedHandler(options: ReportsFeedOptions): IntakeHan
         reply(request, response, unsigned(401, check.reason))
         return
       }
-      if (!replayGuard!.firstSeen(headerValue(request, NONCE_HEADER)!, now())) {
-        reply(request, response, { status: 401, body: { error: 'replayed' }, signed: true })
+      const claimed = claimNonce(replayGuard!, headerValue(request, NONCE_HEADER)!, now())
+      if (claimed) {
+        reply(request, response, { ...claimed, signed: true })
         return
       }
     }

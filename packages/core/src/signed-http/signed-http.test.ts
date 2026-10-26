@@ -148,6 +148,19 @@ describe('ReplayGuard', () => {
     expect(guard.firstSeen('sig-2', now + 500)).toBe(true)
     expect(guard.firstSeen('sig-1', now + 1_001)).toBe(true)
   })
+
+  it('память полна — новый ключ отвергается как full, принятые раньше не вытесняются', () => {
+    const guard = new ReplayGuard(1_000, 2)
+    expect(guard.remember('a', now)).toBe('first')
+    expect(guard.remember('b', now)).toBe('first')
+    expect(guard.remember('c', now + 10)).toBe('full')
+    expect(guard.firstSeen('c', now + 10)).toBe(false)
+    // Вытеснения нет: принятый ключ всё ещё узнаётся как повтор.
+    expect(guard.remember('a', now + 20)).toBe('replayed')
+    expect(guard.wasSeen('a', now + 20)).toBe(true)
+    // Окно прошло — место освободилось.
+    expect(guard.remember('c', now + 1_001)).toBe('first')
+  })
 })
 
 describe('строгий вид подписи', () => {

@@ -19,6 +19,8 @@ export interface TaskRecord {
   cancelReason?: string
   /** Итог агента уже ушёл врачу. */
   resultSent?: boolean
+  /** Ключ задачи: им агент подписывает команды по этому случаю. Нет (запись старого моста) — команды не примутся. */
+  agentKey?: string
 }
 
 interface StateShape {

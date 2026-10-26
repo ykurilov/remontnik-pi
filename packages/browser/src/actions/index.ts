@@ -232,6 +232,7 @@ export function createBrowserActions(options: {
       return fail('refused_origin', `поле не на сайте входа ${site} (нужен точно этот адрес и https): пароль не вписан`)
     }
     await session.fields.mark(handle, 'filled')
+    session.passwordFilled()
     await handle.fill(password, { timeout: ACTION_TIMEOUT_MS })
     return outcome(session)
   }

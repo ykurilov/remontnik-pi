@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -14,6 +14,7 @@ import {
   shopTask,
   signedPost,
   startBridge,
+  taskKeyFrom,
   until,
 } from './bridge-world.js'
 
@@ -65,14 +66,16 @@ afterEach(async () => {
   await doctor.stop()
 })
 
+const key = () => taskKeyFrom(paseo.letters[0]!.text)
+
 const handoffs = () =>
   doctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/')).map((request) => [request.path, JSON.parse(request.body)])
 
 describe('remontnik-paseo', () => {
   it('accept и done доходят до врача через мост; итог по задаче — один', async () => {
-    expect((await run(['accept', '7'])).code).toBe(0)
-    expect((await run(['done', '7', '--commit', 'abc1234', '--deployed', 'v12'])).code).toBe(0)
-    const again = await run(['cannot', '7', '--reason', 'нужна схема базы'])
+    expect((await run(['accept', '7', '--key', key()])).code).toBe(0)
+    expect((await run(['done', '7', '--key', key(), '--commit', 'abc1234', '--deployed', 'v12'])).code).toBe(0)
+    const again = await run(['cannot', '7', '--key', key(), '--reason', 'нужна схема базы'])
     expect(again.code).toBe(1)
     expect(again.stderr).toContain('result_already_sent')
     const taskId = shopTask().taskId
@@ -83,7 +86,7 @@ describe('remontnik-paseo', () => {
   })
 
   it('cannot доходит до врача', async () => {
-    expect((await run(['cannot', '7', '--reason', 'нужна схема базы'])).code).toBe(0)
+    expect((await run(['cannot', '7', '--key', key(), '--reason', 'нужна схема базы'])).code).toBe(0)
     expect(handoffs()).toEqual([['/v1/handoffs/7/result', { taskId: shopTask().taskId, kind: 'cannot', reason: 'нужна схема базы' }]])
   })
 
@@ -93,7 +96,7 @@ describe('remontnik-paseo', () => {
       method === 'GET' && path === '/v1/cases/7'
         ? { status: 200, body: { case: { id: 7, message: injected, stack: 'y'.repeat(20_000) } } }
         : undefined
-    const result = await run(['case', '7'])
+    const result = await run(['case', '7', '--key', key()])
     expect(result.code).toBe(0)
     const marker = /^<<<ДАННЫЕ-([0-9a-f]{16})$/m.exec(result.stdout)
     expect(marker).not.toBeNull()
@@ -107,13 +110,13 @@ describe('remontnik-paseo', () => {
   })
 
   it('ошибки: нет причины у cannot, чужой случай, неизвестная команда; секрет не печатается', async () => {
-    const noReason = await run(['cannot', '7'])
+    const noReason = await run(['cannot', '7', '--key', key()])
     expect(noReason.code).not.toBe(0)
     expect(noReason.stderr).toMatch(/--reason/)
 
-    const unknownCase = await run(['accept', '99'])
+    const unknownCase = await run(['accept', '99', '--key', key()])
     expect(unknownCase.code).not.toBe(0)
-    expect(unknownCase.stderr).toContain('unknown_task')
+    expect(unknownCase.stderr).toContain('bad_signature')
 
     const unknownCommand = await run(['deploy', '7'])
     expect(unknownCommand.code).not.toBe(0)
@@ -122,11 +125,26 @@ describe('remontnik-paseo', () => {
     expect(handoffs()).toEqual([])
   })
 
+  it('секрет моста консольной не нужен: файл секрета недоступен — команды работают; без --key — ошибка использования', async () => {
+    const config = JSON.parse(readFileSync(configFile, 'utf8')) as { apps: Record<string, { secretFile: string }> }
+    rmSync(config.apps['shop']!.secretFile)
+    expect((await run(['accept', '7', '--key', key()])).code).toBe(0)
+
+    const noKey = await run(['accept', '7'])
+    expect(noKey.code).toBe(2)
+    expect(noKey.stderr).toMatch(/--key/)
+
+    const wrongKey = await run(['done', '7', '--key', 'f'.repeat(64)])
+    expect(wrongKey.code).toBe(1)
+    expect(wrongKey.stderr).toContain('bad_signature')
+    expect(handoffs()).toEqual([['/v1/handoffs/7/accepted', { taskId: shopTask().taskId, agent: SHOP_AGENT }]])
+  })
+
   it('несколько приложений в настройке — нужен --app', async () => {
     configFile = writeOwnerConfig(['shop', 'blog'])
-    const ambiguous = await run(['accept', '7'])
+    const ambiguous = await run(['accept', '7', '--key', key()])
     expect(ambiguous.code).not.toBe(0)
     expect(ambiguous.stderr).toMatch(/--app/)
-    expect((await run(['accept', '7', '--app', 'shop'])).code).toBe(0)
+    expect((await run(['accept', '7', '--key', key(), '--app', 'shop'])).code).toBe(0)
   })
 })

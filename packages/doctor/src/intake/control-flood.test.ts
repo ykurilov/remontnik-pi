@@ -1,0 +1,103 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { ReplayGuard, signRequest } from '@ykurilov/remontnik-core/signed-http'
+import { createMemoryRecordStore } from '../records/index.js'
+import { createControls } from '../ledgers/controls.js'
+import { createCaseRetryHandler } from './case-retry.js'
+import { createDeployControlsHandler } from './deploy-controls.js'
+import { createIntakeHandler, startIntakeServer, type IntakeHandler, type IntakeServer } from './index.js'
+
+// Приложение с общим секретом не должно уметь вытеснить из памяти повторов метку перехваченной команды владельца:
+// отказ по роли метку не занимает, полная память отвечает отказом, а не вытесняет; пути управления — с пределом запросов.
+
+const SECRET = 'shared-secret-for-flood-tests'
+const CONTROL_SECRET = 'owner-secret-for-flood-tests'
+
+let server: IntakeServer | undefined
+
+afterEach(async () => {
+  await server?.close()
+  server = undefined
+})
+
+async function serve(handler: Partial<Parameters<typeof createIntakeHandler>[0]>): Promise<string> {
+  server = await startIntakeServer({
+    handler: createIntakeHandler({ secret: SECRET, receiveEvents: async () => ({ accepted: [] }), health: () => ({ ok: true }), ...handler }),
+    host: '127.0.0.1',
+    port: 0,
+  })
+  return server.url
+}
+
+function signedPost(target: string, body: string, secret: string) {
+  return { method: 'POST', headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target, body, secret }) }, body }
+}
+
+describe('память повторов на путях управления', () => {
+  it('отказы общим секретом (403) не вытесняют метку команды владельца: её повтор — 401 replayed', async () => {
+    const retried: number[] = []
+    const caseRetry: IntakeHandler = createCaseRetryHandler({
+      secret: SECRET,
+      controlSecret: CONTROL_SECRET,
+      replayGuard: new ReplayGuard(600_000, 3),
+      retryCase: async (caseId) => {
+        retried.push(caseId)
+        return { retried: 'parked', attempt: 2 }
+      },
+    })
+    const url = await serve({ caseRetry })
+    const command = JSON.stringify({ caseId: 7, action: 'retry', by: 'owner' })
+    const owner = signedPost('/v1/control/cases', command, CONTROL_SECRET)
+    expect((await fetch(`${url}/v1/control/cases`, owner)).status).toBe(200)
+
+    for (let index = 0; index < 5; index += 1) {
+      const flood = await fetch(`${url}/v1/control/cases`, signedPost('/v1/control/cases', command, SECRET))
+      expect(flood.status).toBe(403)
+    }
+    const replay = await fetch(`${url}/v1/control/cases`, owner)
+    expect(replay.status).toBe(401)
+    expect(await replay.json()).toEqual({ error: 'replayed' })
+    expect(retried).toEqual([7])
+  })
+
+  it('стоп-кран: «пуск» общим секретом не занимает память; полная память — 503, а не вытеснение', async () => {
+    const controls = createControls(createMemoryRecordStore(), () => new Date())
+    const deployControls = createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET, replayGuard: new ReplayGuard(600_000, 2) })
+    const url = await serve({ deployControls })
+    const target = '/v1/control/deploys'
+    const resume = signedPost(target, JSON.stringify({ action: 'resume', by: 'owner' }), CONTROL_SECRET)
+    expect((await fetch(`${url}${target}`, resume)).status).toBe(200)
+    for (let index = 0; index < 4; index += 1) {
+      expect((await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'resume', by: 'app' }), SECRET))).status).toBe(403)
+    }
+    expect((await fetch(`${url}${target}`, resume)).status).toBe(401)
+
+    // «Стоп» общим секретом разрешён и место занимает: второе место занято — дальше отказ, метка владельца на месте.
+    expect((await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))).status).toBe(200)
+    const full = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))
+    expect(full.status).toBe(503)
+    expect(await full.json()).toEqual({ error: 'replay_memory_full' })
+    const replay = await fetch(`${url}${target}`, resume)
+    expect(replay.status).toBe(401)
+    expect(await replay.json()).toEqual({ error: 'replayed' })
+  })
+})
+
+describe('предел запросов с одного адреса на путях управления', () => {
+  it('сверх предела — 429 rate_limited до чтения подписи; приём событий и /health предел не считают', async () => {
+    const controls = createControls(createMemoryRecordStore(), () => new Date())
+    const url = await serve({
+      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
+      controlRateLimit: { limit: 3, windowMs: 60_000 },
+    })
+    const target = '/v1/control/deploys'
+    for (let index = 0; index < 3; index += 1) {
+      expect((await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))).status).toBe(200)
+    }
+    const limited = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))
+    expect(limited.status).toBe(429)
+    expect(await limited.json()).toEqual({ error: 'rate_limited' })
+    expect((await fetch(`${url}/v1/control/cases`, { method: 'POST', body: '{}' })).status).toBe(429)
+    expect((await fetch(`${url}/health`)).status).toBe(200)
+    expect((await fetch(`${url}/v1/events`, { method: 'POST', body: '{}' })).status).toBe(401)
+  })
+})

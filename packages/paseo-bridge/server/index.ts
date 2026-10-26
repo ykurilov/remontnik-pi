@@ -2,7 +2,9 @@ export { AgentPost, type AgentState, type DeliveryOutcome, type PaseoAgentsPort 
 export {
   DEFAULT_CONFIG_PATH,
   DEFAULT_STATE_FILE,
+  loadBridgeAddressBook,
   loadBridgeConfig,
+  type BridgeAddressBook,
   type BridgeApp,
   type BridgeConfig,
 } from './bridge-config.js'
@@ -12,6 +14,7 @@ export {
   startBridgeServer,
   type BridgeHandler,
   type BridgeServer,
+  type BridgeServerLimits,
   type PaseoBridge,
   type PaseoBridgeOptions,
 } from './bridge-http.js'

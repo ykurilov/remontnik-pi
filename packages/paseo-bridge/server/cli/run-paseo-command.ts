@@ -1,10 +1,11 @@
 import { parseArgs } from 'node:util'
 import { signRequest } from '@ykurilov/remontnik-core/signed-http'
-import { DEFAULT_CONFIG_PATH, loadBridgeConfig } from '../bridge-config.js'
+import { DEFAULT_CONFIG_PATH, loadBridgeAddressBook } from '../bridge-config.js'
 import { hostForUrl } from '../private-address.js'
 import { caseDetailsText } from '../task-text.js'
 
 // Консольная `remontnik-paseo`: агент приложения отчитывается врачу через мост на своём компьютере.
+// Команды подписаны ключом задачи из письма моста (`--key`); секрет моста консольной не нужен и не читается.
 
 export interface PaseoCommandIo {
   env: Record<string, string | undefined>
@@ -14,10 +15,10 @@ export interface PaseoCommandIo {
 }
 
 const USAGE = `Использование:
-  remontnik-paseo accept <caseId> [--app <имя>]
-  remontnik-paseo done <caseId> [--commit <sha>] [--deployed <версия>] [--app <имя>]
-  remontnik-paseo cannot <caseId> --reason "<текст>" [--app <имя>]
-  remontnik-paseo case <caseId> [--app <имя>]
+  remontnik-paseo accept <caseId> --key <ключ> [--app <имя>]
+  remontnik-paseo done <caseId> --key <ключ> [--commit <sha>] [--deployed <версия>] [--app <имя>]
+  remontnik-paseo cannot <caseId> --key <ключ> --reason "<текст>" [--app <имя>]
+  remontnik-paseo case <caseId> --key <ключ> [--app <имя>]
 `
 
 const PATHS = { accept: '/v1/agent/accepted', done: '/v1/agent/result', cannot: '/v1/agent/result', case: '/v1/agent/case' }
@@ -48,6 +49,7 @@ export async function runPaseoCommand(argv: string[], io: PaseoCommandIo): Promi
       allowPositionals: true,
       options: {
         app: { type: 'string' },
+        key: { type: 'string' },
         commit: { type: 'string' },
         deployed: { type: 'string' },
         reason: { type: 'string' },
@@ -58,21 +60,23 @@ export async function runPaseoCommand(argv: string[], io: PaseoCommandIo): Promi
     const caseId = Number(caseText)
     if (!Number.isSafeInteger(caseId) || caseId <= 0) throw new UsageError('номер случая — целое число больше нуля')
 
-    const config = loadBridgeConfig(io.env.REMONTNIK_PASEO_BRIDGE_CONFIG ?? DEFAULT_CONFIG_PATH)
+    const key = values['key']?.trim()
+    if (!key) throw new UsageError('нужен ключ задачи из письма моста: --key <ключ>')
+
+    const config = loadBridgeAddressBook(io.env.REMONTNIK_PASEO_BRIDGE_CONFIG ?? DEFAULT_CONFIG_PATH)
     let app = values['app']
     if (app === undefined) {
       if (config.apps.size !== 1) throw new UsageError(`в настройке моста несколько приложений — укажи --app <имя>`)
       app = [...config.apps.keys()][0]!
     }
-    const entry = config.apps.get(app)
-    if (!entry) throw new UsageError(`приложения «${app}» нет в настройке моста`)
+    if (!config.apps.has(app)) throw new UsageError(`приложения «${app}» нет в настройке моста`)
 
     const body = JSON.stringify({ app, ...buildPayload(command as Command, caseId, values) })
     const path = PATHS[command as Command]
     const url = `http://${hostForUrl(config.listen.host)}:${config.listen.port}${path}`
     const response = await (io.fetch ?? fetch)(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: path, body, secret: entry.secret }) },
+      headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: path, body, secret: key }) },
       body,
       redirect: 'manual',
       signal: AbortSignal.timeout(30_000),

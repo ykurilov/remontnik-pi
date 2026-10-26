@@ -220,6 +220,8 @@ export function verifySignedResponse(input: {
 /**
  * Память увиденных ключей на время окна: ключ, уже принятый раз, второй раз не проходит.
  * Окно по умолчанию — вдвое больше допуска по времени: подпись годна на `maxSkew` в обе стороны.
+ * Память полна — новый ключ отвергается (`full`), а не вытесняет старый: иначе поток верно подписанных
+ * запросов вытеснил бы метку перехваченного запроса, и тот прошёл бы повтором.
  */
 export class ReplayGuard {
   private readonly seen = new Map<string, number>()
@@ -237,17 +239,25 @@ export class ReplayGuard {
     return expires !== undefined && expires > now
   }
 
-  /** Запоминает ключ и говорит, был ли он первым. Ключом берут разовую метку запроса (`X-Remontnik-Nonce`), а не строку подписи. */
-  firstSeen(key: string, now: number = Date.now()): boolean {
+  /**
+   * Запоминает ключ: `first` — принят впервые, `replayed` — уже был, `full` — места нет, ключ не запомнен.
+   * Ключом берут разовую метку запроса (`X-Remontnik-Nonce`), а не строку подписи.
+   */
+  remember(key: string, now: number = Date.now()): 'first' | 'replayed' | 'full' {
     for (const [old, oldExpires] of this.seen) {
       if (oldExpires > now) break
       this.seen.delete(old)
     }
     const expires = this.seen.get(key)
-    if (expires !== undefined && expires > now) return false
-    if (this.seen.size >= this.maxEntries) this.seen.delete(this.seen.keys().next().value!)
+    if (expires !== undefined && expires > now) return 'replayed'
+    if (this.seen.size >= this.maxEntries) return 'full'
     this.seen.delete(key)
     this.seen.set(key, now + this.windowMs)
-    return true
+    return 'first'
+  }
+
+  /** Запоминает ключ и говорит, был ли он первым; полная память — тоже `false`. */
+  firstSeen(key: string, now: number = Date.now()): boolean {
+    return this.remember(key, now) === 'first'
   }
 }

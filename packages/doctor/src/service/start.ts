@@ -5,7 +5,7 @@ import { createCaseServices, type CaseServices } from '../case-services/index.js
 import { createServerDeployer } from '../deployer/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
-import { assertOwnerSecrets } from '../intake/http-kit.js'
+import { assertOwnerSecrets, secretProblems } from '../intake/http-kit.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
 import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
@@ -115,7 +115,13 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const sharedSecret = required(env, 'REMONTNIK_SHARED_SECRET')
   // Секрет владельца снимает стоп-кран выкаток: утечка общего секрета не должна давать того же.
   const controlSecret = env.REMONTNIK_CONTROL_SECRET?.trim() || undefined
-  assertOwnerSecrets({ secret: sharedSecret, controlSecret })
+  const problems = secretProblems([
+    { name: 'REMONTNIK_SHARED_SECRET', value: sharedSecret },
+    { name: 'REMONTNIK_CONTROL_SECRET', value: controlSecret },
+    ...(bridge ? [{ name: config.handoff.paseo!.bridgeSecretEnv, value: bridge.secret }] : []),
+  ])
+  if (problems.length > 0) throw new Error(`секреты врача: ${problems.join('; ')}`)
+  assertOwnerSecrets({ secret: sharedSecret, controlSecret, bridgeSecret: bridge?.secret })
 
   const guard = createGitGuard({
     repoDir,

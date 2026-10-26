@@ -14,6 +14,8 @@ export interface ProfileSession {
   readonly fields: SensitiveFields
   /** Заблокированные запросы с последнего вызова: действие по ним понимает, что его остановил замок. */
   takeBlocked(): BlockedRequest[]
+  /** Сейчас в рабочую вкладку впишется пароль: сетевой замок закрывает другие сайты до новой страницы. */
+  passwordFilled(): void
 }
 
 export interface Profiles {
@@ -55,7 +57,7 @@ export function createProfiles(options: {
       ...(proxy ? { proxy } : {}),
     })
     let blocked: BlockedRequest[] = []
-    await installNetworkGuard(context, policy, (request) => {
+    const guard = await installNetworkGuard(context, policy, (request) => {
       blocked.push(request)
       log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason })
     })
@@ -77,6 +79,7 @@ export function createProfiles(options: {
         blocked = []
         return taken
       },
+      passwordFilled: () => guard.passwordFilled(page),
     }
   }
 

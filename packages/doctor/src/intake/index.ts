@@ -4,6 +4,7 @@ import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/inc
 import { redactValue } from '@ykurilov/remontnik-core/redact'
 import { DEFAULT_MAX_SKEW_MS, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { createRateLimiter, DEFAULT_CONTROL_RATE_LIMIT, type RateLimitSettings } from './rate-limit.js'
 
 // Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health; рядом — лента отчётов и стоп-кран.
 
@@ -26,6 +27,8 @@ export interface IntakeHandlerOptions {
   deployControls?: IntakeHandler
   /** Снова поставить случай в работу: `POST /v1/control/cases`. Не задано — адреса нет. */
   caseRetry?: IntakeHandler
+  /** Предел запросов с одного адреса на `/v1/control/*`; по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
+  controlRateLimit?: RateLimitSettings
 }
 
 export type { IntakeHandler }
@@ -62,10 +65,16 @@ function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
 }
 
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
+  const controlAllowed = createRateLimiter(options.controlRateLimit ?? DEFAULT_CONTROL_RATE_LIMIT)
   return async (request, response) => {
-    const path = (request.url ?? '/').split('?')[0]
+    const path = (request.url ?? '/').split('?')[0]!
     if (request.method === 'GET' && path === '/health') {
       sendJson(response, 200, await options.health())
+      return
+    }
+    // Команды владельца и стоп-кран: подбор и поток подписанных запросов упираются в предел до проверки подписи.
+    if (path.startsWith('/v1/control/') && !controlAllowed(request.socket.remoteAddress ?? '')) {
+      refuse(request, response, 429, { error: 'rate_limited' })
       return
     }
     if (options.deployControls && path === '/v1/control/deploys') {

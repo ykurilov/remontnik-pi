@@ -17,6 +17,7 @@ import {
   signedPost,
   signedPostRequest,
   startBridge,
+  taskKeyFrom,
   until,
 } from './bridge-world.js'
 
@@ -24,6 +25,8 @@ let shopDoctor: FakeDoctor
 let blogDoctor: FakeDoctor
 let paseo: FakePaseo
 let running: Awaited<ReturnType<typeof startBridge>>[] = []
+/** Ключ первой задачи: им агент подписывает свои команды (он в письме с задачей). */
+const taskKey = () => taskKeyFrom(paseo.letters[0]!.text)
 
 async function bridgeFor(stateFile?: string) {
   const started = await startBridge({
@@ -455,7 +458,7 @@ describe('команды агента через мост', () => {
 
   it('accept и result уходят врачу этого приложения с номером задачи и агентом', async () => {
     const { server } = await bridgeWithTask()
-    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, taskKey())).toEqual({
       status: 200,
       body: { ok: true },
     })
@@ -463,7 +466,7 @@ describe('команды агента через мост', () => {
       await signedPost(
         `${server.url}/v1/agent/result`,
         { app: 'shop', caseId: 7, kind: 'done', commit: 'abc1234', version: 'v12' },
-        SHOP_SECRET,
+        taskKey(),
       ),
     ).toEqual({ status: 200, body: { ok: true } })
 
@@ -480,16 +483,16 @@ describe('команды агента через мост', () => {
     const taskId = shopTask().taskId
     await signedPost(`${server.url}/v1/tasks/${taskId}/cancel`, { app: 'shop', taskId, reason: 'work_timeout' }, SHOP_SECRET)
 
-    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, taskKey())).toEqual({
       status: 409,
       body: { error: 'task_cancelled' },
     })
     expect(
-      await signedPost(`${server.url}/v1/agent/result`, { app: 'shop', caseId: 7, kind: 'cannot', reason: 'x' }, SHOP_SECRET),
+      await signedPost(`${server.url}/v1/agent/result`, { app: 'shop', caseId: 7, kind: 'cannot', reason: 'x' }, taskKey()),
     ).toEqual({ status: 409, body: { error: 'task_cancelled' } })
     const done = { app: 'shop', caseId: 7, kind: 'done', version: 'v13' }
-    expect(await signedPost(`${server.url}/v1/agent/result`, done, SHOP_SECRET)).toEqual({ status: 200, body: { ok: true } })
-    expect(await signedPost(`${server.url}/v1/agent/result`, done, SHOP_SECRET)).toEqual({
+    expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({ status: 200, body: { ok: true } })
+    expect(await signedPost(`${server.url}/v1/agent/result`, done, taskKey())).toEqual({
       status: 409,
       body: { error: 'result_already_sent' },
     })
@@ -500,16 +503,38 @@ describe('команды агента через мост', () => {
 
   it('по случаю без задачи у моста — отказ; неверная подпись — отказ; врачу ничего', async () => {
     const { server } = await bridgeWithTask()
-    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 99 }, SHOP_SECRET)).toEqual({
-      status: 404,
-      body: { error: 'unknown_task' },
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 99 }, taskKey())).toEqual({
+      status: 401,
+      body: { error: 'bad_signature' },
     })
-    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'blog', caseId: 7 }, BLOG_SECRET)).toEqual({
-      status: 404,
-      body: { error: 'unknown_task' },
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'blog', caseId: 7 }, taskKey())).toEqual({
+      status: 401,
+      body: { error: 'bad_signature' },
     })
     expect((await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, 'wrong')).status).toBe(401)
     expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/'))).toEqual([])
+  })
+
+  it('команды агента подписаны ключом задачи из письма, а не секретом моста: секрет агенту не нужен', async () => {
+    const { server } = await bridgeWithTask()
+    const letter = paseo.letters[0]!.text
+    expect(letter).not.toContain(SHOP_SECRET)
+    for (const command of ['accept 7', 'case 7', 'done 7', 'cannot 7']) expect(letter).toContain(`remontnik-paseo ${command} --key ${taskKey()}`)
+
+    // Секрет моста на путях агента не годится: им подписывает только врач.
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+      status: 401,
+      body: { error: 'bad_signature' },
+    })
+    // Ключ задачи не годится на путях врача и для другого случая.
+    expect((await signedPost(`${server.url}/v1/tasks`, shopTask({ taskId: '01JBBBBBBBBBBBBBBBBBBBBBBB', caseId: 8 }), taskKey())).status).toBe(401)
+    expect(await signedPost(`${server.url}/v1/tasks`, shopTask({ taskId: '01JBBBBBBBBBBBBBBBBBBBBBBB', caseId: 8 }), SHOP_SECRET)).toMatchObject({ status: 200 })
+    await until(() => paseo.letters.length === 2)
+    expect((await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 8 }, taskKey())).status).toBe(401)
+    const secondKey = taskKeyFrom(paseo.letters[1]!.text)
+    expect(secondKey).not.toBe(taskKey())
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 8 }, secondKey)).toEqual({ status: 200, body: { ok: true } })
+    expect(await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, taskKey())).toEqual({ status: 200, body: { ok: true } })
   })
 
   it('«не смог» с длинной причиной — отказ; case отдаёт подробности врача', async () => {
@@ -517,11 +542,11 @@ describe('команды агента через мост', () => {
     const tooLong = await signedPost(
       `${server.url}/v1/agent/result`,
       { app: 'shop', caseId: 7, kind: 'cannot', reason: 'x'.repeat(1001) },
-      SHOP_SECRET,
+      taskKey(),
     )
     expect(tooLong).toEqual({ status: 400, body: { error: 'bad_request' } })
 
-    const details = await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)
+    const details = await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, taskKey())
     expect(details).toEqual({ status: 200, body: { case: { id: 7 } } })
   })
 
@@ -529,7 +554,7 @@ describe('команды агента через мост', () => {
     const { server } = await bridgeWithTask()
     shopDoctor.override = (method, path) =>
       method === 'GET' && path === '/v1/cases/7' ? { status: 200, body: { case: { id: 7, log: 'x'.repeat(300 * 1024) } } } : undefined
-    expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+    expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, taskKey())).toEqual({
       status: 502,
       body: { error: 'doctor_unreachable' },
     })
@@ -586,7 +611,7 @@ describe('подпись запроса и повторы', () => {
     const { server } = await bridgeFor()
     await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
     await until(() => paseo.letters.length === 1)
-    const moved = await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET, '/v1/agent/case')
+    const moved = await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, taskKey(), '/v1/agent/case')
     expect(moved).toEqual({ status: 401, body: { error: 'bad_signature' } })
     expect(shopDoctor.requests.filter((request) => request.path.startsWith('/v1/handoffs/'))).toEqual([])
   })
@@ -596,7 +621,7 @@ describe('подпись запроса и повторы', () => {
     const url = `${server.url}/v1/agent/accepted`
     await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
     await until(() => paseo.letters.length === 1)
-    const request = signedPostRequest(url, { app: 'shop', caseId: 7 }, SHOP_SECRET)
+    const request = signedPostRequest(url, { app: 'shop', caseId: 7 }, taskKey())
     expect(await send(url, request)).toEqual({ status: 200, body: { ok: true } })
     expect(await send(url, request)).toEqual({ status: 401, body: { error: 'replayed' } })
     expect(shopDoctor.requests.filter((r) => r.path === '/v1/handoffs/7/accepted')).toHaveLength(1)
@@ -607,9 +632,9 @@ describe('подпись запроса и повторы', () => {
     await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
     await until(() => paseo.letters.length === 1)
     shopDoctor.answerSigning = 'none'
-    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(502)
+    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, taskKey())).status).toBe(502)
     shopDoctor.answerSigning = 'foreign'
-    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(502)
+    expect((await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, taskKey())).status).toBe(502)
     expect(shopDoctor.requests.every((request) => request.signatureOk)).toBe(true)
   })
 
@@ -621,7 +646,7 @@ describe('подпись запроса и повторы', () => {
       await signedPost(`${server.url}/v1/tasks`, shopTask(), SHOP_SECRET)
       await until(() => paseo.letters.length === 1)
       shopDoctor.override = () => ({ status: 307, body: {}, headers: { location: `${elsewhere.url}/v1/cases/7` } })
-      expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).toEqual({
+      expect(await signedPost(`${server.url}/v1/agent/case`, { app: 'shop', caseId: 7 }, taskKey())).toEqual({
         status: 502,
         body: { error: 'doctor_unreachable' },
       })
@@ -648,7 +673,7 @@ describe('гонки', () => {
     await until(() => paseo.letters.length === 2)
     expect(paseo.letters[0]!.text).toContain('передаёт тебе случай')
     expect(paseo.letters[1]!.text).toContain('Остановись')
-    expect((await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, SHOP_SECRET)).status).toBe(409)
+    expect((await signedPost(`${server.url}/v1/agent/accepted`, { app: 'shop', caseId: 7 }, taskKey())).status).toBe(409)
   })
 
   it('одна задача двумя запросами сразу — одно письмо', async () => {

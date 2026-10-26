@@ -95,7 +95,8 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
       'content-type': type,
       'cache-control': 'no-store',
       'x-frame-options': 'DENY',
-      'referrer-policy': 'no-referrer',
+      // Не `no-referrer`: с ним браузер шлёт и со своей страницы `Origin: null`, а `null` — признак чужой.
+      'referrer-policy': 'same-origin',
       'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
       ...headers,
     })
@@ -109,6 +110,8 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
     log({ event: action === 'take' ? 'owner_took_control' : 'owner_released_control', profile })
   }
 
+  const sameOrigin = (request: IncomingMessage) => request.headers.origin === undefined || request.headers.origin === `http://${request.headers.host}`
+
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? '/', 'http://live.invalid')
     const profile = url.searchParams.get('profile') ?? ''
@@ -117,6 +120,13 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
       if (!PROFILE.test(profile)) return send(response, 400, 'нужен ?profile=', 'text/plain; charset=utf-8')
       const page = ownerSession(request) ? liveScreenPage(profile) : liveLoginPage(profile)
       return send(response, 200, page, 'text/html; charset=utf-8')
+    }
+
+    // POST шлёт только своя страница: форма или fetch с чужого сайта приходят с его Origin (или `null`) — отказ.
+    // Заголовка нет у консольных клиентов, у браузера на своей странице он равен адресу экрана.
+    if (request.method === 'POST' && !sameOrigin(request)) {
+      request.resume()
+      return send(response, 403, 'запрос с чужой страницы', 'text/plain; charset=utf-8')
     }
 
     if (request.method === 'POST' && url.pathname === '/live/login') {
@@ -228,8 +238,7 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
     if (url.pathname !== '/live/stream' || !PROFILE.test(profile)) return refuse(404, 'Not Found')
     if (!ownerSession(request)) return refuse(401, 'Unauthorized')
     // Поток открывает только своя страница: чужой сайт с куки владельца сюда не подключится.
-    const origin = request.headers.origin
-    if (origin !== undefined && origin !== `http://${request.headers.host}`) return refuse(403, 'Forbidden')
+    if (!sameOrigin(request)) return refuse(403, 'Forbidden')
     sockets.handleUpgrade(request, socket, head, (ws) => serveStream(ws, profile))
   })
 

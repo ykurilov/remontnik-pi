@@ -217,6 +217,25 @@ describe('check-config: окружение', () => {
     expect(warnings(missing).join('\n')).toMatch(/REMONTNIK_CONTROL_SECRET/)
   })
 
+  it('секреты: короче 32 знаков или секрет моста равен общему или владельца — ошибка, без значений в тексте', async () => {
+    const paseo = { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 }
+    const config = testRemontnikConfig({ handoff: { mode: 'paseo-first', paseo } })
+    const repoDir = appRepo({ config: { ...config, forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access } } })
+    const docker = fakeDocker(HEALTHY_DOCKER)
+    const gh = fakeGh(GOOD_RULESETS)
+    const bridgeEnv = (overrides: Record<string, string | undefined>) =>
+      serverEnv(repoDir, { TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_LISTEN: '10.0.0.1:7820', TEST_BRIDGE_SECRET: 'bridge-secret-for-check-config-tests', ...overrides })
+    expect(errors(await checkDoctorConfig(bridgeEnv({}), { docker, gh }))).toEqual([])
+
+    const same = errors(await checkDoctorConfig(bridgeEnv({ TEST_BRIDGE_SECRET: SHARED }), { docker, gh }))
+    expect(same).toEqual(['TEST_BRIDGE_SECRET совпадает с REMONTNIK_SHARED_SECRET'])
+    const owner = errors(await checkDoctorConfig(bridgeEnv({ TEST_BRIDGE_SECRET: OWNER }), { docker, gh }))
+    expect(owner).toEqual(['TEST_BRIDGE_SECRET совпадает с REMONTNIK_CONTROL_SECRET'])
+    const short = await checkDoctorConfig(bridgeEnv({ REMONTNIK_SHARED_SECRET: 'too-short-secret' }), { docker, gh })
+    expect(errors(short)).toEqual(['REMONTNIK_SHARED_SECRET короче 32 знаков'])
+    expect(JSON.stringify(short)).not.toContain('too-short-secret')
+  })
+
   it('ключи провайдеров eval из настройки нужны врачу', async () => {
     const config = testRemontnikConfig()
     const raw = {

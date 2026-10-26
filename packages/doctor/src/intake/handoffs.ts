@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, signResponse, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import { HANDOFF_COLLECTION, handoffKey, type Handoff, type HandoffResult } from '../handoff/index.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
-import { headerValue, readLimitedBody, refuse, type IntakeHandler } from './http-kit.js'
+import { claimNonce, headerValue, readLimitedBody, refuse, type IntakeHandler } from './http-kit.js'
 
 // Команды агента Paseo через мост (contracts/doctor-api.md): `POST /v1/handoffs/:caseId/accepted|result`.
 // Только на адресе частной сети и только с подписью моста; ответ подписан и привязан к разовой метке запроса.
@@ -146,8 +146,9 @@ export function createHandoffsHandler(options: HandoffsHandlerOptions): IntakeHa
       reply(request, response, { status: 401, body: { error: check.reason }, signed: false })
       return
     }
-    if (!replayGuard.firstSeen(headerValue(request, NONCE_HEADER)!, now())) {
-      reply(request, response, answer(401, { error: 'replayed' }))
+    const claimed = claimNonce(replayGuard, headerValue(request, NONCE_HEADER)!, now())
+    if (claimed) {
+      reply(request, response, answer(claimed.status, claimed.body))
       return
     }
     let body: unknown

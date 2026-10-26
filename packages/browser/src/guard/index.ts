@@ -1,6 +1,6 @@
 // Замки браузера: опасные действия, разрешённые сайты, сетевой замок изменяющих запросов, признаки капчи и кодов.
 // Решения — чистые функции; установка на контекст Chromium — installNetworkGuard.
-import type { BrowserContext, Frame, Page, Route } from 'playwright-core'
+import type { BrowserContext, Frame, Page, Request, Route, WebSocketRoute } from 'playwright-core'
 import type { SitePolicy } from '../policy/index.js'
 
 export const DANGER_KINDS = ['none', 'submit', 'send', 'pay', 'delete', 'publish'] as const
@@ -112,9 +112,11 @@ export interface RequestFacts {
   url: string
   isNavigation: boolean
   isMainFrame: boolean
+  /** На странице вписан пароль из хранилища: запросы на другие сайты закрыты, даже чтение. */
+  passwordOnPage?: boolean
 }
 
-export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation'
+export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak'
 export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string }
 
 export function describeRequest(method: string, url: string): string {
@@ -132,6 +134,11 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
     const where = originOf(request.url) ?? 'адрес без сайта'
     return { allow: false, code: 'refused_mutation', reason: `${describeRequest(request.method, request.url)} на ${where} вне allowedMutations` }
   }
+  // Скрипт страницы прочитал бы вписанный пароль и унёс его в адресе картинки или скрипта с другого сайта.
+  const origin = originOf(request.url)
+  if (request.passwordOnPage && origin !== null && !policy.allowedOrigins.includes(origin)) {
+    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: на странице пароль, сайт вне allowedOrigins` }
+  }
   return { allow: true }
 }
 
@@ -140,12 +147,37 @@ export interface BlockedRequest {
   reason: string
 }
 
+export interface NetworkGuard {
+  /**
+   * На странице вписан пароль: до новой страницы (не смены адреса в той же странице) запросы и WebSocket на сайты
+   * вне allowedOrigins закрыты.
+   */
+  passwordFilled(page: Page): void
+}
+
+/** Адрес WebSocket как адрес сайта: `ws:` — `http:`, `wss:` — `https:`. */
+function webSocketSite(url: string): string {
+  return url.replace(/^ws(s?):/i, 'http$1:')
+}
+
 /** Ставит сетевой замок на весь контекст: действует и для врача, и при ручном управлении владельца. */
 export async function installNetworkGuard(
   context: BrowserContext,
   policy: SitePolicy,
   onBlocked: (blocked: BlockedRequest) => void,
-): Promise<void> {
+): Promise<NetworkGuard> {
+  /** Страницы с вписанным паролем; значение — с тех пор ушёл запрос нового документа верхнего фрейма. */
+  const locked = new Map<Page, { newDocument: boolean }>()
+  const pageOf = (request: Request): Page | undefined => {
+    try {
+      return request.frame().page()
+    } catch {
+      return undefined
+    }
+  }
+  // Запрос не из страницы (служебный работник) считается со страницей с паролем, если такая есть: строже.
+  const passwordOn = (page: Page | undefined) => (page ? locked.has(page) : locked.size > 0)
+
   await context.route('**/*', async (route: Route) => {
     const request = route.request()
     let isMainFrame = false
@@ -155,11 +187,18 @@ export async function installNetworkGuard(
       // Запрос не из страницы (служебный работник): считаем верхним уровнем — строже.
       isMainFrame = true
     }
+    const page = pageOf(request)
     const decision = decideRequest(
-      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame },
+      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, passwordOnPage: passwordOn(page) },
       policy,
     )
-    if (decision.allow) return route.fallback()
+    if (decision.allow) {
+      if (page && isMainFrame && request.isNavigationRequest()) {
+        const lock = locked.get(page)
+        if (lock) lock.newDocument = true
+      }
+      return route.fallback()
+    }
     onBlocked({ code: decision.code, reason: decision.reason })
     if (request.isNavigationRequest()) return route.abort('blockedbyclient')
     return route.fulfill({
@@ -168,6 +207,40 @@ export async function installNetworkGuard(
       body: JSON.stringify({ error: 'запрос заблокирован Ремонтником' }),
     })
   })
+
+  // WebSocket — через замок с самого начала: сокет на другой сайт, открытый до пароля, закрывается, как только
+  // пароль вписан, иначе скрипт отправил бы пароль по уже открытому сокету. Рабочая вкладка в контексте одна.
+  const foreignSockets = new Set<WebSocketRoute>()
+  const closeForeign = (socket: WebSocketRoute) => {
+    foreignSockets.delete(socket)
+    onBlocked({ code: 'refused_leak', reason: `WebSocket на ${originOf(webSocketSite(socket.url())) ?? 'адрес без сайта'}: на странице пароль, сайт вне allowedOrigins` })
+    void socket.close({ code: 1008, reason: 'blocked' }).catch(() => {})
+  }
+  await context.routeWebSocket(/.*/, (socket: WebSocketRoute) => {
+    if (isAllowedOrigin(webSocketSite(socket.url()), policy.allowedOrigins)) {
+      socket.connectToServer()
+      return
+    }
+    foreignSockets.add(socket)
+    socket.onClose(() => foreignSockets.delete(socket))
+    if (locked.size > 0) return closeForeign(socket)
+    socket.connectToServer()
+  })
+
+  const watched = new WeakSet<Page>()
+  return {
+    passwordFilled(page) {
+      locked.set(page, { newDocument: false })
+      for (const socket of [...foreignSockets]) closeForeign(socket)
+      if (watched.has(page)) return
+      watched.add(page)
+      // Смена адреса внутри страницы (history API) запроса документа не шлёт — замок остаётся до новой страницы.
+      page.on('framenavigated', (frame) => {
+        if (frame === page.mainFrame() && locked.get(page)?.newDocument) locked.delete(page)
+      })
+      page.on('close', () => locked.delete(page))
+    },
+  }
 }
 
 const CAPTCHA_SELECTORS = [

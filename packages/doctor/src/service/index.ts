@@ -232,7 +232,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
         : createPaseoBridgeClient({ url: options.paseoBridge.url, secret: bridgeAccess.secret, appName: bridgeAccess.appName })
       : undefined
   // До открытия хранилища: равные секреты — приложение получило бы права владельца.
-  assertOwnerSecrets({ secret: options.sharedSecret, controlSecret: options.controlSecret })
+  assertOwnerSecrets({ secret: options.sharedSecret, controlSecret: options.controlSecret, bridgeSecret: bridgeAccess?.secret })
   const log = options.log ?? ((line: string) => console.error(line))
   const exit = options.exit ?? ((code: number) => process.exit(code))
   const now = options.now ?? Date.now

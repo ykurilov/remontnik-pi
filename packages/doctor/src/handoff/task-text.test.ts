@@ -35,7 +35,7 @@ function letterOf(body: HandoffTaskBody): string {
     summary: body.summary,
     untrusted: body.untrusted,
     links: body.links,
-  })
+  }, 'a'.repeat(64))
 }
 
 /** Строки письма вне блока данных: шаблон моста и поля, которые мост пишет как есть. */
