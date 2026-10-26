@@ -1,9 +1,10 @@
 // Снимок страницы с номерами элементов. Номера — встроенные в закреплённый playwright-core
 // (`ariaSnapshotJSON({ mode: 'ai' })`, `getByRef`); значения полей пароля скрываем сами.
 import type { ElementHandle, Page } from 'playwright-core'
-import { type FieldMark, type SnapshotNode, fieldRefs, renderSnapshot, snapshotText } from './render.js'
+import { isFrameAllowed } from '../guard/index.js'
+import { type FieldMark, type SnapshotNode, fieldNodes, renderSnapshot, snapshotText } from './render.js'
 
-export { type FieldMark, type SnapshotNode, fieldRefs, renderSnapshot, snapshotText } from './render.js'
+export { type FieldMark, type SnapshotNode, fieldNodes, fieldRefs, renderSnapshot, snapshotText } from './render.js'
 
 /**
  * Поля, значение которых не показывается никогда: были полем пароля хоть в одном снимке
@@ -61,10 +62,39 @@ export interface PageSnapshot {
 
 const PASSWORD_AUTOCOMPLETE = /\b(?:current|new)-password\b/i
 
-export async function takeSnapshot(page: Page, fields: SensitiveFields): Promise<PageSnapshot> {
+export interface SnapshotOptions {
+  allowedOrigins: readonly string[]
+  /** Сохранённые пароли: поле с таким значением скрыто, даже если сайт пересоздал его без метки. */
+  secrets: () => readonly string[]
+}
+
+export const HIDDEN_FRAME = 'скрыт: сайт вне allowedOrigins'
+
+/** Фреймы чужих сайтов (и всё внутри них) не попадают к врачу: остаётся только пометка. */
+async function hideForeignFrames(page: Page, nodes: ReadonlyArray<SnapshotNode | string>, allowedOrigins: readonly string[]): Promise<void> {
+  for (const node of nodes) {
+    if (typeof node === 'string') continue
+    if (node.role === 'iframe' && node.ref) {
+      const handle = await page.getByRef(node.ref).elementHandle({ timeout: 2000 }).catch(() => null)
+      const frame = await handle?.contentFrame().catch(() => null)
+      await handle?.dispose()
+      if (!frame || !isFrameAllowed(frame, allowedOrigins)) {
+        node.children = []
+        node['фрейм'] = HIDDEN_FRAME
+        continue
+      }
+    }
+    if (node.children) await hideForeignFrames(page, node.children, allowedOrigins)
+  }
+}
+
+export async function takeSnapshot(page: Page, fields: SensitiveFields, options: SnapshotOptions): Promise<PageSnapshot> {
   const nodes = (await page.ariaSnapshotJSON({ mode: 'ai', timeout: 10_000 })) as unknown as Array<SnapshotNode | string>
+  await hideForeignFrames(page, nodes, options.allowedOrigins)
+  const secrets = options.secrets()
   const marks = new Map<string, FieldMark>()
-  for (const ref of fieldRefs(nodes)) {
+  for (const node of fieldNodes(nodes)) {
+    const ref = node.ref!
     const handle = await page
       .getByRef(ref)
       .elementHandle({ timeout: 2000 })
@@ -75,9 +105,13 @@ export async function takeSnapshot(page: Page, fields: SensitiveFields): Promise
       continue
     }
     let kept = false
-    const facts = await handle.evaluate((element) => ({ type: element.getAttribute('type'), autocomplete: element.getAttribute('autocomplete') }))
-    if (facts.type?.toLowerCase() === 'password' || PASSWORD_AUTOCOMPLETE.test(facts.autocomplete ?? '')) {
-      kept = await fields.mark(handle, 'password')
+    if (typeof node.text === 'string' && secrets.some((secret) => node.text!.includes(secret))) {
+      kept = await fields.mark(handle, 'filled')
+    } else {
+      const facts = await handle.evaluate((element) => ({ type: element.getAttribute('type'), autocomplete: element.getAttribute('autocomplete') }))
+      if (facts.type?.toLowerCase() === 'password' || PASSWORD_AUTOCOMPLETE.test(facts.autocomplete ?? '')) {
+        kept = await fields.mark(handle, 'password')
+      }
     }
     const kind = await fields.kindOf(handle)
     if (kind) marks.set(ref, kind)

@@ -14,8 +14,6 @@ export interface ProfileSession {
   readonly fields: SensitiveFields
   /** Заблокированные запросы с последнего вызова: действие по ним понимает, что его остановил замок. */
   takeBlocked(): BlockedRequest[]
-  /** Последняя найденная проверка человеком (капча, код), null — нет. */
-  humanCheck: string | null
 }
 
 export interface Profiles {
@@ -74,7 +72,6 @@ export function createProfiles(options: {
       context,
       page,
       fields: createSensitiveFields(),
-      humanCheck: null,
       takeBlocked() {
         const taken = blocked
         blocked = []

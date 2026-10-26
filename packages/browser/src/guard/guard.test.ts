@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { checkDanger, decideRequest, detectHumanCheck, isAllowedOrigin, matchesMutation } from './index.js'
+import { checkDanger, dangerInText, decideRequest, detectHumanCheck, isAllowedOrigin, isLoginOrigin, isAllowedFrameUrl, matchesMutation } from './index.js'
 
 const policy = {
   allowedOrigins: ['https://app.example.com', 'http://127.0.0.1:4100'],
@@ -61,9 +61,55 @@ describe('сетевой замок', () => {
     expect(decideRequest(request('GET', 'https://evil.example.com/', true), policy)).toMatchObject({ allow: false, code: 'refused_origin' })
     expect(decideRequest(request('GET', 'about:blank', true), policy)).toEqual({ allow: true })
     expect(decideRequest(request('GET', 'data:text/html,hi', true), policy)).toMatchObject({ allow: false, code: 'refused_origin' })
-    expect(decideRequest({ method: 'GET', url: 'https://widget.example.com/frame', isNavigation: true, isMainFrame: false }, policy)).toEqual({
-      allow: true,
-    })
+    const frame = (url: string) => ({ method: 'GET', url, isNavigation: true, isMainFrame: false })
+    expect(decideRequest(frame('https://widget.example.com/frame'), policy)).toMatchObject({ allow: false, code: 'refused_frame' })
+    expect(decideRequest(frame('https://app.example.com/frame'), policy)).toEqual({ allow: true })
+    expect(decideRequest(frame('about:blank'), policy)).toEqual({ allow: true })
+  })
+
+  it('фрейм виден врачу, только если он и все его родители — с разрешённых сайтов', () => {
+    const origins = policy.allowedOrigins
+    expect(isAllowedFrameUrl(['https://app.example.com/frame', 'https://app.example.com/'], origins)).toBe(true)
+    expect(isAllowedFrameUrl(['https://evil.example.com/', 'https://app.example.com/'], origins)).toBe(false)
+    expect(isAllowedFrameUrl(['about:blank', 'https://app.example.com/'], origins)).toBe(true)
+    expect(isAllowedFrameUrl(['about:srcdoc', 'https://app.example.com/'], origins)).toBe(true)
+    expect(isAllowedFrameUrl(['about:blank', 'https://evil.example.com/', 'https://app.example.com/'], origins)).toBe(false)
+    expect(isAllowedFrameUrl(['data:text/html,hi', 'https://app.example.com/'], origins)).toBe(false)
+    expect(isAllowedFrameUrl(['chrome-error://chromewebdata/', 'https://app.example.com/'], origins)).toBe(false)
+  })
+})
+
+describe('опасное по самому элементу, а не по слову модели', () => {
+  it.each([
+    ['Оплатить тариф Про', 'pay'],
+    ['Купить сейчас', 'pay'],
+    ['Pay now', 'pay'],
+    ['Proceed to checkout', 'pay'],
+    ['Удалить аккаунт', 'delete'],
+    ['Delete account', 'delete'],
+    ['/api/account/delete', 'delete'],
+    ['Опубликовать пост', 'publish'],
+    ['Publish', 'publish'],
+    ['Отправить сообщение', 'send'],
+    ['Send message', 'send'],
+  ])('«%s» → %s', (text, kind) => {
+    expect(dangerInText(text)).toBe(kind)
+  })
+
+  it.each(['Войти', 'Отправить', 'Показать пароль', 'Сохранить настройки', 'Кабинет', ''])('«%s» — не опасно', (text) => {
+    expect(dangerInText(text)).toBeNull()
+  })
+})
+
+describe('сайт входа для fill-password', () => {
+  it('только точный origin входа и только https, кроме локального адреса', () => {
+    expect(isLoginOrigin('https://app.example.com/login', 'https://app.example.com')).toBe(true)
+    expect(isLoginOrigin('https://evil.app.example.com/login', 'https://app.example.com')).toBe(false)
+    expect(isLoginOrigin('https://app.example.com:8443/login', 'https://app.example.com')).toBe(false)
+    expect(isLoginOrigin('http://app.example.com/login', 'http://app.example.com')).toBe(false)
+    expect(isLoginOrigin('http://127.0.0.1:4100/login', 'http://127.0.0.1:4100')).toBe(true)
+    expect(isLoginOrigin('http://localhost:4100/login', 'http://localhost:4100')).toBe(true)
+    expect(isLoginOrigin('not a url', 'https://app.example.com')).toBe(false)
   })
 })
 

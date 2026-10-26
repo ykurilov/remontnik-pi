@@ -1,13 +1,15 @@
 // Хранилище сохранённых входов: пароли зашифрованы AES-256-GCM ключом из окружения контейнера браузера.
 // Пароль приходит только потоком стандартного ввода и уходит только в поле пароля (fill-password).
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 export { createOutputFilter, type OutputFilter } from './output-filter.js'
 
 const ALGORITHM = 'aes-256-gcm'
 const KEY_CHECK_TEXT = 'remontnik-browser-vault'
+/** Короче — фильтр выхода резал бы случайные совпадения в любом тексте и не мог бы надёжно найти пароль. */
+export const MIN_PASSWORD_LENGTH = 8
 
 export class VaultKeyError extends Error {
   constructor() {
@@ -91,6 +93,7 @@ export async function readPasswordFromStdin(input: AsyncIterable<Uint8Array | st
   for await (const chunk of input) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk))
   const password = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '')
   if (password === '') throw new Error('пароль пуст: передайте его в стандартный ввод')
+  if ([...password].length < MIN_PASSWORD_LENGTH) throw new Error(`пароль короче ${MIN_PASSWORD_LENGTH} знаков не сохраняется: фильтр выхода не смог бы надёжно его скрыть`)
   return password
 }
 
@@ -117,6 +120,14 @@ export function openLoginVault(options: { file: string; key: Buffer }): LoginVau
     if (unseal(key, stored.keyCheck, 'key-check') !== KEY_CHECK_TEXT) throw new VaultKeyError()
     return stored
   }
+
+  // Файл всегда заменяется целиком (rename): новый inode, время и размер — надёжный признак смены.
+  const fileVersion = () => {
+    if (!existsSync(file)) return 'none'
+    const stats = statSync(file)
+    return `${stats.ino}:${stats.mtimeMs}:${stats.size}`
+  }
+  let cachedPasswords: { version: string; passwords: string[] } | null = null
 
   function save(vault: StoredVault): void {
     mkdirSync(dirname(file), { recursive: true })
@@ -161,7 +172,12 @@ export function openLoginVault(options: { file: string; key: Buffer }): LoginVau
       return { entry: summary(entry), password: unseal(key, entry.secret, entryContext(entry)) }
     },
     knownPasswords() {
-      return load().entries.map((entry) => unseal(key, entry.secret, entryContext(entry)))
+      // Фильтр зовёт это на каждый ответ и строку журнала: расшифровываем заново, только если файл сменился.
+      const version = fileVersion()
+      if (!cachedPasswords || cachedPasswords.version !== version) {
+        cachedPasswords = { version, passwords: load().entries.map((entry) => unseal(key, entry.secret, entryContext(entry))) }
+      }
+      return cachedPasswords.passwords
     },
   }
 }

@@ -6,7 +6,8 @@ import { isIP } from 'node:net'
 import type { Duplex } from 'node:stream'
 import { WebSocketServer, type WebSocket } from 'ws'
 import type { ServiceLog } from '../log.js'
-import { sameToken } from '../service/index.js'
+import { createAttemptLimiter } from '../attempts.js'
+import { clientAddress, sameToken } from '../service/index.js'
 import { type ControlLock, handleOwnerInput } from './control.js'
 import { liveLoginPage, liveScreenPage } from './page/index.js'
 import type { LiveTargets } from './stream.js'
@@ -88,7 +89,7 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
   if (sameToken(ownerToken, doctorToken)) throw new Error('ключ владельца совпадает с ключом врача: нужен отдельный')
 
   const sessions = new Map<string, number>()
-  const failures: number[] = []
+  const failures = createAttemptLimiter({ limit: LOGIN_ATTEMPTS_PER_MINUTE, windowMs: 60_000 })
 
   const ownerSession = (request: IncomingMessage) => {
     const id = cookieOf(request, SESSION_COOKIE)
@@ -114,10 +115,10 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
   }
   const json = (response: ServerResponse, status: number, body: unknown) => send(response, status, JSON.stringify(body), 'application/json; charset=utf-8')
 
-  function tooManyFailures(): boolean {
-    const minuteAgo = Date.now() - 60_000
-    while (failures.length > 0 && failures[0]! < minuteAgo) failures.shift()
-    return failures.length >= LOGIN_ATTEMPTS_PER_MINUTE
+  function setControl(profile: string, action: 'take' | 'release'): void {
+    if (action === 'take') control.take(profile)
+    else control.release(profile)
+    log({ event: action === 'take' ? 'owner_took_control' : 'owner_released_control', profile })
   }
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -131,11 +132,13 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
     }
 
     if (request.method === 'POST' && url.pathname === '/live/login') {
-      if (tooManyFailures()) return send(response, 429, liveLoginPage('', 'Слишком много попыток. Подождите минуту.'), 'text/html; charset=utf-8')
+      // Счёт по адресу клиента: чужие ошибки в той же сети не закрывают вход владельцу.
+      const client = clientAddress(request)
+      if (failures.blocked(client)) return send(response, 429, liveLoginPage('', 'Слишком много попыток. Подождите минуту.'), 'text/html; charset=utf-8')
       const form = new URLSearchParams(await readBody(request))
       const loginProfile = PROFILE.test(form.get('profile') ?? '') ? form.get('profile')! : ''
       if (!sameToken(form.get('token') ?? '', ownerToken)) {
-        failures.push(Date.now())
+        failures.fail(client)
         log({ event: 'live_login_refused' })
         return send(response, 401, liveLoginPage(loginProfile, 'Ключ не подошёл.'), 'text/html; charset=utf-8')
       }
@@ -157,9 +160,7 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
       if (typeof body.profile !== 'string' || !PROFILE.test(body.profile) || (body.action !== 'take' && body.action !== 'release')) {
         return json(response, 400, { ok: false, code: 'bad_request', message: '{ profile, action: "take" | "release" }' })
       }
-      if (body.action === 'take') control.take(body.profile)
-      else control.release(body.profile)
-      log({ event: body.action === 'take' ? 'owner_took_control' : 'owner_released_control', profile: body.profile })
+      setControl(body.profile, body.action)
       return json(response, 200, { ok: true, holder: control.holder(body.profile) })
     }
 
@@ -206,6 +207,11 @@ export async function createLiveScreen(options: LiveScreenOptions): Promise<Live
             // ниже — отказ bad_request
           }
           inputQueue = inputQueue.then(async () => {
+            const message = input as { type?: unknown; action?: unknown } | null
+            if (message?.type === 'control' && (message.action === 'take' || message.action === 'release')) {
+              setControl(profile, message.action)
+              return void sendState()
+            }
             const result = await handleOwnerInput(control, profile, input, target).catch(() => ({ ok: false as const, code: 'internal', message: 'ввод не прошёл' }))
             if (!result.ok && socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: 'refused', code: result.code, message: result.message }))
           })

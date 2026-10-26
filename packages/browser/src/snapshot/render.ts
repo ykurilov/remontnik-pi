@@ -59,17 +59,19 @@ export function renderSnapshot(nodes: ReadonlyArray<SnapshotNode | string>, mark
   return lines.join('\n')
 }
 
-/** Номера всех полей ввода, включая фреймы: их надо проверить на «поле пароля». */
-export function fieldRefs(nodes: ReadonlyArray<SnapshotNode | string>): string[] {
-  const refs: string[] = []
+/** Все поля ввода с номерами, включая фреймы: их надо проверить на «поле пароля». */
+export function fieldNodes(nodes: ReadonlyArray<SnapshotNode | string>): SnapshotNode[] {
+  const found: SnapshotNode[] = []
   const visit = (node: SnapshotNode | string) => {
     if (typeof node === 'string') return
-    if (node.ref && FIELD_ROLES.has(node.role)) refs.push(node.ref)
+    if (node.ref && FIELD_ROLES.has(node.role)) found.push(node)
     node.children?.forEach(visit)
   }
   nodes.forEach(visit)
-  return refs
+  return found
 }
+
+export const fieldRefs = (nodes: ReadonlyArray<SnapshotNode | string>): string[] => fieldNodes(nodes).map((node) => node.ref!)
 
 /** Видимый текст снимка без значений скрытых полей — для поиска признаков капчи и кодов. */
 export function snapshotText(nodes: ReadonlyArray<SnapshotNode | string>, marks: ReadonlyMap<string, FieldMark> = new Map()): string {

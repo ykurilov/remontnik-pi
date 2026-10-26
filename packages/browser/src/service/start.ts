@@ -10,7 +10,8 @@ import { createProfiles } from '../profiles/index.js'
 import { createOutputFilter, loginVaultPath, openLoginVault, parseVaultKey } from '../vault/index.js'
 import { createBrowserHttpServer } from './index.js'
 
-export const DEFAULT_BROWSER_LISTEN = '0.0.0.0:7700'
+/** Только петля; «все адреса» (`0.0.0.0`, нужно в контейнере) — только явно через REMONTNIK_BROWSER_LISTEN. */
+export const DEFAULT_BROWSER_LISTEN = '127.0.0.1:7700'
 
 export interface BrowserServiceOptions {
   token: string

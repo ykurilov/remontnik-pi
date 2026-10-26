@@ -3,6 +3,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
+import type { Page } from '@playwright/test'
 import { DEMO_LOGIN, DEMO_PASSWORD } from '../../../../apps/patient/src/auth/sessions.ts'
 import { startBrowserService } from '../../src/service/start.js'
 import { loginVaultPath, openLoginVault } from '../../src/vault/index.js'
@@ -66,7 +67,25 @@ export async function startTestBrowser(options: { live?: boolean } = {}) {
     return JSON.parse(text) as BrowserResult
   }
 
-  return { patientUrl, dataDir, entryId: entry.id, foreignEntryId: foreignEntry.id, call, logs, outputs, service, close: () => service.close() }
+  /** Владелец через живой экран: вход по ключу владельца и «Взять управление» / «Вернуть». */
+  async function ownerControl(action: 'take' | 'release'): Promise<void> {
+    if (!service.liveUrl) throw new Error('живой экран не включён: startTestBrowser({ live: true })')
+    const login = await fetch(`${service.liveUrl}/live/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: OWNER_TOKEN, profile: PROFILE }),
+      redirect: 'manual',
+    })
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? ''
+    const response = await fetch(`${service.liveUrl}/live/control`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: PROFILE, action }),
+    })
+    if (!response.ok) throw new Error(`живой экран ответил ${response.status}`)
+  }
+
+  return { patientUrl, dataDir, entryId: entry.id, foreignEntryId: foreignEntry.id, call, ownerControl, logs, outputs, service, close: () => service.close() }
 }
 
 /** Номер элемента по роли и имени из снимка; пустое имя — элемент без подписи. */
@@ -80,4 +99,24 @@ export function refOf(snapshot: string | undefined, role: string, name: string):
 
 export function countOccurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1
+}
+
+/** Сколько пикселей снимка экрана залито маской (пурпурный цвет Playwright). */
+export async function maskedPixels(page: Page, jpeg: Buffer): Promise<number> {
+  await page.setContent(`<img id="shot" src="data:image/jpeg;base64,${jpeg.toString('base64')}">`)
+  return page.evaluate(async () => {
+    const image = document.querySelector<HTMLImageElement>('#shot')!
+    await image.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth
+    canvas.height = image.naturalHeight
+    const context = canvas.getContext('2d')!
+    context.drawImage(image, 0, 0)
+    const { data } = context.getImageData(0, 0, canvas.width, canvas.height)
+    let magenta = 0
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index]! > 200 && data[index + 1]! < 80 && data[index + 2]! > 200) magenta++
+    }
+    return magenta
+  })
 }

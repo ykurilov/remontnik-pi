@@ -87,7 +87,49 @@ describe('хранилище входов', () => {
   })
 })
 
+describe('хранилище входов: короткие пароли и кэш', () => {
+  it('пароль короче 8 знаков не сохраняется: фильтр выхода не смог бы надёжно его вырезать', async () => {
+    const { vault } = freshVault()
+    await expect(vault.add({ site: 'https://app.example.com', login: 'a@example.com', profile: 'remontnik' }, stdinWith('1234567'))).rejects.toThrow(/8/)
+    expect(vault.list()).toEqual([])
+  })
+
+  it('пароли для фильтра берутся из памяти, но изменение файла другим процессом видно сразу', async () => {
+    const { vault, file, key } = freshVault()
+    await vault.add({ site: 'https://app.example.com', login: 'a@example.com', profile: 'remontnik' }, stdinWith('first-password'))
+    expect(vault.knownPasswords()).toEqual(['first-password'])
+    expect(vault.knownPasswords()).toBe(vault.knownPasswords())
+    await openLoginVault({ file, key }).add({ site: 'https://b.example.com', login: 'b@example.com', profile: 'remontnik' }, stdinWith('second-password'))
+    expect(vault.knownPasswords()).toEqual(['first-password', 'second-password'])
+  })
+})
+
 describe('фильтр выхода', () => {
+  it('ловит пароль в схлопнутых пробелах, HTML, hex, base64url и URL-кодировании любого регистра', () => {
+    const secret = 'p@ss  word/+"<7&'
+    const filter = createOutputFilter(() => [secret])
+    const bytes = Buffer.from(secret)
+    const percentAll = [...bytes].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('')
+    const html = secret.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')
+    const forms = [
+      secret.replace(/\s+/g, ' '),
+      html,
+      secret.replace(/&/g, '&#38;').replace(/</g, '&#60;').replace(/"/g, '&#34;'),
+      bytes.toString('hex'),
+      bytes.toString('hex').toUpperCase(),
+      bytes.toString('base64url'),
+      bytes.toString('base64').replace(/=+$/, ''),
+      encodeURIComponent(secret).toLowerCase(),
+      percentAll,
+      percentAll.toUpperCase(),
+    ]
+    for (const form of forms) expect(filter.text(`[${form}]`), form).toBe('[[пароль скрыт]]')
+  })
+
+  it('короткий пароль из старого хранилища тоже вырезается', () => {
+    expect(createOutputFilter(() => ['abc']).text('x abc y')).toBe('x [пароль скрыт] y')
+  })
+
   it('вырезает сохранённые пароли из текста и из любых значений, в том числе в кодировках', async () => {
     const { vault } = freshVault()
     const secret = 'p@ss word/+"7'

@@ -29,7 +29,7 @@ function fakeTargets(): LiveTargets & { emit(frame: LiveFrame): void } {
   }
 }
 
-async function startLive(env: Record<string, string | undefined>, targets = fakeTargets()) {
+async function startLive(env: Record<string, string | undefined>, targets: LiveTargets = fakeTargets()) {
   const live = await startLiveScreen(env, { control: createControlLock(), targets, doctorToken: DOCTOR_TOKEN, log: () => {} })
   if (live) opened.push(live)
   return live
@@ -53,10 +53,13 @@ async function ownerCookie(live: LiveScreen): Promise<string> {
 
 function connectStream(live: LiveScreen, headers: Record<string, string>) {
   const socket = new WebSocket(`${live.url.replace('http', 'ws')}/live/stream?profile=remontnik`, { headers })
-  return new Promise<{ opened: boolean; status?: number; socket: WebSocket }>((resolve) => {
-    socket.once('open', () => resolve({ opened: true, socket }))
-    socket.once('unexpected-response', (_request, response) => resolve({ opened: false, status: response.statusCode, socket }))
-    socket.once('error', () => resolve({ opened: false, socket }))
+  // Сообщения копятся с самого подключения: первое состояние может прийти раньше, чем тест повесит слушателя.
+  const messages: Array<{ type?: string; holder?: string }> = []
+  socket.on('message', (data) => messages.push(JSON.parse(String(data))))
+  return new Promise<{ opened: boolean; status?: number; socket: WebSocket; messages: typeof messages }>((resolve) => {
+    socket.once('open', () => resolve({ opened: true, socket, messages }))
+    socket.once('unexpected-response', (_request, response) => resolve({ opened: false, status: response.statusCode, socket, messages }))
+    socket.once('error', () => resolve({ opened: false, socket, messages }))
   })
 }
 
@@ -161,6 +164,36 @@ describe('живой экран: доступ', () => {
     )
     targets.emit({ data: 'ZnJhbWU=', width: 1280, height: 800 })
     expect(JSON.parse(await message)).toMatchObject({ type: 'frame', data: 'ZnJhbWU=' })
+    stream.socket.close()
+  })
+
+  it('«Взять» и «Вернуть» по потоку идут строго после уже отправленного ввода', async () => {
+    const dispatched: unknown[] = []
+    const targets: LiveTargets = {
+      open: async () => ({
+        subscribe: () => () => {},
+        dispatch: async (input) => {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          dispatched.push(input)
+        },
+      }),
+    }
+    const live = (await startLive(liveEnv, targets))!
+    const stream = await connectStream(live, { cookie: await ownerCookie(live), origin: live.url })
+    const holders = () => stream.messages.filter((message) => message.type === 'control').map((message) => message.holder)
+    // Поток готов принимать ввод, когда пришло первое состояние управления.
+    await expect.poll(() => holders().length).toBeGreaterThan(0)
+    stream.socket.send(JSON.stringify({ type: 'control', action: 'take' }))
+    for (const text of ['П', 'р', 'и']) stream.socket.send(JSON.stringify({ type: 'text', text }))
+    stream.socket.send(JSON.stringify({ type: 'key', key: 'Enter' }))
+    stream.socket.send(JSON.stringify({ type: 'control', action: 'release' }))
+    await expect.poll(() => holders().at(-1) === 'doctor' && holders().includes('owner')).toBe(true)
+    expect(dispatched).toEqual([
+      { type: 'text', text: 'П' },
+      { type: 'text', text: 'р' },
+      { type: 'text', text: 'и' },
+      { type: 'key', key: 'Enter' },
+    ])
     stream.socket.close()
   })
 

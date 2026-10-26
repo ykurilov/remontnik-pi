@@ -1,5 +1,6 @@
 # Браузер Ремонтника: служба врача и живой экран владельца. Только Chromium, прокси нет, пока не задан в профиле.
 # Сборка из корня репозитория: docker build -f deploy/browser.Dockerfile -t remontnik-browser .
+# Порт 7700 — только во внутреннюю сеть compose или на частный адрес (`-p 10.0.0.5:7700:7700`), не на все адреса хоста.
 FROM node:22-bookworm-slim AS build
 WORKDIR /src
 RUN corepack enable
@@ -12,6 +13,7 @@ FROM node:22-bookworm-slim
 ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     REMONTNIK_BROWSER_DATA_DIR=/data \
+    REMONTNIK_BROWSER_LISTEN=0.0.0.0:7700 \
     REMONTNIK_BROWSER_POLICY=/config/browser-policy.json
 COPY --from=build /app /app
 # Безголовый Chromium той же сборки, что ждёт закреплённый playwright-core, и системные библиотеки к нему.

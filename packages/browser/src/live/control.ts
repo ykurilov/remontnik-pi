@@ -14,10 +14,13 @@ export interface ControlLock {
   /** Любой знак жизни владельца: сообщение, ответ на пинг, запрос. */
   ownerSeen(profile: string): void
   holder(profile: string): ControlHolder
+  /** Сколько раз владелец сам нажал «Вернуть»: после этого проверка человеком считается пройденной. */
+  releases(profile: string): number
 }
 
 interface ProfileControl {
   taken: boolean
+  releases: number
   connections: number
   lastSeen: number
 }
@@ -34,7 +37,7 @@ export function createControlLock(options: { now?: () => number; silenceLimitMs?
 
   const stateOf = (profile: string) => {
     let state = profiles.get(profile)
-    if (!state) profiles.set(profile, (state = { taken: false, connections: 0, lastSeen: now() }))
+    if (!state) profiles.set(profile, (state = { taken: false, releases: 0, connections: 0, lastSeen: now() }))
     expire(state)
     return state
   }
@@ -46,7 +49,9 @@ export function createControlLock(options: { now?: () => number; silenceLimitMs?
       state.lastSeen = now()
     },
     release(profile) {
-      stateOf(profile).taken = false
+      const state = stateOf(profile)
+      if (state.taken) state.releases += 1
+      state.taken = false
     },
     ownerConnected(profile) {
       const state = stateOf(profile)
@@ -69,6 +74,7 @@ export function createControlLock(options: { now?: () => number; silenceLimitMs?
       expire(state)
       return state.taken ? 'owner' : 'doctor'
     },
+    releases: (profile) => profiles.get(profile)?.releases ?? 0,
   }
 }
 

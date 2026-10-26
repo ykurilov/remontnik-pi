@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { expect, test } from '@playwright/test'
-import { DEMO_LOGIN, DEMO_PASSWORD, countOccurrences, refOf, startTestBrowser } from './helpers.js'
+import { DEMO_LOGIN, DEMO_PASSWORD, countOccurrences, maskedPixels, refOf, startTestBrowser } from './helpers.js'
 
 // SC-010: пароль сохранённого входа не встречается ни в одном снимке, ответе или журнале.
 test('вход по сохранённому входу, «глаз», смена типа поля, снимки — пароль не утёк', async ({ page }) => {
@@ -45,23 +45,7 @@ test('вход по сохранённому входу, «глаз», смен�
     const jpeg = readFileSync(shot.path!)
     expect(jpeg.subarray(0, 2).toString('hex')).toBe('ffd8')
     expect(countOccurrences(jpeg.toString('latin1'), DEMO_PASSWORD)).toBe(0)
-    await page.setContent(`<img id="shot" src="data:image/jpeg;base64,${jpeg.toString('base64')}">`)
-    const maskedPixels = await page.evaluate(async () => {
-      const image = document.querySelector<HTMLImageElement>('#shot')!
-      await image.decode()
-      const canvas = document.createElement('canvas')
-      canvas.width = image.naturalWidth
-      canvas.height = image.naturalHeight
-      const context = canvas.getContext('2d')!
-      context.drawImage(image, 0, 0)
-      const { data } = context.getImageData(0, 0, canvas.width, canvas.height)
-      let magenta = 0
-      for (let index = 0; index < data.length; index += 4) {
-        if (data[index]! > 200 && data[index + 1]! < 80 && data[index + 2]! > 200) magenta++
-      }
-      return magenta
-    })
-    expect(maskedPixels).toBeGreaterThan(500)
+    expect(await maskedPixels(page, jpeg)).toBeGreaterThan(500)
 
     const submitted = await browser.call('click', { ref: refOf(shown.snapshot, 'button', 'Войти'), danger: 'submit' })
     expect(submitted).toMatchObject({ ok: true, title: 'Кабинет — Пациент' })
@@ -70,6 +54,26 @@ test('вход по сохранённому входу, «глаз», смен�
     expect(countOccurrences(everything, DEMO_PASSWORD)).toBe(0)
     expect(countOccurrences(everything, encodeURIComponent(DEMO_PASSWORD))).toBe(0)
     expect(browser.logs.length).toBeGreaterThan(0)
+  } finally {
+    await browser.close()
+  }
+})
+
+// Сайт пересоздал поле после вписывания (перерисовка при «показать пароль»): новое поле type=text без старой метки.
+test('поле подменено после fill-password — значение всё равно скрыто и в снимке, и на картинке', async ({ page }) => {
+  const browser = await startTestBrowser()
+  try {
+    const loginPage = await browser.call('url', { url: `${browser.patientUrl}/login-rerender` })
+    const passwordRef = refOf(loginPage.snapshot, 'textbox', 'Пароль')
+    expect(await browser.call('fill-password', { entryId: browser.entryId, ref: passwordRef })).toMatchObject({ ok: true })
+    const shown = await browser.call('click', { ref: refOf(loginPage.snapshot, 'button', 'Показать пароль'), danger: 'none' })
+    expect(shown).toMatchObject({ ok: true })
+    expect(shown.snapshot).toMatch(/textbox "Пароль" \[ref=\w+\] \[пароль вписан\]: \[скрыто\]/)
+
+    const shot = await browser.call('shot')
+    expect(shot).toMatchObject({ ok: true })
+    expect(await maskedPixels(page, readFileSync(shot.path!))).toBeGreaterThan(500)
+    expect(countOccurrences([...browser.outputs, ...browser.logs].join('\n'), DEMO_PASSWORD)).toBe(0)
   } finally {
     await browser.close()
   }

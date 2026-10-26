@@ -111,14 +111,19 @@ function pointOf(event) {
   };
 }
 
+// «Взять» и «Вернуть» идут тем же потоком, что и ввод: «Вернуть» не обгонит ещё не дошедшие буквы.
 async function setControl(action) {
-  const response = await fetch('/live/control', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ profile, action }),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (result.holder) showHolder(result.holder);
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'control', action }));
+  } else {
+    const response = await fetch('/live/control', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile, action }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (result.holder) showHolder(result.holder);
+  }
   if (action === 'take') screen.focus();
 }
 

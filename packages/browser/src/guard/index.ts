@@ -1,6 +1,6 @@
 // Замки браузера: опасные действия, разрешённые сайты, сетевой замок изменяющих запросов, признаки капчи и кодов.
 // Решения — чистые функции; установка на контекст Chromium — installNetworkGuard.
-import type { BrowserContext, Page, Route } from 'playwright-core'
+import type { BrowserContext, Frame, Page, Route } from 'playwright-core'
 import type { SitePolicy } from '../policy/index.js'
 
 export const DANGER_KINDS = ['none', 'submit', 'send', 'pay', 'delete', 'publish'] as const
@@ -26,6 +26,25 @@ export function checkDanger(danger: unknown): { ok: true } | Refusal {
   return { ok: true }
 }
 
+// Опасное служба узнаёт сама — по подписи, тексту и адресу цели, а не по слову модели в `danger`.
+// Обычное «Отправить» не опасно: так отправляется форма или сообщение боту; опасно — сообщение людям.
+const DANGER_WORDS: ReadonlyArray<readonly [Exclude<DangerKind, 'none' | 'submit'>, RegExp]> = [
+  ['pay', /оплат|заплат|купить|покупк|оформить заказ|\bpay\b|payment|checkout|purchase|\bbuy\b|place order/i],
+  ['delete', /удал|стереть|delete|remove|erase/i],
+  ['publish', /опубликов|публикац|publish/i],
+  ['send', /отправить (?:сообщение|письмо)|написать (?:сообщение|письмо)|разослать|рассылк|send (?:a )?(?:message|e-?mail|mail)/i],
+]
+
+export function dangerInText(text: string): Exclude<DangerKind, 'none' | 'submit'> | null {
+  return DANGER_WORDS.find(([, pattern]) => pattern.test(text))?.[0] ?? null
+}
+
+export function refuseDangerousTarget(text: string): Refusal | null {
+  const kind = dangerInText(text)
+  if (!kind) return null
+  return { ok: false, code: 'refused_danger', message: `цель похожа на действие «${DANGER_NAMES[kind]}»: оно запрещено Ремонтнику, что бы ни было указано в danger; сообщите владельцу` }
+}
+
 function originOf(url: string): string | null {
   try {
     const parsed = new URL(url)
@@ -38,6 +57,34 @@ function originOf(url: string): string | null {
 export function isAllowedOrigin(url: string, allowedOrigins: readonly string[]): boolean {
   const origin = originOf(url)
   return origin !== null && allowedOrigins.includes(origin)
+}
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
+/** Пароль входа — только в точный origin входа и только по https (локальный адрес — для проверок). */
+export function isLoginOrigin(frameUrl: string, site: string): boolean {
+  try {
+    const frame = new URL(frameUrl)
+    return frame.origin === site && (frame.protocol === 'https:' || (frame.protocol === 'http:' && LOCAL_HOSTS.has(frame.hostname)))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Адреса фрейма от него самого до верхней страницы. Фрейм доступен врачу, только если каждый — с разрешённого
+ * сайта; пустой фрейм (`about:blank`, `about:srcdoc`) наследует сайт родителя.
+ */
+export function isAllowedFrameUrl(chain: readonly string[], allowedOrigins: readonly string[]): boolean {
+  if (chain.length === 0) return false
+  return chain.every((url, index) => isAllowedOrigin(url, allowedOrigins) || ((url === 'about:blank' || url === 'about:srcdoc') && index < chain.length - 1))
+}
+
+/** Живой фрейм страницы: он и все его родители — с разрешённых сайтов. */
+export function isFrameAllowed(frame: Frame, allowedOrigins: readonly string[]): boolean {
+  const chain: string[] = []
+  for (let current: Frame | null = frame; current; current = current.parentFrame()) chain.push(current.url())
+  return isAllowedFrameUrl(chain, allowedOrigins)
 }
 
 const READING_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
@@ -67,7 +114,8 @@ export interface RequestFacts {
   isMainFrame: boolean
 }
 
-export type RequestDecision = { allow: true } | { allow: false; code: 'refused_origin' | 'refused_mutation'; reason: string }
+export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation'
+export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string }
 
 export function describeRequest(method: string, url: string): string {
   const origin = originOf(url)
@@ -75,9 +123,10 @@ export function describeRequest(method: string, url: string): string {
 }
 
 export function decideRequest(request: RequestFacts, policy: SitePolicy): RequestDecision {
-  const topLevel = request.isNavigation && request.isMainFrame
-  if (topLevel && request.url !== 'about:blank' && !isAllowedOrigin(request.url, policy.allowedOrigins)) {
-    return { allow: false, code: 'refused_origin', reason: `переход на ${originOf(request.url) ?? 'адрес без сайта'} вне allowedOrigins` }
+  if (request.isNavigation && request.url !== 'about:blank' && !isAllowedOrigin(request.url, policy.allowedOrigins)) {
+    const where = originOf(request.url) ?? 'адрес без сайта'
+    if (!request.isMainFrame) return { allow: false, code: 'refused_frame', reason: `фрейм с ${where} вне allowedOrigins` }
+    return { allow: false, code: 'refused_origin', reason: `переход на ${where} вне allowedOrigins` }
   }
   if (isMutatingMethod(request.method) && !matchesMutation(request.method, request.url, policy)) {
     const where = originOf(request.url) ?? 'адрес без сайта'
@@ -87,7 +136,7 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
 }
 
 export interface BlockedRequest {
-  code: 'refused_origin' | 'refused_mutation'
+  code: BlockCode
   reason: string
 }
 

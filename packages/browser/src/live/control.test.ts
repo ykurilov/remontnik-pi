@@ -67,6 +67,19 @@ describe('замок управления', () => {
     expect(lock.holder('remontnik')).toBe('doctor')
   })
 
+  it('считает, сколько раз владелец вернул управление сам; пропавшая связь — не возврат', () => {
+    const clock = fakeClock()
+    const lock = createControlLock({ now: clock.now })
+    expect(lock.releases('remontnik')).toBe(0)
+    lock.take('remontnik')
+    lock.release('remontnik')
+    expect(lock.releases('remontnik')).toBe(1)
+    lock.take('remontnik')
+    clock.advance(OWNER_SILENCE_LIMIT_MS)
+    expect(lock.holder('remontnik')).toBe('doctor')
+    expect(lock.releases('remontnik')).toBe(1)
+  })
+
   it('OWNER_SILENCE_LIMIT_MS — две минуты', () => {
     expect(OWNER_SILENCE_LIMIT_MS).toBe(120_000)
   })
