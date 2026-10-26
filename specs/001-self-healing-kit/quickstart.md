@@ -10,10 +10,10 @@ Node 22.19+, pnpm, Docker (только для живой группы), Chromiu
 
 ```bash
 pnpm install
-pnpm verify          # тесты → типы → сборка → check-pins → check-public
+pnpm verify          # тесты → типы → сборка → check-pins → check-public → check-history
 ```
 
-Ожидаемо: всё зелёное; `check-pins` подтверждает точные версии pi-durable и pi-ai; `check-public` и `gitleaks` находят 0 секретов и адресов.
+Ожидаемо: всё зелёное; `check-pins` подтверждает точные версии pi-durable и pi-ai; `check-public` и `gitleaks` находят 0 секретов и адресов; `check-history` подтверждает, что `.private/` не была ни в одном коммите и `gitleaks` чист по всей истории (`pnpm check-history --trees` дополнительно гонит `check-public` по дереву каждого коммита).
 
 ## 2. Весь цикл на «Пациенте» без Docker и без сети
 
@@ -59,6 +59,7 @@ pnpm --filter @ykurilov/remontnik-browser test
 ```bash
 pnpm --filter @ykurilov/remontnik-watch test          # подставная модель
 pnpm --filter @ykurilov/remontnik-watch test:live     # настоящий DeepSeek, размеченный выдуманный набор
+pnpm --filter @ykurilov/remontnik-watch bench         # горячий путь: ошибка, ответ модели, конец разговора — не больше 1 мс на событие
 ```
 
 Ожидаемо (живая): найдено ≥ 80% плохих ответов, ложных отметок ≤ 10%; при отказе основного пути — ответ через запасной.

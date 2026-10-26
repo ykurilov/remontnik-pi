@@ -1,0 +1,2 @@
+# Ложное срабатывание: выдуманный токен блокировки в тестовых данных отчёта врача.
+ca058a88571f204edee87a228357133ce768d805:packages/doctor/src/reports/texts.test.ts:generic-api-key:100
