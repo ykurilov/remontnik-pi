@@ -110,6 +110,8 @@ export interface GitGuard {
   mergeIntoMain(branch: string, commit: string): Promise<void>
   /** Ревизия `commit` уже в основной ветке origin (по свежему fetch). */
   isInMainline(commit: string): Promise<boolean>
+  /** Голова основной ветки origin по свежему fetch. */
+  mainlineHead(): Promise<string>
   /**
    * Замки git, брошенные убитым врачом (его git убит вместе с ним): в gitdir копий врача, у веток и меток `remontnik/…`.
    * Замки веток origin и `packed-refs.lock` — общие с человеком — только старше `STALE_SHARED_LOCK_MS`. Только на
@@ -671,6 +673,8 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: ревизия — по её полному id')
       return isAncestor(commit, await fetchedMainline())
     },
+
+    mainlineHead: () => fetchedMainline(),
   }
 }
 

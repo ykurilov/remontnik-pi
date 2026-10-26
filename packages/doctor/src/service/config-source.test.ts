@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RemontnikConfigError } from '@ykurilov/remontnik-core/config'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { localConfigReader } from './config-reader.js'
-import { ConfigSourceError, loadMainBranchConfig } from './config-source.js'
+import { localConfigReaderForTests, type ConfigCodeReader } from './config-reader.js'
+import { ConfigSourceError, createMainBranchConfigSource, loadMainBranchConfig } from './config-source.js'
 
 function configObject(overrides: { timeoutMs?: number; moneyMask?: string; mainBranch?: string; fixablePaths?: string[] } = {}) {
   return {
@@ -29,15 +29,16 @@ function moduleText(config: object): string {
   return `export default ${JSON.stringify(config)}\n`
 }
 
+// Без фонового обслуживания git после коммита: оно пишет в .git, пока тест уже удаляет папку (ENOTEMPTY).
 function git(directory: string, ...args: string[]): void {
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
+  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0', ...args], {
     cwd: directory,
     stdio: 'pipe',
   })
 }
 
 function loadMain(directory: string, mainBranch = 'main') {
-  return loadMainBranchConfig({ mainCheckoutDirectory: directory, mainBranch, reader: localConfigReader({ scratchDir: join(root, 'scratch') }) })
+  return loadMainBranchConfig({ mainCheckoutDirectory: directory, mainBranch, reader: localConfigReaderForTests({ scratchDir: join(root, 'scratch') }) })
 }
 
 let root: string
@@ -186,6 +187,34 @@ describe('loadMainBranchConfig: ошибки', () => {
     writeFileSync(outside, moduleText(configObject()))
     symlinkSync(outside, join(mainCheckout, 'remontnik.config.mjs'))
     await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'outside_checkout' })
+  })
+
+  // Список файлов настройки строится по git, а там ссылка — это строка с путём, а не текст файла: выполнялся бы
+  // файл, которого нет в списке, который защищает шлюз правки. Поэтому ссылка — отказ, и код не выполняется.
+  it('файл настройки — ссылка внутри рабочей копии: отказ', async () => {
+    writeFileSync(join(mainCheckout, 'real.config.mjs'), moduleText(configObject()))
+    symlinkSync('real.config.mjs', join(mainCheckout, 'remontnik.config.mjs'))
+    commitAll(mainCheckout, 'config')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'symlink', message: expect.stringContaining('remontnik.config.mjs') })
+  })
+
+  it('подключённый файл — ссылка внутри рабочей копии: отказ до выполнения', async () => {
+    mkdirSync(join(mainCheckout, 'src'))
+    writeFileSync(join(mainCheckout, 'src/real.mjs'), `export const NAME = 'demo'\n`)
+    symlinkSync('real.mjs', join(mainCheckout, 'src/link.mjs'))
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import { NAME } from './src/link.mjs'\nexport default { ...${JSON.stringify(configObject())}, app: { name: NAME } }\n`)
+    commitAll(mainCheckout, 'config')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'symlink', message: expect.stringContaining('src/link.mjs') })
+    expect(existsSync(join(root, 'scratch'))).toBe(false)
+  })
+
+  it('папка на пути подключённого файла — ссылка: отказ', async () => {
+    mkdirSync(join(mainCheckout, 'lib'))
+    writeFileSync(join(mainCheckout, 'lib/name.mjs'), `export const NAME = 'demo'\n`)
+    symlinkSync('lib', join(mainCheckout, 'src'))
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import { NAME } from './src/name.mjs'\nexport default { ...${JSON.stringify(configObject())}, app: { name: NAME } }\n`)
+    commitAll(mainCheckout, 'config')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'symlink', message: expect.stringContaining('src/name.mjs') })
   })
 
   it('ConfigSourceError — обычная ошибка с кодом', () => {
@@ -445,5 +474,81 @@ describe('loadMainBranchConfig: импорты из настройки', () => {
     commitAll(mainCheckout, 'config')
 
     expect((await loadMain(mainCheckout)).config.app.name).toBe('demo')
+  })
+})
+
+describe('createMainBranchConfigSource: код настройки выполняется один раз на коммит и тексты её файлов', () => {
+  function countingReader(options: { failFirst?: boolean } = {}) {
+    const inner = localConfigReaderForTests({ scratchDir: join(root, 'scratch') })
+    let runs = 0
+    const reader: ConfigCodeReader = {
+      ...inner,
+      run: async (input) => {
+        runs += 1
+        if (options.failFirst && runs === 1) throw new Error('сбой чтения')
+        return inner.run(input)
+      },
+    }
+    return { reader, runs: () => runs }
+  }
+
+  function writeImportingConfig(name: string) {
+    mkdirSync(join(mainCheckout, 'src'), { recursive: true })
+    writeFileSync(join(mainCheckout, 'src/name.mjs'), `export const NAME = ${JSON.stringify(name)}\n`)
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import { NAME } from './src/name.mjs'\nexport default { ...${JSON.stringify(configObject())}, app: { name: NAME } }\n`)
+  }
+
+  it('повторные и одновременные чтения — один запуск', async () => {
+    writeImportingConfig('demo')
+    commitAll(mainCheckout, 'config')
+    const { reader, runs } = countingReader()
+    const source = createMainBranchConfigSource({ mainCheckoutDirectory: mainCheckout, mainBranch: 'main', reader })
+
+    const together = await Promise.all([source.load(), source.load(), source.load()])
+    const later = await source.load()
+
+    expect(runs()).toBe(1)
+    expect(together.map((loaded) => loaded.config.app.name)).toEqual(['demo', 'demo', 'demo'])
+    expect(later.config).toBe(together[0]!.config)
+  })
+
+  it('изменился подключённый файл или коммит основной ветки — новое чтение', async () => {
+    writeImportingConfig('first')
+    commitAll(mainCheckout, 'config')
+    const { reader, runs } = countingReader()
+    const source = createMainBranchConfigSource({ mainCheckoutDirectory: mainCheckout, mainBranch: 'main', reader })
+    expect((await source.load()).config.app.name).toBe('first')
+
+    writeFileSync(join(mainCheckout, 'src/name.mjs'), `export const NAME = 'second'\n`)
+    expect((await source.load()).config.app.name).toBe('second')
+    expect(runs()).toBe(2)
+
+    writeFileSync(join(mainCheckout, 'notes.txt'), 'не файл настройки\n')
+    commitAll(mainCheckout, 'другой коммит')
+    await source.load()
+    await source.load()
+    expect(runs()).toBe(3)
+  })
+
+  it('неудачное чтение не запоминается: следующий вызов читает заново', async () => {
+    writeImportingConfig('demo')
+    commitAll(mainCheckout, 'config')
+    const { reader, runs } = countingReader({ failFirst: true })
+    const source = createMainBranchConfigSource({ mainCheckoutDirectory: mainCheckout, mainBranch: 'main', reader })
+
+    await expect(source.load()).rejects.toMatchObject({ code: 'unreadable' })
+    expect((await source.load()).config.app.name).toBe('demo')
+    expect(runs()).toBe(2)
+  })
+
+  it('ветку рабочей копии проверяет каждый вызов: копия ушла с основной — отказ, даже если текст тот же', async () => {
+    writeImportingConfig('demo')
+    commitAll(mainCheckout, 'config')
+    const { reader } = countingReader()
+    const source = createMainBranchConfigSource({ mainCheckoutDirectory: mainCheckout, mainBranch: 'main', reader })
+    await source.load()
+
+    git(mainCheckout, 'checkout', '-b', 'remontnik/case-1')
+    await expect(source.load()).rejects.toMatchObject({ code: 'branch_mismatch' })
   })
 })

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { localConfigReader } from '../service/config-reader.js'
+import { localConfigReaderForTests } from '../service/config-reader.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { checkDoctorConfig, formatFindings } from './check-config.js'
 import { runDoctorCommand } from './run-doctor-command.js'
@@ -71,6 +71,8 @@ interface DockerScenario {
   networks?: { name: string; subnet: string; caseNetwork?: boolean }[]
   /** Что docker пишет в stderr при отказе. */
   errorText?: string
+  /** Как у врача смонтирована папка состояния: по умолчанию — тем же путём, что на хосте. */
+  stateMount?: 'same' | 'volume'
 }
 
 const HEALTHY_DOCKER: DockerScenario = {
@@ -97,6 +99,10 @@ const out = (text) => { process.stdout.write(text + '\\n'); process.exit(0) }
 const fail = () => { process.stderr.write(s.errorText || 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock'); process.exit(1) }
 if (s.down) fail()
 if (a[0] === 'version') out('27.3.1')
+if (a[0] === 'inspect' && a[2].includes('Mounts')) {
+  const state = process.env.REMONTNIK_STATE_DIR
+  out(JSON.stringify([{ Type: 'bind', Source: '/var/run/docker.sock', Destination: '/var/run/docker.sock' }, s.stateMount === 'volume' ? { Type: 'volume', Source: '/var/lib/docker/volumes/state/_data', Destination: state } : { Type: 'bind', Source: state, Destination: state }]))
+}
 if (a[0] === 'inspect') { const name = a.at(-1); if (name !== 'remontnik-doctor') { process.stderr.write('No such object: ' + name); process.exit(1) } out(JSON.stringify(Object.fromEntries(Object.entries(s.gatewayNetworks || {}).map(([n, ip]) => [n, { IPAddress: ip }])))) }
 if (a[0] === 'network' && a[1] === 'ls') {
   if (a.includes('label=remontnik.case-network')) out((s.caseNetworks || []).map((n) => n.id).join('\\n'))
@@ -274,7 +280,7 @@ describe('check-config: настройка', () => {
     git(repoDir, 'add', '-A')
     git(repoDir, 'commit', '--quiet', '-m', 'настройка')
 
-    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS), configReader: localConfigReader() })
+    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS), configReader: localConfigReaderForTests() })
 
     expect(errors(findings)).toEqual([])
     expect(warnings(findings)).toHaveLength(1)
@@ -322,6 +328,13 @@ describe('check-config: настройка', () => {
 })
 
 describe('check-config: Docker и сети', () => {
+  it('папка состояния у врача смонтирована не тем же путём, что на хосте — ошибка: копию файлов настройки контейнер чтения не увидит', async () => {
+    const findings = await checkDoctorConfig(serverEnv(appRepo()), { docker: fakeDocker({ ...HEALTHY_DOCKER, stateMount: 'volume' }), gh: fakeGh(GOOD_RULESETS) })
+    const problem = findings.find((finding) => finding.level === 'error' && finding.problem.includes('REMONTNIK_STATE_DIR'))
+    expect(problem).toMatchObject({ area: 'docker', problem: expect.stringContaining('не тем же путём') })
+    expect(problem!.fix).toContain('одинаковым путём')
+  })
+
   it('Docker недоступен — ошибка, остальные проверки Docker не идут', async () => {
     const findings = await checkDoctorConfig(serverEnv(appRepo()), { docker: fakeDocker({ down: true }), gh: fakeGh(GOOD_RULESETS) })
     const problems = errors(findings).filter((problem) => /docker/i.test(problem))

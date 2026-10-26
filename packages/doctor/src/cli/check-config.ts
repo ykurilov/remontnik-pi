@@ -176,6 +176,29 @@ function ipv4Range(cidr: string): { start: number; end: number } | undefined {
   return { start, end: start + size - 1 }
 }
 
+/**
+ * Контейнер чтения настройки монтирует копию её файлов из папки состояния по пути врача: у врача и у хоста
+ * этот путь должен быть один (том «путь:путь» в compose), иначе Docker смонтирует пустую папку хоста.
+ */
+async function checkStateMount(env: DoctorEnv, docker: string, container: string, stateDir: string): Promise<Finding[]> {
+  const inspect = await run(docker, ['inspect', '--format', '{{json .Mounts}}', container], env)
+  let mounts: { Source?: string; Destination?: string }[] = []
+  try {
+    mounts = JSON.parse(inspect.stdout) ?? []
+  } catch {}
+  const path = stateDir.replace(/\/+$/, '')
+  const holder = mounts
+    .filter((mount) => mount.Destination && (path === mount.Destination || path.startsWith(`${mount.Destination.replace(/\/+$/, '')}/`)))
+    .sort((a, b) => b.Destination!.length - a.Destination!.length)[0]
+  if (holder && holder.Source === holder.Destination) return []
+  return [{
+    level: 'error',
+    area: 'docker',
+    problem: 'папка состояния REMONTNIK_STATE_DIR смонтирована у врача не тем же путём, что на хосте: контейнер чтения настройки не увидит копию её файлов',
+    fix: 'смонтируйте папку состояния одинаковым путём у хоста и врача (том «путь:путь», как в deploy/compose.remontnik.yml)',
+  }]
+}
+
 async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
   const version = await run(docker, ['version', '--format', '{{.Server.Version}}'], env)
   if (!version.ok) {
@@ -198,6 +221,8 @@ async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
         findings.push({ level: 'error', area: 'docker', problem: `контейнер врача не подключён к сети приложения «${network}»`, fix: 'подключите врача к сети приложения в compose (networks) или исправьте REMONTNIK_LISTEN_NETWORK' })
       }
     }
+    const stateDir = value(env, 'REMONTNIK_STATE_DIR')
+    if (inspect.ok && stateDir) findings.push(...(await checkStateMount(env, docker, container, stateDir)))
   }
   if (findings.length === 0) findings.push({ level: 'ok', area: 'docker', problem: 'Docker доступен, врач на месте', fix: '' })
 

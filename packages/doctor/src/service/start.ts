@@ -1,4 +1,3 @@
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
@@ -11,8 +10,8 @@ import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
 import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
 import { browserClientFromEnv } from '../browser-tools/index.js'
-import { containerConfigReader, type ConfigCodeReader } from './config-reader.js'
-import { loadMainBranchConfig } from './config-source.js'
+import { containerConfigReader, removeOrphanConfigReads, unavailableConfigReader, type ConfigCodeReader } from './config-reader.js'
+import { createMainBranchConfigSource, type MainBranchConfigSource } from './config-source.js'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions, type DoctorTreatmentOptions } from './index.js'
 
 // Боевой запуск врача (`remontnik-doctor start`): всё берётся из окружения сервера и настройки основной ветки.
@@ -99,18 +98,29 @@ function paseoBridgeOf(env: DoctorEnv, config: RemontnikConfig): Pick<DoctorServ
 export function configReaderFromEnv(env: DoctorEnv, options: { docker?: string } = {}): ConfigCodeReader {
   const gatewayContainer = env.REMONTNIK_GATEWAY_CONTAINER?.trim()
   const stateDir = env.REMONTNIK_STATE_DIR?.trim()
-  if (!gatewayContainer || !stateDir) {
-    const missing = new Error('код настройки врач выполняет только в контейнере: нужны REMONTNIK_GATEWAY_CONTAINER и REMONTNIK_STATE_DIR')
-    return { isolation: 'container', scratchDir: tmpdir(), run: () => Promise.reject(missing) }
-  }
-  return containerConfigReader({ gatewayContainer, scratchDir: join(stateDir, 'config-read'), ...(options.docker ? { docker: options.docker } : {}) })
+  if (!gatewayContainer || !stateDir) return unavailableConfigReader('код настройки врач выполняет только в контейнере: нужны REMONTNIK_GATEWAY_CONTAINER и REMONTNIK_STATE_DIR')
+  return containerConfigReader({ gatewayContainer, scratchDir: configReadDirOf(stateDir), ...(options.docker ? { docker: options.docker } : {}) })
+}
+
+/** Папка копий файлов настройки для чтения: внутри папки состояния, путь общий у врача и хоста. */
+function configReadDirOf(stateDir: string): string {
+  return join(stateDir, 'config-read')
+}
+
+/** Настройка основной ветки для службы: один источник с кэшем на весь запуск врача. */
+function configSourceOf(env: DoctorEnv, mainBranch: string, options: { docker?: string }): MainBranchConfigSource {
+  return createMainBranchConfigSource({ mainCheckoutDirectory: required(env, 'REMONTNIK_CONFIG_REPO_DIR'), mainBranch, reader: configReaderFromEnv(env, options) })
 }
 
 /**
  * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
  * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
-export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options: { log?: (line: string) => void; docker?: string } = {}): DoctorStartPlan {
+export function doctorStartPlan(
+  env: DoctorEnv,
+  config: RemontnikConfig,
+  options: { log?: (line: string) => void; docker?: string; configSource?: MainBranchConfigSource } = {},
+): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
   const worktreesDir = env.REMONTNIK_WORKTREES_DIR?.trim() || join(stateDir, 'worktrees')
@@ -142,8 +152,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options
     author: { name: env.REMONTNIK_GIT_AUTHOR_NAME?.trim() || 'Ремонтник', email: env.REMONTNIK_GIT_AUTHOR_EMAIL?.trim() || 'remontnik@example.invalid' },
     env: gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()),
   })
-  const reader = configReaderFromEnv(env, options)
-  const loadConfig = async () => (await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch: config.repo.mainBranch, reader })).config
+  const configSource = options.configSource ?? configSourceOf(env, config.repo.mainBranch, options)
+  const loadConfig = async () => (await configSource.load()).config
 
   return {
     listen,
@@ -223,10 +233,10 @@ export async function createCaseGateway(plan: DoctorStartPlan, options: { docker
 
 /** Запуск врача из окружения сервера: настройка основной ветки, адрес приёма, сети случая, служба. */
 export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string } = {}): Promise<DoctorService> {
-  const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
-  const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch, reader: configReaderFromEnv(env, options) })
-  const plan = doctorStartPlan(env, config, options)
+  const configSource = configSourceOf(env, mainBranch, options)
+  const { config } = await configSource.load()
+  const plan = doctorStartPlan(env, config, { ...options, configSource })
   const listen = 'network' in plan.listen
     ? { host: await containerAddress(plan.gateway.container, plan.listen.network, options.docker), port: plan.listen.port }
     : plan.listen
@@ -235,6 +245,13 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   try {
     // Сначала контейнеры верстака прошлого запуска (их команды обрываются) и службы для тестов, потом их сети.
     await removeOrphanWorkbenches({ homesDir: plan.runner.homesDir, ...(options.docker ? { docker: options.docker } : {}), ...(options.log ? { log: options.log } : {}) })
+    // Чтения настройки, оборванные падением врача: их контейнеры и копии файлов.
+    await removeOrphanConfigReads({
+      gatewayContainer: plan.gateway.container,
+      scratchDir: configReadDirOf(plan.service.stateDir),
+      ...(options.docker ? { docker: options.docker } : {}),
+      ...(options.log ? { log: options.log } : {}),
+    })
     await gateway.caseServices.removeStale()
     await gateway.caseNetworks.removeStale()
     service = await startDoctorService({

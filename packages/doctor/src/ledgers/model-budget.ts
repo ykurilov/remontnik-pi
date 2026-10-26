@@ -9,6 +9,7 @@ import {
 } from '@earendil-works/pi-ai'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { RecordStore } from '../records/index.js'
+import { ConfigSourceError } from '../service/config-source.js'
 import { mayHaveBeenPaid, maxRequestUsd, unknownPriceOf } from '../model/request-price.js'
 import { caseLimitUsdOf, holdModelIn, settleModelHoldIn, spendDayKey, type ModelBlock } from './spend-ledger.js'
 
@@ -69,7 +70,13 @@ export function createModelBudget(options: { models: Models; boot: string; now()
 
   async function hold(caseId: number | undefined, maxUsd: number): Promise<{ held: true; dayKey: string; holdId: string } | { held: false; why: string }> {
     if (!ledger) return { held: false, why: 'учёт расходов ещё не открыт' }
-    const config = await ledger.loadConfig()
+    // Без настройки нет ни потолков, ни часового пояса дня: запрос не уходит, а причина — та, что у настройки
+    // (например, «настройку нельзя прочитать: Docker недоступен»), а не «учёт расходов не отвечает».
+    const config = await ledger.loadConfig().catch((error: unknown) => {
+      report(error)
+      return { why: error instanceof ConfigSourceError ? error.message : 'настройка не читается' }
+    })
+    if ('why' in config) return { held: false, why: config.why }
     const dayKey = spendDayKey(options.now(), config.app.timeZone)
     const holdId = randomUUID()
     const answer = await ledger.records.transaction((tx) =>

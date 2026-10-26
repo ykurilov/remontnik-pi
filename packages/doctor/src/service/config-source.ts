@@ -1,17 +1,20 @@
-import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { defineRemontnikConfig, type RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { collectConfigFiles, CONFIG_FILE_NAMES } from '../config-files/index.js'
 import { assertValidMask, matchesAllowMask, normalizeRepoPath, PathMaskError } from '../path-mask/index.js'
-import type { ConfigCodeReader } from './config-reader.js'
+import { ConfigReaderUnavailableError, type ConfigCodeReader } from './config-reader.js'
 
 // Источник настройки (R7): врач читает `remontnik.config.*` только из рабочей копии ОСНОВНОЙ ветки.
 // Настройка в ветке врача на выкатку не влияет: ветка врача — не то место, откуда берутся запреты.
 // Файл настройки — это код. Поэтому ветка проверяется ДО его выполнения, а выполняется он не в процессе врача:
 // в отдельном контейнере без секретов врача, сокета Docker и сети (`config-reader.ts`), и только над копией
 // файлов настройки. Подключённые файлы каждый раз читаются заново, а не берутся из кэша модулей.
+// Выполняется код один раз на коммит основной ветки и тексты файлов настройки (`createMainBranchConfigSource`):
+// врач спрашивает настройку на каждый запрос к модели и шаг выкатки, а контейнер на каждый вопрос — это секунды.
 
 const READ_TIMEOUT_MS = 30_000
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024
@@ -20,6 +23,10 @@ export type ConfigSourceErrorCode =
   | 'not_found'
   | 'ambiguous'
   | 'outside_checkout'
+  /** Файл настройки или подключённый файл — символическая ссылка: выполнялся бы не тот текст, что защищает шлюз правки. */
+  | 'symlink'
+  /** Выполнить код настройки негде (Docker недоступен): сама настройка может быть и в порядке. */
+  | 'reader_unavailable'
   | 'unreadable'
   | 'branch_mismatch'
   | 'branch_unknown'
@@ -41,7 +48,7 @@ export interface LoadMainBranchConfigOptions {
   mainCheckoutDirectory: string
   /** Имя основной ветки, как его знает вызывающий (не файл настройки): копия должна стоять ровно на ней. */
   mainBranch: string
-  /** Где выполняется код настройки: на сервере — `containerConfigReader`, в тестах — `localConfigReader`. */
+  /** Где выполняется код настройки: на сервере — `containerConfigReader`, в тестах — `localConfigReaderForTests`. */
   reader: ConfigCodeReader
 }
 
@@ -82,7 +89,12 @@ function findConfigFile(checkout: string): string {
   if (!realFile.startsWith(realCheckout + sep)) {
     throw new ConfigSourceError('outside_checkout', `Файл настройки ${file} ведёт за пределы рабочей копии`)
   }
+  if (realFile !== join(realCheckout, basename(file))) throw symlinkRefusal(basename(file))
   return file
+}
+
+function symlinkRefusal(path: string): ConfigSourceError {
+  return new ConfigSourceError('symlink', `Файл настройки ${path} — символическая ссылка: врач читает настройку только из обычных файлов репозитория`)
 }
 
 // Как выполняется код настройки. Импорты самой настройки и её файлов разрешаются так:
@@ -163,25 +175,45 @@ function hookOptions(copyDir: string, files: readonly string[]): string {
   })
 }
 
-/** Текст файла рабочей копии; ссылка за пределы копии — отказ, не файл (папка, нет такого) — `undefined`. */
+/**
+ * Текст файла рабочей копии; не файл (папка, нет такого) — `undefined`. Ссылка — отказ: и за пределы копии,
+ * и внутри неё (список файлов настройки по git видит ссылку, а не файл, на который она ведёт).
+ */
 function checkoutFileReader(realCheckout: string): (path: string) => Promise<string | undefined> {
   return async (path) => {
     const absolute = join(realCheckout, path)
     if (!existsSync(absolute)) return undefined
     const real = realpathSync(absolute)
     if (!real.startsWith(realCheckout + sep)) throw new ConfigSourceError('outside_checkout', `Файл настройки ${path} ведёт за пределы рабочей копии`)
+    if (real !== absolute) throw symlinkRefusal(path)
     return statSync(real).isFile() ? readFileSync(real, 'utf8') : undefined
   }
 }
 
-/**
- * Код настройки выполняется в копии, где есть только файлы настройки — ровно те тексты, по которым построен их список.
- * Сама копия и процесс чтения — у исполнителя (`ConfigCodeReader`): на сервере это отдельный контейнер.
- */
-async function runConfigCode(file: string, checkout: string, reader: ConfigCodeReader): Promise<{ config: unknown; imports: string[] }> {
+/** Файлы настройки и их тексты с диска, без выполнения: по ним строится и копия для чтения, и ключ кэша. */
+interface ConfigFiles {
+  entry: string
+  files: string[]
+  texts: Map<string, string>
+}
+
+async function gatherConfigFiles(file: string, checkout: string): Promise<ConfigFiles> {
+  try {
+    return await gatherConfigFilesOf(file, checkout)
+  } catch (error) {
+    if (error instanceof ConfigSourceError) throw error
+    throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+  }
+}
+
+async function gatherConfigFilesOf(file: string, checkout: string): Promise<ConfigFiles> {
   const realCheckout = realpathSync(checkout)
-  const entry = relative(realCheckout, realpathSync(file)).split(sep).join('/')
+  const entry = basename(file)
   const texts = new Map<string, string>()
+  if (entry.endsWith('.json')) {
+    texts.set(entry, readFileSync(join(realCheckout, entry), 'utf8'))
+    return { entry, files: [entry], texts }
+  }
   const readFile = checkoutFileReader(realCheckout)
   const { files, problems } = await collectConfigFiles(entry, async (path) => {
     if (!texts.has(path)) {
@@ -191,8 +223,15 @@ async function runConfigCode(file: string, checkout: string, reader: ConfigCodeR
     }
     return texts.get(path)
   })
-  if (problems.length > 0) throw new Error(problems.join('; '))
+  if (problems.length > 0) throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${problems.join('; ')}`)
+  return { entry, files, texts }
+}
 
+/**
+ * Код настройки выполняется в копии, где есть только файлы настройки — ровно те тексты, по которым построен их список.
+ * Сама копия и процесс чтения — у исполнителя (`ConfigCodeReader`): на сервере это отдельный контейнер.
+ */
+async function runConfigCode({ entry, files, texts }: ConfigFiles, reader: ConfigCodeReader): Promise<{ config: unknown; imports: string[] }> {
   mkdirSync(reader.scratchDir, { recursive: true })
   const copyDir = realpathSync(mkdtempSync(join(reader.scratchDir, 'config-')))
   try {
@@ -217,13 +256,16 @@ async function runConfigCode(file: string, checkout: string, reader: ConfigCodeR
   }
 }
 
-async function readRawConfig(file: string, checkout: string, reader: ConfigCodeReader): Promise<{ raw: unknown; imports: string[] }> {
+async function readRawConfig(file: string, configFiles: ConfigFiles, reader: ConfigCodeReader): Promise<{ raw: unknown; imports: string[] }> {
   try {
-    if (file.endsWith('.json')) return { raw: JSON.parse(readFileSync(file, 'utf8')), imports: [] }
-    const { config, imports } = await runConfigCode(file, checkout, reader)
+    if (file.endsWith('.json')) return { raw: JSON.parse(configFiles.texts.get(configFiles.entry)!), imports: [] }
+    const { config, imports } = await runConfigCode(configFiles, reader)
     return { raw: config, imports }
   } catch (error) {
     if (error instanceof ConfigSourceError) throw error
+    if (error instanceof ConfigReaderUnavailableError) {
+      throw new ConfigSourceError('reader_unavailable', `настройку нельзя прочитать: ${error.message}`, { cause: error })
+    }
     throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${error instanceof Error ? error.message : String(error)}`, {
       cause: error,
     })
@@ -276,30 +318,79 @@ function assertServicesNotFixable(config: RemontnikConfig, file: string): void {
   }
 }
 
+/** Коммит, на котором стоит копия; не вышло узнать — пусто (ключ кэша тогда держится на текстах файлов). */
+function headCommitOf(checkout: string): Promise<string> {
+  return new Promise((done) => {
+    execFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: checkout, timeout: 10_000 }, (error, stdout) => done(error ? '' : stdout.trim()))
+  })
+}
+
+function cacheKeyOf(commit: string, configFiles: ConfigFiles): string {
+  const hash = createHash('sha256').update(`${commit}\0${configFiles.entry}\0`)
+  for (const path of configFiles.files) hash.update(`${path}\0${configFiles.texts.get(path)}\0`)
+  return hash.digest('hex')
+}
+
+export interface MainBranchConfigSource {
+  /** Настройка основной ветки: ветка и файлы проверяются каждый раз, код выполняется, только если они изменились. */
+  load(): Promise<LoadedConfig>
+}
+
+/**
+ * Источник настройки основной ветки с кэшем. Ключ — коммит копии и тексты всех файлов настройки (без Docker):
+ * изменился любой — код выполняется заново. Одновременные вызовы ждут одно чтение; неудачное не запоминается.
+ */
+export function createMainBranchConfigSource(options: LoadMainBranchConfigOptions): MainBranchConfigSource {
+  let cached: { key: string; loaded: Promise<LoadedConfig> } | undefined
+  return {
+    async load() {
+      const checkout = isAbsolute(options.mainCheckoutDirectory) ? options.mainCheckoutDirectory : resolve(options.mainCheckoutDirectory)
+      const file = mainBranchConfigFile(checkout, options.mainBranch)
+      const configFiles = await gatherConfigFiles(file, checkout)
+      const key = cacheKeyOf(await headCommitOf(checkout), configFiles)
+      if (cached?.key === key) return cached.loaded
+      const loaded = readMainBranchConfig(file, configFiles, options)
+      const entry = { key, loaded }
+      cached = entry
+      loaded.catch(() => {
+        if (cached === entry) cached = undefined
+      })
+      return loaded
+    },
+  }
+}
+
 /**
  * Читает и проверяет настройку приложения из рабочей копии основной ветки.
  * Копия обязана стоять ровно на основной ветке из параметров. Отдельная голова (detached HEAD),
  * чужая ветка, ветка врача и «не git» — отказ, и файл при этом не выполняется.
  */
 export async function loadMainBranchConfig(options: LoadMainBranchConfigOptions): Promise<LoadedConfig> {
-  const checkout = isAbsolute(options.mainCheckoutDirectory) ? options.mainCheckoutDirectory : resolve(options.mainCheckoutDirectory)
+  return createMainBranchConfigSource(options).load()
+}
+
+/** Файл настройки копии, если копия стоит ровно на основной ветке; иначе — отказ до выполнения. */
+function mainBranchConfigFile(checkout: string, mainBranch: string): string {
   const file = findConfigFile(checkout)
 
   const branch = currentBranchOf(checkout)
   if (branch === undefined) {
     throw new ConfigSourceError(
       'branch_unknown',
-      `Не удалось узнать ветку рабочей копии ${checkout} (нет git или отдельная голова). Настройка читается только из основной ветки "${options.mainBranch}".`,
+      `Не удалось узнать ветку рабочей копии ${checkout} (нет git или отдельная голова). Настройка читается только из основной ветки "${mainBranch}".`,
     )
   }
-  if (branch !== options.mainBranch) {
+  if (branch !== mainBranch) {
     throw new ConfigSourceError(
       'branch_mismatch',
-      `Рабочая копия ${checkout} стоит на ветке "${branch}", а основная — "${options.mainBranch}". Настройка читается только из основной.`,
+      `Рабочая копия ${checkout} стоит на ветке "${branch}", а основная — "${mainBranch}". Настройка читается только из основной.`,
     )
   }
+  return file
+}
 
-  const { raw, imports } = await readRawConfig(file, checkout, options.reader)
+async function readMainBranchConfig(file: string, configFiles: ConfigFiles, options: LoadMainBranchConfigOptions): Promise<LoadedConfig> {
+  const { raw, imports } = await readRawConfig(file, configFiles, options.reader)
   const config = defineRemontnikConfig(withoutResolvedBuiltIn(raw) as Parameters<typeof defineRemontnikConfig>[0])
   if (config.repo.mainBranch !== options.mainBranch) {
     throw new ConfigSourceError(

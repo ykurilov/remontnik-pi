@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { existsSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { dockerClientEnv } from '../workbench/runner.js'
 
 // Где выполняется код `remontnik.config.*` (`config-source.ts`). Код настройки берётся из основной ветки, но файлы,
@@ -21,12 +23,28 @@ export interface ConfigReadRun {
 }
 
 export interface ConfigCodeReader {
-  /** `container` — отдельный контейнер без секретов, сокета Docker и сети; `none` — процесс Node с правами врача. */
-  readonly isolation: 'container' | 'none'
+  /**
+   * `container` — отдельный контейнер без секретов, сокета Docker и сети; `none` — процесс Node с правами врача (тесты);
+   * `unavailable` — выполнять негде, любое чтение кода настройки — отказ.
+   */
+  readonly isolation: 'container' | 'none' | 'unavailable'
   /** Где создаются копии файлов настройки. Контейнеру копия видна по тому же пути, что и врачу. */
   readonly scratchDir: string
   /** Выполняет `node <args>` в копии; ответ — stdout. */
   run(input: ConfigReadRun): Promise<string>
+}
+
+/** Исполнитель не может выполнить код настройки вовсе (нет Docker, нет контейнера врача): сама настройка тут ни при чём. */
+export class ConfigReaderUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConfigReaderUnavailableError'
+  }
+}
+
+/** Исполнитель, которому выполнять негде: каждое чтение — понятный отказ. */
+export function unavailableConfigReader(reason: string): ConfigCodeReader {
+  return { isolation: 'unavailable', scratchDir: tmpdir(), run: () => Promise.reject(new ConfigReaderUnavailableError(reason)) }
 }
 
 function outputOf(error: Error | null, stdout: string, stderr: string): string {
@@ -34,8 +52,8 @@ function outputOf(error: Error | null, stdout: string, stderr: string): string {
   return stdout
 }
 
-/** Чтение настройки процессом Node на этой машине — только для тестов и разработки: код настройки может всё, что может врач. */
-export function localConfigReader(options: { scratchDir?: string } = {}): ConfigCodeReader {
+/** Только для тестов: чтение настройки процессом Node на этой машине, без изоляции — код настройки может всё, что может врач. */
+export function localConfigReaderForTests(options: { scratchDir?: string } = {}): ConfigCodeReader {
   return {
     isolation: 'none',
     scratchDir: options.scratchDir ?? tmpdir(),
@@ -59,11 +77,15 @@ export function localConfigReader(options: { scratchDir?: string } = {}): Config
 
 export interface ConfigReadContainerSpec {
   name: string
+  /** Контейнер врача, чей это контейнер чтения: по метке его остатки убирает старт этого врача. */
+  owner: string
   image: string
   copyDir: string
   user?: string
   env: Record<string, string>
   args: string[]
+  /** Срок жизни внутри контейнера: по нему `timeout` убивает код настройки, даже если клиент `docker` уже не ждёт. */
+  lifetimeSeconds: number
 }
 
 export const CONFIG_READ_LABEL = 'remontnik.config-read'
@@ -75,7 +97,7 @@ export function configReadDockerArgs(spec: ConfigReadContainerSpec): string[] {
     'run',
     '--rm',
     '--name', spec.name,
-    '--label', `${CONFIG_READ_LABEL}=1`,
+    '--label', `${CONFIG_READ_LABEL}=${spec.owner}`,
     '--network', 'none',
     ...(spec.user ? ['--user', spec.user] : []),
     '--cap-drop', 'ALL',
@@ -89,8 +111,11 @@ export function configReadDockerArgs(spec: ConfigReadContainerSpec): string[] {
     '--mount', `type=bind,source=${spec.copyDir},target=${spec.copyDir},readonly`,
     '-w', spec.copyDir,
     ...Object.entries(spec.env).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
-    '--entrypoint', 'node',
+    // `timeout` из coreutils образа врача (Debian): по сроку — KILL всей группе процессов; с ним кончается и контейнер.
+    '--entrypoint', 'timeout',
     spec.image,
+    '-s', 'KILL', String(spec.lifetimeSeconds),
+    'node',
     ...spec.args,
   ]
 }
@@ -106,6 +131,17 @@ export interface ContainerConfigReaderOptions {
 /** Запас на запуск и остановку контейнера сверх срока чтения. */
 const CONTAINER_MARGIN_MS = 30_000
 
+// Клиент docker не дозвался до Docker: нет программы, сокета, прав на сокет или демон лежит.
+const DOCKER_UNREACHABLE = /Cannot connect to the Docker daemon|error during connect|Is the docker daemon running|permission denied while trying to connect|docker\.sock: connect/i
+
+/** Ошибка вызова docker: Docker недоступен — `ConfigReaderUnavailableError`, остальное — как есть. */
+function dockerFailure(error: Error & { code?: unknown }, stderr: string): Error {
+  const text = stderr.trim() || error.message
+  if (error.code === 'ENOENT') return new ConfigReaderUnavailableError(`Docker недоступен (нет программы ${String((error as { path?: unknown }).path ?? 'docker')})`)
+  if (DOCKER_UNREACHABLE.test(text)) return new ConfigReaderUnavailableError(`Docker недоступен (${text.split('\n')[0]!.slice(0, 200)})`)
+  return new Error(text)
+}
+
 /**
  * Чтение настройки в контейнере из образа врача. Образ берётся по ID у контейнера врача: тот же Node и те же пакеты
  * Ремонтника, что у врача. Не вышло за срок — контейнер удаляется по имени.
@@ -117,11 +153,8 @@ export function containerConfigReader(options: ContainerConfigReaderOptions): Co
   const call = (args: string[], timeoutMs: number, maxBuffer = 1024 * 1024) =>
     new Promise<string>((resolve, reject) => {
       execFile(docker, args, { env, timeout: timeoutMs, maxBuffer }, (error, stdout, stderr) => {
-        try {
-          resolve(outputOf(error, stdout, stderr))
-        } catch (failure) {
-          reject(failure)
-        }
+        if (error) reject(dockerFailure(error, stderr))
+        else resolve(stdout)
       })
     })
   let image: string | undefined
@@ -130,10 +163,21 @@ export function containerConfigReader(options: ContainerConfigReaderOptions): Co
     scratchDir: options.scratchDir,
     async run(input) {
       image ??= (await call(['inspect', '--format', '{{.Image}}', options.gatewayContainer], CONTAINER_MARGIN_MS).catch((error: Error) => {
+        if (error instanceof ConfigReaderUnavailableError) throw error
         throw new Error(`образ врача не найден у контейнера ${options.gatewayContainer}: ${error.message}`)
       })).trim()
       const name = `remontnik-config-${randomBytes(6).toString('hex')}`
-      const args = configReadDockerArgs({ name, image, copyDir: input.copyDir, ...(user ? { user } : {}), env: input.env, args: input.args })
+      const lifetimeSeconds = Math.ceil(input.timeoutMs / 1000)
+      const args = configReadDockerArgs({
+        name,
+        owner: options.gatewayContainer,
+        image,
+        copyDir: input.copyDir,
+        ...(user ? { user } : {}),
+        env: input.env,
+        args: input.args,
+        lifetimeSeconds,
+      })
       try {
         return await call(args, input.timeoutMs + CONTAINER_MARGIN_MS, input.maxOutputBytes)
       } catch (error) {
@@ -142,4 +186,33 @@ export function containerConfigReader(options: ContainerConfigReaderOptions): Co
       }
     },
   }
+}
+
+/**
+ * Остатки чтений настройки прошлого запуска врача (врач упал посреди чтения): контейнеры с его меткой и копии файлов
+ * настройки `config-*` в папке чтения. Старт врача зовёт это раньше первого чтения.
+ */
+export async function removeOrphanConfigReads(options: { gatewayContainer: string; scratchDir: string; docker?: string; log?: (line: string) => void }): Promise<string[]> {
+  const docker = options.docker ?? 'docker'
+  const env = dockerClientEnv()
+  const call = (args: string[]) =>
+    new Promise<string>((resolve, reject) => {
+      execFile(docker, args, { env, timeout: CONTAINER_MARGIN_MS }, (error, stdout, stderr) => (error ? reject(dockerFailure(error, stderr)) : resolve(stdout)))
+    })
+  const listed = await call(['ps', '-aq', '--filter', `label=${CONFIG_READ_LABEL}=${options.gatewayContainer}`])
+  const removed: string[] = []
+  for (const id of listed.split('\n').map((line) => line.trim()).filter(Boolean)) {
+    try {
+      await call(['rm', '-f', id])
+      removed.push(id)
+    } catch (error) {
+      options.log?.(`[врач] старый контейнер чтения настройки ${id} не удалился: ${(error as Error).message.slice(-300)}`)
+    }
+  }
+  if (existsSync(options.scratchDir)) {
+    for (const entry of readdirSync(options.scratchDir)) {
+      if (entry.startsWith('config-')) rmSync(join(options.scratchDir, entry), { recursive: true, force: true })
+    }
+  }
+  return removed
 }

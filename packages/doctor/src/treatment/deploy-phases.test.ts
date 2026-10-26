@@ -221,12 +221,12 @@ function fixBranch(r: Repo): string {
 }
 
 /** Человек отправил свою правку в основную ветку origin из своей копии. */
-function humanPush(r: Repo): string {
+function humanPush(r: Repo, files: Record<string, string> = { 'README.md': 'человек\n' }): string {
   const clone = join(r.root, 'human')
   git(r.root, 'clone', r.origin, clone)
   git(clone, 'config', 'user.email', 'owner@example.com')
   git(clone, 'config', 'user.name', 'Owner')
-  writeFileSync(join(clone, 'README.md'), 'человек\n')
+  for (const [path, content] of Object.entries(files)) writeFileSync(join(clone, path), content)
   git(clone, 'add', '-A')
   git(clone, 'commit', '-m', 'человек')
   git(clone, 'push', 'origin', 'main')
@@ -547,6 +547,51 @@ describe('лечение до выкатки: deploying → observing → ито
       expect(text).not.toContain('origin.git')
       expect(text).not.toContain('git push')
     }
+  }, 90_000)
+
+  // Настройка на основной ветке origin теперь подключает файл, который меняет правка: проверка правки шла по её основе.
+  const CONFIG_IMPORTING_PRICE = { 'remontnik.config.mjs': `import { price } from './src/price.mjs'\nexport default { price }\n` }
+
+  it('настройка на свежей основной ветке подключает файл правки → перед выкаткой это запретная зона: не выкатывает, нужен человек', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    humanPush(r, CONFIG_IMPORTING_PRICE)
+    const doctor = await startDoctor(r, model, app, clock, { mainline: 'merge' })
+
+    await doctor.receiveEvents([priceCrash()])
+    const closed = await settledCase(doctor)
+
+    expect(closed.state).toBe('report_only')
+    expect(app.promotes).toBe(0)
+    expect(git(r.origin, 'tag', '--list', 'remontnik/*')).toBe('')
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.type).toBe('needs_human')
+    expect(last.full).toContain('запретные зоны (remontnik)')
+  }, 90_000)
+
+  it('настройка на основной ветке подключила файл правки за окно наблюдения → в main не вливает, причина в отчёте', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    const doctor = await startDoctor(r, model, app, clock, { mainline: 'merge' })
+    let human: string | undefined
+    clock.beforeWake = async () => {
+      if (app.promotes === 1 && !human) human = humanPush(r, CONFIG_IMPORTING_PRICE)
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await settledCase(doctor)
+
+    expect(healed.state).toBe('healed')
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(human)
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.short).toContain('подключает настройка Ремонтника на основной ветке: src/price.mjs')
+    expect(last.short).toContain('запрос на слияние')
   }, 90_000)
 
   it('стоп-кран нажат во время наблюдения → выкатка доходит до конца, но в main не вливает: правка ждёт запроса на слияние', async () => {

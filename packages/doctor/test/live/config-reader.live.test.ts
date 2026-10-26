@@ -150,4 +150,25 @@ describe.skipIf(!dockerReady)('чтение настройки в контейн
     expect(docker(['ps', '-aq', '--filter', 'label=remontnik.config-read']).trim()).toBe('')
     expect(docker(['exec', DOCTOR, 'ls', '-A', join(stateDir, 'config-read')]).trim()).toBe('')
   }, 120_000)
+
+  it('Docker недоступен — врач говорит это прямо и код настройки не выполняет', () => {
+    const script = `
+      const { loadMainBranchConfig } = await import('/app/dist/service/config-source.js')
+      const { configReaderFromEnv } = await import('/app/dist/service/start.js')
+      try {
+        await loadMainBranchConfig({ mainCheckoutDirectory: ${JSON.stringify(appDir)}, mainBranch: 'main', reader: configReaderFromEnv(process.env) })
+        process.stdout.write(JSON.stringify({ loaded: true }))
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ code: error.code, message: error.message }))
+      }
+    `
+    const out = JSON.parse(
+      docker(['exec', '-e', `DOCKER_HOST=unix://${join(stateDir, 'no-docker.sock')}`, DOCTOR, 'node', '--input-type=module', '-e', script]),
+    ) as { loaded?: boolean; code?: string; message?: string }
+
+    expect(out.loaded).toBeUndefined()
+    expect(out.code).toBe('reader_unavailable')
+    expect(out.message).toMatch(/^настройку нельзя прочитать: Docker недоступен/)
+    expect(docker(['exec', DOCTOR, 'ls', '-A', join(stateDir, 'config-read')]).trim()).toBe('')
+  }, 120_000)
 })

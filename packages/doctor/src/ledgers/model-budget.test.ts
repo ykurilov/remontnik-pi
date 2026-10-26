@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { createMemoryRecordStore } from '../records/index.js'
 import { createScriptedModel, say, testRemontnikConfig } from '../testing/index.js'
 import { createFallbackProvider, DOCTOR_MODEL_ID, DOCTOR_PROVIDER_ID } from '../model/provider-fallback.js'
+import { ConfigSourceError } from '../service/config-source.js'
 import { createModelBudget, maxRequestUsd } from './model-budget.js'
 import { modelSpentUsd, type CaseSpend, type SpendDay } from './spend-ledger.js'
 
@@ -196,6 +197,30 @@ describe('бронь перед запросом к модели', () => {
     const answer = await budget.models.completeSimple(model, { messages: [{ role: 'user', content: 'привет', timestamp: NOON }] }, { maxTokens: 0 })
     expect(answer.errorMessage).toContain('out of budget')
     expect(scripted.requests).toHaveLength(0)
+  })
+
+  it('настройку нельзя прочитать (Docker недоступен) → запрос не уходит, причина — от настройки, а не «учёт не отвечает»', async () => {
+    const scripted = createScriptedModel({ costPerResponseUsd: 0.1 })
+    scripted.script(say('один'))
+    const lines: string[] = []
+    const reported: unknown[] = []
+    const budget = createModelBudget({ models: scripted.models, boot: 'boot-a', now: () => NOON, log: (line) => lines.push(line), report: (error) => reported.push(error) })
+    const unavailable = new ConfigSourceError('reader_unavailable', 'настройку нельзя прочитать: Docker недоступен (Cannot connect to the Docker daemon)')
+    const records = createMemoryRecordStore()
+    budget.attach({ records, loadConfig: async () => Promise.reject(unavailable) })
+    const model = budget.models.getModel(scripted.model.provider, scripted.model.modelId)!
+    const signal = new AbortController().signal
+    budget.bind(signal, 7)
+
+    const answer = await budget.models.streamSimple(model, { messages: [] }, { signal }).result()
+
+    expect(answer.stopReason).toBe('error')
+    expect(answer.errorMessage).toContain('out of budget — настройку нельзя прочитать: Docker недоступен')
+    expect(answer.errorMessage).not.toContain('учёт расходов не отвечает')
+    expect(lines).toEqual(['запрос к модели не отправлен (случай 7): настройку нельзя прочитать: Docker недоступен (Cannot connect to the Docker daemon)'])
+    expect(reported).toEqual([unavailable])
+    expect(scripted.requests).toHaveLength(0)
+    expect(await records.read<CaseSpend>('spend-case', '7')).toBeUndefined()
   })
 
   it('учёт не подключён или не отвечает → запрос не уходит', async () => {
