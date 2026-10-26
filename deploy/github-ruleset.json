@@ -1,0 +1,34 @@
+[
+  {
+    "name": "remontnik: основная ветка без переписывания истории",
+    "target": "branch",
+    "enforcement": "active",
+    "bypass_actors": [],
+    "conditions": {
+      "ref_name": {
+        "include": ["~DEFAULT_BRANCH"],
+        "exclude": []
+      }
+    },
+    "rules": [
+      { "type": "non_fast_forward" },
+      { "type": "deletion" }
+    ]
+  },
+  {
+    "name": "remontnik: метки врача неизменны",
+    "target": "tag",
+    "enforcement": "active",
+    "bypass_actors": [],
+    "conditions": {
+      "ref_name": {
+        "include": ["refs/tags/remontnik/**"],
+        "exclude": []
+      }
+    },
+    "rules": [
+      { "type": "update" },
+      { "type": "deletion" }
+    ]
+  }
+]
