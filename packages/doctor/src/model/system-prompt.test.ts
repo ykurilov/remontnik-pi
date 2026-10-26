@@ -27,6 +27,13 @@ describe('системный промпт врача', () => {
     expect(buildSystemPrompt(input())).toContain('Tool bash was interrupted')
   })
 
+  it('тест правки — новым файлом: правку, которая меняет существующий тест, врач не примет, и модель об этом знает', () => {
+    // Живой прогон: модель дописала тест в существующий файл, и правка ушла человеку (`existing_test_changed`).
+    const prompt = buildSystemPrompt(input())
+    expect(prompt).toContain('новым файлом')
+    expect(prompt).toContain('Существующие тесты и сценарии eval не меняй')
+  })
+
   it('для одной основы байты одинаковы при любом порядке файлов', () => {
     const first = buildSystemPrompt(input())
     const second = buildSystemPrompt(input({ repoMap: buildRepoMap([...files].reverse(), { closedPaths: ['secrets/**'] }) }))

@@ -110,7 +110,7 @@ export function configReaderFromEnv(env: DoctorEnv, options: { docker?: string }
  * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
  * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
-export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options: { docker?: string } = {}): DoctorStartPlan {
+export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options: { log?: (line: string) => void; docker?: string } = {}): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
   const worktreesDir = env.REMONTNIK_WORKTREES_DIR?.trim() || join(stateDir, 'worktrees')
@@ -124,7 +124,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig, options
   if (!chatIdEnv) throw new Error('врачу нужен чат тревог: reports.telegram.chatIdEnv в настройке')
   const apiBaseUrl = telegram.apiBaseUrlEnv ? env[telegram.apiBaseUrlEnv]?.trim() : undefined
   const proxyToken = telegram.proxyTokenEnv ? env[telegram.proxyTokenEnv]?.trim() : undefined
-  const model = createDoctorModels(env)
+  // Переход модели на запасной путь и обратно — в журнал врача.
+  const model = createDoctorModels(env, options.log ? { log: options.log } : {})
   const browserClient = browserClientFromEnv(env)
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
   const { bridge, paseoBridge } = paseoBridgeOf(env, config)

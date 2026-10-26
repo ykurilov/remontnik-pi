@@ -120,7 +120,7 @@ export function createModelBudget(options: { models: Models; boot: string; now()
       }
       const settle = (answer: AssistantMessage | undefined) =>
         ledger!.records
-          .transaction((tx) => settleModelHoldIn(tx, { dayKey: held.dayKey, holdId: held.holdId, actualUsd: actualUsdOf(answer, maxUsd) }))
+          .transaction((tx) => settleModelHoldIn(tx, { dayKey: held.dayKey, holdId: held.holdId, actualUsd: actualUsdOf(answer, maxUsd), ...(answer?.provider ? { provider: answer.provider } : {}) }))
           // Итог не записался — бронь остаётся и закрывается целиком по возрасту (`holdModelIn`).
           .catch((error: unknown) => report(error))
       try {

@@ -23,7 +23,7 @@
 2. Поставить `@ykurilov/remontnik-watch` и `@ykurilov/remontnik-core` точными версиями. Врача в приложение не ставить.
 3. Подключить сторожа в каждый процесс приложения (`createWatch`).
 4. Написать `remontnik.config.ts` в корне: запретные зоны, где врач может править, команды проверки.
-5. Дать команды выкатки `build`, `promote`, `confirm`, `rollback`, `current`, `health`. Проверить вручную: `build` → `promote` → `rollback`.
+5. Дать команды выкатки `build`, `promote`, `confirm`, `rollback`, `current`, `health`. `promote` выходит, только когда кандидат уже отвечает. Адреса команды берут из своих файлов на сервере: переменные с `URL` в имени врач им не передаёт. Проверить вручную: `build` → `promote` → `rollback`.
 6. По желанию — eval и службы для тестов.
 7. Задать окружение сервера; секреты — только через `secret-handoff`.
 8. Запустить врача контейнером из `deploy/compose.remontnik.yml`.
