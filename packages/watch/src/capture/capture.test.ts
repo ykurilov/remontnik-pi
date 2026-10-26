@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -24,15 +24,18 @@ interface FakeDoctor {
   signatureFailures: number
   /** Сколько следующих запросов получат 503. */
   failNext: number
+  /** Пауза перед ответом. */
+  delayMs: number
   close(): Promise<void>
 }
 
 async function startFakeDoctor(): Promise<FakeDoctor> {
-  const doctor: FakeDoctor = { url: '', batches: [], signatureFailures: 0, failNext: 0, close: async () => {} }
+  const doctor: FakeDoctor = { url: '', batches: [], signatureFailures: 0, failNext: 0, delayMs: 0, close: async () => {} }
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = []
     for await (const chunk of request) chunks.push(chunk as Buffer)
     const body = Buffer.concat(chunks).toString('utf8')
+    if (doctor.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, doctor.delayMs))
     if (doctor.failNext > 0) {
       doctor.failNext -= 1
       response.writeHead(503).end()
@@ -187,13 +190,83 @@ describe('capture', () => {
     const before = openOutbox({ dir, processName: 'web' })
     const { createIncidentEvent } = await import('@ykurilov/remontnik-core/incident')
     before.append(createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/x.ts:1:1', message: 'crashed' }), { notify: true })
+    before.close()
 
     const watch = openWatch()
     await until(() => telegram.messages.length === 1 && doctor.batches.length === 1)
 
     expect(telegram.messages[0]?.text).toContain('crash')
-    await until(() => openOutbox({ dir, processName: 'web' }).awaitingNotification().length === 0)
+    expect(await watch.flush(3000)).toBe(true)
     watch.close()
+    const after = openOutbox({ dir, processName: 'web' })
+    expect(after.awaitingNotification()).toHaveLength(0)
+    after.close()
+  })
+
+  it('остатки прошлого процесса склеиваются по отпечатку: одна тревога со счётчиком', async () => {
+    const before = openOutbox({ dir, processName: 'web' })
+    const { createIncidentEvent } = await import('@ykurilov/remontnik-core/incident')
+    for (let index = 0; index < 3; index += 1) {
+      before.append(createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/x.ts:1:1', message: `crashed on ${index}` }), { notify: true })
+    }
+    before.close()
+
+    const watch = openWatch()
+    expect(await watch.flush(3000)).toBe(true)
+
+    expect(telegram.messages).toHaveLength(1)
+    expect(telegram.messages[0]?.text).toContain('Повторов: 3')
+    watch.close()
+    const after = openOutbox({ dir, processName: 'web' })
+    expect(after.awaitingNotification()).toHaveLength(0)
+    after.close()
+  })
+
+  it('сломанная очередь посреди работы не роняет приложение', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const watch = openWatch()
+      watch.capture(new Error('first'))
+      // Файл очереди становится папкой: любая запись в него бросает.
+      rmSync(join(dir, 'outbox-web.jsonl'))
+      mkdirSync(join(dir, 'outbox-web.jsonl'))
+
+      await until(() => doctor.batches.length >= 1)
+      await expect(watch.flush(500)).resolves.toBeTypeOf('boolean')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      expect(unhandled).toEqual([])
+      expect(watch.stats().ownErrors).toBeGreaterThan(0)
+      expect(errors.mock.calls.some(([line]) => String(line).startsWith('[remontnik]'))).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('flush по сроку не запускает вторую доставку тех же событий', async () => {
+    doctor.delayMs = 400
+    const watch = openWatch()
+    watch.capture(new Error('slow doctor'))
+
+    expect(await watch.flush(50)).toBe(false)
+    expect(await watch.flush(3000)).toBe(true)
+
+    expect(doctor.batches.flat()).toHaveLength(1)
+  })
+
+  it('потолок очереди: повторы склеены, врач получает счётчик повторов', async () => {
+    const watch = openWatch({ maxQueue: 2 })
+
+    for (let index = 0; index < 5; index += 1) watch.capture(new Error(`order ${index} failed`), { kind: 'tool_error', where: 'lookupOrder' })
+    expect(watch.stats().queue.pending).toBe(2)
+    expect(await watch.flush(3000)).toBe(true)
+
+    const received = doctor.batches.flat()
+    expect(received).toHaveLength(2)
+    expect(received.map((item) => item.context.repeats ?? 0)).toEqual([0, 3])
   })
 
   it('свои ошибки — строка [remontnik] без случая, приложение не падает', async () => {
@@ -275,6 +348,53 @@ describe('wrapModelCatalog', () => {
     expect(model.provider).toBe('fake-provider.chat')
   })
 
+  it('отмена запроса («Стоп») — не сбой', async () => {
+    class AbortingModel {
+      async doGenerate(): Promise<never> {
+        throw new DOMException('This operation was aborted', 'AbortError')
+      }
+    }
+    const watch = openWatch()
+    const model = watch
+      .wrapModelCatalog({ models: [], providers: [{ id: 'fake', createLanguageModel: () => new AbortingModel() }] })
+      .providers[0]!.createLanguageModel()
+
+    await expect(model.doGenerate()).rejects.toThrow('aborted')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(watch.stats().queue.pending).toBe(0)
+    expect(doctor.batches).toEqual([])
+  })
+
+  it('каталог-экземпляр класса сохраняет прототип и методы', async () => {
+    class Provider {
+      readonly id = 'fake'
+      createLanguageModel(_id: string, _key: string) {
+        return new FakeModel(true)
+      }
+      describe() {
+        return `provider ${this.id}`
+      }
+    }
+    class Catalog {
+      readonly models = [{ id: 'fake-model' }]
+      readonly providers = [new Provider()]
+      count() {
+        return this.models.length
+      }
+    }
+    const watch = openWatch()
+
+    const wrapped = watch.wrapModelCatalog(new Catalog())
+
+    expect(wrapped).toBeInstanceOf(Catalog)
+    expect(wrapped.count()).toBe(1)
+    expect(wrapped.providers[0]).toBeInstanceOf(Provider)
+    expect(wrapped.providers[0]!.describe()).toBe('provider fake')
+    await expect(wrapped.providers[0]!.createLanguageModel('fake-model', 'key').doGenerate()).rejects.toThrow('503')
+    await until(() => doctor.batches.length === 1)
+  })
+
   it('удачный ответ не трогает, ошибка в потоке — model_error', async () => {
     const watch = openWatch()
     const model = watch.wrapModelCatalog(catalog(false)).providers[0]!.createLanguageModel('fake-model', 'key')
@@ -328,6 +448,13 @@ describe('installProcessHandlers: поведение процесса как б�
     expect(run.stdout).toContain('app handled: crashed on order 41')
     expect(run.stdout).toContain('still alive')
     expect(run.outbox).toContain('crashed on order 41')
+  })
+
+  it('одна и та же ошибка-константа, брошенная дважды, — два падения', () => {
+    const run = runCrashingApp('same-error-twice')
+
+    expect(run.status).toBe(0)
+    expect(run.outbox.match(/"kind":"crash"/g)).toHaveLength(2)
   })
 
   it('свой обработчик отказов приложения работает как раньше, случай записан', () => {

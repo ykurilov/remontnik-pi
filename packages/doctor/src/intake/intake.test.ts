@@ -1,5 +1,6 @@
 import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { signBody } from '@ykurilov/remontnik-core/signed-http'
+import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createIntakeHandler, startIntakeServer, type IntakeServer } from './index.js'
 
@@ -27,6 +28,7 @@ beforeEach(async () => {
       return { accepted: events.map((item) => item.eventId) }
     },
     health: () => ({ ok: true, harness: 'open', queue: { telegramPending: 0 }, autoDeploy: 'on' }),
+    bodyTimeoutMs: 300,
   })
   server = await startIntakeServer({ handler, host: '127.0.0.1', port: 0 })
 })
@@ -105,12 +107,12 @@ describe('POST /v1/events', () => {
     expect(received).toHaveLength(0)
   })
 
-  it('слишком большое тело — 413', async () => {
+  it('слишком большое тело без Content-Length — 413 по ходу чтения, соединение закрыто', async () => {
     const body = JSON.stringify({ events: [], padding: 'x'.repeat(2 * 1024 * 1024) })
 
-    const response = await post(body, signBody(body, secret))
+    const result = await partialPost({ ...signBody(body, secret), 'transfer-encoding': 'chunked' }, body)
 
-    expect(response.status).toBe(413)
+    expect(result.status).toBe(413)
   })
 
   it('врач ещё раз вычищает секреты в принятых событиях', async () => {
@@ -121,6 +123,58 @@ describe('POST /v1/events', () => {
     await post(body, signBody(body, secret))
 
     expect(JSON.stringify(received)).not.toContain(key)
+  })
+})
+
+/** Запрос, который шлёт заголовки и часть тела, но не дописывает его: ответ должен прийти без всего тела. */
+function partialPost(headers: Record<string, string>, firstChunk = ''): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${server.url}/v1/events`)
+    const outgoing = httpRequest({ host: url.hostname, port: url.port, path: url.pathname, method: 'POST', headers })
+    outgoing.on('response', (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', (chunk: Buffer) => chunks.push(chunk))
+      // Сервер закрывает соединение сразу после ответа: ждём «close», а не только «end».
+      response.on('close', () => {
+        resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') })
+        outgoing.destroy()
+      })
+    })
+    outgoing.on('error', () => {})
+    outgoing.setTimeout(3000, () => reject(new Error('ответа нет: сервер ждёт тело')))
+    outgoing.write(firstChunk)
+  })
+}
+
+describe('отказ до чтения тела', () => {
+  it('без подписи — 401 сразу, тело не ждём', async () => {
+    const result = await partialPost({ 'content-type': 'application/json', 'content-length': String(500_000) }, '{"events":')
+
+    expect(result.status).toBe(401)
+    expect(JSON.parse(result.body)).toEqual({ error: 'missing' })
+  })
+
+  it('устаревшая отметка времени — 401 stale сразу', async () => {
+    const headers = signBody('{}', secret, Date.now() - 10 * 60_000)
+    const result = await partialPost({ ...headers, 'content-length': String(500_000) }, '{')
+
+    expect(result.status).toBe(401)
+    expect(JSON.parse(result.body)).toEqual({ error: 'stale' })
+  })
+
+  it('Content-Length больше предела — 413 сразу', async () => {
+    const headers = signBody('{}', secret)
+    const result = await partialPost({ ...headers, 'content-length': String(5 * 1024 * 1024) })
+
+    expect(result.status).toBe(413)
+  })
+
+  it('тело не дописано за срок — 408', async () => {
+    const headers = signBody('{}', secret)
+    const result = await partialPost({ ...headers, 'content-length': '100' }, '{"events":')
+
+    expect(result.status).toBe(408)
+    expect(received).toHaveLength(0)
   })
 })
 

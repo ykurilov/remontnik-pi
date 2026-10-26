@@ -1,6 +1,6 @@
 import { truncateText } from '@ykurilov/remontnik-core/incident'
 import type { TelegramClient } from '@ykurilov/remontnik-core/telegram'
-import { copyRecord, type RecordStore } from '../records/index.js'
+import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
 
 // Отчёты врача: номера по порядку (курсор для Paseo) и очередь сообщений в Telegram с повторами.
 
@@ -53,6 +53,8 @@ export interface AddReportInput {
 
 export interface Reports {
   add(input: AddReportInput): Promise<Report>
+  /** То же внутри чужой транзакции: отчёт появится или откатится вместе с ней. */
+  addIn(tx: RecordTransaction, input: AddReportInput): Promise<Report>
   get(reportId: number): Promise<Report | undefined>
   list(query: { after: number; limit: number }): Promise<Report[]>
   /** Отправляет в Telegram отчёты, чья попытка подошла. Без настроенного Telegram ничего не делает. */
@@ -126,9 +128,7 @@ export function createReports(options: CreateReportsOptions): Reports {
     }
   }
 
-  return {
-    add(input) {
-      return store.transaction(async (tx) => {
+  async function addIn(tx: RecordTransaction, input: AddReportInput): Promise<Report> {
         const index = await tx.doc<ReportIndex>(INDEX.collection, INDEX.key, emptyIndex())
         const reportId = index.nextReportId
         index.nextReportId += 1
@@ -143,8 +143,11 @@ export function createReports(options: CreateReportsOptions): Reports {
         }
         if (input.telegram === 'pending') index.pending.push(reportId)
         return copyRecord(await tx.doc<Report>('report', reportKey(reportId), report))
-      })
-    },
+  }
+
+  return {
+    add: (input) => store.transaction((tx) => addIn(tx, input)),
+    addIn,
 
     get: (reportId) => store.read<Report>('report', reportKey(reportId)),
 

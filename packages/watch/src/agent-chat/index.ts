@@ -42,7 +42,8 @@ export interface AgentChatInnerHooks<AfterTurnResult = unknown, NotStartedResult
 
 export interface AgentChatWatchHooks<AfterTurnResult = unknown, NotStartedResult = unknown> {
   logError(message: string): void
-  afterTurn(result: AgentChatTurnResult): Promise<AfterTurnResult | undefined>
+  /** Есть, только если включён: SDK с хуком afterTurn требует хранилище с `setAfterTurnState`. */
+  afterTurn?(result: AgentChatTurnResult): Promise<AfterTurnResult | undefined>
   turnNotStarted(input: AgentChatTurnNotStarted): NotStartedResult | undefined
 }
 
@@ -51,9 +52,14 @@ const PROVIDER_LINE = /провайдер|поставщик|provider|модел
 
 export function agentChatWatchHooks<AfterTurnResult = unknown, NotStartedResult = unknown>(
   watch: Pick<Watch, 'capture'>,
-  options: { inner?: AgentChatInnerHooks<AfterTurnResult, NotStartedResult> } = {},
+  options: {
+    inner?: AgentChatInnerHooks<AfterTurnResult, NotStartedResult>
+    /** Смотреть итоги ходов (сбои ходов и инструментов). Включать, только если хранилище чата умеет `setAfterTurnState`. */
+    afterTurn?: boolean
+  } = {},
 ): AgentChatWatchHooks<AfterTurnResult, NotStartedResult> {
   const { inner } = options
+  const withAfterTurn = options.afterTurn === true || inner?.afterTurn !== undefined
 
   // Наблюдение не должно мешать ходу: сбой сторожа — строка в журнал, и всё.
   const safely = (record: () => void) => {
@@ -82,7 +88,7 @@ export function agentChatWatchHooks<AfterTurnResult = unknown, NotStartedResult 
     return null
   }
 
-  return {
+  const hooks: AgentChatWatchHooks<AfterTurnResult, NotStartedResult> = {
     logError(message) {
       if (!message.startsWith(OWN_LINE)) {
         safely(() =>
@@ -94,27 +100,6 @@ export function agentChatWatchHooks<AfterTurnResult = unknown, NotStartedResult 
       }
       if (inner?.logError) inner.logError(message)
       else console.error(message)
-    },
-
-    async afterTurn(result) {
-      safely(() => {
-        if (result.status === 'error') {
-          const details = result.error?.details
-          const reason = [details?.statusCode, details?.reason].filter((item) => item !== undefined).join(' ')
-          const message = `ход сорвался: ${result.error?.kind ?? 'неизвестная ошибка'}${reason ? ` (${reason})` : ''}`
-          watch.capture(new Error(message), { kind: 'turn_failed', where: 'agent-chat:turn', context: turnContext(result) })
-        }
-        for (const part of result.parts) {
-          const tool = part.state === 'output-error' ? toolName(part) : null
-          if (!tool) continue
-          watch.capture(new Error(part.errorText ?? 'ошибка инструмента'), {
-            kind: 'tool_error',
-            where: tool,
-            context: { chatId: result.chatId, tool },
-          })
-        }
-      })
-      return inner?.afterTurn ? await inner.afterTurn(result) : undefined
     },
 
     turnNotStarted(input) {
@@ -130,4 +115,27 @@ export function agentChatWatchHooks<AfterTurnResult = unknown, NotStartedResult 
       return inner?.turnNotStarted ? inner.turnNotStarted(input) : undefined
     },
   }
+  if (!withAfterTurn) return hooks
+
+  hooks.afterTurn = async (result) => {
+    safely(() => {
+      if (result.status === 'error') {
+        const details = result.error?.details
+        const reason = [details?.statusCode, details?.reason].filter((item) => item !== undefined).join(' ')
+        const message = `ход сорвался: ${result.error?.kind ?? 'неизвестная ошибка'}${reason ? ` (${reason})` : ''}`
+        watch.capture(new Error(message), { kind: 'turn_failed', where: 'agent-chat:turn', context: turnContext(result) })
+      }
+      for (const part of result.parts) {
+        const tool = part.state === 'output-error' ? toolName(part) : null
+        if (!tool) continue
+        watch.capture(new Error(part.errorText ?? 'ошибка инструмента'), {
+          kind: 'tool_error',
+          where: tool,
+          context: { chatId: result.chatId, tool },
+        })
+      }
+    })
+    return inner?.afterTurn ? await inner.afterTurn(result) : undefined
+  }
+  return hooks
 }

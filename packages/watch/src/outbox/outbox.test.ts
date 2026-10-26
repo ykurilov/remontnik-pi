@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
-import { beforeEach, describe, expect, it } from 'vitest'
-import { OUTBOX_RETRY_DELAYS_MS, openOutbox } from './index.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { OUTBOX_RETRY_DELAYS_MS, openOutbox as openOutboxRaw, type OpenOutboxOptions, type Outbox } from './index.js'
 
 const start = Date.parse('2026-10-26T10:00:00Z')
 let dir: string
@@ -12,8 +12,21 @@ function event(message: string, occurredAt = new Date(start)): IncidentEvent {
   return createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/server.ts:1:1', message, occurredAt })
 }
 
+const opened: Outbox[] = []
+
+function openOutbox(options: OpenOutboxOptions): Outbox {
+  const outbox = openOutboxRaw(options)
+  opened.push(outbox)
+  return outbox
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'remontnik-outbox-'))
+})
+
+afterEach(() => {
+  for (const outbox of opened.splice(0)) outbox.close()
+  vi.restoreAllMocks()
 })
 
 describe('очередь сторожа', () => {
@@ -37,7 +50,7 @@ describe('очередь сторожа', () => {
     worker.append(event('worker'), { notify: false })
 
     expect(web.file).not.toBe(worker.file)
-    expect(readdirSync(dir).sort()).toEqual(['outbox-web.jsonl', 'outbox-worker.jsonl'])
+    expect(readdirSync(dir).filter((name) => name.endsWith('.jsonl')).sort()).toEqual(['outbox-web.jsonl', 'outbox-worker.jsonl'])
     expect(web.due(start)).toHaveLength(1)
   })
 
@@ -65,6 +78,7 @@ describe('очередь сторожа', () => {
     outbox.ack([delivered.eventId])
     outbox.recordFailure([failing.eventId], start)
     outbox.markNotified(failing.eventId)
+    outbox.close()
 
     const reopened = openOutbox({ dir, processName: 'web', now: () => start })
 
@@ -82,33 +96,126 @@ describe('очередь сторожа', () => {
     const first = event('first')
     outbox.append(first, { notify: false })
     appendFileSync(outbox.file, '{"event":{"eventId":"broken')
+    outbox.close()
 
     const reopened = openOutbox({ dir, processName: 'web', now: () => start })
 
     expect(reopened.due(start).map((entry) => entry.event.eventId)).toEqual([first.eventId])
   })
 
-  it('сжимает файл при старте: подтверждённые старше суток выброшены, ожидающие остались', () => {
-    const day = 24 * 60 * 60 * 1000
+  it('подтверждённые сразу уходят из памяти и из файла при сжатии', () => {
     const outbox = openOutbox({ dir, processName: 'web', now: () => start })
-    const old = event('old')
-    const fresh = event('fresh')
+    const delivered = event('delivered')
     const pending = event('pending')
-    outbox.append(old, { notify: false })
-    outbox.ack([old.eventId])
-    const later = start + day + 1
-    const outboxLater = openOutbox({ dir, processName: 'web', now: () => later })
-    outboxLater.append(fresh, { notify: false })
-    outboxLater.append(pending, { notify: false })
-    outboxLater.ack([fresh.eventId])
+    outbox.append(delivered, { notify: false })
+    outbox.append(pending, { notify: false })
 
-    const compacted = openOutbox({ dir, processName: 'web', now: () => later + 1 })
+    outbox.ack([delivered.eventId])
 
+    expect(outbox.stats()).toMatchObject({ pending: 1, stored: 1 })
+    outbox.close()
+    const compacted = openOutbox({ dir, processName: 'web', now: () => start })
     const text = readFileSync(compacted.file, 'utf8')
-    expect(text).not.toContain(old.eventId)
-    expect(text).toContain(fresh.eventId)
-    expect(text).toContain(pending.eventId)
-    expect(compacted.due(later + 1).map((entry) => entry.event.eventId)).toEqual([pending.eventId])
+    expect(text).not.toContain(delivered.eventId)
+    expect(compacted.due(start).map((entry) => entry.event.eventId)).toEqual([pending.eventId])
+  })
+
+  it('подтверждённое с неотправленной тревогой ждёт тревоги, потом уходит', () => {
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+    const crash = event('crash')
+    outbox.append(crash, { notify: true })
+
+    outbox.ack([crash.eventId])
+    expect(outbox.awaitingNotification().map((entry) => entry.event.eventId)).toEqual([crash.eventId])
+    expect(outbox.stats()).toMatchObject({ pending: 0, stored: 1 })
+
+    outbox.markNotified(crash.eventId)
+    expect(outbox.stats().stored).toBe(0)
+  })
+
+  it('сжимает файл и на ходу, а не только при старте', () => {
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+    for (let index = 0; index < 3000; index += 1) {
+      const item = event(`event ${index}`)
+      outbox.append(item, { notify: false })
+      outbox.ack([item.eventId])
+    }
+
+    const lines = readFileSync(outbox.file, 'utf8').trim().split('\n').filter(Boolean)
+    expect(lines.length).toBeLessThan(2100)
+  })
+
+  it('потолок очереди: повторы отпечатка склеиваются в счётчик', () => {
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start, maxEntries: 3 })
+    const same = (index: number) =>
+      createIncidentEvent({ appName: 'patient', kind: 'tool_error', where: 'lookupOrder', message: `order ${index} failed` })
+    for (let index = 0; index < 3; index += 1) outbox.append(same(index), { notify: false })
+
+    for (let index = 3; index < 10; index += 1) outbox.append(same(index), { notify: false })
+
+    expect(outbox.stats()).toMatchObject({ pending: 3, lost: 0 })
+    expect(outbox.due(start).map((entry) => entry.repeats)).toEqual([0, 0, 7])
+    outbox.close()
+    const reopened = openOutbox({ dir, processName: 'web', now: () => start, maxEntries: 3 })
+    expect(reopened.due(start).map((entry) => entry.repeats)).toEqual([0, 0, 7])
+  })
+
+  it('потолок очереди: новый отпечаток вытесняет самый старый с пометкой «потеряно N»', () => {
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start, maxEntries: 3 })
+    const items = Array.from({ length: 5 }, (_, index) => event(`distinct failure ${'x'.repeat(index)}`))
+    for (const item of items) outbox.append(item, { notify: false })
+
+    expect(outbox.stats()).toMatchObject({ pending: 3, lost: 2 })
+    const due = outbox.due(start)
+    expect(due.map((entry) => entry.event.eventId)).toEqual(items.slice(2).map((item) => item.eventId))
+    expect(due.map((entry) => entry.lostBefore)).toEqual([0, 1, 1])
+    outbox.close()
+    const reopened = openOutbox({ dir, processName: 'web', now: () => start, maxEntries: 3 })
+    expect(reopened.stats()).toMatchObject({ pending: 3, lost: 2 })
+  })
+
+  it('большая очередь не ломает расчёт следующей попытки', () => {
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start, maxEntries: 200_000 })
+    for (let index = 0; index < 130_000; index += 1) {
+      outbox.append(createIncidentEvent({ appName: 'p', kind: 'crash', where: 'w', message: `m ${'y'.repeat(index % 7)}`, eventId: `E${index}` }), { notify: false })
+    }
+
+    expect(() => outbox.nextAttemptAt()).not.toThrow()
+    expect(() => outbox.stats()).not.toThrow()
+  }, 60_000)
+
+  it('второй экземпляр с тем же именем процесса пишет в свой файл и предупреждает', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const first = openOutbox({ dir, processName: 'web', now: () => start })
+    const second = openOutbox({ dir, processName: 'web', now: () => start })
+
+    first.append(event('first'), { notify: false })
+    second.append(event('second'), { notify: false })
+
+    expect(second.file).not.toBe(first.file)
+    expect(errors.mock.calls.some(([line]) => String(line).startsWith('[remontnik]'))).toBe(true)
+    expect(first.stats().pending).toBe(1)
+    expect(second.stats().pending).toBe(1)
+  })
+
+  it('подбирает осиротевший файл второго экземпляра после его смерти', () => {
+    const orphan = event('orphan')
+    writeFileSync(join(dir, 'outbox-web.dead-1.jsonl'), `${JSON.stringify({ event: orphan, state: 'pending', attempts: 0, nextAttemptAt: 0, notify: true })}\n`)
+    writeFileSync(join(dir, 'outbox-web.dead-1.lock'), '999999999:token')
+
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+    expect(outbox.due(start).map((entry) => entry.event.eventId)).toEqual([orphan.eventId])
+    expect(outbox.awaitingNotification()).toHaveLength(1)
+    expect(existsSync(join(dir, 'outbox-web.dead-1.jsonl'))).toBe(false)
+  })
+
+  it('после падения процесса (замок с мёртвым номером) файл снова свой', () => {
+    writeFileSync(join(dir, 'outbox-web.lock'), '999999999:token')
+
+    const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+    expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
   })
 
   it('повторы через 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин', () => {

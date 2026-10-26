@@ -1,7 +1,7 @@
 import type { IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
-import { copyRecord, type RecordStore } from '../records/index.js'
+import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
 
-// Книга случаев: события склеиваются по отпечатку в один открытый случай.
+// Книга случаев: события склеиваются по приложению и отпечатку в один открытый случай.
 
 export const CASE_LINKED_EVENTS_LIMIT = 50
 /** Сколько последних номеров событий помнить, чтобы повторная доставка не считалась дважды. */
@@ -35,6 +35,9 @@ export const CLOSED_CASE_STATES: readonly CaseState[] = ['healed', 'healed_by_pa
 
 export interface Case {
   caseId: number
+  appName: string
+  /** Процесс приложения, где сбой случился впервые (веб, фоновый работник), если сторож его назвал. */
+  processName?: string
   fingerprint: string
   kind: IncidentKind
   where: string
@@ -51,7 +54,7 @@ export interface Case {
 
 interface CaseIndex {
   nextCaseId: number
-  /** Отпечаток → номер открытого случая. */
+  /** Приложение и отпечаток (см. openKey) → номер открытого случая. */
   open: Record<string, number>
   recentEventIds: string[]
 }
@@ -61,16 +64,28 @@ export interface RecordEventsResult {
   newCases: Case[]
 }
 
+export interface RecordEventsOptions {
+  /** Вызывается для каждого нового случая внутри той же транзакции: сбой откатывает всю пачку. */
+  onNewCase?(tx: RecordTransaction, opened: Case): Promise<void>
+}
+
 export interface CaseBook {
-  recordEvents(events: readonly IncidentEvent[]): Promise<RecordEventsResult>
+  recordEvents(events: readonly IncidentEvent[], options?: RecordEventsOptions): Promise<RecordEventsResult>
   getCase(caseId: number): Promise<Case | undefined>
-  openCaseFor(fingerprint: string): Promise<Case | undefined>
+  openCaseFor(fingerprint: string, appName: string): Promise<Case | undefined>
   setState(caseId: number, state: CaseState): Promise<Case>
   linkReport(caseId: number, reportId: number): Promise<void>
 }
 
 const INDEX = { collection: 'case-index', key: 'main' } as const
 const emptyIndex = (): CaseIndex => ({ nextCaseId: 1, open: {}, recentEventIds: [] })
+const openKey = (appName: string, fingerprint: string) => `${appName}\u0000${fingerprint}`
+
+/** Сколько появлений несёт событие: сторож склеивает повторы при переполненной очереди. */
+function occurrences(event: IncidentEvent): number {
+  const repeats = event.context.repeats
+  return 1 + (typeof repeats === 'number' && Number.isInteger(repeats) && repeats > 0 ? repeats : 0)
+}
 
 export function createCaseBook(store: RecordStore): CaseBook {
   const caseKey = (caseId: number) => String(caseId)
@@ -87,7 +102,7 @@ export function createCaseBook(store: RecordStore): CaseBook {
   }
 
   return {
-    async recordEvents(events) {
+    async recordEvents(events, options = {}) {
       for (const event of events) {
         if (Number.isNaN(Date.parse(event.occurredAt))) throw new Error(`событие ${event.eventId}: неверное время ${event.occurredAt}`)
       }
@@ -102,10 +117,11 @@ export function createCaseBook(store: RecordStore): CaseBook {
           recent.add(event.eventId)
           index.recentEventIds.push(event.eventId)
 
-          const openId = index.open[event.fingerprint]
+          const key = openKey(event.appName, event.fingerprint)
+          const openId = index.open[key]
           if (openId !== undefined) {
             const opened = await tx.doc<Case>('case', caseKey(openId), {} as Case)
-            opened.events += 1
+            opened.events += occurrences(event)
             if (Date.parse(event.occurredAt) > Date.parse(opened.lastSeenAt)) opened.lastSeenAt = event.occurredAt
             if (Date.parse(event.occurredAt) < Date.parse(opened.firstSeenAt)) opened.firstSeenAt = event.occurredAt
             opened.linkedEventIds.push(event.eventId)
@@ -117,22 +133,27 @@ export function createCaseBook(store: RecordStore): CaseBook {
 
           const caseId = index.nextCaseId
           index.nextCaseId += 1
-          index.open[event.fingerprint] = caseId
+          index.open[key] = caseId
+          const processName = event.context.processName
           const fresh: Case = {
             caseId,
+            appName: event.appName,
+            ...(typeof processName === 'string' && processName !== '' ? { processName } : {}),
             fingerprint: event.fingerprint,
             kind: event.kind,
             where: event.where,
             message: event.message,
             stack: event.stack,
-            events: 1,
+            events: occurrences(event),
             firstSeenAt: event.occurredAt,
             lastSeenAt: event.occurredAt,
             linkedEventIds: [event.eventId],
             state: 'received',
             reportIds: [],
           }
-          created.push(await tx.doc<Case>('case', caseKey(caseId), fresh))
+          const draft = await tx.doc<Case>('case', caseKey(caseId), fresh)
+          if (options.onNewCase) await options.onNewCase(tx, draft)
+          created.push(draft)
         }
         const overflow = index.recentEventIds.length - RECENT_EVENT_IDS_LIMIT
         if (overflow > 0) index.recentEventIds.splice(0, overflow)
@@ -142,9 +163,9 @@ export function createCaseBook(store: RecordStore): CaseBook {
 
     getCase: (caseId) => store.read<Case>('case', caseKey(caseId)),
 
-    async openCaseFor(fingerprint) {
+    async openCaseFor(fingerprint, appName) {
       const index = await store.read<CaseIndex>(INDEX.collection, INDEX.key)
-      const caseId = index?.open[fingerprint]
+      const caseId = index?.open[openKey(appName, fingerprint)]
       return caseId === undefined ? undefined : store.read<Case>('case', caseKey(caseId))
     },
 
@@ -155,7 +176,8 @@ export function createCaseBook(store: RecordStore): CaseBook {
           opened.state = state
         },
         (index, opened) => {
-          if (CLOSED_CASE_STATES.includes(state) && index.open[opened.fingerprint] === caseId) delete index.open[opened.fingerprint]
+          const key = openKey(opened.appName, opened.fingerprint)
+          if (CLOSED_CASE_STATES.includes(state) && index.open[key] === caseId) delete index.open[key]
         },
       ),
 

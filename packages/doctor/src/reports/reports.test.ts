@@ -88,6 +88,22 @@ describe('отчёты врача', () => {
     await expect(reports.pump()).resolves.toBeUndefined()
   })
 
+  it('отчёт можно записать внутри чужой транзакции: откат убирает и его', async () => {
+    const store = createMemoryRecordStore()
+    const reports = reportsWithTelegram(store)
+
+    await expect(
+      store.transaction(async (tx) => {
+        await reports.addIn(tx, { type: 'case_received', caseId: 1, short: 'x', telegram: 'not_needed' })
+        throw new Error('stop')
+      }),
+    ).rejects.toThrow('stop')
+    const added = await store.transaction((tx) => reports.addIn(tx, { type: 'case_received', caseId: 1, short: 'y', telegram: 'not_needed' }))
+
+    expect(added.reportId).toBe(1)
+    expect(await reports.get(1)).toMatchObject({ short: 'y' })
+  })
+
   it('короткий текст не длиннее 1000 знаков', async () => {
     const reports = reportsWithTelegram()
 

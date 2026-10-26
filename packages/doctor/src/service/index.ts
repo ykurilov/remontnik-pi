@@ -120,17 +120,19 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   })
 
   async function receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }> {
-    const { accepted, newCases } = await caseBook.recordEvents(events)
-    for (const opened of newCases) {
-      // Владелец уже получил тревогу от сторожа; этот отчёт — для журнала и Paseo.
-      const report = await reports.add({
-        type: 'case_received',
-        caseId: opened.caseId,
-        short: `Случай ${opened.caseId}: ${opened.kind} в ${opened.where || 'неизвестном месте'} — ${opened.message}`,
-        telegram: 'not_needed',
-      })
-      await caseBook.linkReport(opened.caseId, report.reportId)
-    }
+    // Случай и отчёт о нём — одна транзакция: не бывает случая без отчёта для Paseo.
+    const { accepted } = await caseBook.recordEvents(events, {
+      async onNewCase(tx, opened) {
+        // Владелец уже получил тревогу от сторожа; этот отчёт — для журнала и Paseo.
+        const report = await reports.addIn(tx, {
+          type: 'case_received',
+          caseId: opened.caseId,
+          short: `Случай ${opened.caseId} (${opened.appName}): ${opened.kind} в ${opened.where || 'неизвестном месте'} — ${opened.message}`,
+          telegram: 'not_needed',
+        })
+        opened.reportIds.push(report.reportId)
+      },
+    })
     return { accepted }
   }
 

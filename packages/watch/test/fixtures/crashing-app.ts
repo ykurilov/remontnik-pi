@@ -21,7 +21,22 @@ if (mode === 'own-handler') {
   })
 }
 
-setTimeout(() => {
+if (mode === 'same-error-twice') {
+  const failure = new Error('constant failure')
+  let seen = 0
+  process.on('uncaughtException', () => {
+    seen += 1
+    if (seen === 2) setTimeout(() => process.exit(0), 50)
+  })
+  setTimeout(() => {
+    throw failure
+  }, 10)
+  setTimeout(() => {
+    throw failure
+  }, 30)
+}
+
+if (mode !== 'same-error-twice') setTimeout(() => {
   if (mode === 'rejection') void Promise.reject(new Error('rejected order 42'))
   else if (mode === 'rejection-own-handler') {
     process.on('unhandledRejection', (reason) => {

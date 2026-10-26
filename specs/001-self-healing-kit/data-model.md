@@ -21,7 +21,12 @@
 
 ### OutboxEntry — строка JSONL очереди
 
-`{ event: IncidentEvent, state: "pending" | "delivered", attempts, nextAttemptAt }`. Подтверждение пишется отдельной строкой `{ ack: eventId }`. Файл сжимается при старте: подтверждённые строки старше суток выбрасываются.
+`{ event: IncidentEvent, state: "pending" | "delivered", attempts, nextAttemptAt, notify, repeats, lostBefore }`. Изменения — отдельными строками: `{ ack }`, `{ retry, attempts, nextAttemptAt }`, `{ notified }`, `{ repeats, count }`, `{ drop }`, `{ lost }`.
+
+- Подтверждённое врачом событие сразу уходит из памяти; `delivered` — только пока ждёт своей тревоги в Telegram.
+- Файл сжимается при старте и на ходу, когда строк вдвое больше записей (не меньше 1000).
+- Потолок — `maxQueue` записей (по умолчанию 1000). Повтор отпечатка при полной очереди склеивается в `repeats` последней записи; иначе самые старые вытесняются, новая запись получает `lostBefore`, общий счётчик — `lost`. Врачу `repeats` и `lostBefore` уходят в `context`.
+- Замок `outbox-<processName>.lock` (`pid:метка`). Второй живой экземпляр с тем же именем пишет в `outbox-<processName>.<pid>-<метка>.jsonl` и предупреждает строкой `[remontnik]`; хозяин основного файла при старте забирает такие файлы умерших экземпляров.
 
 ### LocalIncidentState — счётчики для Telegram у сторожа
 
@@ -42,9 +47,11 @@
 | Поле | Тип | Правила |
 |---|---|---|
 | `caseId` | число, по порядку | |
-| `fingerprint` | string | один открытый случай на отпечаток; новые события склеиваются |
+| `appName` | string | из события; ключ склейки — `appName` + `fingerprint` |
+| `processName` | string? | процесс первого события (`context.processName`) |
+| `fingerprint` | string | один открытый случай на приложение и отпечаток; новые события склеиваются |
 | `kind`, `where`, `message`, `stack` | как у события | из первого события |
-| `events` | число | счётчик |
+| `events` | число | счётчик появлений, с учётом `context.repeats` от сторожа |
 | `firstSeenAt`, `lastSeenAt` | время | |
 | `linkedEventIds` | ULID[] ≤ 50 | последние |
 | `state` | см. ниже | |
@@ -70,6 +77,10 @@ paseo_working → observing                         (агент выкатил)
 paseo_working → healed_by_paseo                   (агент сделал без выкатки; итог — у агента)
 handed_off | paseo_working → reclaimed → triage    (срок вышел, «не смог», мост пропал)
 ```
+
+Закрыты только `healed` и `healed_by_paseo`: после них тот же отпечаток открывает новый случай. Повторы после `report_only`, `needs_human` и других итогов без лечения склеиваются в открытый случай — владелец уже знает о сбое, второй случай был бы шумом.
+
+Отчёт `case_received` пишется в той же транзакции, что и новый случай.
 
 ### Handoff — передача агенту Paseo (документ `remontnik.handoff/<caseId>`)
 
@@ -146,7 +157,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `short` | string ≤ 1000 (для Telegram) |
 | `full` | Markdown |
 | `screenshots` | пути к снимкам браузера? |
-| `telegram` | `{ state: "pending" | "sent" | "failed", attempts, messageId? }` |
+| `telegram` | `{ state: "pending" | "sent" | "failed" | "not_needed", attempts, messageId? }`; `not_needed` — только для журнала и Paseo (например, `case_received`: о сбое владелец уже узнал от сторожа) |
 | `createdAt` | время |
 
 ## Браузер

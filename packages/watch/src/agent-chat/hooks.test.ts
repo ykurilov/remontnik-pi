@@ -62,9 +62,9 @@ describe('agentChatWatchHooks', () => {
 
   it('afterTurn: ход с ошибкой — turn_failed с моделью и поставщиком', async () => {
     const { watch, captured } = fakeWatch()
-    const hooks = agentChatWatchHooks(watch)
+    const hooks = agentChatWatchHooks(watch, { afterTurn: true })
 
-    await hooks.afterTurn(
+    await hooks.afterTurn!(
       turn({ status: 'error', error: { kind: 'overloaded', details: { providerId: 'openrouter', modelId: 'm1', statusCode: 503, reason: 'busy' } } }),
     )
 
@@ -75,9 +75,9 @@ describe('agentChatWatchHooks', () => {
 
   it('afterTurn: инструмент с ошибкой — tool_error с именем инструмента', async () => {
     const { watch, captured } = fakeWatch()
-    const hooks = agentChatWatchHooks(watch)
+    const hooks = agentChatWatchHooks(watch, { afterTurn: true })
 
-    await hooks.afterTurn(
+    await hooks.afterTurn!(
       turn({
         parts: [
           { type: 'text', text: 'Извините' },
@@ -97,7 +97,7 @@ describe('agentChatWatchHooks', () => {
   it('afterTurn: удачный ход без ошибок — ничего', async () => {
     const { watch, captured } = fakeWatch()
 
-    await agentChatWatchHooks(watch).afterTurn(turn())
+    await agentChatWatchHooks(watch, { afterTurn: true }).afterTurn!(turn())
 
     expect(captured).toEqual([])
   })
@@ -110,9 +110,17 @@ describe('agentChatWatchHooks', () => {
       inner: { afterTurn: async () => events, turnNotStarted: () => { throw failure } },
     })
 
-    await expect(hooks.afterTurn(turn({ status: 'error', error: { kind: 'other' } }))).resolves.toBe(events)
+    await expect(hooks.afterTurn!(turn({ status: 'error', error: { kind: 'other' } }))).resolves.toBe(events)
     expect(() => hooks.turnNotStarted({ reason: 'error', chat: { id: 'c1' } })).toThrow(failure)
     expect(captured.map((item) => item.kind)).toEqual(['turn_failed', 'turn_failed'])
+  })
+
+  it('afterTurn по умолчанию не подключается: SDK требует для него хранилище с setAfterTurnState', () => {
+    const { watch } = fakeWatch()
+
+    expect(agentChatWatchHooks(watch)).not.toHaveProperty('afterTurn')
+    expect(agentChatWatchHooks(watch, { afterTurn: true }).afterTurn).toBeTypeOf('function')
+    expect(agentChatWatchHooks(watch, { inner: { afterTurn: () => undefined } }).afterTurn).toBeTypeOf('function')
   })
 
   it('turnNotStarted: только сбой (`error`) — turn_failed', () => {
@@ -128,9 +136,9 @@ describe('agentChatWatchHooks', () => {
 
   it('сбой самого наблюдения не мешает ходу', async () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const hooks = agentChatWatchHooks({ capture: () => { throw new Error('watch broken') } })
+    const hooks = agentChatWatchHooks({ capture: () => { throw new Error('watch broken') } }, { afterTurn: true })
 
-    await expect(hooks.afterTurn(turn({ status: 'error' }))).resolves.toBeUndefined()
+    await expect(hooks.afterTurn!(turn({ status: 'error' }))).resolves.toBeUndefined()
     expect(errors.mock.calls.some(([line]) => String(line).startsWith('[remontnik]'))).toBe(true)
     errors.mockRestore()
   })

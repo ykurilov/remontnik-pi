@@ -8,11 +8,12 @@ import {
 import { signBody } from '@ykurilov/remontnik-core/signed-http'
 import { createTelegramClient, type TelegramClient } from '@ykurilov/remontnik-core/telegram'
 import { createIncidentNotifier, formatIncidentAlert } from '../notify/index.js'
-import { OUTBOX_BATCH_LIMIT, openOutbox, type Outbox, type OutboxEntry, type OutboxStats } from '../outbox/index.js'
+import { openOutbox, type Outbox, type OutboxEntry, type OutboxStats } from '../outbox/index.js'
 
 // Сторож внутри приложения. Горячий путь — только синхронная запись в очередь на диске;
 // доставка врачу и тревога в Telegram идут позже, в фоне. Ошибки сторожа не роняют приложение:
 // они уходят строкой `[remontnik] …` в журнал и в счётчик ownErrors, но случаем не становятся.
+// Ни один путь сторожа (вызов, таймер, промис) не выпускает исключение в приложение.
 
 export interface WatchOptions {
   appName: string
@@ -34,6 +35,8 @@ export interface WatchOptions {
   redact?: (text: string) => string
   /** Текущая версия приложения для отметки в событии; функция вызывается один раз при старте. */
   release?: string | null | (() => Promise<string | null>)
+  /** Потолок очереди на диске и в памяти; дальше повторы склеиваются, новые вытесняют старые. По умолчанию 1000. */
+  maxQueue?: number
   fetch?: typeof fetch
   now?: () => number
 }
@@ -72,6 +75,23 @@ export interface Watch {
 }
 
 const DOCTOR_TIMEOUT_MS = 10_000
+const NO_RETHROW = Symbol('no-rethrow')
+/** Пауза после неудачного прохода доставки, если очередь не назвала срок позже. */
+const FAILED_PASS_PAUSE_MS = 5_000
+const EMPTY_QUEUE_STATS: OutboxStats = {
+  pending: 0,
+  stored: 0,
+  awaitingNotification: 0,
+  failedAttempts: 0,
+  lost: 0,
+  oldestPendingAt: null,
+  nextAttemptAt: null,
+}
+
+/** Отмена запроса (пользователь нажал «Стоп») — не сбой. */
+function isCancellation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError'
+}
 
 function errorParts(error: unknown): { message: string; stack: string } {
   if (error instanceof Error) return { message: error.message, stack: error.stack ?? '' }
@@ -138,7 +158,12 @@ export function createWatch(options: WatchOptions): Watch {
 
   let outbox: Outbox | null = null
   try {
-    outbox = openOutbox({ dir: options.dir, processName: options.processName, now })
+    outbox = openOutbox({
+      dir: options.dir,
+      processName: options.processName,
+      now,
+      ...(options.maxQueue === undefined ? {} : { maxEntries: options.maxQueue }),
+    })
   } catch (error) {
     ownError(`очередь в ${options.dir} недоступна, случаи не сохраняются`, error)
   }
@@ -148,7 +173,12 @@ export function createWatch(options: WatchOptions): Watch {
     return typeof chatId === 'string' ? chatId : chatId()
   }
 
-  function sendAlert(event: IncidentEvent, counter: { count: number; firstSeenAt: number; lastSeenAt: number }): void {
+  /** Тревога о событии; `eventIds` — все записи очереди, которые она закрывает (склеенные остатки). */
+  function sendAlert(
+    event: IncidentEvent,
+    counter: { count: number; firstSeenAt: number; lastSeenAt: number },
+    eventIds: readonly string[] = [event.eventId],
+  ): void {
     if (closed || notifyingIds.has(event.eventId)) return
     notifyingIds.add(event.eventId)
     const sending = (async () => {
@@ -156,7 +186,7 @@ export function createWatch(options: WatchOptions): Watch {
         const chatId = await resolveChatId()
         if (chatId === null) return
         await telegram.sendMessage(chatId, formatIncidentAlert(event, counter))
-        outbox?.markNotified(event.eventId)
+        for (const eventId of eventIds) outbox?.markNotified(eventId)
       } catch (error) {
         ownError('тревога в Telegram не ушла', error)
       } finally {
@@ -167,11 +197,25 @@ export function createWatch(options: WatchOptions): Watch {
     void sending.finally(() => notifications.delete(sending))
   }
 
-  async function postToDoctor(entries: OutboxEntry[]): Promise<void> {
-    if (!outbox || entries.length === 0) return
+  /** Событие для врача: склеенные повторы и потери очереди — в контексте. */
+  function eventForDoctor(entry: OutboxEntry): IncidentEvent {
+    if (entry.repeats === 0 && entry.lostBefore === 0) return entry.event
+    return {
+      ...entry.event,
+      context: {
+        ...entry.event.context,
+        ...(entry.repeats > 0 ? { repeats: entry.repeats } : {}),
+        ...(entry.lostBefore > 0 ? { lostBefore: entry.lostBefore } : {}),
+      },
+    }
+  }
+
+  /** Одна пачка врачу. `true` — врач ответил и принял всё. Не бросает. */
+  async function postToDoctor(queue: Outbox, entries: OutboxEntry[]): Promise<boolean> {
     const ids = entries.map((entry) => entry.event.eventId)
+    let accepted: Set<string>
     try {
-      const body = JSON.stringify({ events: entries.map((entry) => entry.event) })
+      const body = JSON.stringify({ events: entries.map(eventForDoctor) })
       const response = await fetchImpl(doctorUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...signBody(body, options.doctor.secret, now()) },
@@ -180,44 +224,88 @@ export function createWatch(options: WatchOptions): Watch {
       })
       if (!response.ok) throw new Error(`врач ответил ${response.status}`)
       const payload = (await response.json()) as { accepted?: unknown }
-      const accepted = new Set(Array.isArray(payload.accepted) ? payload.accepted.filter((id) => typeof id === 'string') : [])
-      outbox.ack([...accepted])
-      const rest = ids.filter((id) => !accepted.has(id))
-      if (rest.length > 0) outbox.recordFailure(rest, now())
+      accepted = new Set(Array.isArray(payload.accepted) ? payload.accepted.filter((id) => typeof id === 'string') : [])
       doctorFailing = false
     } catch (error) {
-      outbox.recordFailure(ids, now())
       // Одна строка на начало перебоя, а не на каждую попытку.
       if (!doctorFailing) ownError('врач недоступен, случаи ждут в очереди', error)
       doctorFailing = true
+      try {
+        queue.recordFailure(ids, now())
+      } catch (writeError) {
+        ownError('неудачная попытка не записана в очередь', writeError)
+      }
+      return false
     }
+    const rest = ids.filter((id) => !accepted.has(id))
+    try {
+      queue.ack([...accepted])
+      if (rest.length > 0) queue.recordFailure(rest, now())
+    } catch (writeError) {
+      ownError('подтверждение врача не записано в очередь', writeError)
+      return false
+    }
+    return rest.length === 0
   }
 
   function scheduleDelivery(delayMs = 0): void {
     if (closed || !outbox) return
-    if (deliveryTimer) clearTimeout(deliveryTimer)
-    deliveryTimer = setTimeout(() => {
-      deliveryTimer = null
-      void deliverDue()
-    }, Math.max(0, delayMs))
-    deliveryTimer.unref?.()
+    try {
+      if (deliveryTimer) clearTimeout(deliveryTimer)
+      deliveryTimer = setTimeout(() => {
+        deliveryTimer = null
+        void startDelivery(false)
+      }, Math.max(0, delayMs))
+      deliveryTimer.unref?.()
+    } catch (error) {
+      ownError('доставка не запланирована', error)
+    }
   }
 
-  async function deliverDue(): Promise<void> {
-    if (!outbox || closed) return
-    if (delivering) return
-    delivering = (async () => {
-      for (let batch = outbox.due(now()); batch.length > 0 && !closed; batch = outbox.due(now())) {
-        await postToDoctor(batch)
+  /**
+   * Проход доставки; одновременно идёт не больше одного. `force` — не ждать сроков повторов (flush).
+   * Промис никогда не отклоняется; `delivering` сбрасывается только когда проход и правда закончился.
+   */
+  function startDelivery(force: boolean): Promise<void> {
+    if (delivering) return delivering
+    const queue = outbox
+    if (!queue || closed) return Promise.resolve()
+    const pass = (async () => {
+      let failed = false
+      try {
+        for (let batch = queue.due(force ? Number.POSITIVE_INFINITY : now()); batch.length > 0 && !closed; ) {
+          if (!(await postToDoctor(queue, batch))) {
+            failed = true
+            break
+          }
+          batch = queue.due(force ? Number.POSITIVE_INFINITY : now())
+        }
+      } catch (error) {
+        failed = true
+        ownError('сбой доставки врачу', error)
+      }
+      try {
+        const next = queue.nextAttemptAt()
+        if (next !== null && !force) scheduleDelivery(Math.max(next - now(), failed ? FAILED_PASS_PAUSE_MS : 0))
+      } catch (error) {
+        ownError('доставка не запланирована', error)
+        scheduleDelivery(FAILED_PASS_PAUSE_MS)
       }
     })()
+    delivering = pass
+    void pass.then(() => {
+      if (delivering === pass) delivering = null
+    })
+    return pass
+  }
+
+  function pendingCount(): number {
     try {
-      await delivering
-    } finally {
-      delivering = null
+      return outbox?.stats().pending ?? 0
+    } catch (error) {
+      ownError('очередь не читается', error)
+      return 0
     }
-    const next = outbox.nextAttemptAt()
-    if (next !== null) scheduleDelivery(next - now())
   }
 
   function capture(error: unknown, captureOptions: CaptureOptions = {}): string {
@@ -245,8 +333,12 @@ export function createWatch(options: WatchOptions): Watch {
       }
       if (!closed) {
         const deferred = setImmediate(() => {
-          if (decision.notify) sendAlert(event, decision.state)
-          scheduleDelivery()
+          try {
+            if (decision.notify) sendAlert(event, decision.state)
+            scheduleDelivery()
+          } catch (deferredError) {
+            ownError('тревога или доставка не запущены', deferredError)
+          }
         })
         deferred.unref?.()
       }
@@ -258,47 +350,67 @@ export function createWatch(options: WatchOptions): Watch {
   }
 
   // Тревоги, которые прошлый процесс записал, но отправить не успел (обычно — его падение).
+  // Одинаковые склеиваются по отпечатку: одна тревога со счётчиком, а не по сообщению на запись.
   if (outbox) {
-    const leftovers = outbox.awaitingNotification()
-    const startup = setImmediate(() => {
-      for (const entry of leftovers) {
+    const groups = new Map<string, { event: IncidentEvent; eventIds: string[]; count: number; firstSeenAt: number; lastSeenAt: number }>()
+    try {
+      for (const entry of outbox.awaitingNotification()) {
         const seenAt = Date.parse(entry.event.occurredAt)
-        notifier.observe(entry.event, now())
-        sendAlert(entry.event, { count: 1, firstSeenAt: seenAt, lastSeenAt: seenAt })
+        const occurrences = 1 + entry.repeats
+        const group = groups.get(entry.event.fingerprint)
+        if (!group) {
+          groups.set(entry.event.fingerprint, { event: entry.event, eventIds: [entry.event.eventId], count: occurrences, firstSeenAt: seenAt, lastSeenAt: seenAt })
+          continue
+        }
+        group.eventIds.push(entry.event.eventId)
+        group.count += occurrences
+        group.firstSeenAt = Math.min(group.firstSeenAt, seenAt)
+        group.lastSeenAt = Math.max(group.lastSeenAt, seenAt)
       }
-      scheduleDelivery()
+    } catch (error) {
+      ownError('остатки прошлого процесса не прочитаны', error)
+    }
+    const startup = setImmediate(() => {
+      try {
+        for (const group of groups.values()) {
+          notifier.observe(group.event, now())
+          sendAlert(group.event, group, group.eventIds)
+        }
+        scheduleDelivery()
+      } catch (error) {
+        ownError('тревога об остатках прошлого процесса не запущена', error)
+      }
     })
     startup.unref?.()
   }
 
   function installProcessHandlers(): void {
     // Монитор не меняет поведения: Node сам напечатает след и завершит процесс или отдаст ошибку обработчику приложения.
-    const recorded = new WeakSet<object>()
+    // Отказ промиса, который мы сами перебрасываем как ошибку, уже записан: пропустить ровно один раз.
+    let rethrown: unknown = NO_RETHROW
     const onException = (error: unknown) => {
-      if (typeof error === 'object' && error !== null) {
-        if (recorded.has(error)) return
-        recorded.add(error)
+      if (rethrown !== NO_RETHROW && error === rethrown) {
+        rethrown = NO_RETHROW
+        return
       }
       capture(error, { kind: 'crash' })
     }
     const onRejection = (reason: unknown) => {
-      if (typeof reason === 'object' && reason !== null) recorded.add(reason)
       capture(reason, { kind: 'crash' })
       // Если обработчик отказов только наш, повторяем то, что Node сделал бы без него.
       if (process.listenerCount('unhandledRejection') > 1) return
       const mode = unhandledRejectionsMode()
       const asError = (() => {
         if (reason instanceof Error) return reason
-        const wrapped = Object.assign(
+        return Object.assign(
           new Error(
             `This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason "${errorParts(reason).message}".`,
           ),
           { code: 'ERR_UNHANDLED_REJECTION' },
         )
-        recorded.add(wrapped)
-        return wrapped
       })()
       if (mode === 'throw' || mode === 'strict') {
+        rethrown = asError
         process.nextTick(() => {
           throw asError
         })
@@ -317,8 +429,10 @@ export function createWatch(options: WatchOptions): Watch {
 
   function wrapModel(model: unknown, place: { model: string; provider: string }): unknown {
     if (typeof model !== 'object' || model === null) return model
-    const report = (error: unknown) =>
+    const report = (error: unknown) => {
+      if (isCancellation(error)) return
       capture(error, { kind: 'model_error', where: place.model, context: { model: place.model, provider: place.provider } })
+    }
     return new Proxy(model, {
       get(target, property) {
         const value: unknown = Reflect.get(target, property, target)
@@ -363,53 +477,67 @@ export function createWatch(options: WatchOptions): Watch {
     capture,
     installProcessHandlers,
     wrapModelCatalog<C extends ModelCatalogLike>(catalog: C): C {
-      const providers = catalog.providers.map(
-        (provider) =>
-          new Proxy(provider, {
-            get(target, property) {
-              const value: unknown = Reflect.get(target, property, target)
-              if (property !== 'createLanguageModel' || typeof value !== 'function') {
-                return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
-              }
-              return (modelId: string, ...rest: unknown[]) =>
-                wrapModel((value as (...a: unknown[]) => unknown).call(target, modelId, ...rest), {
-                  model: modelId,
-                  provider: target.id,
-                })
-            },
-          }),
-      )
-      return { ...catalog, providers } as C
+      const wrapProvider = (provider: C['providers'][number]) =>
+        new Proxy(provider, {
+          get(target, property) {
+            const value: unknown = Reflect.get(target, property, target)
+            if (property !== 'createLanguageModel' || typeof value !== 'function') {
+              return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+            }
+            return (modelId: string, ...rest: unknown[]) =>
+              wrapModel((value as (...a: unknown[]) => unknown).call(target, modelId, ...rest), {
+                model: modelId,
+                provider: target.id,
+              })
+          },
+        })
+      // Каталог остаётся тем же объектом для приложения: прототип и методы на месте, подменяется только список поставщиков.
+      let source: C['providers'] | null = null
+      let wrapped: C['providers'] = []
+      return new Proxy(catalog, {
+        get(target, property) {
+          const value: unknown = Reflect.get(target, property, target)
+          if (property === 'providers') {
+            if (value !== source) {
+              source = value as C['providers']
+              wrapped = Array.isArray(value) ? value.map(wrapProvider) : (value as C['providers'])
+            }
+            return wrapped
+          }
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
+        },
+      })
     },
     async flush(timeoutMs) {
-      const deadline = Date.now() + timeoutMs
-      const timeLeft = () => deadline - Date.now()
-      const withinDeadline = <T>(promise: Promise<T>) =>
-        Promise.race([promise, new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), Math.max(0, timeLeft())).unref?.())])
-      // Тревоги, отложенные в setImmediate, должны успеть начаться.
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      while (outbox && outbox.stats().pending > 0 && timeLeft() > 0 && !closed) {
-        if (delivering) {
-          await withinDeadline(delivering)
-          continue
+      try {
+        const deadline = Date.now() + timeoutMs
+        const timeLeft = () => deadline - Date.now()
+        const withinDeadline = <T>(promise: Promise<T>) =>
+          Promise.race([promise, new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), Math.max(0, timeLeft())).unref?.())])
+        // Тревоги, отложенные в setImmediate, должны успеть начаться.
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        while (pendingCount() > 0 && timeLeft() > 0 && !closed) {
+          // По сроку перестаём ждать, но проход не бросаем: он закончится сам, и второй не начнётся раньше.
+          if ((await withinDeadline(startDelivery(true))) === 'timeout') break
+          if (pendingCount() > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, timeLeft()))))
         }
-        const batch = outbox.pending().slice(0, OUTBOX_BATCH_LIMIT)
-        delivering = postToDoctor(batch)
-        try {
-          if ((await withinDeadline(delivering)) === 'timeout') break
-        } finally {
-          delivering = null
+        while (notifications.size > 0 && timeLeft() > 0) {
+          if ((await withinDeadline(Promise.allSettled([...notifications]))) === 'timeout') break
         }
-        if (outbox.stats().pending > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, timeLeft()))))
+        if (pendingCount() > 0 && outbox) scheduleDelivery(Math.max(0, (outbox.nextAttemptAt() ?? now()) - now()))
+        return pendingCount() === 0 && notifications.size === 0
+      } catch (error) {
+        ownError('flush не удался', error)
+        return false
       }
-      while (notifications.size > 0 && timeLeft() > 0) {
-        if ((await withinDeadline(Promise.allSettled([...notifications]))) === 'timeout') break
-      }
-      if (outbox && outbox.stats().pending > 0) scheduleDelivery(Math.max(0, (outbox.nextAttemptAt() ?? now()) - now()))
-      return (outbox?.stats().pending ?? 0) === 0 && notifications.size === 0
     },
     stats() {
-      const queue: OutboxStats = outbox?.stats() ?? { pending: 0, delivered: 0, failedAttempts: 0, oldestPendingAt: null, nextAttemptAt: null }
+      let queue = EMPTY_QUEUE_STATS
+      try {
+        if (outbox) queue = outbox.stats()
+      } catch (error) {
+        ownError('очередь не читается', error)
+      }
       return { queue, ownErrors, fingerprints: notifier.size() }
     },
     close() {
@@ -417,6 +545,11 @@ export function createWatch(options: WatchOptions): Watch {
       if (deliveryTimer) clearTimeout(deliveryTimer)
       deliveryTimer = null
       for (const remove of removeProcessHandlers.splice(0)) remove()
+      try {
+        outbox?.close()
+      } catch (error) {
+        ownError('замок очереди не снят', error)
+      }
     },
   }
 }
