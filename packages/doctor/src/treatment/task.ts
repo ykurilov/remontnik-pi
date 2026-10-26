@@ -21,7 +21,7 @@ import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCach
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
-import { GitGuardError, slugify, type GitGuard, type GitGuardErrorCode } from '../git-guard/index.js'
+import { GIT_GUARD_REASONS, GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
 import { diagnoseMessage, fixMessage, resumeMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
@@ -202,14 +202,6 @@ type Base = { commit: string; running: boolean }
 type DeployPhase = Extract<TreatmentState, { phase: 'deploying' | 'observing' }>
 type DeploySleep = Extract<DeployStep, { kind: 'sleep' }>
 
-/** Почему не удалось влить правку — для отчёта человеку, без текста git. */
-const MERGE_FAILURES: Record<GitGuardErrorCode, string> = {
-  diverged: 'основная ветка ушла вперёд',
-  failed: 'origin отказал',
-  timeout: 'origin не ответил вовремя',
-  forbidden: 'git-замок не разрешил',
-  escape: 'git-замок не разрешил',
-}
 const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
 /** Остаток eval на сегодня держат чужие брони: через сколько спросить снова. */
@@ -466,7 +458,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       if (!(error instanceof GitGuardError)) throw error
       // Текст git (в нём адрес origin) — только в журнал; в отчёт — причина по коду ошибки.
       runtime.report(error)
-      return { kind: 'merge_failed', branch, reason: MERGE_FAILURES[error.code] }
+      return { kind: 'merge_failed', branch, reason: GIT_GUARD_REASONS[error.code] }
     }
   }
 

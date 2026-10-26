@@ -21,6 +21,15 @@ const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 /** `diverged` — основная ветка origin ушла вперёд мимо правки: влить её вперёд нельзя. */
 export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape' | 'diverged'
 
+/** Причина сбоя git-замка для человека — по коду ошибки, без текста git: в нём адрес и пути origin. */
+export const GIT_GUARD_REASONS: Record<GitGuardErrorCode, string> = {
+  diverged: 'основная ветка ушла вперёд',
+  failed: 'origin отказал',
+  timeout: 'origin не ответил вовремя',
+  forbidden: 'git-замок не разрешил',
+  escape: 'git-замок не разрешил',
+}
+
 export class GitGuardError extends Error {
   readonly code: GitGuardErrorCode
 
