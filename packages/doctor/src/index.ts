@@ -7,6 +7,7 @@ export { startDoctorService, type DoctorService, type DoctorServiceOptions } fro
 export { caseWorkbenchEnv, createCaseGateway, doctorStartPlan, startDoctorFromEnv, type DoctorEnv } from './service/start.js'
 export { createGitGuard, slugify, treatmentBranch, type GitGuard, type GitGuardOptions } from './git-guard/index.js'
 export { type DoctorTreatmentOptions } from './service/index.js'
+export { BROWSER_TOOL_NAMES, browserClientFromEnv, createBrowserClient, type BrowserAnswer, type BrowserClient } from './browser-tools/index.js'
 export {
   DOCTOR_TOOL_NAMES,
   TreatmentDoc,

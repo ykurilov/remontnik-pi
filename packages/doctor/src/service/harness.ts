@@ -65,6 +65,8 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   'deployment-index': recordFamily('remontnik.deployment-index'),
   /** Стоп-кран автовыкатки. */
   controls: recordFamily('remontnik.controls'),
+  /** Браузер врача по случаю: снимки для ближайшего отчёта и открытое ожидание человека. */
+  'case-browser': recordFamily('remontnik.case-browser'),
 }
 
 /** Семейство документов коллекции записей: для чтения из задач pi-durable (`runtime.snapshot`). */

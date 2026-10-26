@@ -18,7 +18,7 @@ pnpm verify          # тесты → типы → сборка → check-pins �
 ## 2. Весь цикл на «Пациенте» без Docker и без сети
 
 ```bash
-pnpm --filter patient test:cycle
+pnpm exec vitest run apps/patient/test/cycle   # из корня набора: пакеты берутся из исходников по корневому vitest.config.ts
 ```
 
 Подставная модель, выкатка на папках. Каждый сценарий — своя временная папка:
