@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import type { CaseNetworkLease, CaseNetworks } from '../case-networks/index.js'
 
 // Исполнитель команд верстака и проверок. Окружение процесса собирается с нуля: PATH, свой HOME у каждой копии
 // и только явно переданные переменные. Окружение врача (ключи моделей, git, Telegram) не наследуется.
@@ -21,7 +22,7 @@ export interface RunOptions {
   timeoutSeconds: number
   onOutput?: (text: string, stream: 'stdout' | 'stderr') => void
   signal?: AbortSignal
-  /** `internal` — внутренняя сеть проверок, где видно только прокси модели и службы тестов. По умолчанию — внешняя. */
+  /** `internal` — сеть проверок копии, где видно только прокси eval. По умолчанию — сеть верстака с зеркалом реестра. */
   network?: 'internal'
 }
 
@@ -110,9 +111,14 @@ export function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGrace
   })
 }
 
+/** Ключ копии: имя её HOME и метка её контейнеров. */
+function copyKey(copyDir: string): string {
+  return createHash('sha256').update(resolve(copyDir)).digest('hex').slice(0, 16)
+}
+
 /** HOME копии: папка по имени корня копии внутри `homesDir`. */
 function homeOf(homesDir: string, copyDir: string): string {
-  const home = join(homesDir, createHash('sha256').update(resolve(copyDir)).digest('hex').slice(0, 16))
+  const home = join(homesDir, copyKey(copyDir))
   mkdirSync(home, { recursive: true })
   return home
 }
@@ -159,15 +165,29 @@ export interface DockerRunSpec {
   workdir: string
   writableDirs: readonly string[]
   network: string
+  /** Записи `/etc/hosts` контейнера: имя → адрес (врач в сети случая). */
+  hosts?: Record<string, string>
   user?: string
   /** Файл переменных (`--env-file`): значения не видны в `ps` и аргументах клиента. */
   envFile: string
   memory: string
   cpus: string
   command: string
+  /** Срок жизни контейнера в секундах: по нему обёртка убивает всё внутри, даже если врача уже нет. */
+  lifetimeSeconds: number
 }
 
 const CONTAINER_HOME = '/home/remontnik'
+export const WORKBENCH_LABEL = 'remontnik.workbench'
+const COPY_LABEL = 'remontnik.copy'
+/** Запас срока жизни контейнера сверх тайм-аута команды: обычно её убивает врач, обёртка — когда врача нет. */
+export const CONTAINER_LIFETIME_MARGIN_SECONDS = 60
+/**
+ * Обёртка — первый процесс контейнера (`sh -c <обёртка> remontnik <срок> <команда>`). Команда идёт дочерним `sh`,
+ * обёртка раз в секунду сверяет часы и по сроку убивает все процессы контейнера, кроме себя, — контейнер кончается.
+ * Счёт ведёт сам первый процесс: сигналы от процессов контейнера ему не доходят, команда срок не отменит.
+ */
+const LIFETIME_WRAPPER = 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
 
 function bindMount(source: string, target: string): string[] {
   if (/[,\n]/.test(source) || /[,\n]/.test(target)) throw new Error(`путь с запятой нельзя смонтировать: ${source}`)
@@ -193,8 +213,10 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     'create',
     '--rm',
     '--name', spec.name,
-    '--label', 'remontnik.workbench=1',
+    '--label', `${WORKBENCH_LABEL}=1`,
+    '--label', `${COPY_LABEL}=${copyKey(spec.copyDir)}`,
     '--network', spec.network,
+    ...Object.entries(spec.hosts ?? {}).flatMap(([host, ip]) => ['--add-host', `${host}:${ip}`]),
     ...(spec.user ? ['--user', spec.user] : []),
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
@@ -210,7 +232,7 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     '-w', spec.workdir,
     '--env-file', spec.envFile,
     spec.image,
-    'sh', '-c', spec.command,
+    'sh', '-c', LIFETIME_WRAPPER, 'remontnik', String(spec.lifetimeSeconds), spec.command,
   ]
 }
 
@@ -223,13 +245,14 @@ export interface DockerRunnerOptions {
   image: string
   /** Где лежат HOME копий (на сервере, вне папки копий). */
   homesDir: string
-  /** Сеть контейнера: нужна для установки пакетов, но не внутренняя сеть приложения. По умолчанию `bridge`. */
-  network?: string
   /**
-   * Внутренняя сеть Docker (`internal: true`) для тестов, проверки типов и eval: выхода наружу нет, видны только
-   * прокси модели и службы тестов приложения. Не задана — такие команды не запускаются.
+   * Сети случая: у каждой копии своя закрытая сеть верстака (команды модели, установка; там зеркало реестра)
+   * и своя сеть проверок (тесты, типы, eval; там прокси eval). Сеть берётся по ID и сверяется перед каждой командой.
+   * Не заданы — у команд нет сети совсем, а проверки не запускаются.
    */
-  internalNetwork?: string
+  caseNetworks?: CaseNetworks
+  /** Переменные команд в сети верстака (адрес зеркала реестра). Сильнее переданных; в сеть проверок не уходят. */
+  workbenchEnv?: Record<string, string>
   /** Пользователь в контейнере; по умолчанию — тот же, что у врача, чтобы файлы копии оставались его. */
   user?: string
   /** Лимит памяти контейнера (без подкачки). По умолчанию `4g`. */
@@ -240,7 +263,47 @@ export interface DockerRunnerOptions {
 }
 
 const DOCKER_STEP_TIMEOUT_SECONDS = 120
+/** Имя врача в контейнере случая: по нему зеркало реестра и прокси eval, адрес — свой в каждой сети. */
+export const CASE_GATEWAY_HOST = 'remontnik-gateway'
+
+/** Окружение клиента `docker`: только то, что ему нужно, без ключей врача. */
+export function dockerClientEnv(): Record<string, string> {
+  return {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+    ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
+  }
+}
 const DOCKER_KILL_TIMEOUT_SECONDS = 30
+
+/** Отметка испорченной копии рядом с её HOME: переживает перезапуск врача. */
+function spoiledMarkOf(homesDir: string, key: string): string {
+  return `${join(homesDir, key)}.spoiled`
+}
+
+/**
+ * Контейнеры верстака прошлого запуска врача (врач упал, `--rm` их не убрал): убить и удалить. Если команда в
+ * контейнере уже шла, она оборвана на середине — копия помечается испорченной. Возвращает ID удалённых.
+ */
+export async function removeOrphanWorkbenches(options: { homesDir: string; docker?: string; log?: (line: string) => void }): Promise<string[]> {
+  const docker = options.docker ?? 'docker'
+  const step = (args: string[]) => spawnWithTimeout({ file: docker, args, cwd: tmpdir(), env: dockerClientEnv() }, { cwd: tmpdir(), timeoutSeconds: DOCKER_STEP_TIMEOUT_SECONDS })
+  const listed = await step(['ps', '-a', '--filter', `label=${WORKBENCH_LABEL}=1`, '--format', `{{.ID}} {{.State}} {{.Label "${COPY_LABEL}"}}`])
+  if (listed.exitCode !== 0) throw new Error(`контейнеры верстака не перечислились: ${(listed.spawnError ?? listed.output).trim().slice(-300)}`)
+  const removed: string[] = []
+  for (const line of listed.output.split('\n')) {
+    const [id, state, key] = line.trim().split(/\s+/)
+    if (!id) continue
+    if (state !== 'created' && key && /^[0-9a-f]{16}$/.test(key)) {
+      mkdirSync(options.homesDir, { recursive: true })
+      writeFileSync(spoiledMarkOf(options.homesDir, key), `${id}\n`)
+    }
+    const killed = await step(['rm', '-f', id])
+    if (killed.exitCode === 0) removed.push(id)
+    else options.log?.(`[врач] старый контейнер верстака ${id} не удалился: ${killed.output.trim().slice(-300)}`)
+  }
+  return removed
+}
 
 /**
  * Исполнитель в контейнере: на каждую команду — свой контейнер с одной копией. Основного репозитория,
@@ -252,12 +315,8 @@ const DOCKER_KILL_TIMEOUT_SECONDS = 30
 export function createDockerRunner(options: DockerRunnerOptions): CommandRunner {
   const docker = options.docker ?? 'docker'
   const user = options.user ?? (process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined)
-  const clientEnv = {
-    PATH: process.env.PATH ?? '/usr/bin:/bin',
-    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-    ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
-  }
-  const spoiledMark = (copyDir: string) => `${homeOf(options.homesDir, copyDir)}.spoiled`
+  const clientEnv = dockerClientEnv()
+  const spoiledMark = (copyDir: string) => spoiledMarkOf(options.homesDir, copyKey(copyDir))
   const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
   const dockerStep = (args: string[], cwd: string, timeoutSeconds: number, signal?: AbortSignal) =>
     spawnWithTimeout({ file: docker, args, cwd, env: clientEnv }, { cwd, timeoutSeconds, ...(signal ? { signal } : {}) })
@@ -270,6 +329,48 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
     return inspected.exitCode !== null && /no such (object|container)/i.test(inspected.output)
   }
 
+  /** Одна команда в своём контейнере; сеть (если есть) уже сверена. */
+  async function runInContainer(command: string | readonly string[], runOptions: RunOptions, copyDir: string, lease: CaseNetworkLease | undefined): Promise<RunResult> {
+    const internal = runOptions.network === 'internal'
+    const name = `remontnik-${randomBytes(6).toString('hex')}`
+    const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
+    const envFile = join(envDir, 'env')
+    let created: RunResult
+    try {
+      const env = internal ? (runOptions.env ?? {}) : { ...runOptions.env, ...options.workbenchEnv }
+      writeFileSync(envFile, envFileText(env), { mode: 0o600 })
+      const args = dockerCreateArgs({
+        name,
+        image: options.image,
+        copyDir,
+        home: homeOf(options.homesDir, copyDir),
+        workdir: resolve(runOptions.cwd),
+        writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
+        network: lease?.network.id ?? 'none',
+        ...(lease ? { hosts: { [CASE_GATEWAY_HOST]: lease.network.gatewayIp } } : {}),
+        ...(user ? { user } : {}),
+        envFile,
+        memory: options.memory ?? '4g',
+        cpus: options.cpus ?? '2',
+        command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
+        lifetimeSeconds: Math.ceil(runOptions.timeoutSeconds) + CONTAINER_LIFETIME_MARGIN_SECONDS,
+      })
+      created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
+    } catch (error) {
+      return failed((error as Error).message)
+    } finally {
+      rmSync(envDir, { recursive: true, force: true })
+    }
+    if (created.exitCode !== 0) {
+      return { ...created, exitCode: null, spawnError: created.spawnError ?? `контейнер не создан: ${created.output.trim().slice(-500)}` }
+    }
+    const result = await spawnWithTimeout({ file: docker, args: ['start', '--attach', name], cwd: copyDir, env: clientEnv }, runOptions, 0, () =>
+      killContainer(name, copyDir),
+    )
+    if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
+    return result
+  }
+
   return {
     isolation: 'container',
     spoiled: (copyDir) => existsSync(spoiledMark(resolve(copyDir))),
@@ -278,41 +379,19 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
       const inCopy = relative(copyDir, resolve(runOptions.cwd))
       if (inCopy.startsWith('..') || isAbsolute(inCopy)) return failed(`папка ${runOptions.cwd} вне копии ${copyDir}`)
       if (existsSync(spoiledMark(copyDir))) return failed(new SpoiledCopyError(copyDir).message)
-      if (runOptions.network === 'internal' && !options.internalNetwork) return failed('внутренняя сеть проверок не задана (internalNetwork)')
-      const name = `remontnik-${randomBytes(6).toString('hex')}`
-      const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
-      const envFile = join(envDir, 'env')
-      let created: RunResult
+      const internal = runOptions.network === 'internal'
+      if (internal && !options.caseNetworks) return failed('сети случая не заданы (caseNetworks): проверки без закрытой сети не запускаются')
+      let lease: CaseNetworkLease | undefined
       try {
-        writeFileSync(envFile, envFileText(runOptions.env ?? {}), { mode: 0o600 })
-        const args = dockerCreateArgs({
-          name,
-          image: options.image,
-          copyDir,
-          home: homeOf(options.homesDir, copyDir),
-          workdir: resolve(runOptions.cwd),
-          writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
-          network: runOptions.network === 'internal' ? options.internalNetwork! : (options.network ?? 'bridge'),
-          ...(user ? { user } : {}),
-          envFile,
-          memory: options.memory ?? '4g',
-          cpus: options.cpus ?? '2',
-          command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
-        })
-        created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
+        lease = await options.caseNetworks?.use(copyDir, internal ? 'checks' : 'workbench')
       } catch (error) {
         return failed((error as Error).message)
+      }
+      try {
+        return await runInContainer(command, runOptions, copyDir, lease)
       } finally {
-        rmSync(envDir, { recursive: true, force: true })
+        lease?.done()
       }
-      if (created.exitCode !== 0) {
-        return { ...created, exitCode: null, spawnError: created.spawnError ?? `контейнер не создан: ${created.output.trim().slice(-500)}` }
-      }
-      const result = await spawnWithTimeout({ file: docker, args: ['start', '--attach', name], cwd: copyDir, env: clientEnv }, runOptions, 0, () =>
-        killContainer(name, copyDir),
-      )
-      if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
-      return result
     },
   }
 }
