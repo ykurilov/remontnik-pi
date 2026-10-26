@@ -257,6 +257,30 @@ describe('check-config: настройка', () => {
     expect(problems.length).toBeGreaterThanOrEqual(3)
   })
 
+  it('настройка подключает файл вне запретных зон — предупреждение; файл в зоне — нет', async () => {
+    const config = testRemontnikConfig()
+    const data = { ...config, forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access } }
+    const repoDir = join(tempDir(), 'app')
+    mkdirSync(join(repoDir, 'src'), { recursive: true })
+    git(repoDir, 'init', '--quiet', '--initial-branch=main')
+    git(repoDir, 'remote', 'add', 'origin', 'https://github.com/example-owner/example-app.git')
+    writeFileSync(join(repoDir, 'src/shared-names.mjs'), `export const NAME = ${JSON.stringify(data.app.name)}\n`)
+    writeFileSync(join(repoDir, 'remontnik.config.shared.mjs'), `export const CHECKS = ${JSON.stringify(data.checks)}\n`)
+    writeFileSync(
+      join(repoDir, 'remontnik.config.mjs'),
+      `import { NAME } from './src/shared-names.mjs'\nimport { CHECKS } from './remontnik.config.shared.mjs'\nexport default { ...${JSON.stringify(data)}, app: { name: NAME }, checks: CHECKS }\n`,
+    )
+    git(repoDir, 'add', '-A')
+    git(repoDir, 'commit', '--quiet', '-m', 'настройка')
+
+    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+
+    expect(errors(findings)).toEqual([])
+    expect(warnings(findings)).toHaveLength(1)
+    expect(warnings(findings)[0]).toContain('src/shared-names.mjs')
+    expect(warnings(findings)[0]).toContain('вне запретных зон')
+  })
+
   it('файл служб в fixablePaths — ошибка чтения настройки', async () => {
     const raw = { ...configWithServices(), fixablePaths: ['src/**', 'ci/**'] }
     const findings = await checkDoctorConfig(serverEnv(appRepo({ config: raw, services: `services:\n  db:\n    image: postgres${PIN}\n` })), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })

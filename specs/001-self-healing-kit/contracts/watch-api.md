@@ -28,7 +28,7 @@ const watch = createWatch({
     timeZone?: string;
     reasoningEffort?: "low" | "high" | "max"; // уровень рассуждения модели; см. research.md R2
   },
-  release?: () => Promise<string | null>, // текущая версия приложения, для отметки в событии
+  release?: string | null | (() => Promise<string | null>), // текущая версия приложения, для отметки в событии
   redact?: (text: string) => string,    // дополнительная вычистка приложения
   maxQueue?: number,                    // потолок очереди, по умолчанию 1000 (см. data-model: OutboxEntry)
 });
