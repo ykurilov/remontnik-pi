@@ -83,13 +83,14 @@ function loginsOf(logins: unknown): unknown[] {
 /** Текст для модели — только из известных полей ответа: кадры и прочее лишнее от службы дальше не идут. */
 function describeAnswer(answer: BrowserAnswer): BrowserToolAnswer {
   if (!answer.ok) return { isError: true, text: `${answer.code}: ${answer.message}` }
-  const { url, title, snapshot, path, logins, state } = answer
+  const { url, title, snapshot, path, logins, state, reason } = answer
   const lines = [
     ...(typeof url === 'string' ? [`Адрес: ${url}`] : []),
     ...(typeof title === 'string' ? [`Заголовок: ${title}`] : []),
     ...(typeof path === 'string' ? [`Снимок экрана: ${path} (попадёт в отчёт)`] : []),
     ...(logins !== undefined ? [`Входы: ${JSON.stringify(loginsOf(logins))}`] : []),
     ...(typeof state === 'string' ? [`Состояние: ${state}`] : []),
+    ...(typeof reason === 'string' ? [`Причина: ${reason}`] : []),
     ...(typeof snapshot === 'string' ? ['', snapshot] : []),
   ]
   return { isError: false, text: lines.length > 0 ? lines.join('\n') : 'Готово.' }
@@ -112,7 +113,8 @@ export async function runBrowserCommand(
     return error(`Браузер ждёт человека: проверку проходит владелец. Вызови ${WAIT_TOOL} — он дождётся, пока владелец вернёт управление.`)
   }
   const { profile: _ignored, ...input } = request.input
-  const answer = await client.call(request.command, { ...input, profile: browser.profile })
+  const startedAt = scope.now()
+  const answer = await client.call(request.command, { ...input, profile: browser.profile }, scope.signal)
   if (!answer.ok && (answer.code === 'needs_human' || answer.code === 'refused_human_control')) {
     await startHumanWait(deps, answer, liveLink, scope)
     const next = liveLink
@@ -120,7 +122,8 @@ export async function runBrowserCommand(
       : 'Владельцу сообщено, живого экрана нет: продолжай без браузера.'
     return error(`${answer.code}: ${answer.message}. ${next}`)
   }
-  if (answer.ok) await clearHumanWait(scope)
+  // Успех снимает только проверку, начатую раньше этой команды: капча, открытая по ходу её выполнения, ещё не пройдена.
+  if (answer.ok) await clearHumanWait(scope, startedAt)
   if (answer.ok && typeof answer.path === 'string') {
     const path = answer.path
     await scope.records.transaction((records) => addCaseScreenshotIn(records, scope.caseId, path))
@@ -139,16 +142,16 @@ export async function runHumanWait(deps: BrowserToolsDeps, scope: BrowserCommand
   if (!browser?.enabled || !client) return describeAnswer(UNAVAILABLE)
   // Вышедший срок здесь не снимается заранее: цикл ниже сначала спросит службу, а потом скажет «не вернул управление».
   const waiting = await openHumanWait(scope, { keepExpired: true })
-  if (!waiting) return describeAnswer(await client.call('read', { profile: browser.profile }))
+  if (!waiting) return describeAnswer(await client.call('read', { profile: browser.profile }, scope.signal))
   if (!liveLinkOf(browser, deps.env ?? {})) return error('Живого экрана нет, ждать нечего: продолжай без браузера.')
   const sleep = deps.sleep ?? sleepUnlessAborted
   const deadline = waiting.since + BROWSER_HUMAN_WAIT_MS
   for (;;) {
-    const status = await client.call('status', { profile: browser.profile })
+    const status = await client.call('status', { profile: browser.profile }, scope.signal)
     if (!status.ok) return describeAnswer(status)
     if (status.state === 'ready') {
       await clearHumanWait(scope)
-      const page = describeAnswer(await client.call('read', { profile: browser.profile }))
+      const page = describeAnswer(await client.call('read', { profile: browser.profile }, scope.signal))
       return { ...page, text: `Владелец вернул управление. Страница сейчас:\n${page.text}` }
     }
     const left = deadline - scope.now()
@@ -185,10 +188,11 @@ async function openHumanWait(scope: BrowserCommandScope, options: { keepExpired?
   })
 }
 
-async function clearHumanWait(scope: BrowserCommandScope): Promise<void> {
+/** `before` — снять, только если проверка началась раньше этого момента. */
+async function clearHumanWait(scope: BrowserCommandScope, before?: number): Promise<void> {
   await scope.records.transaction(async (records) => {
     const state = await caseBrowserIn(records, scope.caseId)
-    if (state.humanWait) delete state.humanWait
+    if (state.humanWait && (before === undefined || state.humanWait.since < before)) delete state.humanWait
   })
 }
 

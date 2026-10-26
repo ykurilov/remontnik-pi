@@ -33,7 +33,7 @@ export async function checkPages(
   const screenshots: string[] = []
   for (const [index, page] of browser.pagesToCheck.entries()) {
     signal?.throwIfAborted()
-    const opened = await client.call('url', { profile: browser.profile, url: page.url })
+    const opened = await client.call('url', { profile: browser.profile, url: page.url }, signal)
     if (!opened.ok && opened.code === 'unavailable') {
       const unchecked = browser.pagesToCheck.slice(index).map((rest) => ({ url: rest.url, ok: false, unchecked: true as const }))
       const status = pages.some((checked) => !checked.ok) ? 'failed' : 'unavailable'
@@ -46,7 +46,7 @@ export async function checkPages(
         : undefined
     pages.push({ url: page.url, ok: problem === undefined, ...(problem ? { problem } : {}) })
     signal?.throwIfAborted()
-    const shot = await client.call('shot', { profile: browser.profile })
+    const shot = await client.call('shot', { profile: browser.profile }, signal)
     if (shot.ok && typeof shot.path === 'string') screenshots.push(shot.path)
   }
   return { status: pages.every((page) => page.ok) ? 'checked' : 'failed', pages, screenshots }

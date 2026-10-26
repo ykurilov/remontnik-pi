@@ -82,6 +82,10 @@ async function wait(deps: BrowserToolsDeps, store: RecordStore, now = () => 1_00
   return runHumanWait(deps, { caseId: 1, reportCase: REPORT_CASE, records: store, now, ...(signal ? { signal } : {}) })
 }
 
+async function until(check: () => boolean): Promise<void> {
+  while (!check()) await new Promise((resolve) => setTimeout(resolve, 1))
+}
+
 function takeCaseScreenshots(store: RecordStore): Promise<string[]> {
   return store.transaction((records) => takeCaseScreenshotsIn(records, 1))
 }
@@ -294,6 +298,33 @@ describe('нужен человек: капча или код', () => {
     expect(await reports.list({ after: 0, limit: 10 })).toEqual([])
   })
 
+  it('успех команды, начатой до капчи, метку не снимает; успех команды после капчи — снимает', async () => {
+    const time = clock()
+    let releaseRead = () => {}
+    const fake = fakeClient((command) => {
+      if (command === 'url') return { ok: false, code: 'needs_human', message: 'капча' }
+      return new Promise<BrowserAnswer>((resolve) => (releaseRead = () => resolve(snapshotOf('страница'))))
+    })
+    const store = await seededStore()
+    const deps = depsWith(fake.client, configWith({}), { reports: createReports({ store }) })
+    const humanWait = async () => (await store.read<CaseBrowser>('case-browser', '1'))?.humanWait
+
+    const slowRead = run(deps, store, 'read', {}, time.now)
+    await until(() => fake.calls.length === 1)
+    time.advance(1_000)
+    await run(deps, store, 'url', { url: `${SITE}/captcha` }, time.now)
+    releaseRead()
+    await slowRead
+
+    expect(await humanWait()).toBeDefined()
+    time.advance(1_000)
+    const laterRead = run(deps, store, 'read', {}, time.now)
+    await until(() => fake.calls.length === 3)
+    releaseRead()
+    await laterRead
+    expect(await humanWait()).toBeUndefined()
+  })
+
   it('ждать нечего — browser_wait_human просто показывает страницу', async () => {
     const fake = fakeClient(() => snapshotOf('обычная страница'))
     const store = await seededStore()
@@ -304,6 +335,13 @@ describe('нужен человек: капча или код', () => {
 })
 
 describe('что видит модель', () => {
+  it('причина из ответа status доходит до модели', async () => {
+    const fake = fakeClient(() => ({ ok: true, state: 'busy', reason: 'управление у владельца' }))
+    const answer = await run(depsWith(fake.client, configWith({})), await seededStore(), 'read')
+    expect(answer.text).toContain('Состояние: busy')
+    expect(answer.text).toContain('управление у владельца')
+  })
+
   it('пароль и кадры живого экрана из ответа службы не доходят до модели и отчёта', async () => {
     const leaks = { frame: 'data:image/jpeg;base64,/9j/4AAQSkZJRg', password: 'owner-pass-value-77', live: { frame: 'AAAAframe' } }
     const fake = fakeClient((command) =>
@@ -457,6 +495,18 @@ describe('клиент службы браузера', () => {
     await new Promise<void>((resolve) => server!.close(() => resolve()))
     server = undefined
     expect(await createBrowserClient({ url, token: 't' }).call('read', { profile: PROFILE })).toMatchObject({ ok: false, code: 'unavailable' })
+  })
+
+  it('закрытие врача обрывает запрос сразу, а не по тайм-ауту: вызов бросает отмену', async () => {
+    server = createServer(() => {})
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()))
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    const closing = new AbortController()
+    setTimeout(() => closing.abort(new Error('врач закрывается')), 50)
+    const startedAt = Date.now()
+    await expect(createBrowserClient({ url, token: 't', timeoutMs: 10_000 }).call('status', { profile: PROFILE }, closing.signal)).rejects.toThrow('врач закрывается')
+    expect(Date.now() - startedAt).toBeLessThan(5_000)
+    server.closeAllConnections()
   })
 
   it('из окружения врача: без адреса или ключа клиента нет', () => {
