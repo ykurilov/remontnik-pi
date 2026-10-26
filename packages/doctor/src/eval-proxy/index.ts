@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from '../guarded-http/index.js'
 
 // Прокси модели для eval. Настоящие ключи провайдеров живут только у врача: контейнер eval получает
 // адрес прокси (`baseUrlEnv`) и одноразовый токен прогона (в `tokenEnv` и вместо ключа в `keyEnv`).
@@ -77,15 +77,24 @@ export interface EvalProxyRun {
 export interface EvalProxy {
   url: string
   openRun(options: EvalProxyRunOptions): EvalProxyRun
+  /** Слушать ещё и на этом адресе (адрес врача в сети проверок случая), на порту `port`. */
+  listen(host: string): Promise<GuardedListener>
   close(): Promise<void>
 }
 
 export interface EvalProxyOptions {
-  /** Только адрес частной сети. */
-  listen: { host: string; port: number }
-  /** Адрес прокси, как его видит контейнер eval (тоже частный); по умолчанию — адрес, на котором он слушает. */
+  /** Постоянный адрес (только частная сеть). Без него прокси слушает только там, куда его позовут (`listen`). */
+  listen?: { host: string; port: number }
+  /** Порт для `listen(host)`; по умолчанию 7810. */
+  port?: number
+  /**
+   * Адрес прокси, как его видит контейнер eval: частный адрес или имя без точек (`remontnik-gateway` — врач в сети
+   * случая). По умолчанию — постоянный адрес.
+   */
   publicUrl?: string
   upstreamTimeoutMs?: number
+  /** Пределы соединений: всего, на один контейнер и срок до первого запроса. */
+  limits?: Partial<GuardedHttpLimits>
 }
 
 const UPSTREAM_TIMEOUT_MS = 300_000
@@ -327,9 +336,16 @@ function urlHost(url: string): string {
   return new URL(url).hostname.replace(/^\[|\]$/g, '')
 }
 
+const DEFAULT_PORT = 7810
+
 export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalProxy> {
-  assertPrivateAddress(options.listen.host, 'адрес прокси eval')
-  if (options.publicUrl) assertPrivateAddress(urlHost(options.publicUrl), 'внешний адрес прокси eval (publicUrl)')
+  if (options.listen) assertPrivateAddress(options.listen.host, 'адрес прокси eval')
+  if (!options.listen && !options.publicUrl) throw new Error('прокси eval без постоянного адреса: нужен publicUrl')
+  if (options.publicUrl) {
+    const host = urlHost(options.publicUrl)
+    // Имя без точек — имя в /etc/hosts контейнера, в интернет оно не ведёт.
+    if (!/^[a-z][a-z0-9-]*$/i.test(host)) assertPrivateAddress(host, 'внешний адрес прокси eval (publicUrl)')
+  }
   const runs = new Map<string, OpenRun>()
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS
 
@@ -425,23 +441,17 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
     await tracked
   }
 
-  const server: Server = createServer((request, response) => {
+  const http = createGuardedHttp((request, response) => {
     // Eval мог уйти, не дочитав ответ: запись в закрытое соединение — не сбой прокси.
     response.on('error', () => {})
     handle(request, response).catch(() => {
       if (!response.headersSent) reply(response, 500, 'сбой прокси')
       else response.destroy()
     })
-  })
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(options.listen.port, options.listen.host, () => {
-      server.off('error', reject)
-      resolve()
-    })
-  })
-  const { port } = server.address() as AddressInfo
-  const url = (options.publicUrl ?? `http://${options.listen.host.includes(':') ? `[${options.listen.host}]` : options.listen.host}:${port}`).replace(/\/$/, '')
+  }, options.limits)
+  const fixed = options.listen ? await http.listen(options.listen.host, options.listen.port) : undefined
+  const url = (options.publicUrl ?? fixed!.url).replace(/\/$/, '')
+  const port = options.port ?? DEFAULT_PORT
 
   return {
     url,
@@ -477,11 +487,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
         },
       }
     },
-    close() {
-      return new Promise<void>((resolve) => {
-        server.close(() => resolve())
-        server.closeAllConnections()
-      })
-    },
+    listen: (host) => http.listen(host, port),
+    close: () => http.close(),
   }
 }

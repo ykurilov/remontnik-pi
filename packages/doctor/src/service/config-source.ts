@@ -4,7 +4,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { defineRemontnikConfig, type RemontnikConfig } from '@ykurilov/remontnik-core/config'
-import { assertValidMask, PathMaskError } from '../path-mask/index.js'
+import { assertValidMask, matchesAllowMask, normalizeRepoPath, PathMaskError } from '../path-mask/index.js'
 
 // Источник настройки (R7): врач читает `remontnik.config.*` только из рабочей копии ОСНОВНОЙ ветки.
 // Настройка в ветке врача на выкатку не влияет: ветка врача — не то место, откуда берутся запреты.
@@ -24,6 +24,7 @@ export type ConfigSourceErrorCode =
   | 'branch_mismatch'
   | 'branch_unknown'
   | 'invalid_mask'
+  | 'services_fixable'
 
 export class ConfigSourceError extends Error {
   readonly code: ConfigSourceErrorCode
@@ -151,6 +152,20 @@ function assertMasksUnderstood(config: RemontnikConfig, file: string): void {
   }
 }
 
+/** Файл служб для тестов задаёт, что поднимает врач: правка не может его менять, значит, он не в `fixablePaths`. */
+function assertServicesNotFixable(config: RemontnikConfig, file: string): void {
+  const services = config.checks.services
+  if (!services) return
+  const path = normalizeRepoPath(services.trim())
+  const mask = config.fixablePaths.find((candidate) => matchesAllowMask([candidate], path))
+  if (mask) {
+    throw new ConfigSourceError(
+      'services_fixable',
+      `В настройке ${file} файл служб для тестов checks.services «${path}» попадает в fixablePaths («${mask}»). Этот файл врач не даёт править: уберите его из fixablePaths или перенесите вне их.`,
+    )
+  }
+}
+
 /**
  * Читает и проверяет настройку приложения из рабочей копии основной ветки.
  * Копия обязана стоять ровно на основной ветке из параметров. Отдельная голова (detached HEAD),
@@ -182,5 +197,6 @@ export async function loadMainBranchConfig(options: LoadMainBranchConfigOptions)
     )
   }
   assertMasksUnderstood(config, file)
+  assertServicesNotFixable(config, file)
   return { config, file }
 }

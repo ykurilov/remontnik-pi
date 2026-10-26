@@ -1,5 +1,5 @@
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { connect, type AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createEvalProxy, usageCostUsd, type EvalProxy, type EvalProxyLimits, type EvalProxyProvider, type EvalProxyRunOptions, type EvalSpend } from './index.js'
 
@@ -409,6 +409,38 @@ describe('прокси модели для eval', () => {
     const proxy = await createEvalProxy({ listen: { host: '127.0.0.1', port: 0 }, publicUrl: 'http://172.30.0.2:7720/' })
     expect(proxy.url).toBe('http://172.30.0.2:7720')
     await proxy.close()
+  })
+
+  it('в сетях случая: адрес — имя врача remontnik-gateway, слушает на адресе врача в каждой сети проверок', async () => {
+    const upstream = await startUpstream(chatReply({ prompt_tokens: 1, completion_tokens: 1 }))
+    const proxy = await createEvalProxy({ port: 0, publicUrl: 'http://remontnik-gateway:7810' })
+    closers.push(() => proxy.close())
+    expect(proxy.url).toBe('http://remontnik-gateway:7810')
+    const listener = await proxy.listen('127.0.0.1')
+    const run = openRun(proxy, upstream)
+    const viaListener = run.env.CHAT_BASE_URL!.replace('http://remontnik-gateway:7810', listener.url)
+    expect((await post(`${viaListener}/chat/completions`, { model: 'm', max_tokens: 10 })).status).toBe(200)
+    await listener.close()
+    await expect(post(`${viaListener}/chat/completions`, { model: 'm', max_tokens: 10 })).rejects.toThrow()
+    await run.close()
+    await expect(createEvalProxy({ port: 0, publicUrl: 'http://remontnik.gateway.example.com:7810' })).rejects.toThrow(/частной сети/)
+    await expect(createEvalProxy({ port: 0 })).rejects.toThrow(/publicUrl/)
+  })
+
+  it('один клиент не занимает все соединения, а пустое соединение закрывается по короткому сроку', async () => {
+    const proxy = await createEvalProxy({ listen: { host: '127.0.0.1', port: 0 }, limits: { maxConnectionsPerClient: 1, firstRequestTimeoutMs: 300 } })
+    closers.push(() => proxy.close())
+    const { hostname, port } = new URL(proxy.url)
+    const first = connect({ host: hostname, port: Number(port) })
+    first.on('error', () => {})
+    await new Promise((resolve) => first.once('connect', resolve))
+    const openedAt = Date.now()
+    const second = connect({ host: hostname, port: Number(port) })
+    second.on('error', () => {})
+    await new Promise((resolve) => second.once('close', resolve))
+    expect(Date.now() - openedAt).toBeLessThan(250)
+    await new Promise((resolve) => first.once('close', resolve))
+    expect(Date.now() - openedAt).toBeLessThan(2_500)
   })
 })
 

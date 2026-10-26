@@ -96,6 +96,16 @@ describe('защищённые пути правки', () => {
     expect(paths([file('src/price.ts')], own)).toEqual(['src/price.ts'])
   })
 
+  it('файл служб для тестов (checks.services) — всегда защищён, даже если стоит в fixablePaths', () => {
+    const own = testRemontnikConfig({
+      checks: { test: 'pnpm test', services: './ci/services.yml' },
+      fixablePaths: ['ci/**', 'src/**'],
+      forbidden: { schema: ['db/**'], money: ['pay/**'], access: ['auth/**'], allowDependencyChanges: true, allowBuildAndDeployChanges: true },
+    })
+    expect(paths([file('ci/services.yml')], own)).toEqual(['ci/services.yml'])
+    expect(paths([file('ci/other.yml')], own)).toEqual([])
+  })
+
   it('флаги allow* не снимают защиту package.json, замков и сборки', () => {
     expect(paths([file('package.json'), file('pnpm-lock.yaml'), file('Dockerfile')], allowAll)).toEqual(['package.json', 'pnpm-lock.yaml', 'Dockerfile'])
   })

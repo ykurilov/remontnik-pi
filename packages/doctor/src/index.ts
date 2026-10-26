@@ -4,6 +4,7 @@ export { createReportsFeedHandler, type ReportsFeedAccess } from './intake/repor
 export { createMemoryRecordStore, type RecordStore, type RecordTransaction } from './records/index.js'
 export { REPORT_FULL_LIMIT, REPORT_RETRY_DELAYS_MS, createReports, type Report, type ReportType, type Reports } from './reports/index.js'
 export { startDoctorService, type DoctorService, type DoctorServiceOptions } from './service/index.js'
+export { caseWorkbenchEnv, createCaseGateway, doctorStartPlan, startDoctorFromEnv, type DoctorEnv } from './service/start.js'
 export { createGitGuard, slugify, treatmentBranch, type GitGuard, type GitGuardOptions } from './git-guard/index.js'
 export { type DoctorTreatmentOptions } from './service/index.js'
 export {
@@ -42,5 +43,8 @@ export {
 export { runDeploymentInTask } from './service/harness.js'
 export { createControls, readControls, type DeployControls } from './ledgers/controls.js'
 export { createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
+export { createCaseNetworks, type CaseNetworks, type CaseNetworksOptions } from './case-networks/index.js'
+export { createCaseServices, parseServicesFile, type CaseServices, type CaseServicesOptions } from './case-services/index.js'
+export { createRegistryMirror, type RegistryMirror, type RegistryMirrorOptions } from './registry-mirror/index.js'
 export { createEvalProxy, type EvalProxy, type EvalProxyOptions } from './eval-proxy/index.js'
 export { runDoctorCommand, type DoctorCommandIo } from './cli/run-doctor-command.js'

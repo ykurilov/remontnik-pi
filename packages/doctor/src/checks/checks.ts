@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
+import type { CaseServices } from '../case-services/index.js'
 import { isRunnerConfigOrEvalPath } from '../diff-inspector/index.js'
 import type { EvalProxy, EvalProxyProvider, EvalSpend } from '../eval-proxy/index.js'
 import { SpoiledCopyError, type CommandRunner, type RunResult } from '../workbench/index.js'
@@ -17,6 +18,9 @@ import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 // итога не читается — его пишет код правки. Скрипты eval — только из основы: правка, задевшая их, eval не
 // запускает. Тесты, проверка типов и eval идут во внутренней сети (видно только прокси); установка — во внешней.
 // Итог eval лежит вне копий, и писать туда может только он. Хвосты вывода и заметки вычищаются от ключей.
+//
+// Службы для тестов (`checks.services`, например временная база) поднимаются из файла основы — копию правки модель
+// могла поменять — у каждой копии свои, в её сети проверок, перед её первой командой там. Убираются после всех проверок.
 
 export interface EvalScenarioResult {
   id: string
@@ -84,6 +88,8 @@ export interface ChecksOptions {
   workDir: string
   /** Тайм-аут одной команды. */
   timeoutSeconds: number
+  /** Службы для тестов (`case-services`); без них проверки приложения с `checks.services` не запускаются. */
+  services?: Pick<CaseServices, 'up'>
   now?: () => number
 }
 
@@ -197,10 +203,63 @@ export function createChecks(options: ChecksOptions) {
     return { status: 'red', failed: [name], durationMs: now() - startedAt, outputTail: tail(`${why}\n${result.spawnError ?? ''}${result.output}`) }
   }
 
-  async function runTests(dir: string): Promise<TestsOutcome> {
+  /**
+   * Установка зависимостей перед проверками — строго по файлу-замку: подлинность пакетов держит `integrity` в нём.
+   * Флаг ставит врач сам, а не `CI=1` образа; переменная сильнее `.npmrc` копии.
+   */
+  function installDependencies(dir: string): Promise<RunResult> {
+    return run(config.workbench.install, dir, { env: { npm_config_frozen_lockfile: 'true' } })
+  }
+
+  /** Службы копий одной проверки: поднимаются по одной на копию и убираются вместе в конце. */
+  function servicesScope(baseDir: string) {
+    const started = new Map<string, Promise<{ down(): Promise<void> }>>()
+    return {
+      /** Поднять службы копии `dir`; не вышло — текст причины. */
+      async ensure(dir: string): Promise<string | undefined> {
+        const file = config.checks.services
+        if (!file) return undefined
+        if (!options.services) return `службы для тестов (checks.services) поднять нечем: врач запущен без Docker`
+        let up = started.get(dir)
+        if (!up) {
+          up = (async () => {
+            const path = resolve(baseDir, file)
+            const inBase = relative(resolve(baseDir), path)
+            if (inBase.startsWith('..') || isAbsolute(inBase)) throw new Error(`файл служб (checks.services) вне копии основы: ${file}`)
+            let text: string
+            try {
+              text = readFileSync(path, 'utf8')
+            } catch {
+              throw new Error(`файл служб (checks.services) не найден в основе: ${file}`)
+            }
+            return options.services!.up(dir, text)
+          })()
+          started.set(dir, up)
+        }
+        try {
+          await up
+          return undefined
+        } catch (error) {
+          return (error as Error).message
+        }
+      },
+      async downAll(): Promise<void> {
+        for (const up of started.values()) {
+          const running = await up.catch(() => undefined)
+          await running?.down()
+        }
+      },
+    }
+  }
+
+  type Services = ReturnType<typeof servicesScope>
+
+  async function runTests(dir: string, services: Services): Promise<TestsOutcome> {
     const startedAt = now()
-    const install = await run(config.workbench.install, dir)
+    const install = await installDependencies(dir)
     if (install.exitCode !== 0) return failedStep('install', install, startedAt)
+    const servicesError = await services.ensure(dir)
+    if (servicesError) return { status: 'red', failed: ['services'], durationMs: now() - startedAt, outputTail: tail(servicesError) }
     if (config.checks.typecheck) {
       const typecheck = await run(config.checks.typecheck, dir, { network: 'internal' })
       if (typecheck.exitCode !== 0) return failedStep('typecheck', typecheck, startedAt)
@@ -286,7 +345,7 @@ export function createChecks(options: ChecksOptions) {
     return { ok: result.exitCode === 0, scenarios: record.scenarios, costUsd, ...(result.exitCode === 0 ? {} : { note: `eval (${label}) завершился с кодом ${result.exitCode ?? '—'}` }) }
   }
 
-  async function runEvalChecks(input: ChecksInput, tests: TestsOutcome): Promise<EvalOutcome> {
+  async function runEvalChecks(input: ChecksInput, tests: TestsOutcome, services: Services): Promise<EvalOutcome> {
     const evalConfig = config.checks.eval
     if (!evalConfig) {
       return input.evalRequired ? { status: 'not_run', scenarios: [], costUsd: 0, note: 'eval в настройке не задан' } : { status: 'not_needed', scenarios: [], costUsd: 0 }
@@ -335,8 +394,10 @@ export function createChecks(options: ChecksOptions) {
     if (missingScenarios.length > 0) {
       const remaining = budgetUsd - costUsd
       if (remaining <= 0) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: 'на eval основы не осталось денег' }
-      const baseInstall = await run(config.workbench.install, input.baseDir)
+      const baseInstall = await installDependencies(input.baseDir)
       if (baseInstall.exitCode !== 0) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `установка зависимостей основы: код ${baseInstall.exitCode ?? '—'}` }
+      const servicesError = await services.ensure(input.baseDir)
+      if (servicesError) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `службы для тестов основы: ${servicesError}` }
       const baseRun = await runEval(input.baseDir, 'base', missingScenarios, remaining, providers, onSpend)
       costUsd += baseRun.costUsd
       if (baseRun.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: baseRun.note! }
@@ -368,8 +429,13 @@ export function createChecks(options: ChecksOptions) {
 
   return {
     async run(input: ChecksInput): Promise<ChecksResult> {
-      const tests = await runTests(input.candidateDir)
-      return { tests, eval: await runEvalChecks(input, tests) }
+      const services = servicesScope(input.baseDir)
+      try {
+        const tests = await runTests(input.candidateDir, services)
+        return { tests, eval: await runEvalChecks(input, tests, services) }
+      } finally {
+        await services.downAll()
+      }
     },
   }
 }

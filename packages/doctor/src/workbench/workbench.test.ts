@@ -6,7 +6,8 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createGitGuard } from '../git-guard/index.js'
 import { bashCallPolicy } from '../treatment/tools.js'
-import { ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, type CommandRunner } from './index.js'
+import type { CaseNetworks } from '../case-networks/index.js'
+import { CONTAINER_LIFETIME_MARGIN_SECONDS, ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, removeOrphanWorkbenches, type CommandRunner } from './index.js'
 
 const dirs: string[] = []
 
@@ -276,7 +277,8 @@ describe('исполнитель в контейнере', () => {
     expect(args!.join('\n')).not.toContain(b.repoDir + '/.git')
     expect(args!.join('\n')).not.toContain('test-secret-should-not-leak')
     expect(fake.envFile()).not.toContain('test-secret-should-not-leak')
-    expect(args!.slice(-4)).toEqual(['example.test/app-dev:1', 'sh', '-c', 'pnpm test'])
+    expect(args!.slice(-7, -1)).toEqual(['example.test/app-dev:1', 'sh', '-c', expect.stringContaining('kill -KILL -1'), 'remontnik', String(5 + CONTAINER_LIFETIME_MARGIN_SECONDS)])
+    expect(args!.at(-1)).toBe('pnpm test')
     expect(args![args!.indexOf('-w') + 1]).toBe(join(b.workbench.path, 'src'))
     expect(start).toEqual(['start', '--attach', flagValue(args!, '--name')])
   })
@@ -297,23 +299,81 @@ describe('исполнитель в контейнере', () => {
     expect(mountSources(args!)).toEqual([b.workbench.path, expect.stringContaining(join(b.root, 'homes')), outDir])
   })
 
-  it('проверки во внутренней сети: видно только прокси модели; установка — во внешней', async () => {
+  /** Подставные сети случая: выдают сеть по копии и виду, считают незакрытые аренды. */
+  function fakeCaseNetworks(fail?: string) {
+    const uses: string[] = []
+    let open = 0
+    const networks: CaseNetworks = {
+      async use(copyDir, kind) {
+        uses.push(`${kind} ${copyDir}`)
+        if (fail) throw new Error(fail)
+        open += 1
+        const network = { id: `${kind}-id`, name: `remontnik-case-${kind}`, kind, gatewayIp: kind === 'workbench' ? '10.213.0.2' : '10.213.0.34' }
+        return { network, done: () => void (open -= 1) }
+      },
+      removeStale: async () => {},
+      close: async () => {},
+    }
+    return { networks, uses, open: () => open }
+  }
+
+  it('сети случая: установка — в сети верстака, проверки — в сети проверок; сеть по ID, врач — по имени remontnik-gateway', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
-    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, network: 'remontnik-install', internalNetwork: 'remontnik-eval' })
+    const caseNetworks = fakeCaseNetworks()
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, caseNetworks: caseNetworks.networks })
     await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
     await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    expect(caseNetworks.uses).toEqual([`workbench ${b.workbench.path}`, `checks ${b.workbench.path}`])
     const creates = fake.calls().filter((call) => call[0] === 'create')
-    expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['remontnik-install', 'remontnik-eval'])
+    expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['workbench-id', 'checks-id'])
+    expect(creates.map((args) => flagValue(args, '--add-host'))).toEqual(['remontnik-gateway:10.213.0.2', 'remontnik-gateway:10.213.0.34'])
+    expect(caseNetworks.open()).toBe(0)
   })
 
-  it('внутренняя сеть не задана → команда для неё не запускается', async () => {
+  it('сеть не задана → у контейнера нет сети совсем', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    expect(flagValue(fake.calls()[0]!, '--network')).toBe('none')
+  })
+
+  it('адрес зеркала реестра — только командам в сети верстака, не проверкам; модель его не подменит', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({
+      image: 'example.test/app-dev:1',
+      homesDir: join(b.root, 'homes'),
+      docker: fake.docker,
+      caseNetworks: fakeCaseNetworks().networks,
+      workbenchEnv: { npm_config_registry: 'http://remontnik-gateway:7801/' },
+    })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { npm_config_registry: 'http://model.example.com/' }, timeoutSeconds: 5 })
+    await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    const [install, tests] = fake.envFile().split(/^-rw-------/m).filter(Boolean)
+    expect(install).toContain('npm_config_registry=http://remontnik-gateway:7801/\n')
+    expect(install).not.toContain('model.example.com')
+    expect(tests).not.toContain('npm_config_registry')
+  })
+
+  it('сеть случая не прошла сверку → команда не запускается', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, caseNetworks: fakeCaseNetworks('сеть случая не закрыта').networks })
+    const result = await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    expect(result.exitCode).toBeNull()
+    expect(result.spawnError).toContain('не закрыта')
+    expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
+  })
+
+  it('сетей случая нет → проверки не запускаются', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
     const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
     const result = await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
     expect(result.exitCode).toBeNull()
-    expect(result.spawnError).toContain('внутренн')
+    expect(result.spawnError).toContain('сет')
     expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
   })
 
@@ -417,4 +477,58 @@ describe('исполнитель в контейнере', () => {
       expect(args![args!.length - 1]).toBe(command)
     },
   )
+})
+
+describe('контейнеры верстака после падения врача', () => {
+  it('у контейнера свой срок жизни: врач упал — команда внутри всё равно умрёт чуть позже своего тайм-аута', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 40 })
+    const [args] = fake.calls()
+    const wrapper = args![args!.indexOf('-c') + 1]!
+    expect(args!.slice(args!.indexOf('-c') + 2)).toEqual(['remontnik', String(40 + CONTAINER_LIFETIME_MARGIN_SECONDS), 'pnpm test'])
+    // Обёртка — первый процесс контейнера: по сроку убивает все остальные, и контейнер кончается.
+    expect(wrapper).toContain('date +%s')
+    expect(wrapper).toContain('kill -KILL -1')
+  })
+
+  /** Подставной docker со «старыми» контейнерами верстака: `ps` их выдаёт, `rm` записывает. */
+  function orphanDocker(root: string, rows: string[]) {
+    const log = join(root, 'orphan-docker.log')
+    const docker = join(root, 'orphan-docker')
+    writeFileSync(
+      docker,
+      ['#!/bin/sh', `echo "$*" >> '${log}'`, 'case "$1" in', `  ps) printf '%s\n' ${rows.map((row) => `'${row}'`).join(' ')};;`, 'esac', 'exit 0', ''].join('\n'),
+      { mode: 0o755 },
+    )
+    return { docker, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) }
+  }
+
+  it('на старте врача контейнеры с меткой верстака убиваются, а копии, где команда шла, помечаются испорченными', async () => {
+    const b = await bench()
+    const homesDir = join(b.root, 'homes')
+    // Метку копии ставит сам исполнитель: берём её из настоящего `docker create`.
+    const fake = fakeDocker(b.root)
+    await createDockerRunner({ image: 'example.test/app-dev:1', homesDir, docker: fake.docker }).run('ls', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    const label = fake.calls()[0]!.find((arg) => arg.startsWith('remontnik.copy='))!
+    const copy = label.slice('remontnik.copy='.length)
+    const other = '0123456789abcdef'
+    const orphans = orphanDocker(b.root, [`aaa running ${copy}`, `bbb created ${other}`])
+    const removed = await removeOrphanWorkbenches({ homesDir, docker: orphans.docker })
+    expect(orphans.calls()[0]).toBe('ps -a --filter label=remontnik.workbench=1 --format {{.ID}} {{.State}} {{.Label "remontnik.copy"}}')
+    expect(orphans.calls()).toEqual(expect.arrayContaining(['rm -f aaa', 'rm -f bbb']))
+    expect(removed).toEqual(['aaa', 'bbb'])
+    // Команда в копии оборвана на середине — копии больше не доверяют. Контейнер, который не начинал, копию не портит.
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir, docker: fake.docker })
+    expect(runner.spoiled(b.workbench.path)).toBe(true)
+    expect(existsSync(join(homesDir, `${other}.spoiled`))).toBe(false)
+  })
+
+  it('старых контейнеров нет — ничего не удаляется', async () => {
+    const b = await bench()
+    const orphans = orphanDocker(b.root, [])
+    expect(await removeOrphanWorkbenches({ homesDir: join(b.root, 'homes'), docker: orphans.docker })).toEqual([])
+    expect(orphans.calls()).toHaveLength(1)
+  })
 })
