@@ -196,6 +196,9 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   const modelBudget = treatmentOptions
     ? createModelBudget({ models: treatmentOptions.models, boot, now, report: (error) => log(`[врач] учёт расходов модели: ${describeError(error)}`), log: (line) => log(`[врач] ${line}`) })
     : undefined
+  // До открытия хранилища и продолжения задач: git врача сейчас не идёт, а замки убитого запуска не дадут коммитить.
+  const staleLocks = treatmentOptions ? await treatmentOptions.guard.clearStaleLocks() : []
+  if (staleLocks.length > 0) log(`[врач] убраны замки git прошлого запуска: ${staleLocks.join(', ')}`)
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),

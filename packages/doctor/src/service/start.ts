@@ -198,7 +198,7 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   const gateway = await createCaseGateway(plan, options)
   let service: DoctorService
   try {
-    // Сначала контейнеры верстака прошлого запуска (их копии испорчены) и службы для тестов, потом их сети.
+    // Сначала контейнеры верстака прошлого запуска (их команды обрываются) и службы для тестов, потом их сети.
     await removeOrphanWorkbenches({ homesDir: plan.runner.homesDir, ...(options.docker ? { docker: options.docker } : {}), ...(options.log ? { log: options.log } : {}) })
     await gateway.caseServices.removeStale()
     await gateway.caseNetworks.removeStale()

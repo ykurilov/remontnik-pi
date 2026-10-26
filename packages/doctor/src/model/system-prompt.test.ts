@@ -22,6 +22,11 @@ describe('системный промпт врача', () => {
     expect([...positions].sort((a, b) => a - b)).toEqual(positions)
   })
 
+  it('прерванная перезапуском команда bash объяснена: модель продолжает, а не начинает заново', () => {
+    // Текст ответа — из pi-durable: так он пишет итог инструмента, оборванного падением врача.
+    expect(buildSystemPrompt(input())).toContain('Tool bash was interrupted')
+  })
+
   it('для одной основы байты одинаковы при любом порядке файлов', () => {
     const first = buildSystemPrompt(input())
     const second = buildSystemPrompt(input({ repoMap: buildRepoMap([...files].reverse(), { closedPaths: ['secrets/**'] }) }))

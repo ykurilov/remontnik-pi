@@ -1,4 +1,6 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Wake } from '@earendil-works/pi-durable'
 import { fauxAssistantMessage, fauxToolCall, type AssistantMessage, type TranscriptContext } from '@earendil-works/pi-ai'
 import type { AppCommands, CommandOutcome } from '../../src/deployer/app-commands.js'
@@ -139,6 +141,14 @@ function crashingGuard(guard: GitGuard): GitGuard {
       const made = await guard.addWorktree(options)
       if (options.path === world.workbenchPath) crash('triage')
       return made
+    },
+    async commitAll(cwd, message) {
+      if (crashAt === 'mid_commit') {
+        const gitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], { cwd, encoding: 'utf8' }).trim()
+        writeFileSync(join(gitDir, 'index.lock'), '')
+        crash('mid_commit')
+      }
+      return guard.commitAll(cwd, message)
     },
   }
 }

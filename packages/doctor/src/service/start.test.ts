@@ -138,11 +138,11 @@ describe('старт врача', () => {
       const started = vi.mocked(startDoctorService).mock.lastCall![0]
       expect(started.treatment.deployer?.step).toBeTypeOf('function')
       expect(fake.calls()).toEqual(expect.arrayContaining(['inspect --format {{json .NetworkSettings.Networks}} remontnik-doctor', 'network rm stale-network-id']))
-      // Контейнеры верстака прошлого запуска убиваются раньше, чем удаляются их сети; их копии испорчены.
+      // Контейнеры верстака прошлого запуска убиваются раньше, чем удаляются их сети; удалённый контейнер копию не портит.
       const calls = fake.calls()
       expect(calls.indexOf('rm -f orphan-container')).toBeGreaterThan(-1)
       expect(calls.indexOf('rm -f orphan-container')).toBeLessThan(calls.findIndex((call) => call.startsWith('network ls')))
-      expect(existsSync(join(repoDir, '..', 'state', 'homes', '0123456789abcdef.spoiled'))).toBe(true)
+      expect(existsSync(join(repoDir, '..', 'state', 'homes', '0123456789abcdef.spoiled'))).toBe(false)
       // Службы для тестов прошлого запуска — тоже до удаления сетей: иначе сеть занята.
       const staleServices = calls.indexOf('ps -aq --filter label=remontnik.case-services')
       expect(staleServices).toBeGreaterThan(-1)

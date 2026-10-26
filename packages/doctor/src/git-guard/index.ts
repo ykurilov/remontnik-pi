@@ -99,6 +99,12 @@ export interface GitGuard {
    * Рабочую копию основной ветки не трогает: её держат выкатки, и смена копии посреди чужой выкатки — её отказ.
    */
   mergeIntoMain(branch: string, commit: string): Promise<void>
+  /**
+   * Замки git, брошенные убитым врачом (его git убит посреди коммита вместе с ним): в gitdir копий врача и у веток и
+   * меток `remontnik/…`. Только на старте врача, пока его git не идёт. Замки основной копии не трогает. Возвращает
+   * убранные пути относительно общего gitdir.
+   */
+  clearStaleLocks(): Promise<string[]>
 }
 
 const TRANSLIT: Record<string, string> = {
@@ -525,6 +531,32 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
 
     async changedFiles(cwd, base) {
       return readChangedFiles((args) => run(args, { cwd }), base)
+    },
+
+    async clearStaleLocks() {
+      const removed: string[] = []
+      const drop = (path: string) => {
+        rmSync(path, { force: true })
+        removed.push(relative(commonGitDir, path))
+      }
+      const admins = join(commonGitDir, 'worktrees')
+      for (const name of existsSync(admins) ? readdirSync(admins) : []) {
+        const admin = join(admins, name)
+        let copy: string
+        try {
+          copy = dirname(readFileSync(join(admin, 'gitdir'), 'utf8').trim())
+        } catch {
+          continue
+        }
+        if (!inside(canonical(worktreesDir), canonical(copy))) continue
+        for (const file of readdirSync(admin)) if (file.endsWith('.lock')) drop(join(admin, file))
+      }
+      for (const refs of ['refs/heads', 'refs/tags']) {
+        const own = join(commonGitDir, refs, TREATMENT_BRANCH_PREFIX)
+        if (!existsSync(own)) continue
+        for (const file of readdirSync(own, { recursive: true, encoding: 'utf8' })) if (file.endsWith('.lock')) drop(join(own, file))
+      }
+      return removed
     },
 
     async commitAll(cwd, message) {

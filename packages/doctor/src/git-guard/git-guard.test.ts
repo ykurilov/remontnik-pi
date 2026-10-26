@@ -104,6 +104,30 @@ describe('git-замок', () => {
     await guard.addWorktree({ path, branch: treatmentBranch(2, 'x'), base })
   })
 
+  it('замки git, брошенные убитым врачом в его копиях, убираются на старте; замки основной копии — нет', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const base = await guard.resolve('HEAD')
+    const path = join(r.worktreesDir, '3')
+    const branch = treatmentBranch(3, 'x')
+    await guard.addWorktree({ path, branch, base })
+    const copyGitDir = git(path, 'rev-parse', '--absolute-git-dir')
+    const commonGitDir = join(r.repoDir, '.git')
+    // Врач и его git убиты посреди коммита: замки индекса копии и ветки врача остались.
+    writeFileSync(join(copyGitDir, 'index.lock'), '')
+    writeFileSync(join(commonGitDir, 'refs', 'heads', `${branch}.lock`), '')
+    writeFileSync(join(commonGitDir, 'index.lock'), '')
+
+    expect((await guard.clearStaleLocks()).sort()).toEqual([`refs/heads/${branch}.lock`, 'worktrees/3/index.lock'])
+
+    expect(existsSync(join(copyGitDir, 'index.lock'))).toBe(false)
+    // Основная копия — человека и выкаток: её замок врач не трогает.
+    expect(existsSync(join(commonGitDir, 'index.lock'))).toBe(true)
+    rmSync(join(commonGitDir, 'index.lock'))
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 3\n')
+    expect(await guard.commitAll(path, 'Ремонтник: случай 3')).toMatch(/^[0-9a-f]{40}$/)
+  })
+
   it.each([
     [['push', '--force', 'origin', 'remontnik/1-x']],
     [['push', '-f', 'origin', 'remontnik/1-x']],

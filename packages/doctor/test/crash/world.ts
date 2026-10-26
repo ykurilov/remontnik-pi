@@ -2,8 +2,11 @@ import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-cor
 
 // Общее для стенда падений и врача в дочернем процессе: точки падения, приложение-пациент и пути на диске.
 
-/** Где врача убивают: по одной точке на фазу лечения, у выкатки — до и после переключения версии. */
-export const CRASH_POINTS = ['triage', 'diagnosing', 'fixing', 'verifying', 'gated', 'before_promote', 'after_promote', 'observing'] as const
+/**
+ * Где врача убивают: по одной точке на фазу лечения, у выкатки — до и после переключения версии. `mid_commit` — посреди
+ * коммита правки: git тоже убит и оставил замок индекса (так бывает, когда перезапускают весь контейнер врача).
+ */
+export const CRASH_POINTS = ['triage', 'diagnosing', 'fixing', 'mid_commit', 'verifying', 'gated', 'before_promote', 'after_promote', 'observing'] as const
 /** Правка делает хуже: врача убивают сразу после отката. */
 export const ROLLBACK_CRASH_POINT = 'after_rollback'
 export type CrashPoint = (typeof CRASH_POINTS)[number] | typeof ROLLBACK_CRASH_POINT
