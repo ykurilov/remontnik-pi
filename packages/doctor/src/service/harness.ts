@@ -67,6 +67,8 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   controls: recordFamily('remontnik.controls'),
   /** Браузер врача по случаю: снимки для ближайшего отчёта и открытое ожидание человека. */
   'case-browser': recordFamily('remontnik.case-browser'),
+  /** Пометки об отказе хранилища, по которым отчёт уже записан. */
+  'storage-failure-report': recordFamily('remontnik.storage-failure-report'),
 }
 
 /** Семейство документов коллекции записей: для чтения из задач pi-durable (`runtime.snapshot`). */

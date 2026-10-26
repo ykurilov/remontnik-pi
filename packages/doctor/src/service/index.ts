@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
@@ -23,6 +23,7 @@ import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls, readControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
+import type { RecordStore } from '../records/index.js'
 import type { BrowserClient } from '../browser-tools/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, TREATMENT_TASK_NAME, type Treatment, type TreatmentInput } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
@@ -118,8 +119,12 @@ const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
 const RETRYABLE_REPORTS: readonly ReportInfo['type'][] = ['task_parked', 'task_faulted']
 /** Пометка об отказе хранилища: переживает выход врача, после перезапуска — отчёт doctor_problem. */
 const STORAGE_FAILURE_MARK = 'storage-failure.json'
+/** Отчёты по пометкам: врач, упавший между отчётом и удалением пометки, второй отчёт не пишет. */
+const STORAGE_FAILURE_REPORTS = 'storage-failure-report'
 
 interface StorageFailureMark {
+  /** Ключ отчёта по этой пометке. */
+  id?: string
   at: string
   reason: string
   /** Тревога ушла в Telegram: отчёт после перезапуска её не повторяет. */
@@ -167,22 +172,31 @@ function problemReason(error: unknown): string {
 }
 
 /** Отказ хранилища прошлого запуска — отчётом doctor_problem: в ленте Paseo и, если тревога не ушла, в Telegram. */
-async function reportStorageFailure(stateDir: string, reports: Reports, log: (line: string) => void): Promise<void> {
+async function reportStorageFailure(stateDir: string, records: RecordStore, reports: Reports, log: (line: string) => void): Promise<void> {
   const path = join(stateDir, STORAGE_FAILURE_MARK)
   if (!existsSync(path)) return
   let mark: StorageFailureMark
+  let raw = ''
   try {
-    mark = JSON.parse(readFileSync(path, 'utf8')) as StorageFailureMark
+    raw = readFileSync(path, 'utf8')
+    mark = JSON.parse(raw) as StorageFailureMark
   } catch (error) {
     // Пометка недописана: врач умер посреди записи. Причина неизвестна, но об отказе владелец узнает.
     log(`[врач] пометка об отказе хранилища не прочитана: ${describeError(error)}`)
     mark = { at: 'время неизвестно', reason: 'причина неизвестна', telegramSent: false }
   }
+  // Пометка без ключа (недописана или от прежней версии врача) — ключ по её содержимому.
+  const key = mark.id ?? createHash('sha256').update(raw).digest('hex').slice(0, 32)
   try {
-    await reports.add({
-      type: 'doctor_problem',
-      short: `Врач перезапустился после отказа хранилища (${mark.reason}, ${mark.at}).`,
-      telegram: mark.telegramSent ? 'not_needed' : 'pending',
+    await records.transaction(async (tx) => {
+      const reported = await tx.doc<{ reportId?: number }>(STORAGE_FAILURE_REPORTS, key, {})
+      if (reported.reportId !== undefined) return
+      const report = await reports.addIn(tx, {
+        type: 'doctor_problem',
+        short: `Врач перезапустился после отказа хранилища (${mark.reason}, ${mark.at}).`,
+        telegram: mark.telegramSent ? 'not_needed' : 'pending',
+      })
+      reported.reportId = report.reportId
     })
   } catch (error) {
     // Пометка остаётся до следующего запуска.
@@ -273,7 +287,9 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     ? createModelBudget({ models: treatmentOptions.models, boot, now, report: (error) => log(`[врач] учёт расходов модели: ${describeError(error)}`), log: (line) => log(`[врач] ${line}`) })
     : undefined
   // До открытия хранилища и продолжения задач: git врача сейчас не идёт, а замки убитого запуска не дадут коммитить.
-  const staleLocks = treatmentOptions ? await treatmentOptions.guard.clearStaleLocks() : []
+  // Копию, где контейнер не удалился (команда, возможно, ещё пишет), не трогать: там может идти живой git.
+  const staleLocks =
+    treatmentOptions && runners ? await treatmentOptions.guard.clearStaleLocks({ inUse: (copy) => runners.runner.spoiled(copy) || runners.checksRunner.spoiled(copy) }) : []
   if (staleLocks.length > 0) log(`[врач] убраны замки git прошлого запуска: ${staleLocks.join(', ')}`)
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
@@ -295,7 +311,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   })
   reportsRef = reports
   for (const report of reportsBeforeOpen.splice(0)) report()
-  await reportStorageFailure(options.stateDir, reports, log)
+  await reportStorageFailure(options.stateDir, opened.records, reports, log)
 
   let evalProxy: EvalProxy | undefined
   let ownEvalProxy: EvalProxy | undefined
@@ -349,7 +365,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     if (closing) return
     log(`[врач] хранилище отказало: ${describeError(end.error)}`)
     const reason = problemReason(end.error)
-    const mark: StorageFailureMark = { at: new Date(now()).toISOString(), reason, telegramSent: false }
+    const mark: StorageFailureMark = { id: randomUUID(), at: new Date(now()).toISOString(), reason, telegramSent: false }
     const writeMark = () => {
       try {
         writeFileSync(join(options.stateDir, STORAGE_FAILURE_MARK), JSON.stringify(mark))
