@@ -166,7 +166,23 @@ function unhandledRejectionsMode(): string {
   return 'throw'
 }
 
+/** Обязательные поля без значения — понятный TypeError с названием поля, а не отказ где-то внутри. */
+function assertWatchOptions(options: WatchOptions): void {
+  const required: [string, unknown][] = [
+    ['dir', options.dir],
+    ['doctor.url', options.doctor?.url],
+    ['doctor.secret', options.doctor?.secret],
+    ['telegram.botToken', options.telegram?.botToken],
+    ['telegram.chatId', options.telegram?.chatId],
+  ]
+  const missing = required.filter(([, value]) => value === undefined || value === null || value === '').map(([name]) => name)
+  if (missing.length > 0) {
+    throw new TypeError(`createWatch: не заданы обязательные поля: ${missing.join(', ')} (обычно это пустая переменная окружения)`)
+  }
+}
+
 export function createWatch(options: WatchOptions): Watch {
+  assertWatchOptions(options)
   const now = options.now ?? Date.now
   const fetchImpl = options.fetch ?? ((...args: Parameters<typeof fetch>) => fetch(...args))
   const appRoot = options.appRoot ?? process.cwd()

@@ -36,6 +36,15 @@ importers:
         specifier: workspace:*
         version: link:../../packages/watch
 
+  examples/mini-app:
+    dependencies:
+      '@ykurilov/remontnik-core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@ykurilov/remontnik-watch':
+        specifier: workspace:*
+        version: link:../../packages/watch
+
   packages/browser:
     dependencies:
       '@ykurilov/remontnik-core':

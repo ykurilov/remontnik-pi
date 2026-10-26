@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -35,7 +35,7 @@ function git(dir: string, ...args: string[]): void {
 }
 
 /** Репозиторий приложения на основной ветке: настройка и, по желанию, файл служб. */
-function appRepo(options: { config?: object; services?: string } = {}): string {
+function appRepo(options: { config?: object; services?: string; deployFiles?: Record<string, { content: string; executable?: boolean } | null> } = {}): string {
   const repoDir = join(tempDir(), 'app')
   mkdirSync(repoDir)
   git(repoDir, 'init', '--quiet', '--initial-branch=main')
@@ -43,6 +43,13 @@ function appRepo(options: { config?: object; services?: string } = {}): string {
   const config = testRemontnikConfig()
   const raw = options.config ?? { ...config, forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access } }
   writeFileSync(join(repoDir, 'remontnik.config.json'), JSON.stringify(raw))
+  const deployFiles = options.deployFiles ?? { 'deploy.ts': { content: '// команды выкатки\n' } }
+  for (const [name, file] of Object.entries(deployFiles)) {
+    if (!file) continue
+    mkdirSync(dirname(join(repoDir, name)), { recursive: true })
+    writeFileSync(join(repoDir, name), file.content)
+    if (file.executable) chmodSync(join(repoDir, name), 0o755)
+  }
   if (options.services !== undefined) {
     mkdirSync(join(repoDir, 'ci'))
     writeFileSync(join(repoDir, 'ci/services.yml'), options.services)
@@ -202,6 +209,45 @@ describe('check-config: всё в порядке', () => {
   })
 })
 
+describe('check-config: файлы команд выкатки', () => {
+  const withCommands = (commands: Record<string, string>, deployFiles: NonNullable<Parameters<typeof appRepo>[0]>['deployFiles']): string => {
+    const base = testRemontnikConfig()
+    const config = { ...base, deploy: { ...base.deploy, commands: { ...base.deploy.commands, ...commands } }, forbidden: { schema: base.forbidden.schema, money: base.forbidden.money, access: base.forbidden.access } }
+    return appRepo({ config, deployFiles })
+  }
+  const check = (repoDir: string) => checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+
+  it('файла команды нет в основной ветке — ошибка с именем файла', async () => {
+    const findings = await check(appRepo({ deployFiles: {} }))
+    expect(errors(findings).join('\n')).toContain('deploy.ts')
+  })
+
+  it('команда запускает файл напрямую, а бита исполнения нет — ошибка', async () => {
+    const repoDir = withCommands({ build: './deploy/build.sh' }, { 'deploy.ts': { content: '//\n' }, 'deploy/build.sh': { content: '#!/bin/sh\nexit 0\n' } })
+    expect(errors(await check(repoDir)).join('\n')).toContain('deploy/build.sh')
+  })
+
+  it('синтаксическая ошибка в скрипте на node — ошибка, сама команда не запускается', async () => {
+    const marker = join(tempDir(), 'ran')
+    const repoDir = withCommands({ build: 'node deploy.mjs build' }, { 'deploy.ts': { content: '//\n' }, 'deploy.mjs': { content: `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'x')\nconst = \n` } })
+    expect(errors(await check(repoDir)).join('\n')).toContain('deploy.mjs')
+    expect(() => execFileSync('test', ['-e', marker])).toThrow()
+  })
+
+  it('исполняемый скрипт и рабочий скрипт на node — без ошибок', async () => {
+    const repoDir = withCommands(
+      { build: './deploy/build.sh', promote: 'node deploy.mjs promote' },
+      { 'deploy.ts': { content: '//\n' }, 'deploy/build.sh': { content: '#!/bin/sh\nexit 0\n', executable: true }, 'deploy.mjs': { content: 'console.log(1)\n' } },
+    )
+    expect(errors(await check(repoDir))).toEqual([])
+  })
+
+  it('в команде pnpm или curl — предупреждение: в контейнере врача их нет', async () => {
+    const repoDir = withCommands({ build: 'pnpm build' }, { 'deploy.ts': { content: '//\n' } })
+    expect(warnings(await check(repoDir)).join('\n')).toContain('pnpm')
+  })
+})
+
 describe('check-config: окружение', () => {
   it('все недостающие переменные — сразу списком, у каждой — как исправить', async () => {
     const repoDir = appRepo()
@@ -290,6 +336,7 @@ describe('check-config: настройка', () => {
     mkdirSync(join(repoDir, 'src'), { recursive: true })
     git(repoDir, 'init', '--quiet', '--initial-branch=main')
     git(repoDir, 'remote', 'add', 'origin', 'https://github.com/example-owner/example-app.git')
+    writeFileSync(join(repoDir, 'deploy.ts'), '// команды выкатки\n')
     writeFileSync(join(repoDir, 'src/shared-names.mjs'), `export const NAME = ${JSON.stringify(data.app.name)}\n`)
     writeFileSync(join(repoDir, 'remontnik.config.shared.mjs'), `export const CHECKS = ${JSON.stringify(data.checks)}\n`)
     writeFileSync(
@@ -313,6 +360,7 @@ describe('check-config: настройка', () => {
     mkdirSync(repoDir, { recursive: true })
     git(repoDir, 'init', '--quiet', '--initial-branch=main')
     writeFileSync(join(repoDir, 'remontnik.config.mjs'), `export default ${JSON.stringify(testRemontnikConfig())}\n`)
+    writeFileSync(join(repoDir, 'deploy.ts'), '// команды выкатки\n')
     git(repoDir, 'add', '-A')
     git(repoDir, 'commit', '--quiet', '-m', 'настройка')
 

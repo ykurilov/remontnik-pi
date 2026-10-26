@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { constants } from 'node:fs'
+import { access, readFile } from 'node:fs/promises'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { CASE_NETWORK_LABEL } from '../case-networks/index.js'
@@ -224,7 +225,7 @@ async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
   if (container) {
     const inspect = await run(docker, ['inspect', '--format', '{{json .NetworkSettings.Networks}}', container], env)
     if (!inspect.ok) {
-      findings.push({ level: 'error', area: 'docker', problem: `контейнер врача «${container}» не найден`, fix: 'REMONTNIK_GATEWAY_CONTAINER — имя контейнера, в котором работает врач (container_name в compose)' })
+      findings.push({ level: 'error', area: 'docker', problem: `контейнер врача «${container}» не найден`, fix: 'REMONTNIK_GATEWAY_CONTAINER — имя контейнера, в котором работает врач (в compose его задаёт REMONTNIK_CONTAINER_NAME, по умолчанию remontnik-doctor)' })
     } else if (network) {
       let networks: Record<string, unknown> = {}
       try {
@@ -321,11 +322,66 @@ async function checkGithub(env: DoctorEnv, gh: string, config: RemontnikConfig |
   return findings
 }
 
+const INTERPRETERS = new Set(['node', 'sh', 'bash'])
+/** Программы, которых нет в образе врача: команда, которая их зовёт, на сервере не заработает. */
+const MISSING_IN_DOCTOR = /(^|[\s;&|(])(pnpm|npm|npx|yarn|bun|curl|wget|python3?)(\s|$)/
+
+/** Файл, который запускает команда выкатки, и нужен ли ему бит исполнения; программы без файла (make) пропускаются. */
+function deployCommandFile(command: string): { file: string; direct: boolean; interpreter?: string } | undefined {
+  const words = command.trim().split(/\s+/).filter(Boolean)
+  const first = words[0]
+  if (!first) return undefined
+  if (INTERPRETERS.has(first)) {
+    const file = words.slice(1).find((word) => !word.startsWith('-'))
+    return file ? { file, direct: false, interpreter: first } : undefined
+  }
+  return first.includes('/') ? { file: first, direct: true } : undefined
+}
+
+/** Файлы команд выкатки на месте и запускаются; сами команды не выполняются — только `node --check` и `sh -n` по файлу. */
+async function checkDeployCommands(env: DoctorEnv, config: RemontnikConfig): Promise<Finding[]> {
+  const repoDir = value(env, 'REMONTNIK_CONFIG_REPO_DIR')
+  if (!repoDir) return []
+  const findings: Finding[] = []
+  for (const [name, command] of [...new Map(Object.entries(config.deploy.commands).map(([key, text]) => [text, key])).entries()].map(([text, key]) => [key, text] as const)) {
+    if (MISSING_IN_DOCTOR.test(command)) {
+      findings.push({ level: 'warning', area: 'настройка', problem: `команда выкатки «${name}» зовёт программу, которой нет в контейнере врача (pnpm, npm, curl и подобные)`, fix: 'команды выкатки выполняет сам врач: пишите их на node или sh и проверьте, что нужное есть в его образе (docs/getting-started.md)' })
+    }
+    const target = deployCommandFile(command)
+    if (!target) continue
+    const path = isAbsolute(target.file) ? target.file : resolve(repoDir, target.file)
+    try {
+      await access(path, constants.R_OK)
+    } catch {
+      findings.push({ level: 'error', area: 'настройка', problem: `команда выкатки «${name}»: файл ${target.file} не найден в основной ветке`, fix: 'добавьте файл в основную ветку или поправьте deploy.commands в remontnik.config' })
+      continue
+    }
+    if (target.direct) {
+      try {
+        await access(path, constants.X_OK)
+      } catch {
+        findings.push({ level: 'error', area: 'настройка', problem: `команда выкатки «${name}»: у файла ${target.file} нет бита исполнения`, fix: `chmod +x ${target.file} и закоммитьте (git update-index --chmod=+x)` })
+        continue
+      }
+    }
+    const interpreter = target.interpreter ?? (/\.(m|c)?js$/.test(target.file) ? 'node' : /\.sh$/.test(target.file) ? 'sh' : undefined)
+    const syntax = interpreter === 'node' && /\.(m|c)?js$/.test(target.file) ? await run('node', ['--check', path], env)
+      : interpreter === 'sh' || interpreter === 'bash' ? await run(interpreter, ['-n', path], env)
+        : undefined
+    if (syntax && !syntax.ok) {
+      findings.push({ level: 'error', area: 'настройка', problem: `команда выкатки «${name}»: файл ${target.file} не разбирается (синтаксическая ошибка)`, fix: `проверьте файл: ${interpreter === 'node' ? 'node --check' : 'sh -n'} ${target.file}` })
+    }
+  }
+  if (findings.length === 0) findings.push({ level: 'ok', area: 'настройка', problem: 'файлы команд выкатки на месте и запускаются', fix: '' })
+  return findings
+}
+
 /** Все проверки подряд; ни одна не меняет сервер, репозиторий или GitHub. */
 export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = {}): Promise<Finding[]> {
   const { config, findings: settings } = await checkSettings(env, deps)
   return [
     ...settings,
+    ...(config ? await checkDeployCommands(env, config) : []),
     ...checkEnvironment(env, config),
     ...(config ? await checkServices(env, config) : []),
     ...(await checkDocker(env, deps.docker ?? 'docker')),

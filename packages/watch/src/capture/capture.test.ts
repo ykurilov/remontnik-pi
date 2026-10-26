@@ -293,6 +293,17 @@ describe('capture', () => {
     expect(errors.mock.calls.some(([line]) => String(line).startsWith('[remontnik]'))).toBe(true)
   })
 
+  it.each([
+    ['dir', { dir: undefined }],
+    ['doctor.url', { doctor: { url: undefined, secret } }],
+    ['doctor.secret', { doctor: { url: 'http://127.0.0.1:1', secret: undefined } }],
+    ['telegram.botToken', { telegram: { botToken: undefined, chatId: 'owner-chat' } }],
+    ['telegram.chatId', { telegram: { botToken, chatId: undefined } }],
+  ])('без поля %s createWatch бросает TypeError с его названием', (field, broken) => {
+    expect(() => createWatch(watchOptions(broken as unknown as Partial<WatchOptions>))).toThrow(TypeError)
+    expect(() => createWatch(watchOptions(broken as unknown as Partial<WatchOptions>))).toThrow(field)
+  })
+
   it('stats показывает очередь', () => {
     const watch = openWatch({ doctor: { url: 'http://127.0.0.1:9', secret } })
 

@@ -14,8 +14,9 @@
     "check-pins": "node scripts/check-pins.mjs",
     "check-public": "node scripts/check-public.mjs",
     "check-history": "node scripts/check-history.mjs",
-    "verify": "pnpm test && pnpm build && pnpm typecheck && pnpm check-pins && pnpm check-public && pnpm check-history",
+    "verify": "pnpm test && pnpm build && pnpm test:examples && pnpm typecheck && pnpm check-pins && pnpm check-public && pnpm check-history",
     "changeset": "changeset",
+    "test:examples": "vitest run --config vitest.examples.config.ts",
     "bench": "vitest run --config vitest.perf.config.ts",
     "test:e2e": "pnpm -r --if-present test:e2e",
     "test:live": "vitest run --config vitest.live.config.ts"
