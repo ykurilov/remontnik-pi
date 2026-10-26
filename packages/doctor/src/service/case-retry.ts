@@ -35,7 +35,7 @@ export function createCaseRetry(deps: CaseRetryDeps): (caseId: number, by: strin
     opened.retriedAt = new Date(deps.now()).toISOString()
   }
 
-  return async function retryCase(caseId, by) {
+  async function retryOnce(caseId: number, by: string): Promise<CaseRetryAnswer> {
     const sick = await deps.records.read<Case>('case', String(caseId))
     if (sick?.caseId !== caseId) return { error: 'unknown_case' }
     if (!UNFINISHED_STATES.includes(sick.state)) return { error: 'case_finished', state: sick.state }
@@ -58,5 +58,21 @@ export function createCaseRetry(deps: CaseRetryDeps): (caseId: number, by: strin
       markRetried(opened, by)
       return { retried: 'restarted', attempt: next }
     })
+  }
+
+  // Команды одного случая — по очереди: вторая, пришедшая, пока первая снимает задачу с остановки, видит её уже
+  // идущей (`already_running`), а не снимает второй раз.
+  const queues = new Map<number, Promise<CaseRetryAnswer>>()
+  return function retryCase(caseId, by) {
+    const next = (queues.get(caseId) ?? Promise.resolve(undefined)).then(
+      () => retryOnce(caseId, by),
+      () => retryOnce(caseId, by),
+    )
+    queues.set(caseId, next)
+    const forget = () => {
+      if (queues.get(caseId) === next) queues.delete(caseId)
+    }
+    next.then(forget, forget)
+    return next
   }
 }
