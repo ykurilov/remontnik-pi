@@ -281,7 +281,7 @@ description: "Задачи реализации Ремонтника Pi"
 ### Реализация
 
 - [ ] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
-- [ ] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
+- [X] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
 - [ ] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
 - [ ] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
 - [ ] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
