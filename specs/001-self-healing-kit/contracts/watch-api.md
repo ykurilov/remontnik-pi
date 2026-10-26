@@ -20,6 +20,7 @@ const watch = createWatch({
   review?: { botDescription: string; usdPerDay: number; minConfidence?: number; timeZone?: string },
   release?: () => Promise<string | null>, // текущая версия приложения, для отметки в событии
   redact?: (text: string) => string,    // дополнительная вычистка приложения
+  maxQueue?: number,                    // потолок очереди, по умолчанию 1000 (см. data-model: OutboxEntry)
 });
 ```
 
@@ -31,18 +32,21 @@ const watch = createWatch({
 | `watch.capture(error, { kind?, where?, context? })` | записать сбой вручную; возвращает `eventId` |
 | `watch.wrapModelCatalog(catalog)` | обёртка каталога моделей: ошибки обращений → `model_error` |
 | `watch.conversationFinished({ id, messages, meta? })` | поставить законченный разговор в очередь чтения |
-| `watch.flush(timeoutMs)` | дождаться отправки очереди при штатной остановке |
+| `watch.flush(timeoutMs)` | дождаться отправки очереди при штатной остановке; по сроку — `false`, текущая отправка доживает в фоне |
+| `watch.close()` | снять обработчики и замок очереди |
 | `watch.stats()` | счётчики очереди и расходов, для проверки здоровья приложения |
 
-Все методы не бросают исключений и не ждут сети в горячем пути: запись в очередь — синхронная дозапись строки, отправка — в фоне.
+Все методы не бросают исключений и не ждут сети в горячем пути: запись в очередь — синхронная дозапись строки, отправка — в фоне. Фоновые таймеры и промисы сторожа тоже не выпускают ошибок в приложение. Отмена запроса к модели (`AbortError`, кнопка «Стоп») — не сбой.
 
 ## Подпуть `/agent-chat`
 
 ```ts
 import { agentChatWatchHooks } from "@ykurilov/remontnik-watch/agent-chat";
 
-const hooks = agentChatWatchHooks(watch, { inner: appHooks }); // logError, afterTurn, turnNotStarted
+const hooks = agentChatWatchHooks(watch, { inner: appHooks, afterTurn: true }); // logError, turnNotStarted, afterTurn
 ```
+
+- `afterTurn` подключается, только если `afterTurn: true` или у приложения есть свой `inner.afterTurn`. SDK с этим хуком требует хранилище с `setAfterTurnState`; без такого хранилища хук не включать.
 
 - `logError(line)` — строки SDK о сбоях провайдера и хода → `model_error` / `turn_failed`.
 - `afterTurn({ stopReason, error, … })` — ход с ошибкой → `turn_failed`; инструмент с ошибкой → `tool_error`.

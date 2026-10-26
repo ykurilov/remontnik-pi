@@ -1,7 +1,7 @@
 {
   "name": "@ykurilov/remontnik-doctor",
   "version": "0.0.0",
-  "description": "Ремонтник Pi: пакет doctor",
+  "description": "Ремонтник Pi: врач — служба на сервере приложения, принимает случаи и лечит их",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -10,7 +10,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -19,6 +21,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@ykurilov/remontnik-core": "workspace:*",
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",

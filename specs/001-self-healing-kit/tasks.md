@@ -67,23 +67,23 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T023 [P] [US1] Тест очереди `packages/watch/src/outbox/outbox.test.ts`: дозапись JSONL, подтверждение, переживает переоткрытие, сжатие при старте, повторы 5 с / 30 с / 2 мин / 10 мин (подменённые часы), свой файл на процесс
-- [ ] T024 [P] [US1] Тест сообщений `packages/watch/src/notify/notify.test.ts`: одно сообщение на отпечаток; повтор — только через час и при росте счётчика
-- [ ] T025 [P] [US1] Тест ловли `packages/watch/src/capture/capture.test.ts`: `uncaughtException`, `unhandledRejection` записаны, поведение процесса не изменилось; свои ошибки — строка `[remontnik]` без случая; в горячем пути нет сети
-- [ ] T026 [P] [US1] Тест хуков SDK `packages/watch/src/agent-chat/hooks.test.ts`: строки `logError` → `model_error`/`turn_failed`; ошибки `afterTurn` → `turn_failed`/`tool_error`; результат хуков приложения не меняется
-- [ ] T027 [P] [US1] Тест приёма у врача `packages/doctor/src/intake/intake.test.ts`: подпись верная/неверная/устаревшая; повтор `eventId` безопасен; ответ `accepted`
-- [ ] T028 [P] [US1] Тест книги случаев `packages/doctor/src/case-book/case-book.test.ts`: склейка по отпечатку, счётчик, один открытый случай на отпечаток, `linkedEventIds` «≤ 50»
+- [X] T023 [P] [US1] Тест очереди `packages/watch/src/outbox/outbox.test.ts`: дозапись JSONL, подтверждение, переживает переоткрытие, сжатие при старте, повторы 5 с / 30 с / 2 мин / 10 мин (подменённые часы), свой файл на процесс
+- [X] T024 [P] [US1] Тест сообщений `packages/watch/src/notify/notify.test.ts`: одно сообщение на отпечаток; повтор — только через час и при росте счётчика
+- [X] T025 [P] [US1] Тест ловли `packages/watch/src/capture/capture.test.ts`: `uncaughtException`, `unhandledRejection` записаны, поведение процесса не изменилось; свои ошибки — строка `[remontnik]` без случая; в горячем пути нет сети
+- [X] T026 [P] [US1] Тест хуков SDK `packages/watch/src/agent-chat/hooks.test.ts`: строки `logError` → `model_error`/`turn_failed`; ошибки `afterTurn` → `turn_failed`/`tool_error`; результат хуков приложения не меняется
+- [X] T027 [P] [US1] Тест приёма у врача `packages/doctor/src/intake/intake.test.ts`: подпись верная/неверная/устаревшая; повтор `eventId` безопасен; ответ `accepted`
+- [X] T028 [P] [US1] Тест книги случаев `packages/doctor/src/case-book/case-book.test.ts`: склейка по отпечатку, счётчик, один открытый случай на отпечаток, `linkedEventIds` «≤ 50»
 
 ### Реализация
 
-- [ ] T029 [P] [US1] Очередь в `packages/watch/src/outbox/`
-- [ ] T030 [P] [US1] Склейка и частота сообщений в `packages/watch/src/notify/`
-- [ ] T031 [US1] `createWatch`, `installProcessHandlers`, `capture`, `wrapModelCatalog`, `flush`, `stats` в `packages/watch/src/capture/` и `packages/watch/src/index.ts` по contracts/watch-api.md
-- [ ] T032 [US1] Подпуть `/agent-chat` в `packages/watch/src/agent-chat/`
-- [ ] T033 [US1] Каркас врача: `Harness.open` с SQLite pi-durable, `resume`, закрытие с ошибкой → выход с ненулевым кодом, `onReport` `task_parked` → Telegram в `packages/doctor/src/service/`
-- [ ] T034 [US1] HTTP приёма `POST /v1/events` и `GET /health` в `packages/doctor/src/intake/`
-- [ ] T035 [US1] Книга случаев на документах pi-durable `remontnik.case/<caseId>` в `packages/doctor/src/case-book/`; минимальная очередь отчётов Telegram с повторами и отчёт `case_received` в `packages/doctor/src/reports/`
-- [ ] T036 [US1] Интеграционный тест `apps/patient/test/cycle/us1-detect.test.ts`: сценарии crash (до приёма врачом), repeat, «врач выключен», «секрет в тексте ошибки»
+- [X] T029 [P] [US1] Очередь в `packages/watch/src/outbox/`
+- [X] T030 [P] [US1] Склейка и частота сообщений в `packages/watch/src/notify/`
+- [X] T031 [US1] `createWatch`, `installProcessHandlers`, `capture`, `wrapModelCatalog`, `flush`, `stats` в `packages/watch/src/capture/` и `packages/watch/src/index.ts` по contracts/watch-api.md
+- [X] T032 [US1] Подпуть `/agent-chat` в `packages/watch/src/agent-chat/`
+- [X] T033 [US1] Каркас врача: `Harness.open` с SQLite pi-durable, `resume`, закрытие с ошибкой → выход с ненулевым кодом, `onReport` `task_parked` → Telegram в `packages/doctor/src/service/`
+- [X] T034 [US1] HTTP приёма `POST /v1/events` и `GET /health` в `packages/doctor/src/intake/`
+- [X] T035 [US1] Книга случаев на документах pi-durable `remontnik.case/<caseId>` в `packages/doctor/src/case-book/`; минимальная очередь отчётов Telegram с повторами и отчёт `case_received` в `packages/doctor/src/reports/`
+- [X] T036 [US1] Интеграционный тест `apps/patient/test/cycle/us1-detect.test.ts`: сценарии crash (до приёма врачом), repeat, «врач выключен», «секрет в тексте ошибки»
 
 **Контрольная точка**: история 1 работает отдельно — уже польза: тревога за минуту и запись случая.
 

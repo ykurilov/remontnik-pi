@@ -1,21 +1,30 @@
 {
   "name": "@ykurilov/remontnik-watch",
   "version": "0.0.0",
-  "description": "Ремонтник Pi: пакет watch",
+  "description": "Ремонтник Pi: сторож внутри приложения — ловит сбои, шлёт тревогу в Telegram и надёжно доставляет случаи врачу",
   "license": "MIT",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./agent-chat": {
+      "types": "./dist/agent-chat/index.d.ts",
+      "import": "./dist/agent-chat/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ykurilov/remontnik-core": "workspace:*"
   }
 }
