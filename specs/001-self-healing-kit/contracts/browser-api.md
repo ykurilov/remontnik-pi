@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран).
+`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран). `REMONTNIK_BROWSER_LISTEN?` — адрес службы, по умолчанию `127.0.0.1:7700`; «все адреса» — только явно (в образе), порт — только во внутреннюю сеть. Для консольных команд — `REMONTNIK_BROWSER_URL?` (по умолчанию `http://127.0.0.1:7700`).
 
 ## HTTP `POST /v1/<команда>` с `Authorization: Bearer`
 
@@ -28,6 +28,10 @@
 `danger`: `none` \| `submit` \| `send` \| `pay` \| `delete` \| `publish`. `send`, `pay`, `delete`, `publish` отклоняются всегда.
 
 Любой ответ при капче или запросе кода: `{ ok: false, code: "needs_human", message }`.
+
+Ещё коды отказа: `refused_field` (`fill-password` не в поле пароля), `refused_profile` (вход от другого профиля), `refused_human_control`, `not_found`, `bad_request`, `timeout`. Неверный ключ — HTTP 401; больше 10 неверных за минуту с одного адреса — 429 `too_many_attempts`.
+
+Опасность цели служба проверяет сама — по подписи, тексту и адресу элемента (для `key` Enter/Space — элемента в фокусе, для отправки формы — её кнопок), независимо от `danger`. После `needs_human` доступны только `read` и `shot`, пока владелец не вернёт управление или `read` не перестанет видеть проверку. `fill-password` — только точный origin входа и `https:` (кроме `localhost`/`127.0.0.1`).
 
 ## Живой экран (только для владельца)
 
@@ -54,5 +58,7 @@
 
 - Нет команды выполнения своего кода на странице.
 - Сетевой замок: изменяющие запросы к сайтам приложения — только по `allowedMutations`; остальные блокируются и пишутся в журнал.
-- Переходы и запросы верхнего уровня — только на `allowedOrigins`.
-- Фильтр выхода вырезает значения всех сохранённых паролей из любых ответов и журналов.
+- Переходы верхнего уровня и фреймов — только на `allowedOrigins`; фрейм чужого сайта скрыт из снимка и не принимает действий.
+- Не ловится: `GET` с побочным действием и запросы под слишком широкий шаблон `allowedMutations`.
+- Фильтр выхода вырезает значения всех сохранённых паролей из любых ответов и журналов (в том числе в HTML, `%xx`, hex, base64); при сбое фильтра текст не выводится. От преобразований страницей не защищает. Пароль короче 8 знаков не сохраняется.
+- Куки живого экрана без `Secure`: только частный шифрованный канал или TLS за прокси. Подбор ключей ограничен по адресу клиента.

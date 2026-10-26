@@ -5,7 +5,7 @@ import { ModelProviderError } from './bot/fake-model.ts'
 import type { ToolError } from './bot/tools.ts'
 import type { PatientBug } from './bugs.ts'
 import { chargeForPlan } from './payments/charge.ts'
-import { cabinetPage, chatPage, homePage, loginPage } from './pages.ts'
+import { cabinetPage, captchaFramePage, captchaPage, chatPage, confirmCodePage, framesPage, frameTextPage, homePage, loginPage, loginRerenderPage, settingsPage } from './pages.ts'
 
 /** Сбой, который «Пациент» отдаёт наружу. Сюда подключается сторож Ремонтника. */
 export type PatientErrorReport =
@@ -107,6 +107,20 @@ export function createPatientServer(options: PatientServerOptions = {}): Server 
         const { plan } = await readJson(request)
         return sendJson(response, 200, chargeForPlan(String(plan ?? ''), bug))
       }
+      case 'GET /captcha':
+        return sendHtml(response, captchaPage())
+      case 'GET /captcha-frame':
+        return sendHtml(response, captchaFramePage())
+      case 'GET /confirm-code':
+        return sendHtml(response, confirmCodePage())
+      case 'GET /login-rerender':
+        return sendHtml(response, loginRerenderPage())
+      case 'GET /settings':
+        return sendHtml(response, settingsPage())
+      case 'GET /frames':
+        return sendHtml(response, framesPage())
+      case 'GET /frame-text':
+        return sendHtml(response, frameTextPage(new URL(request.url ?? '/', 'http://patient.invalid').searchParams.get('who') ?? 'own'))
       case 'GET /chat':
         return sendHtml(response, chatPage(bug))
       case 'POST /api/chat': {

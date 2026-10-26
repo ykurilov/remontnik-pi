@@ -218,35 +218,35 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T087 [P] [US8] Тест хранилища входов `packages/browser/src/vault/vault.test.ts`: AES-256-GCM туда-обратно; чужой ключ не открывает; список без паролей; добавление только из стандартного ввода
-- [ ] T088 [P] [US8] Тест замков `packages/browser/src/guard/guard.test.ts`: `send`/`pay`/`delete`/`publish` отклонены; сайты вне `allowedOrigins`; сопоставление `allowedMutations`
-- [ ] T089 [P] [US8] Тест снимка `packages/browser/src/snapshot/snapshot.test.ts`: номера стабильны на странице; значения полей пароля скрыты; поля, куда впечатан пароль, помечены
-- [ ] T090 [P] [US8] Браузерный тест `packages/browser/test/e2e/password-never-leaks.spec.ts` против кабинета «Пациента»: вход, кнопка «глаз», смена типа поля, `read`, `shot`, ответы и журналы — пароль найден 0 раз (SC-010)
-- [ ] T091 [P] [US8] Браузерный тест `packages/browser/test/e2e/policy.spec.ts`: опасные действия, чужой сайт, изменяющий запрос вне списка, страница с капчей и поле одноразового кода → `needs_human`
+- [X] T087 [P] [US8] Тест хранилища входов `packages/browser/src/vault/vault.test.ts`: AES-256-GCM туда-обратно; чужой ключ не открывает; список без паролей; добавление только из стандартного ввода
+- [X] T088 [P] [US8] Тест замков `packages/browser/src/guard/guard.test.ts`: `send`/`pay`/`delete`/`publish` отклонены; сайты вне `allowedOrigins`; сопоставление `allowedMutations`
+- [X] T089 [P] [US8] Тест снимка `packages/browser/src/snapshot/snapshot.test.ts`: номера стабильны на странице; значения полей пароля скрыты; поля, куда впечатан пароль, помечены
+- [X] T090 [P] [US8] Браузерный тест `packages/browser/test/e2e/password-never-leaks.spec.ts` против кабинета «Пациента»: вход, кнопка «глаз», смена типа поля, `read`, `shot`, ответы и журналы — пароль найден 0 раз (SC-010)
+- [X] T091 [P] [US8] Браузерный тест `packages/browser/test/e2e/policy.spec.ts`: опасные действия, чужой сайт, изменяющий запрос вне списка, страница с капчей и поле одноразового кода → `needs_human`
 
 ### Реализация
 
-- [ ] T092 [US8] Проверить, даёт ли закреплённая версия `playwright-core` снимок с номерами элементов; выбрать: встроенный или свой обход DOM с `data-remontnik-ref`; записать решение в `packages/browser/README.md`
-- [ ] T093 [P] [US8] Профили: постоянные контексты Chromium, профиль обязателен, прокси по желанию, в `packages/browser/src/profiles/`
-- [ ] T094 [P] [US8] Хранилище входов, `fill-password` с проверкой поля и сайта (с фреймами), фильтр выхода в `packages/browser/src/vault/`
-- [ ] T095 [P] [US8] Замки: перехват запросов, сайты, признаки капчи и кодов в `packages/browser/src/guard/`
-- [ ] T096 [US8] Снимок страницы в `packages/browser/src/snapshot/`
-- [ ] T097 [US8] Действия `url`, `back`, `click`, `type`, `key`, `scroll`, `shot` (маска полей пароля) в `packages/browser/src/actions/`
-- [ ] T098 [US8] HTTP-служба с ключом по contracts/browser-api.md в `packages/browser/src/service/`
-- [ ] T099 [US8] Консольная `remontnik-browser`, в том числе `logins add --password-stdin` и `logins remove`, в `packages/browser/src/cli/`
-- [ ] T100 [US8] Образ `deploy/browser.Dockerfile` (Chromium, без прокси по умолчанию)
+- [X] T092 [US8] Проверить, даёт ли закреплённая версия `playwright-core` снимок с номерами элементов; выбрать: встроенный или свой обход DOM с `data-remontnik-ref`; записать решение в `packages/browser/README.md`
+- [X] T093 [P] [US8] Профили: постоянные контексты Chromium, профиль обязателен, прокси по желанию, в `packages/browser/src/profiles/`
+- [X] T094 [P] [US8] Хранилище входов, `fill-password` с проверкой поля и сайта (с фреймами), фильтр выхода в `packages/browser/src/vault/`
+- [X] T095 [P] [US8] Замки: перехват запросов, сайты, признаки капчи и кодов в `packages/browser/src/guard/`
+- [X] T096 [US8] Снимок страницы в `packages/browser/src/snapshot/`
+- [X] T097 [US8] Действия `url`, `back`, `click`, `type`, `key`, `scroll`, `shot` (маска полей пароля) в `packages/browser/src/actions/`
+- [X] T098 [US8] HTTP-служба с ключом по contracts/browser-api.md в `packages/browser/src/service/`
+- [X] T099 [US8] Консольная `remontnik-browser`, в том числе `logins add --password-stdin` и `logins remove`, в `packages/browser/src/cli/`
+- [X] T100 [US8] Образ `deploy/browser.Dockerfile` (Chromium, без прокси по умолчанию)
 - [ ] T101 [US8] Инструменты `browser_*` у врача: постоянный набор, ответ `unavailable`, снимки в отчёт, проверка `pagesToCheck` после выкатки, в `packages/doctor/src/browser-tools/`
 - [ ] T102 [US8] Интеграционный тест `apps/patient/test/cycle/us8-browser.test.ts`: ошибка «только на странице» воспроизведена и после выкатки страница работает; браузер выключен → цикл проходит с пометкой «без проверки в браузере»
 
 
 ### Живой экран (решение Юрия)
 
-- [ ] T103 [P] [US8] Тест доступа `packages/browser/src/live/live-access.test.ts`: без ключа владельца — отказ; ключ врача не подходит; адрес слушается только на `REMONTNIK_BROWSER_LIVE_LISTEN`; переменная не задана — живого экрана нет
-- [ ] T104 [P] [US8] Тест управления `packages/browser/src/live/control.test.ts` (подменённые часы): владелец взял управление → команды врача `refused_human_control`; вернул → работают; связь владельца пропала на 2 минуты → управление у врача; замки сайтов и запросов действуют при ручном управлении
-- [ ] T105 [P] [US8] Браузерный тест `packages/browser/test/e2e/live.spec.ts` против «Пациента»: кадры идут; клик, касание и ввод владельца доходят до страницы; кадров нет в ответах врачу и журналах; один случай с узким экраном телефона
-- [ ] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
-- [ ] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
-- [ ] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
+- [X] T103 [P] [US8] Тест доступа `packages/browser/src/live/live-access.test.ts`: без ключа владельца — отказ; ключ врача не подходит; адрес слушается только на `REMONTNIK_BROWSER_LIVE_LISTEN`; переменная не задана — живого экрана нет
+- [X] T104 [P] [US8] Тест управления `packages/browser/src/live/control.test.ts` (подменённые часы): владелец взял управление → команды врача `refused_human_control`; вернул → работают; связь владельца пропала на 2 минуты → управление у врача; замки сайтов и запросов действуют при ручном управлении
+- [X] T105 [P] [US8] Браузерный тест `packages/browser/test/e2e/live.spec.ts` против «Пациента»: кадры идут; клик, касание и ввод владельца доходят до страницы; кадров нет в ответах врачу и журналах; один случай с узким экраном телефона
+- [X] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
+- [X] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
+- [X] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
 - [ ] T109 [US8] Ссылка на живой экран в отчётах `needs_human` от браузера (по `browser.live.linkEnv`), продолжение после «Вернуть», в `packages/doctor/src/browser-tools/` и `packages/doctor/src/reports/texts.ts`
 
 ---
