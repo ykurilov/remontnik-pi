@@ -39,7 +39,12 @@ export interface ErrorsSince {
 /** Записанные часы приложения: `YYYY-MM-DDTHH`. */
 interface ErrorHourIndex {
   hours: string[]
+  /** Часы, записанные до появления списка, уже найдены и внесены в него. */
+  seeded?: boolean
 }
+
+/** Насколько назад искать часы, записанные до появления списка. */
+const SEED_SEARCH_DAYS = 60
 
 const emptyHour = (): ErrorHour => ({ minutes: {}, fingerprints: {}, overflow: 0 })
 const hourStamp = (hourStart: number) => new Date(hourStart).toISOString().slice(0, 13)
@@ -73,6 +78,30 @@ export async function countErrorIn(tx: RecordTransaction, event: IncidentEvent, 
   } else {
     hour.overflow += occurrences
   }
+}
+
+/**
+ * Один раз на приложение: часы, записанные до появления списка, внести в него, а старше срока хранения — удалить.
+ * Иначе их не удалит никто: удаление идёт только по списку. Искать приходится перебором часов (списка документов
+ * у хранилища нет), поэтому проход однократный: после него в списке пометка `seeded`.
+ */
+export async function seedErrorHourIndex(store: RecordStore, appName: string, at: Date): Promise<void> {
+  if ((await store.read<ErrorHourIndex>(ERROR_HOUR_INDEX_COLLECTION, appName))?.seeded) return
+  const latest = floorTo(at.getTime(), HOUR_MS)
+  const found: string[] = []
+  for (let start = latest - SEED_SEARCH_DAYS * 24 * HOUR_MS; start <= latest; start += HOUR_MS) {
+    if (await store.read(ERROR_HOUR_COLLECTION, hourKey(appName, start))) found.push(hourStamp(start))
+  }
+  await store.transaction(async (tx) => {
+    const index = await tx.doc<ErrorHourIndex>(ERROR_HOUR_INDEX_COLLECTION, appName, { hours: [] })
+    if (index.seeded) return
+    const hours = [...new Set([...index.hours, ...found])]
+    const keepFrom = Math.max(latest, ...hours.map(hourStartOf)) - KEEP_HOURS_DAYS * 24 * HOUR_MS
+    const old = hours.filter((stamp) => hourStartOf(stamp) < keepFrom)
+    for (const stamp of old) await tx.retire(ERROR_HOUR_COLLECTION, `${appName}/${stamp}`)
+    index.hours = hours.filter((stamp) => !old.includes(stamp)).sort()
+    index.seeded = true
+  })
 }
 
 async function readHours(store: RecordStore, appName: string, from: number, to: number): Promise<Array<{ start: number; hour: ErrorHour }>> {

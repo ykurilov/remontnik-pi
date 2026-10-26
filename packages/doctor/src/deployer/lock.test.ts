@@ -1,3 +1,4 @@
+import * as fsPromises from 'node:fs/promises'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -50,11 +51,11 @@ describe('общий замок выкатки', () => {
     }
   })
 
-  it('недописанная строка своей выкатки — свой замок, а не чужой', async () => {
+  it('замок человека, похожий на начало строки врача, — всё равно замок человека', async () => {
     const path = lockPath()
     humanLock(path, 'remontnik deployment 4 tok')
-    expect(await createDeployLock(path).acquire(holder(4), at, stillRunning)).toEqual({ acquired: true })
-    expect(readFileSync(path, 'utf8')).toBe(`remontnik deployment 4 token-4 ${at.toISOString()}\n`)
+    expect(await createDeployLock(path).acquire(holder(4), at, async () => true)).toMatchObject({ acquired: false, holder: 'human' })
+    expect(readFileSync(path, 'utf8')).toBe('remontnik deployment 4 tok')
   })
 
   it('замок закончившейся выкатки (врач упал до снятия) снимается', async () => {
@@ -81,6 +82,42 @@ describe('общий замок выкатки', () => {
     expect(result).toMatchObject({ acquired: false, holder: 'human' })
     expect(readFileSync(path, 'utf8')).toBe('manual deploy\n')
     expect(readdirSync(dirname(path))).toEqual(['deploy.lock'])
+  })
+
+  it('гонка при снятии брошенного замка: чужой замок не удаляется, а откладывается в .lost-* и о нём сказано', async () => {
+    const path = lockPath()
+    await createDeployLock(path).acquire(holder(3), at, stillRunning)
+    const fresh = `remontnik deployment 5 token-5 ${at.toISOString()}\n`
+    // Пока врач решал, что замок 3 брошен, его отпустили и взяла выкатка 5; а в миг, когда врач увёл замок
+    // в сторону для сверки, свой замок поставил человек — вернуть замок 5 на место уже нельзя.
+    const racing = {
+      ...fsPromises,
+      rename: async (from: string, to: string) => {
+        await fsPromises.rename(from, to)
+        if (from === path) writeFileSync(path, 'manual deploy\n', { flag: 'wx' })
+      },
+    }
+    const result = await createDeployLock(path, racing).acquire(holder(4), at, async () => {
+      writeFileSync(path, fresh)
+      return true
+    })
+    expect(result).toMatchObject({ acquired: false, holder: 'human', lost: expect.stringContaining('deploy.lock.lost-') })
+    expect(readFileSync(path, 'utf8')).toBe('manual deploy\n')
+    const lost = readdirSync(dirname(path)).filter((name) => name.startsWith('deploy.lock.lost-'))
+    expect(lost).toHaveLength(1)
+    expect(readFileSync(join(dirname(path), lost[0]!), 'utf8')).toBe(fresh)
+  })
+
+  it('держит ли выкатка замок — только чтение: пустое место не своё', async () => {
+    const path = lockPath()
+    const lock = createDeployLock(path)
+    expect(await lock.holds(holder(1))).toBe(false)
+    await lock.acquire(holder(1), at, stillRunning)
+    expect(await lock.holds(holder(1))).toBe(true)
+    expect(await lock.holds({ deploymentId: 1, token: 'other' })).toBe(false)
+    await lock.release(holder(1))
+    expect(await lock.holds(holder(1))).toBe(false)
+    expect(existsSync(path)).toBe(false)
   })
 
   it('чужой замок врач не отпускает', async () => {

@@ -37,6 +37,8 @@ function parseCommand(body: string): { action: 'stop' | 'resume'; by: string } |
 export function createDeployControlsHandler(options: DeployControlsOptions): IntakeHandler {
   if (options.secret === '') throw new Error('[remontnik] общий секрет пуст')
   if (options.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
+  // Общий секрет знают сторож и кнопки Telegram: равный ему секрет владельца ничего не защищает.
+  if (options.controlSecret === options.secret) throw new Error('[remontnik] секрет владельца совпадает с общим секретом')
   const replayGuard = options.replayGuard ?? new ReplayGuard()
   const now = options.now ?? Date.now
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */

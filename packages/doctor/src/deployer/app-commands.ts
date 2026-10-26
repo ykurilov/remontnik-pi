@@ -13,7 +13,7 @@ export type DeployCommands = RemontnikConfig['deploy']['commands']
 type CommandName = keyof DeployCommands
 
 /** Секреты врача по имени. Фильтр — подсказка против утечки, а не гарантия: невинное имя он не узнает. */
-const DOCTOR_SECRET_ENV = /^REMONTNIK_|KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|COOKIE|SESSION/
+const DOCTOR_SECRET_ENV = /^REMONTNIK_|KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|COOKIE|SESSION/
 
 const DEFAULT_TIMEOUTS_SECONDS: Record<CommandName, number> = {
   build: 30 * 60,

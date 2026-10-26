@@ -139,20 +139,23 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `observeUntil`, `nextTickAt` | конец окна и следующий тик наблюдения |
 | `observation`, `lastTick` | сбои здоровья подряд, итоги последних проверок, число проверок окна и последний замер ошибок |
 | `promoteRequested` | намерение `promote` записано: дальше по `current` видно, прошёл ли он |
-| `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` |
-| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` \| `main_copy_changed` |
+| `promoteReturnedAt?` | когда `promote` вернулся: с этой минуты считаются ошибки кандидата |
+| `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` \| `abandoned` (замок потерян посреди выкатки или её задача умерла) |
+| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` \| `main_copy_changed` \| `lock_lost` \| `unconfirmed_version` |
 | `rollbackCause`, `rollbackReason`, `rollbackAttempts`, `nextRollbackAt?` | почему откатывал (в том числе `current_unavailable`, `reverted`, `main_copy_changed`), сколько законченных попыток (не больше 3) и когда следующая |
+| `rollbackLaunches?` | все запуски `rollback`, и прерванные падением врача; записывается до запуска, не больше 6 |
 | `mainCopyChange?` | чем рабочая копия основной ветки разошлась со снимком во время отката |
 | `healthyAfterRollback`, `healthAfterRollback` | здоровье после отката |
 | `supersededBy`, `confirmFailed`, `detail` | версия человека, сбой `confirm`, хвост вывода для отчёта |
+| `abandonedBy?` | какая выкатка сняла замок этой, когда её задача умерла |
 
-Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую.
+Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую. В том же индексе `abandonedVersions` — кандидаты брошенных выкаток, успевших записать намерение `promote`: такая версия не считается прежней.
 
 ### ErrorHour — ошибки приложения по часам (документ `remontnik.error-hour/<app>/<YYYY-MM-DDTHH>`)
 
 `{ minutes: { [минута]: число }, fingerprints: { [fp]: { count, lastAt } }, overflow }` — не больше 200 отпечатков в часе. Пишется книгой случаев вместе с приёмом события. Из него — уровень ошибок до выкатки (больший из «последний час» и «сутки / 24») и известные за 7 дней отпечатки.
 
-Список записанных часов приложения — `remontnik.error-hour-index/<app>`: `{ hours: ["YYYY-MM-DDTHH"] }`. Когда начинается новый час, часы старше 8 дней от самого нового удаляются в той же записи; запоздавшее событие старше этого срока не считается.
+Список записанных часов приложения — `remontnik.error-hour-index/<app>`: `{ hours: ["YYYY-MM-DDTHH"], seeded?: true }`. Когда начинается новый час, часы старше 8 дней от самого нового удаляются в той же записи; запоздавшее событие старше этого срока не считается. Часы, записанные до появления списка, врач один раз на приложение находит перебором за 60 дней, вносит в список и удаляет старые; после этого в списке `seeded: true`.
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 

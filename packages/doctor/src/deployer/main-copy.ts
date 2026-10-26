@@ -26,11 +26,13 @@ const LISTED_LIMIT = 10
 
 const listed = (paths: readonly string[]) => `${paths.slice(0, LISTED_LIMIT).join(', ')}${paths.length > LISTED_LIMIT ? ` и ещё ${paths.length - LISTED_LIMIT}` : ''}`
 
-/** Чем `actual` отличается от `expected` (и грязна ли сама `actual`); `undefined` — ничем. */
+/** Чем `actual` отличается от `expected`: коммит, новые изменённые файлы, настройка и скрипты; `undefined` — ничем. */
 export function mainCopyChange(expected: MainCopySnapshot, actual: MainCopySnapshot): string | undefined {
   const changes: string[] = []
   if (actual.commit !== expected.commit) changes.push(`коммит ${expected.commit.slice(0, 12)} сменился на ${actual.commit.slice(0, 12)}`)
-  if (actual.dirty.length > 0) changes.push(`изменены файлы: ${listed(actual.dirty)}`)
+  const known = new Set(expected.dirty)
+  const dirty = actual.dirty.filter((path) => !known.has(path))
+  if (dirty.length > 0) changes.push(`изменены файлы: ${listed(dirty)}`)
   const paths = [...new Set([...Object.keys(expected.files), ...Object.keys(actual.files)])].sort()
   const touched = paths.filter((path) => expected.files[path] !== actual.files[path])
   if (touched.length > 0) changes.push(`изменены настройка или скрипты выкатки: ${listed(touched)}`)

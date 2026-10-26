@@ -1,6 +1,6 @@
 import type { IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
-import { countErrorIn } from './error-hours.js'
+import { countErrorIn, seedErrorHourIndex } from './error-hours.js'
 
 // Книга случаев: события склеиваются по приложению и отпечатку в один открытый случай.
 
@@ -90,6 +90,8 @@ function occurrences(event: IncidentEvent): number {
 
 export function createCaseBook(store: RecordStore): CaseBook {
   const caseKey = (caseId: number) => String(caseId)
+  /** Приложения, чьи старые часы ошибок уже внесены в список (`seedErrorHourIndex`). */
+  const seededApps = new Set<string>()
 
   async function updateCase(caseId: number, change: (opened: Case) => void, onIndex?: (index: CaseIndex, opened: Case) => void) {
     return store.transaction(async (tx) => {
@@ -106,6 +108,12 @@ export function createCaseBook(store: RecordStore): CaseBook {
     async recordEvents(events, options = {}) {
       for (const event of events) {
         if (Number.isNaN(Date.parse(event.occurredAt))) throw new Error(`событие ${event.eventId}: неверное время ${event.occurredAt}`)
+      }
+      for (const event of events) {
+        if (seededApps.has(event.appName)) continue
+        const latest = Math.max(...events.filter((other) => other.appName === event.appName).map((other) => Date.parse(other.occurredAt)))
+        await seedErrorHourIndex(store, event.appName, new Date(latest))
+        seededApps.add(event.appName)
       }
       return store.transaction(async (tx) => {
         const index = await tx.doc<CaseIndex>(INDEX.collection, INDEX.key, emptyIndex())

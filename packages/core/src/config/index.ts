@@ -41,6 +41,7 @@ export const DEFAULT_FORBIDDEN = deepFreeze({
     '**/Dockerfile',
     '**/Dockerfile.*',
     '**/*.dockerfile',
+    '**/.dockerignore',
     '**/compose*.yml',
     '**/compose*.yaml',
     '**/docker-compose*.yml',

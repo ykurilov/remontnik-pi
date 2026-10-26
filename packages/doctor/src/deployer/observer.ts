@@ -106,7 +106,8 @@ export async function readObservationTick(input: {
   records: RecordStore
   appName: string
   at: Date
-  promotedAt: Date
+  /** С какого времени считать ошибки кандидата: с конца `promote`. */
+  errorsFrom: Date
   baseline: ErrorBaseline
   caseFingerprint: string
 }): Promise<ObservationTick> {
@@ -119,6 +120,6 @@ export async function readObservationTick(input: {
       knownFingerprints: input.baseline.knownFingerprints7d,
       caseFingerprint: input.caseFingerprint,
     })
-  const recentFrom = new Date(Math.max(input.promotedAt.getTime(), input.at.getTime() - RECENT_ERRORS_MS))
-  return { at: input.at, current, health, errors: await since(input.promotedAt), recentErrors: await since(recentFrom) }
+  const recentFrom = new Date(Math.max(input.errorsFrom.getTime(), input.at.getTime() - RECENT_ERRORS_MS))
+  return { at: input.at, current, health, errors: await since(input.errorsFrom), recentErrors: await since(recentFrom) }
 }

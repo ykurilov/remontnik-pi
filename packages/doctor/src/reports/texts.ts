@@ -212,6 +212,8 @@ const REFUSALS: Record<DeployRefusal, string> = {
   build_failed: 'сборка не прошла',
   promote_failed: 'команда promote не прошла, работает прежняя версия',
   main_copy_changed: 'рабочую копию основной ветки на сервере кто-то изменил',
+  lock_lost: 'замок выкатки перед promote оказался не моим: его сняли или заняли',
+  unconfirmed_version: 'работает версия брошенной выкатки, её никто не подтверждал',
 }
 
 function deploymentLines(deployment: Deployment): string[] {
@@ -251,15 +253,22 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
         return ['not_helped', `${head(input.case)}: правка (версия ${candidate}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.`]
       case 'rolled_back': {
         const why = deployment.rollbackReason ?? (deployment.rollbackCause ? ROLLBACK_CAUSES[deployment.rollbackCause] : 'стало хуже')
-        const copyChanged = deployment.rollbackCause === 'main_copy_changed' || deployment.mainCopyChange !== undefined
-        const after =
-          deployment.healthyAfterRollback === false
-            ? ` Но и после отката приложение нездорово. Нужен человек.`
-            : copyChanged
-              ? ' Рабочую копию основной ветки на сервере изменили: нужен человек.'
-              : ''
-        return ['rolled_back', `${head(input.case)}: откатил правку на прежнюю версию ${previous} — ${why}.${after}`]
+        const rolled = `${head(input.case)}: откатил правку на прежнюю версию ${previous} — ${why}.`
+        const unhealthy = deployment.healthyAfterRollback === false ? ' Но и после отката приложение нездорово.' : ''
+        // Откат из изменённой копии шёл уже не теми командами, что проверял владелец: это видно с первого слова.
+        if (deployment.rollbackCause === 'main_copy_changed' || deployment.mainCopyChange !== undefined) {
+          return [
+            'needs_human',
+            `ВНИМАНИЕ: откат шёл из изменённой рабочей копии основной ветки, команда rollback могла быть уже не той, что проверял владелец. ${rolled}${unhealthy} Нужен человек.`,
+          ]
+        }
+        return ['rolled_back', `${rolled}${unhealthy ? `${unhealthy} Нужен человек.` : ''}`]
       }
+      case 'abandoned':
+        return [
+          'needs_human',
+          `${head(input.case)}: выкатку ${deployment.deploymentId} бросил — ${deployment.detail ?? 'задача врача умерла'}. Возможно, работает правка (версия ${candidate}): её не подтверждал и не откатывал. Нужен человек.`,
+        ]
       case 'rollback_failed':
         return ['needs_human', `${head(input.case)}: откат не удался за ${deployment.rollbackAttempts ?? 0} попытки, работает непонятно что. Нужен человек.`]
       case 'superseded_by_human':
@@ -276,6 +285,21 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
   })()
   const full = [short, '', ...caseLines(input.case), ...deploymentLines(deployment)].join('\n')
   return { type, short, full, ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: [...input.screenshots] } : {}) }
+}
+
+/** Чужая выкатка брошена: её задача умерла, замок снят. Сама она уже никому не доложит. */
+export function abandonedDeploymentReport(input: { deployment: Deployment }): ReportText {
+  const { deployment } = input
+  const short = `Выкатка ${deployment.deploymentId} (случай ${deployment.caseId}, ${deployment.appName}) брошена: её задача врача умерла, замок выкатки снят. Возможно, работает её правка (версия ${version(deployment.candidateVersion)}), но её никто не подтверждал; пока она работает, новых выкаток не будет. Нужен человек.`
+  const full = [short, '', ...deploymentLines(deployment)].join('\n')
+  return { short, full }
+}
+
+/** Гонка при снятии брошенного замка: чужой замок не удалён, а отложен в `lostFile`. */
+export function lostLockReport(input: { deployment: Deployment; lockFile: string; lostFile: string }): ReportText {
+  const { deployment } = input
+  const short = `Случай ${deployment.caseId} (${deployment.appName}): снимая брошенный замок выкатки ${input.lockFile}, врач столкнулся с другой выкаткой. Её замок не удалён, а отложен в файл ${input.lostFile}. Проверьте, чья выкатка идёт, и верните замок на место или удалите этот файл. Нужен человек.`
+  return { short, full: short }
 }
 
 /** Замок выкатки занят дольше `minutes`: врач ждёт дальше, но зовёт человека. `holder` — содержимое файла замка. */

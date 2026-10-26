@@ -74,6 +74,8 @@ describe('POST /v1/control/deploys', () => {
     expect(await byButton.json()).toEqual({ error: 'control_secret_required' })
     expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
 
+    expect(() => createDeployControlsHandler({ controls, secret: SECRET, controlSecret: SECRET })).toThrow(/совпадает с общим/)
+
     const handler = createDeployControlsHandler({ controls, secret: SECRET })
     const bare = await startIntakeServer({
       handler: createIntakeHandler({ secret: SECRET, receiveEvents: async () => ({ accepted: [] }), health: async () => ({ ok: true }), deployControls: handler }),

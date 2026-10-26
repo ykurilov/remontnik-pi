@@ -57,7 +57,7 @@ export default defineRemontnikConfig({
     access: string[],
     extra?: string[],                 // дополнительные запреты приложения
     allowDependencyChanges?: boolean, // по умолчанию false
-    allowBuildAndDeployChanges?: boolean, // по умолчанию false
+    allowBuildAndDeployChanges?: boolean, // по умолчанию false; см. «Правила проверки»
   },
   deploy: {
     commands: {                       // контракт — deploy-commands.md
@@ -130,5 +130,6 @@ export default defineRemontnikConfig({
 - `defineRemontnikConfig` проверяет схему и падает с понятной ошибкой на старте врача.
 - Маски `forbidden.*` пустыми быть не могут: приложение обязано явно сказать, где у него схема, деньги и доступы. Если чего-то нет — пишется `["<нет>"]` с комментарием.
 - Всегда добавляются встроенные запреты (R7), их нельзя убрать.
+- Сборка и выкатка (`allowBuildAndDeployChanges: false`): `Dockerfile*`, `*.dockerfile`, `.dockerignore`, `compose*.yml`, `docker-compose*.yml`, `.github/**`, `deploy/**`, `Makefile`, `tsconfig*.json` и поле `scripts` любого `package.json`: скрипты запускает сборка. Без полного текста `package.json` до и после скрипты проверить нечем — считаются изменёнными. `.npmrc` защищён всегда, флаги его не снимают.
 - Адреса в `allowedOrigins` и `pagesToCheck` в открытых примерах — только `https://app.example.com`.
 - `fixablePaths` — белый список правки. Врач проверяет и отправляет правку, только если она меняет код по этим маскам и добавляет новые тесты по маскам тестов (`*.test.*`, `*.spec.*`, `*_test.*`, `*-test.*`, `test_*.py`, папки `test/`, `tests/`, `__tests__/`). Новый тест — только файл по маске файла теста; другой новый файл в `test/`, `tests/`, `__tests__/`, `e2e/` и новые файлы в `__mocks__/`, `__fixtures__/`, `fixtures/`, `__snapshots__/` — не новый тест. Обвязка тестов внутри `src` (`setupTests.*`, `test-utils.*`, `mocks/**`, `testing/**`, `globalSetup.*`) и конфиги сборки (`next.config.*`, `webpack.*`, `rollup.*`, `tsup.*`, `vite.*`, `.swcrc`, `.babelrc*`) защищены и внутри `fixablePaths`. Маски различают регистр, путь с `\` не проходит; непонятная маска — ошибка при загрузке настройки. Всё остальное — «нужен человек» со списком файлов: существующие тесты, настройки запуска тестов и eval, `package.json`, файлы-замки, `.npmrc`, `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `tsconfig*`, `.env*`, сборка, выкатка, сам Ремонтник. Настройки установки, компилятора и окружения защищены и внутри `fixablePaths`. Флаги `allow*` эту защиту не снимают.

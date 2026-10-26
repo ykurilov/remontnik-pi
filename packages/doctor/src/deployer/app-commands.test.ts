@@ -66,6 +66,8 @@ describe('команды выкатки приложения', () => {
       REMONTNIK_SHARED_SECRET: 'doctor-secret',
       DEEPSEEK_API_KEY: 'model-key',
       TELEGRAM_BOT_TOKEN: 'bot-token',
+      DATABASE_URL: 'postgres://doctor:pass@db.example.com/doctor',
+      SENTRY_DSN: 'https://key@sentry.example.com/1',
       REMONTNIK_VERSION: 'подмена',
     }
     const app = createAppCommands({
@@ -96,6 +98,8 @@ describe('команды выкатки приложения', () => {
     const promoteEnv = readFileSync(join(copyDir, 'promote-env.txt'), 'utf8')
     expect(promoteEnv).toContain('REGISTRY_HOST=registry.example.com')
     expect(promoteEnv).not.toContain('doctor-secret')
+    expect(promoteEnv).not.toContain('DATABASE_URL')
+    expect(promoteEnv).not.toContain('SENTRY_DSN')
   })
 
   it('promote, rollback, confirm идут в рабочей копии основной ветки; код не 0 — неудача с хвостом вывода', async () => {

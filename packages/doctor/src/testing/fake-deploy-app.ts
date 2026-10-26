@@ -22,8 +22,8 @@ export interface FakeDeployApp {
   humanDeploys(version: string): void
   /** Рабочая копия основной ветки на сервере: снимок для проверки, что её никто не трогал. */
   mainCopy: MainCopy
-  /** Кто-то изменил рабочую копию: правка файла, другой коммит или настройка выкатки. */
-  changeMainCopy(part: 'dirty' | 'commit' | 'file'): void
+  /** Кто-то изменил рабочую копию: правка файла (`path`, по умолчанию `src/app.ts`), другой коммит или настройка выкатки. */
+  changeMainCopy(part: 'dirty' | 'commit' | 'file', path?: string): void
 }
 
 export function createFakeDeployApp(initial: { running: string | null; previous?: string | null }): FakeDeployApp {
@@ -113,8 +113,8 @@ export function createFakeDeployApp(initial: { running: string | null; previous?
       running = version
     },
     mainCopy: { snapshot: async () => structuredClone(mainCopy) },
-    changeMainCopy: (part) => {
-      if (part === 'dirty') mainCopy.dirty = ['src/app.ts']
+    changeMainCopy: (part, path = 'src/app.ts') => {
+      if (part === 'dirty') mainCopy.dirty = [...new Set([...mainCopy.dirty, path])].sort()
       else if (part === 'commit') mainCopy.commit = 'e'.repeat(40)
       else mainCopy.files['remontnik.config.ts'] = 'sha-2'
     },

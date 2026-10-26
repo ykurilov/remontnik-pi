@@ -64,6 +64,11 @@ describe('каркас врача', () => {
     expect(health).toMatchObject({ ok: true, harness: 'open', autoDeploy: 'on' })
   })
 
+  it('секрет владельца, равный общему, — не секрет владельца: врач не запускается', async () => {
+    await expect(startDoctorService(options({ controlSecret: secret }))).rejects.toThrow(/совпадает с общим/)
+    expect(existsSync(join(stateDir, 'doctor.sqlite'))).toBe(false)
+  })
+
   it('стоп-кран: подписанная команда останавливает автовыкатку, /health это показывает и после перезапуска', async () => {
     const service = await start()
     const body = JSON.stringify({ action: 'stop', by: 'telegram' })

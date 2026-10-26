@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ChecksResult } from '../checks/index.js'
 import type { Deployment } from '../deployer/deploy-sequence.js'
-import { causeFoundReport, deploymentReport, fixReadyReport, noCauseFoundReport, standBrokenReport } from './texts.js'
+import { abandonedDeploymentReport, causeFoundReport, deploymentReport, fixReadyReport, lostLockReport, noCauseFoundReport, standBrokenReport } from './texts.js'
 
 const sick = { caseId: 7, appName: 'patient', kind: 'tool_error' as const, where: 'src/bot/tools.ts', message: 'orders storage timeout' }
 const diagnosis = {
@@ -139,10 +139,19 @@ describe('тексты отчётов выкатки', () => {
     expect(sick2.full).toContain('база недоступна')
   })
 
-  it('откат из-за правки рабочей копии или возврата приложения: причина и зов человека', () => {
+  it('откат из изменённой рабочей копии: нужен человек, пометка в самом начале', () => {
     const changed = report({ outcome: 'rolled_back', rollbackCause: 'main_copy_changed', rollbackReason: 'рабочая копия основной ветки изменена: изменены файлы: app.ts', healthyAfterRollback: true })
+    expect(changed.type).toBe('needs_human')
+    expect(changed.short).toMatch(/^ВНИМАНИЕ: откат шёл из изменённой рабочей копии основной ветки/)
     expect(changed.short).toContain('app.ts')
-    expect(changed.full).toContain('нужен человек')
+    expect(changed.short).toContain('Нужен человек')
+    // Копию изменили уже во время отката по другой причине — та же пометка.
+    const during = report({ outcome: 'rolled_back', rollbackCause: 'health', mainCopyChange: 'рабочая копия основной ветки изменена: коммит', healthyAfterRollback: true })
+    expect(during.type).toBe('needs_human')
+    expect(during.short).toMatch(/^ВНИМАНИЕ: откат шёл из изменённой рабочей копии основной ветки/)
+  })
+
+  it('откат из-за возврата приложения: причина', () => {
     const reverted = report({ outcome: 'rolled_back', rollbackCause: 'reverted', rollbackReason: 'приложение вернулось к прежней версии', healthyAfterRollback: true })
     expect(reverted.short).toContain('приложение вернулось к прежней версии')
   })
@@ -161,6 +170,28 @@ describe('тексты отчётов выкатки', () => {
     const human = report({ outcome: 'superseded_by_human', supersededBy: 'd'.repeat(40) })
     expect(human.type).toBe('needs_human')
     expect(human.short).toContain('d'.repeat(12))
+  })
+
+  it('выкатку бросили (замок потерян или задача умерла) — нужен человек, кандидат назван', () => {
+    const lost = report({ outcome: 'abandoned', stage: 'done', detail: 'замок выкатки потерян: в файле замка manual deploy' })
+    expect(lost.type).toBe('needs_human')
+    expect(lost.short).toContain('бросил')
+    expect(lost.short).toContain(CAND.slice(0, 12))
+    expect(lost.full).toContain('manual deploy')
+    const lockLost = report({ outcome: 'refused', refusal: 'lock_lost' })
+    expect(lockLost.short).toContain('замок')
+    const unconfirmed = report({ outcome: 'refused', refusal: 'unconfirmed_version' })
+    expect(unconfirmed.short).toContain('брошенной')
+  })
+
+  it('отчёты врача о чужой брошенной выкатке и об отложенном замке', () => {
+    const dead = abandonedDeploymentReport({ deployment: { ...base, outcome: 'abandoned', abandonedBy: 9 } })
+    expect(dead.short).toContain('Выкатка 2')
+    expect(dead.short).toContain(CAND.slice(0, 12))
+    expect(dead.short).toContain('Нужен человек')
+    const lost = lostLockReport({ deployment: base, lockFile: '.remontnik/deploy.lock', lostFile: '/srv/app/.remontnik/deploy.lock.lost-ab12' })
+    expect(lost.short).toContain('/srv/app/.remontnik/deploy.lock.lost-ab12')
+    expect(lost.short).toContain('.remontnik/deploy.lock')
   })
 
   it('стоп-кран: правка готова в ветке, не выкатывал; другие отказы — нужен человек с причиной', () => {

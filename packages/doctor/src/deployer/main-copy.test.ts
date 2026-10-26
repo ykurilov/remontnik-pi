@@ -63,4 +63,12 @@ describe('рабочая копия основной ветки', () => {
     git(repoDir, 'commit', '-am', 'чужой коммит')
     expect(mainCopyChange(before, await mainCopy.snapshot())).toContain(before.commit.slice(0, 12))
   })
+
+  it('изменённые файлы сравниваются со снимком: уже известные — не изменение, новые — изменение', () => {
+    const known = { commit: 'a'.repeat(40), dirty: ['.deploy-state'], files: {} }
+    expect(mainCopyChange(known, known)).toBeUndefined()
+    const changed = mainCopyChange(known, { ...known, dirty: ['.deploy-state', 'src/app.ts'] })
+    expect(changed).toContain('src/app.ts')
+    expect(changed).not.toContain('.deploy-state')
+  })
 })

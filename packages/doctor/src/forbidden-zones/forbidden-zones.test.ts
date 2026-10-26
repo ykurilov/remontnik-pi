@@ -149,7 +149,7 @@ describe('findForbiddenZones: зависимости, сборка, выкатк
     ])
   })
 
-  it('package.json: при allowDependencyChanges=false запрещена любая правка', () => {
+  it('package.json: при allowDependencyChanges=false запрещена любая правка; без полного текста и скрипты не проверить', () => {
     const forbidden = forbiddenOf()
     const dependencyPatch = patchLines('-    "zod": "^4.5.0"', '+    "zod": "^4.6.7"')
     const scriptPatch = patchLines('-    "test": "vitest"', '+    "test": "vitest run"')
@@ -157,19 +157,19 @@ describe('findForbiddenZones: зависимости, сборка, выкатк
     const postinstallPatch = patchLines('+    "postinstall": "node scripts/x.js"')
     const sourcePatch = patchLines('+    "evil": "attacker/evil#main"')
     for (const patch of [dependencyPatch, scriptPatch, trueTestPatch, postinstallPatch, sourcePatch]) {
-      expect(zonesOf(forbidden, file('package.json', { patch }))).toEqual(['dependencies'])
-      expect(zonesOf(forbidden, file('apps/web/package.json', { patch }))).toEqual(['dependencies'])
+      expect(zonesOf(forbidden, file('package.json', { patch })).sort()).toEqual(['build_and_deploy', 'dependencies'])
+      expect(zonesOf(forbidden, file('apps/web/package.json', { patch })).sort()).toEqual(['build_and_deploy', 'dependencies'])
     }
   })
 
   it('package.json без диффа — неизвестно, что изменено: запрет', () => {
-    expect(zonesOf(forbiddenOf(), file('package.json'))).toEqual(['dependencies'])
+    expect(zonesOf(forbiddenOf(), file('package.json')).sort()).toEqual(['build_and_deploy', 'dependencies'])
   })
 
   it('переименование package.json без правок текста — тоже запрет', () => {
     const renamed = file('apps/web/package.json', { status: 'renamed', previousPath: 'apps/old/package.json', added: 0, removed: 0 })
-    expect(zonesOf(forbiddenOf(), renamed)).toEqual(['dependencies'])
-    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true }), renamed)).toEqual(['dependencies'])
+    expect(zonesOf(forbiddenOf(), renamed).sort()).toEqual(['build_and_deploy', 'dependencies'])
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true }), renamed).sort()).toEqual(['build_and_deploy', 'dependencies'])
   })
 
   it('allowDependencyChanges снимает запрет на замки', () => {
@@ -184,9 +184,8 @@ describe('findForbiddenZones: зависимости, сборка, выкатк
     expect(zonesOf(forbidden, file('package.json', { patch: patchLines('+x'), contentBefore: before, contentAfter: after }))).toEqual([])
   })
 
+  // Правка «scripts» — сборка и выкатка (см. ниже).
   it.each([
-    ['scripts: test → true', { scripts: { test: 'true' } }],
-    ['scripts: postinstall', { scripts: { test: 'vitest', postinstall: 'node x.js' } }],
     ['pnpm.overrides', { pnpm: { overrides: { lodash: '4.17.0' } } }],
     ['pnpm.patchedDependencies', { pnpm: { patchedDependencies: { 'zod@4': 'patches/zod.patch' } } }],
     ['overrides', { overrides: { lodash: '4.17.0' } }],
@@ -202,8 +201,8 @@ describe('findForbiddenZones: зависимости, сборка, выкатк
   it('при allowDependencyChanges без полного текста package.json проверить нечем — запрет', () => {
     const forbidden = forbiddenOf({ allowDependencyChanges: true })
     const patch = patchLines('-    "zod": "^4.5.0"', '+    "zod": "^4.6.7"')
-    expect(zonesOf(forbidden, file('package.json', { patch }))).toEqual(['dependencies'])
-    expect(zonesOf(forbidden, file('package.json', { patch, contentBefore: '{', contentAfter: '{' }))).toEqual(['dependencies'])
+    expect(zonesOf(forbidden, file('package.json', { patch })).sort()).toEqual(['build_and_deploy', 'dependencies'])
+    expect(zonesOf(forbidden, file('package.json', { patch, contentBefore: '{', contentAfter: '{' })).sort()).toEqual(['build_and_deploy', 'dependencies'])
   })
 
   it('allowBuildAndDeployChanges снимает запрет на сборку и выкатку', () => {
@@ -336,6 +335,33 @@ describe('findForbiddenZones: файлы, управляющие сборкой,
 
   it.each(['.npmrc', 'pnpm-workspace.yaml', '.pnpmfile.cjs', '.yarnrc.yml'])('%s — запрет, который снять нельзя', (path) => {
     expect(zonesOf(forbiddenOf({ allowDependencyChanges: true }), file(path))).toEqual(['dependencies'])
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true, allowBuildAndDeployChanges: true }), file(path))).toEqual(['dependencies'])
+  })
+
+  it.each(['.dockerignore', 'apps/web/.dockerignore', 'Makefile'])('%s управляет сборкой контейнера — как Dockerfile', (path) => {
+    expect(zonesOf(forbiddenOf(), file(path))).toEqual(['build_and_deploy'])
+    expect(zonesOf(forbiddenOf({ allowBuildAndDeployChanges: true }), file(path))).toEqual([])
+  })
+
+  it('скрипты package.json запускает сборка: их правка — сборка и выкатка, как Dockerfile', () => {
+    const contentBefore = manifest({ scripts: { build: 'tsc' }, dependencies: { zod: '^4.5.0' } })
+    const contentAfter = manifest({ scripts: { build: 'tsc && curl example.com' }, dependencies: { zod: '^4.5.0' } })
+    const patch = patchLines('-    "build": "tsc"', '+    "build": "tsc && curl example.com"')
+    const changed = file('apps/web/package.json', { patch, contentBefore, contentAfter })
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true }), changed)).toEqual(['build_and_deploy'])
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true, allowBuildAndDeployChanges: true }), changed)).toEqual([])
+    expect(zonesOf(forbiddenOf(), changed).sort()).toEqual(['build_and_deploy', 'dependencies'])
+
+    // Только зависимости — сборку не трогает.
+    const depsOnly = file('package.json', {
+      patch: patchLines('-    "zod": "^4.5.0"', '+    "zod": "^4.6.7"'),
+      contentBefore,
+      contentAfter: manifest({ scripts: { build: 'tsc' }, dependencies: { zod: '^4.6.7' } }),
+    })
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true }), depsOnly)).toEqual([])
+    // Без полного текста скрипты проверить нечем — считаются изменёнными.
+    expect(zonesOf(forbiddenOf({ allowDependencyChanges: true, allowBuildAndDeployChanges: true }), file('package.json', { patch: depsOnly.patch! }))).toEqual(['dependencies'])
+    expect(zonesOf(forbiddenOf(), file('package.json', { patch: depsOnly.patch! })).sort()).toEqual(['build_and_deploy', 'dependencies'])
   })
 })
 

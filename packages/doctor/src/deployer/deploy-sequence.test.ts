@@ -10,8 +10,8 @@ import { createReports } from '../reports/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
 import type { AppCommands } from './app-commands.js'
-import { createDeployer, LOCK_RETRY_MS, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
-import { createDeployLock } from './lock.js'
+import { createDeployer, LOCK_RETRY_MS, readDeployment, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
+import { createDeployLock, type DeployLock } from './lock.js'
 
 // Порядок выкатки (contracts/deploy-commands.md) и её доведение до конца после падения врача на любом шаге.
 // Часы подменены: сон выкатки (`sleep`) сразу переводит часы на время пробуждения.
@@ -119,6 +119,7 @@ function rig(options: RigOptions = {}): Rig {
             return {
               acquire: (...args) => effect(() => lock.acquire(...args)),
               release: (id) => effect(() => lock.release(id)),
+              holds: (id) => lock.holds(id),
             }
           },
           tagPreDeploy: (name, commit) =>
@@ -252,6 +253,56 @@ describe('порядок выкатки', () => {
     expect(r.app.running).toBe(PREV)
   })
 
+  it('после падения перед promote повтор идёт, только если стоп-кран не нажат и замок всё ещё свой', async () => {
+    let crashed = false
+    let stopped = false
+    const stop = rig({
+      crashBefore: (name) => name === 'promote' && !crashed && (crashed = true),
+      beforeStep: async (self) => {
+        if (!crashed || stopped) return
+        stopped = true
+        await createControls(self.records).set('stop', 'console')
+      },
+    })
+    expect(await stop.drive()).toMatchObject({ outcome: 'refused', refusal: 'stop_switch' })
+    expect(count(stop.app.calls, 'promote')).toBe(0)
+    expect(stop.app.running).toBe(PREV)
+
+    let crashedAgain = false
+    let replaced = false
+    const lost = rig({
+      crashBefore: (name) => name === 'promote' && !crashedAgain && (crashedAgain = true),
+      beforeStep: (self) => {
+        if (!crashedAgain || replaced) return
+        replaced = true
+        writeFileSync(self.lockPath, 'manual deploy\n')
+      },
+    })
+    expect(await lost.drive()).toMatchObject({ outcome: 'refused', refusal: 'lock_lost' })
+    expect(count(lost.app.calls, 'promote')).toBe(0)
+    expect(readFileSync(lost.lockPath, 'utf8')).toBe('manual deploy\n')
+  })
+
+  it('ошибки кандидата считаются с конца promote, а не с подтверждения current', async () => {
+    // Сразу после promote кандидат сыплет ошибками, а current подтверждает его только через 2 минуты.
+    let confirmedLate = false
+    const r = rig({
+      afterCommand: async (name, self) => {
+        if (name !== 'current' || self.app.running !== CAND || confirmedLate) return
+        confirmedLate = true
+        await createCaseBook(self.records).recordEvents([
+          createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/x.ts', message: 'сбой x', occurredAt: new Date(self.now()), context: { repeats: 9 } }),
+        ])
+        self.advance(2 * MINUTE)
+      },
+    })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'error_rate' })
+    expect(Date.parse(deployment.promotedAt!) - Date.parse(deployment.promoteReturnedAt!)).toBe(2 * MINUTE)
+    // Окно наблюдения — по-прежнему от подтверждения current.
+    expect(Date.parse(deployment.observeUntil!)).toBe(Date.parse(deployment.promotedAt!) + 30 * MINUTE)
+  })
+
   it('время выкатки — когда current подтвердил кандидата, а не когда записано намерение', async () => {
     const r = rig({ afterCommand: (name, self) => void (name === 'promote' && self.advance(10 * MINUTE)) })
     const deployment = await r.drive()
@@ -323,9 +374,39 @@ describe('откат', () => {
     const app = createFakeDeployApp({ running: PREV, previous: OLDER })
     sickAfterPromote(app)
     app.failNext('rollback', 3)
-    const r = rig({ app })
-    expect(await r.drive()).toMatchObject({ outcome: 'rollback_failed', rollbackCause: 'health' })
+    const rolledAt: number[] = []
+    const r = rig({ app, afterCommand: (name, self) => void (name === 'rollback' && rolledAt.push(self.now())) })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rollback_failed', rollbackCause: 'health' })
     expect(count(app.calls, 'rollback')).toBe(3)
+    expect(existsSync(r.lockPath)).toBe(false)
+    // После последней попытки — пауза 90 с и ещё одна проверка current.
+    expect(Date.parse(deployment.endedAt!) - rolledAt[2]!).toBeGreaterThanOrEqual(90_000)
+    expect(app.calls.lastIndexOf('current')).toBeGreaterThan(app.calls.lastIndexOf('rollback'))
+  })
+
+  it('приложение вернулось к прежней в паузе после последней попытки — откат удался', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    sickAfterPromote(app)
+    app.failNext('rollback', 3)
+    let recovered = false
+    const r = rig({
+      app,
+      beforeStep: () => {
+        if (recovered || count(app.calls, 'rollback') < 3) return
+        recovered = true
+        app.humanDeploys(PREV)
+      },
+    })
+    expect(await r.drive()).toMatchObject({ outcome: 'rolled_back', rollbackAttempts: 3 })
+  })
+
+  it('rollback раз за разом обрывается падением врача — потолок запусков, потом нужен человек', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    sickAfterPromote(app)
+    const r = rig({ app, crashBefore: (name) => name === 'rollback' })
+    expect(await r.drive()).toMatchObject({ outcome: 'rollback_failed', rollbackLaunches: 6, detail: expect.stringContaining('врач падал') })
+    expect(r.crashes()).toBe(6)
     expect(existsSync(r.lockPath)).toBe(false)
   })
 
@@ -406,6 +487,32 @@ describe('рабочая копия основной ветки', () => {
     expect(app.running).toBe(PREV)
   })
 
+  it('promote и rollback оставили свои файлы состояния в рабочей копии — это не чужая правка', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({ app, afterCommand: (name) => void (name === 'promote' && app.changeMainCopy('dirty', '.deploy-state')) })
+    expect(await r.drive()).toMatchObject({ outcome: 'holding' })
+    expect(count(app.calls, 'rollback')).toBe(0)
+
+    const sick = createFakeDeployApp({ running: PREV, previous: OLDER })
+    sickAfterPromote(sick)
+    const rolled = rig({ app: sick, afterCommand: (name) => void (name === 'rollback' && sick.changeMainCopy('dirty', '.rollback-state')) })
+    const deployment = await rolled.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'health' })
+    expect(deployment.mainCopyChange).toBeUndefined()
+  })
+
+  it('новый изменённый файл после promote — по-прежнему откат', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({
+      app,
+      afterCommand: (name) => void (name === 'promote' && app.changeMainCopy('dirty', '.deploy-state')),
+      beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.changeMainCopy('dirty', 'src/app.ts')),
+    })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'main_copy_changed', rollbackReason: expect.stringContaining('src/app.ts') })
+    expect(deployment.rollbackReason).not.toContain('.deploy-state')
+  })
+
   it('рабочую копию сменили после promote — откат', async () => {
     const app = createFakeDeployApp({ running: PREV, previous: OLDER })
     const r = rig({ app, beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.changeMainCopy('commit')) })
@@ -462,17 +569,56 @@ describe('общий замок', () => {
     expect(Date.parse(deployment.lockWaitReportedAt!) - START).toBeGreaterThanOrEqual(30 * MINUTE)
   })
 
-  function plainDeployer(app: FakeDeployApp, lockPath: string) {
+  it('замок потерян посреди наблюдения, отката или подтверждения — выкатка брошена, приложение больше не трогает', async () => {
+    const replace = (self: Rig) => writeFileSync(self.lockPath, 'manual deploy\n')
+
+    let observed = false
+    const observing = rig({ beforeStep: (self) => void (!observed && self.app.calls.includes('health') && ((observed = true), replace(self))) })
+    expect(await observing.drive()).toMatchObject({ outcome: 'abandoned', detail: expect.stringContaining('замок выкатки потерян') })
+    expect(count(observing.app.calls, 'health')).toBe(1)
+    expect(count(observing.app.calls, 'confirm') + count(observing.app.calls, 'rollback')).toBe(0)
+    expect(readFileSync(observing.lockPath, 'utf8')).toBe('manual deploy\n')
+
+    const sick = createFakeDeployApp({ running: PREV, previous: OLDER })
+    sickAfterPromote(sick)
+    const rollingBack = rig({ app: sick, afterCommand: (name, self) => void (name === 'health' && count(sick.calls, 'health') === 3 && replace(self)) })
+    expect(await rollingBack.drive()).toMatchObject({ outcome: 'abandoned', rollbackCause: 'health' })
+    expect(count(sick.calls, 'rollback')).toBe(0)
+
+    const confirming = rig({ afterCommand: (name, self) => void (name === 'health' && self.now() - START >= 30 * MINUTE && replace(self)) })
+    expect(await confirming.drive()).toMatchObject({ outcome: 'abandoned', verdict: 'holding' })
+    expect(count(confirming.app.calls, 'confirm')).toBe(0)
+  })
+
+  function plainDeployer(app: FakeDeployApp, lockPath: string, lockFor: () => DeployLock = () => createDeployLock(lockPath)) {
     return createDeployer({
       loadConfig: async () => testRemontnikConfig(),
       commandsFor: () => app.commands,
       mainCopyFor: () => app.mainCopy,
-      lockFor: () => createDeployLock(lockPath),
+      lockFor,
       tagPreDeploy: async () => ({ ok: true }),
     })
   }
 
-  it('замок выкатки, чья задача умерла, снимается: следующая выкатка не ждёт вечно', async () => {
+  it('замок при снятии отложен в .lost-* (гонка) — врач зовёт человека и ждёт', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const records = createMemoryRecordStore()
+    const lockPath = join(mkdtempSync(join(tmpdir(), 'remontnik-deploy-')), 'deploy.lock')
+    const lost = `${lockPath}.lost-ab12`
+    const racing: DeployLock = {
+      acquire: async () => ({ acquired: false, holder: 'human', content: 'manual deploy\n', lost }),
+      release: async () => ({}),
+      holds: async () => false,
+    }
+    const step = await plainDeployer(app, lockPath, () => racing).step(request, { store: records, now: () => START })
+    expect(step).toMatchObject({ kind: 'sleep', stage: 'waiting_lock' })
+    const reports = await createReports({ store: records }).list({ after: 0, limit: 10 })
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({ type: 'needs_human', caseId: 7 })
+    expect(reports[0]!.short).toContain(lost)
+  })
+
+  it('замок выкатки, чья задача умерла, снимается: та выкатка брошена, её кандидат — не прежняя версия', async () => {
     const app = createFakeDeployApp({ running: PREV, previous: OLDER })
     const records = createMemoryRecordStore()
     const lockPath = join(mkdtempSync(join(tmpdir(), 'remontnik-deploy-')), 'deploy.lock')
@@ -481,15 +627,25 @@ describe('общий замок', () => {
     const dead = new Set<number>()
     const io = (taskId: number): DeployIo => ({ store: records, now: () => clock, taskId, isTaskAlive: async (id) => !dead.has(id) })
 
-    expect(await deployer.step(request, io(1))).toMatchObject({ kind: 'sleep', stage: 'observing' })
+    const first = await deployer.step(request, io(1))
+    expect(first).toMatchObject({ kind: 'sleep', stage: 'observing' })
     const other: DeployRequest = { ...request, caseId: 8, candidateVersion: 'e'.repeat(40) }
     expect(await deployer.step(other, io(2))).toMatchObject({ kind: 'sleep', stage: 'waiting_lock' })
 
     dead.add(1)
     clock += LOCK_RETRY_MS
     const next = await deployer.step(other, io(2))
-    expect(next).toMatchObject({ kind: 'sleep', stage: 'observing', deployment: { caseId: 8, previousVersion: CAND } })
-    expect(readFileSync(lockPath, 'utf8')).toMatch(new RegExp(`^remontnik deployment ${next.deployment.deploymentId} `))
+    // Брошенная выкатка не подтверждена: её кандидат работает, но выкатывать поверх него врач не будет.
+    expect(next).toMatchObject({ kind: 'done', deployment: { caseId: 8, outcome: 'refused', refusal: 'unconfirmed_version' } })
+    expect(await readDeployment(records, first.deployment.deploymentId)).toMatchObject({
+      stage: 'done',
+      outcome: 'abandoned',
+      abandonedBy: next.deployment.deploymentId,
+    })
+    const reports = await createReports({ store: records }).list({ after: 0, limit: 10 })
+    expect(reports).toEqual([expect.objectContaining({ type: 'needs_human', caseId: 7 })])
+    expect(existsSync(lockPath)).toBe(false)
+    expect(app.calls.filter((call) => call === 'promote')).toHaveLength(1)
   })
 
   it('замок врача, которого нет в своих записях (чужой врач), не снимается никогда', async () => {

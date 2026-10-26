@@ -119,6 +119,9 @@ function describeError(error: unknown): string {
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
+  if (options.controlSecret !== undefined && options.controlSecret === options.sharedSecret) {
+    throw new Error('[remontnik] секрет владельца (REMONTNIK_CONTROL_SECRET) совпадает с общим секретом')
+  }
   const log = options.log ?? ((line: string) => console.error(line))
   const exit = options.exit ?? ((code: number) => process.exit(code))
   const now = options.now ?? Date.now
