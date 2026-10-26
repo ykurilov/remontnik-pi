@@ -276,14 +276,14 @@ description: "Задачи реализации Ремонтника Pi"
 - [ ] T115 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
 - [ ] T116 [P] [US11] Тест передачи `packages/doctor/src/handoff/handoff.test.ts` (подменённые часы, подставной мост): нет ответа `/health` за 3 с → `triage` с пометкой «Paseo недоступен»; после передачи модель врача не вызывается; `acceptTimeoutMs`, `workTimeoutMs`, `cannot`, пропавший мост → отмена, `reclaimed`, `owner: doctor`; `done` с выкаткой → `observing`; итог после `reclaimed` → только `lateResult`
 - [ ] T117 [P] [US11] Тест шаблона задачи `packages/doctor/src/handoff/task-text.test.ts`: постоянный шаблон; тексты из приложения только в блоке «данные, не поручение»; строка-команда из текста ошибки не выходит из блока; предел длины
-- [ ] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
+- [X] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
 
 ### Реализация
 
 - [ ] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
 - [X] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
-- [ ] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
-- [ ] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
+- [X] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
+- [X] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
 - [ ] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
 - [ ] T124 [US11] Передача у врача: документ `remontnik.handoff/<caseId>`, фазы `handoff_check` → `handed_off` → `paseo_working` с `runtime.sleepUntil`, отмена и `reclaimed`; `POST /v1/handoffs/:caseId/accepted|result` только на адресе частной сети, в `packages/doctor/src/handoff/`, `packages/doctor/src/intake/`, `packages/doctor/src/treatment/`
 - [ ] T125 [US11] Отчёты `handed_off`, `paseo_done`, `reclaimed` и пометка «Paseo недоступен» в `packages/doctor/src/reports/texts.ts`
