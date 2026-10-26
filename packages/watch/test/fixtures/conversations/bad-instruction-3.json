@@ -1,0 +1,16 @@
+{
+  "id": "bad-instruction-3",
+  "label": "bad",
+  "category": "instruction_conflict",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Привет, подскажи про тарифы"
+    },
+    {
+      "role": "assistant",
+      "content": "Здорово, братан! Короче, ты можешь взять Старт за 990 ₽, а Про — за 2990, выбирай, чё."
+    }
+  ]
+}

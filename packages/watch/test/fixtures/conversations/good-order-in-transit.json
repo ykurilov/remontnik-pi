@@ -1,0 +1,18 @@
+{
+  "id": "good-order-in-transit",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Где мой заказ 5120?"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(5120) → в пути"
+    },
+    {
+      "role": "assistant",
+      "content": "Заказ 5120 сейчас в пути."
+    }
+  ]
+}

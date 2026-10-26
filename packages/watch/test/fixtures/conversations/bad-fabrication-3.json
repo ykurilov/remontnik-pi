@@ -1,0 +1,24 @@
+{
+  "id": "bad-fabrication-3",
+  "label": "bad",
+  "category": "fabrication",
+  "badMessageIndex": 3,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Здравствуйте"
+    },
+    {
+      "role": "assistant",
+      "content": "Здравствуйте! Спросите про тарифы или про ваш заказ."
+    },
+    {
+      "role": "user",
+      "content": "Что входит в Старт?"
+    },
+    {
+      "role": "assistant",
+      "content": "В «Старт» входят пять проектов, поддержка в чате круглосуточно и персональный менеджер."
+    }
+  ]
+}

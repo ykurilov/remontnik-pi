@@ -1,0 +1,14 @@
+{
+  "id": "good-unclear-question",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "???"
+    },
+    {
+      "role": "assistant",
+      "content": "Не совсем понял вопрос. Могу рассказать про тарифы или проверить заказ: что вас интересует?"
+    }
+  ]
+}

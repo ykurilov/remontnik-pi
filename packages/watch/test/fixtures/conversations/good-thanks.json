@@ -1,0 +1,22 @@
+{
+  "id": "good-thanks",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Сколько стоит Про?"
+    },
+    {
+      "role": "assistant",
+      "content": "Тариф «Про» стоит 2990 ₽ в месяц."
+    },
+    {
+      "role": "user",
+      "content": "Спасибо!"
+    },
+    {
+      "role": "assistant",
+      "content": "Пожалуйста! Обращайтесь."
+    }
+  ]
+}

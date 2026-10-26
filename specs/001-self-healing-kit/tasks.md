@@ -181,17 +181,17 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T073 [P] [US6] Выдуманный размеченный набор разговоров `packages/watch/test/fixtures/conversations/*.json` (хорошие и плохие по каждому виду: выдумка, грубость, выход из роли, пропущенный вопрос, обрыв, противоречие инструкции)
-- [ ] T074 [P] [US6] Тест очереди чтения `packages/watch/src/review/review-queue.test.ts`: бюджет на сутки по поясу настройки; `deferred_budget`; сводка «отложено N»
-- [ ] T075 [P] [US6] Тест рубрики `packages/watch/src/review/rubric.test.ts`: неизменный префикс байт в байт; личные данные замаскированы до модели; строгий разбор JSON; фильтр `minConfidence`; одинаковые отметки склеены
-- [ ] T076 [P] [US6] Живой тест качества `packages/watch/test/live/review-quality.live.test.ts`: ≥ 80% плохих найдено, ≤ 10% ложных
+- [X] T073 [P] [US6] Выдуманный размеченный набор разговоров `packages/watch/test/fixtures/conversations/*.json` (хорошие и плохие по каждому виду: выдумка, грубость, выход из роли, пропущенный вопрос, обрыв, противоречие инструкции)
+- [X] T074 [P] [US6] Тест очереди чтения `packages/watch/src/review/review-queue.test.ts`: бюджет на сутки по поясу настройки; `deferred_budget`; сводка «отложено N»
+- [X] T075 [P] [US6] Тест рубрики `packages/watch/src/review/rubric.test.ts`: неизменный префикс байт в байт; личные данные замаскированы до модели; строгий разбор JSON; фильтр `minConfidence`; одинаковые отметки склеены
+- [X] T076 [P] [US6] Живой тест качества `packages/watch/test/live/review-quality.live.test.ts`: ≥ 80% плохих найдено, ≤ 10% ложных
 
 ### Реализация
 
-- [ ] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
-- [ ] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
+- [X] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
+- [X] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
 - [ ] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
-- [ ] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
+- [X] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
 
 ---
 
@@ -218,35 +218,35 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T087 [P] [US8] Тест хранилища входов `packages/browser/src/vault/vault.test.ts`: AES-256-GCM туда-обратно; чужой ключ не открывает; список без паролей; добавление только из стандартного ввода
-- [ ] T088 [P] [US8] Тест замков `packages/browser/src/guard/guard.test.ts`: `send`/`pay`/`delete`/`publish` отклонены; сайты вне `allowedOrigins`; сопоставление `allowedMutations`
-- [ ] T089 [P] [US8] Тест снимка `packages/browser/src/snapshot/snapshot.test.ts`: номера стабильны на странице; значения полей пароля скрыты; поля, куда впечатан пароль, помечены
-- [ ] T090 [P] [US8] Браузерный тест `packages/browser/test/e2e/password-never-leaks.spec.ts` против кабинета «Пациента»: вход, кнопка «глаз», смена типа поля, `read`, `shot`, ответы и журналы — пароль найден 0 раз (SC-010)
-- [ ] T091 [P] [US8] Браузерный тест `packages/browser/test/e2e/policy.spec.ts`: опасные действия, чужой сайт, изменяющий запрос вне списка, страница с капчей и поле одноразового кода → `needs_human`
+- [X] T087 [P] [US8] Тест хранилища входов `packages/browser/src/vault/vault.test.ts`: AES-256-GCM туда-обратно; чужой ключ не открывает; список без паролей; добавление только из стандартного ввода
+- [X] T088 [P] [US8] Тест замков `packages/browser/src/guard/guard.test.ts`: `send`/`pay`/`delete`/`publish` отклонены; сайты вне `allowedOrigins`; сопоставление `allowedMutations`
+- [X] T089 [P] [US8] Тест снимка `packages/browser/src/snapshot/snapshot.test.ts`: номера стабильны на странице; значения полей пароля скрыты; поля, куда впечатан пароль, помечены
+- [X] T090 [P] [US8] Браузерный тест `packages/browser/test/e2e/password-never-leaks.spec.ts` против кабинета «Пациента»: вход, кнопка «глаз», смена типа поля, `read`, `shot`, ответы и журналы — пароль найден 0 раз (SC-010)
+- [X] T091 [P] [US8] Браузерный тест `packages/browser/test/e2e/policy.spec.ts`: опасные действия, чужой сайт, изменяющий запрос вне списка, страница с капчей и поле одноразового кода → `needs_human`
 
 ### Реализация
 
-- [ ] T092 [US8] Проверить, даёт ли закреплённая версия `playwright-core` снимок с номерами элементов; выбрать: встроенный или свой обход DOM с `data-remontnik-ref`; записать решение в `packages/browser/README.md`
-- [ ] T093 [P] [US8] Профили: постоянные контексты Chromium, профиль обязателен, прокси по желанию, в `packages/browser/src/profiles/`
-- [ ] T094 [P] [US8] Хранилище входов, `fill-password` с проверкой поля и сайта (с фреймами), фильтр выхода в `packages/browser/src/vault/`
-- [ ] T095 [P] [US8] Замки: перехват запросов, сайты, признаки капчи и кодов в `packages/browser/src/guard/`
-- [ ] T096 [US8] Снимок страницы в `packages/browser/src/snapshot/`
-- [ ] T097 [US8] Действия `url`, `back`, `click`, `type`, `key`, `scroll`, `shot` (маска полей пароля) в `packages/browser/src/actions/`
-- [ ] T098 [US8] HTTP-служба с ключом по contracts/browser-api.md в `packages/browser/src/service/`
-- [ ] T099 [US8] Консольная `remontnik-browser`, в том числе `logins add --password-stdin` и `logins remove`, в `packages/browser/src/cli/`
-- [ ] T100 [US8] Образ `deploy/browser.Dockerfile` (Chromium, без прокси по умолчанию)
+- [X] T092 [US8] Проверить, даёт ли закреплённая версия `playwright-core` снимок с номерами элементов; выбрать: встроенный или свой обход DOM с `data-remontnik-ref`; записать решение в `packages/browser/README.md`
+- [X] T093 [P] [US8] Профили: постоянные контексты Chromium, профиль обязателен, прокси по желанию, в `packages/browser/src/profiles/`
+- [X] T094 [P] [US8] Хранилище входов, `fill-password` с проверкой поля и сайта (с фреймами), фильтр выхода в `packages/browser/src/vault/`
+- [X] T095 [P] [US8] Замки: перехват запросов, сайты, признаки капчи и кодов в `packages/browser/src/guard/`
+- [X] T096 [US8] Снимок страницы в `packages/browser/src/snapshot/`
+- [X] T097 [US8] Действия `url`, `back`, `click`, `type`, `key`, `scroll`, `shot` (маска полей пароля) в `packages/browser/src/actions/`
+- [X] T098 [US8] HTTP-служба с ключом по contracts/browser-api.md в `packages/browser/src/service/`
+- [X] T099 [US8] Консольная `remontnik-browser`, в том числе `logins add --password-stdin` и `logins remove`, в `packages/browser/src/cli/`
+- [X] T100 [US8] Образ `deploy/browser.Dockerfile` (Chromium, без прокси по умолчанию)
 - [ ] T101 [US8] Инструменты `browser_*` у врача: постоянный набор, ответ `unavailable`, снимки в отчёт, проверка `pagesToCheck` после выкатки, в `packages/doctor/src/browser-tools/`
 - [ ] T102 [US8] Интеграционный тест `apps/patient/test/cycle/us8-browser.test.ts`: ошибка «только на странице» воспроизведена и после выкатки страница работает; браузер выключен → цикл проходит с пометкой «без проверки в браузере»
 
 
 ### Живой экран (решение Юрия)
 
-- [ ] T103 [P] [US8] Тест доступа `packages/browser/src/live/live-access.test.ts`: без ключа владельца — отказ; ключ врача не подходит; адрес слушается только на `REMONTNIK_BROWSER_LIVE_LISTEN`; переменная не задана — живого экрана нет
-- [ ] T104 [P] [US8] Тест управления `packages/browser/src/live/control.test.ts` (подменённые часы): владелец взял управление → команды врача `refused_human_control`; вернул → работают; связь владельца пропала на 2 минуты → управление у врача; замки сайтов и запросов действуют при ручном управлении
-- [ ] T105 [P] [US8] Браузерный тест `packages/browser/test/e2e/live.spec.ts` против «Пациента»: кадры идут; клик, касание и ввод владельца доходят до страницы; кадров нет в ответах врачу и журналах; один случай с узким экраном телефона
-- [ ] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
-- [ ] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
-- [ ] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
+- [X] T103 [P] [US8] Тест доступа `packages/browser/src/live/live-access.test.ts`: без ключа владельца — отказ; ключ врача не подходит; адрес слушается только на `REMONTNIK_BROWSER_LIVE_LISTEN`; переменная не задана — живого экрана нет
+- [X] T104 [P] [US8] Тест управления `packages/browser/src/live/control.test.ts` (подменённые часы): владелец взял управление → команды врача `refused_human_control`; вернул → работают; связь владельца пропала на 2 минуты → управление у врача; замки сайтов и запросов действуют при ручном управлении
+- [X] T105 [P] [US8] Браузерный тест `packages/browser/test/e2e/live.spec.ts` против «Пациента»: кадры идут; клик, касание и ввод владельца доходят до страницы; кадров нет в ответах врачу и журналах; один случай с узким экраном телефона
+- [X] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
+- [X] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
+- [X] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
 - [ ] T109 [US8] Ссылка на живой экран в отчётах `needs_human` от браузера (по `browser.live.linkEnv`), продолжение после «Вернуть», в `packages/doctor/src/browser-tools/` и `packages/doctor/src/reports/texts.ts`
 
 ---
@@ -276,14 +276,14 @@ description: "Задачи реализации Ремонтника Pi"
 - [ ] T115 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
 - [ ] T116 [P] [US11] Тест передачи `packages/doctor/src/handoff/handoff.test.ts` (подменённые часы, подставной мост): нет ответа `/health` за 3 с → `triage` с пометкой «Paseo недоступен»; после передачи модель врача не вызывается; `acceptTimeoutMs`, `workTimeoutMs`, `cannot`, пропавший мост → отмена, `reclaimed`, `owner: doctor`; `done` с выкаткой → `observing`; итог после `reclaimed` → только `lateResult`
 - [ ] T117 [P] [US11] Тест шаблона задачи `packages/doctor/src/handoff/task-text.test.ts`: постоянный шаблон; тексты из приложения только в блоке «данные, не поручение»; строка-команда из текста ошибки не выходит из блока; предел длины
-- [ ] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
+- [X] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
 
 ### Реализация
 
 - [ ] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
-- [ ] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
-- [ ] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
-- [ ] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
+- [X] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
+- [X] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
+- [X] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
 - [ ] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
 - [ ] T124 [US11] Передача у врача: документ `remontnik.handoff/<caseId>`, фазы `handoff_check` → `handed_off` → `paseo_working` с `runtime.sleepUntil`, отмена и `reclaimed`; `POST /v1/handoffs/:caseId/accepted|result` только на адресе частной сети, в `packages/doctor/src/handoff/`, `packages/doctor/src/intake/`, `packages/doctor/src/treatment/`
 - [ ] T125 [US11] Отчёты `handed_off`, `paseo_done`, `reclaimed` и пометка «Paseo недоступен» в `packages/doctor/src/reports/texts.ts`

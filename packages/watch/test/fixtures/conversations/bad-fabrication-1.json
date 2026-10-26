@@ -1,0 +1,16 @@
+{
+  "id": "bad-fabrication-1",
+  "label": "bad",
+  "category": "fabrication",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Сколько стоит тариф Макс?"
+    },
+    {
+      "role": "assistant",
+      "content": "Тариф «Макс» стоит 5990 ₽ в месяц и включает безлимит проектов и выделенного менеджера."
+    }
+  ]
+}

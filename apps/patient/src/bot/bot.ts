@@ -15,6 +15,9 @@ export interface Bot {
   reply(message: string): Promise<string>
 }
 
+/** Тарифа «Макс» нет: бот с PATIENT_BUG=bad_answer называет для него выдуманную цену. */
+const INVENTED_MAX_PRICE_RUB = 5990
+
 function findPlanInText(text: string, bug: PatientBug | null): Plan {
   const lower = text.toLowerCase()
   const named = PLANS.find((plan) => new RegExp(`(^|[^а-яё])${plan.name.toLowerCase()}([^а-яё]|$)`).test(lower))
@@ -49,6 +52,9 @@ export function createBot(options: BotOptions): Bot {
         return 'Здравствуйте! Я бот «Пациента». Спросите про тарифы или про ваш заказ.'
       }
       if (/сколько стоит|цена|стоимость/.test(lower)) {
+        if (bug === 'bad_answer' && /(^|[^а-яё])макс([^а-яё]|$)/.test(lower)) {
+          return `Тариф «Макс» стоит ${INVENTED_MAX_PRICE_RUB} ₽ в месяц.`
+        }
         const plan = findPlanInText(message, bug)
         return `Тариф ${plan.name} стоит ${plan.priceRub} ₽ в месяц.`
       }

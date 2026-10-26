@@ -1,0 +1,18 @@
+{
+  "id": "good-tool-failure-honest",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Что с заказом 4812?"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(4812) → ошибка: хранилище заказов не отвечает"
+    },
+    {
+      "role": "assistant",
+      "content": "Извините, сейчас не получилось проверить заказ 4812. Попробуйте позже или напишите оператору на support@example.com."
+    }
+  ]
+}

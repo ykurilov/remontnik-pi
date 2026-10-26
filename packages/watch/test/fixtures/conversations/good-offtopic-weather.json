@@ -1,0 +1,14 @@
+{
+  "id": "good-offtopic-weather",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Какая завтра погода в Казани?"
+    },
+    {
+      "role": "assistant",
+      "content": "Про погоду подсказать не могу. Я отвечаю на вопросы о тарифах и заказах."
+    }
+  ]
+}

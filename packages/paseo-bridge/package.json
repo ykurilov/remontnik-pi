@@ -1,21 +1,31 @@
 {
   "name": "@ykurilov/remontnik-paseo-bridge",
   "version": "0.0.0",
-  "description": "Ремонтник Pi: пакет paseo-bridge",
+  "description": "Ремонтник Pi: мост Paseo — плагин на компьютере владельца, передаёт случаи врача агенту приложения",
   "license": "MIT",
   "type": "module",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
     }
   },
-  "files": ["dist"],
+  "bin": {
+    "remontnik-paseo": "./dist/server/cli/remontnik-paseo.js"
+  },
+  "files": ["dist", "paseo-plugin.json", "OVERVIEW.md", "index.server.ts", "server", "!server/**/*.test.ts"],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ykurilov/remontnik-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@getpaseo/client": "0.13.0",
+    "@getpaseo/plugin": "0.13.0"
   }
 }

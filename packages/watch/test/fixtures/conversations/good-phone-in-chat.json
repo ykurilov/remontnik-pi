@@ -1,0 +1,18 @@
+{
+  "id": "good-phone-in-chat",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Позвоните мне по номеру +7 900 000-12-34 насчёт заказа 7001"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(7001) → собирается"
+    },
+    {
+      "role": "assistant",
+      "content": "Звонить я не могу. Заказ 7001 сейчас собирается. Если нужна помощь человека, напишите оператору на support@example.com."
+    }
+  ]
+}
