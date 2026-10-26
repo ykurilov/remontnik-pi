@@ -18,7 +18,8 @@ import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/i
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import type { Deployer, DeployRequest, Deployment, DeployStep } from '../deployer/deploy-sequence.js'
-import { GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
+import { GitGuardError, slugify, type GitGuard, type GitGuardErrorCode } from '../git-guard/index.js'
+import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
 import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
 import { matchesAnyMask } from '../path-mask/index.js'
@@ -168,6 +169,14 @@ type Base = { commit: string; running: boolean }
 type DeployPhase = Extract<TreatmentState, { phase: 'deploying' | 'observing' }>
 type DeploySleep = Extract<DeployStep, { kind: 'sleep' }>
 
+/** Почему не удалось влить правку — для отчёта человеку, без текста git. */
+const MERGE_FAILURES: Record<GitGuardErrorCode, string> = {
+  diverged: 'основная ветка ушла вперёд',
+  failed: 'origin отказал',
+  timeout: 'origin не ответил вовремя',
+  forbidden: 'git-замок не разрешил',
+  escape: 'git-замок не разрешил',
+}
 const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
 
@@ -401,21 +410,25 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /**
-   * Правка осталась работать — ветка уходит в основную: `merge` — git-замком, только вперёд, `pull-request` — ждёт
-   * запроса на слияние. Повтор безопасен: влитая ветка вливается ещё раз без изменений.
+   * Правка осталась работать — ветка уходит в основную: `merge` — git-замком, проверенной ревизией и только вперёд,
+   * `pull-request` — ждёт запроса на слияние. Стоп-кран, нажатый за окно, слияние останавливает: правка ждёт человека.
+   * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз.
    */
-  async function settleMainline(runtime: Runtime, checkpoint: DeployPhase): Promise<MainlineResult> {
+  async function settleMainline(runtime: Runtime, checkpoint: DeployPhase, context: Context): Promise<MainlineResult> {
     const config = await deps.loadConfig()
     const { branch } = checkpoint
+    const controls = (await runtime.snapshot(recordFamilyOf(CONTROLS.collection), CONTROLS.key, context)) as unknown as DeployControlsState | undefined
     try {
       if (!checkpoint.pushed) await deps.guard.push(branch)
       if (config.repo.mainline !== 'merge') return { kind: 'pull_request', branch }
-      await deps.guard.mergeIntoMain(branch)
+      if (controls?.autoDeploy === 'stopped') return { kind: 'stopped', branch }
+      await deps.guard.mergeIntoMain(branch, checkpoint.fixCommit)
       return { kind: 'merged', into: config.repo.mainBranch }
     } catch (error) {
       if (!(error instanceof GitGuardError)) throw error
+      // Текст git (в нём адрес origin) — только в журнал; в отчёт — причина по коду ошибки.
       runtime.report(error)
-      return { kind: 'merge_failed', branch, reason: error.message.split('\n')[0]!.slice(0, 200) }
+      return { kind: 'merge_failed', branch, reason: MERGE_FAILURES[error.code] }
     }
   }
 
@@ -475,7 +488,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
     await deps.guard.removeWorktree(candidateDir).catch(() => {})
     const stays = deployment.outcome === 'holding' || deployment.outcome === 'not_helped'
-    const mainline = stays ? await settleMainline(runtime, checkpoint) : undefined
+    const mainline = stays ? await settleMainline(runtime, checkpoint, context) : undefined
     const text = deploymentReport({ case: doc.case, deployment, branch: checkpoint.branch, ...(mainline ? { mainline } : {}) })
     const closing = deployClosing(deployment, text.type)
     await finish(

@@ -220,13 +220,19 @@ function deploymentLines(deployment: Deployment): string[] {
 }
 
 /** Что стало с веткой правки, которая осталась работать: влита в основную ветку или ждёт запроса на слияние. */
-export type MainlineResult = { kind: 'merged'; into: string } | { kind: 'pull_request'; branch: string } | { kind: 'merge_failed'; branch: string; reason: string }
+export type MainlineResult =
+  | { kind: 'merged'; into: string }
+  | { kind: 'pull_request'; branch: string }
+  /** Стоп-кран нажали, пока шло наблюдение: в основную ветку не вливал. */
+  | { kind: 'stopped'; branch: string }
+  | { kind: 'merge_failed'; branch: string; reason: string }
 
 function mainlineLine(mainline: MainlineResult | undefined): string {
   if (!mainline) return ''
   if (mainline.kind === 'merged') return ` Правку влил в основную ветку ${mainline.into}.`
   const unmerged = 'Пока она не влита, ручная выкатка из основной ветки сотрёт правку.'
   if (mainline.kind === 'pull_request') return ` Ветка ${mainline.branch} ждёт слияния: откройте запрос на слияние в основную ветку. ${unmerged}`
+  if (mainline.kind === 'stopped') return ` Включён стоп-кран: в основную ветку не вливал. Ветка ${mainline.branch} ждёт: откройте запрос на слияние. ${unmerged}`
   return ` Влить ветку ${mainline.branch} в основную не смог (${mainline.reason}): откройте запрос на слияние. ${unmerged}`
 }
 

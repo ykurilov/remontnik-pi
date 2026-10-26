@@ -32,6 +32,19 @@ function repo() {
   return { root, origin, repoDir, worktreesDir: join(root, 'worktrees') }
 }
 
+/** Человек отправил свою правку в основную ветку origin из другой копии: рабочая копия врача её не видит. */
+function humanCommitOnOrigin(r: ReturnType<typeof repo>): string {
+  const clone = join(r.root, `human-${Math.random().toString(36).slice(2)}`)
+  git(r.root, 'clone', r.origin, clone)
+  git(clone, 'config', 'user.email', 'owner@example.com')
+  git(clone, 'config', 'user.name', 'Owner')
+  writeFileSync(join(clone, 'other.ts'), 'export const other = 1\n')
+  git(clone, 'add', '-A')
+  git(clone, 'commit', '-m', 'человек')
+  git(clone, 'push', 'origin', 'main')
+  return git(r.origin, 'rev-parse', 'main')
+}
+
 function guardFor(r: ReturnType<typeof repo>, overrides: Partial<GitGuardOptions> = {}) {
   return createGitGuard({
     repoDir: r.repoDir,
@@ -119,7 +132,12 @@ describe('git-замок', () => {
     const r = repo()
     const guard = guardFor(r)
     expect((await rejection(guard.push('main'))).code).toBe('forbidden')
-    expect((await rejection(guard.mergeIntoMain('remontnik/1-x'))).code).toBe('forbidden')
+    expect((await rejection(guard.mergeIntoMain('remontnik/1-x', 'a'.repeat(40)))).code).toBe('forbidden')
+  })
+
+  it('политика не пускает merge в рабочей копии основной ветки: в main врач только отправляет правку вперёд', async () => {
+    const r = repo()
+    expect((await rejection(guardFor(r, { mainline: 'merge' }).run(['merge', '--ff-only', 'remontnik/1-x']))).code).toBe('forbidden')
   })
 
   it('при mainline "merge" вливает ветку врача в основную origin вперёд; рабочую копию основной ветки не трогает', async () => {
@@ -131,15 +149,45 @@ describe('git-замок', () => {
     await guard.addWorktree({ path, branch, base })
     writeFileSync(join(path, 'app.ts'), 'export const answer = 3\n')
     const commit = await guard.commitAll(path, 'Ремонтник: случай 3')
-    await guard.mergeIntoMain(branch)
+    await guard.mergeIntoMain(branch, commit!)
     expect(git(r.origin, 'rev-parse', 'main')).toBe(commit)
     // Копию основной ветки держат выкатки: её смена посреди чужой выкатки была бы «копию изменили».
     expect(git(r.repoDir, 'rev-parse', 'HEAD')).toBe(base)
     expect(readFileSync(join(r.repoDir, 'app.ts'), 'utf8')).toBe('export const answer = 1\n')
     // Повтор после перезапуска врача безопасен.
-    await guard.mergeIntoMain(branch)
+    await guard.mergeIntoMain(branch, commit!)
     expect((await rejection(guard.run(['push', '--force', 'origin', 'main']))).code).toBe('forbidden')
-    expect((await rejection(guard.mergeIntoMain('main'))).code).toBe('forbidden')
+    expect((await rejection(guard.mergeIntoMain('main', commit!))).code).toBe('forbidden')
+  })
+
+  it('вливает только проверенную ревизию: ветка ушла с неё — отказ, main не тронута', async () => {
+    const r = repo()
+    const guard = guardFor(r, { mainline: 'merge' })
+    const base = await guard.resolve('HEAD')
+    const branch = treatmentBranch(5, 'moved')
+    const path = join(r.worktreesDir, '5')
+    await guard.addWorktree({ path, branch, base })
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 5\n')
+    const checked = (await guard.commitAll(path, 'Ремонтник: случай 5'))!
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 55\n')
+    await guard.commitAll(path, 'Ремонтник: случай 5, ещё')
+    expect((await rejection(guard.mergeIntoMain(branch, checked))).code).toBe('forbidden')
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(base)
+  })
+
+  it('перезапуск после слияния: правка уже в main, а main ушла дальше → считается влитой, ничего не отправляет', async () => {
+    const r = repo()
+    const guard = guardFor(r, { mainline: 'merge' })
+    const base = await guard.resolve('HEAD')
+    const branch = treatmentBranch(6, 'again')
+    const path = join(r.worktreesDir, '6')
+    await guard.addWorktree({ path, branch, base })
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 6\n')
+    const commit = (await guard.commitAll(path, 'Ремонтник: случай 6'))!
+    await guard.mergeIntoMain(branch, commit)
+    const human = humanCommitOnOrigin(r)
+    await guard.mergeIntoMain(branch, commit)
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(human)
   })
 
   it('основная ветка в origin ушла вперёд → слияние отказано, ничего не перезаписано', async () => {
@@ -150,13 +198,9 @@ describe('git-замок', () => {
     const path = join(r.worktreesDir, '4')
     await guard.addWorktree({ path, branch, base })
     writeFileSync(join(path, 'app.ts'), 'export const answer = 4\n')
-    await guard.commitAll(path, 'Ремонтник: случай 4')
-    writeFileSync(join(r.repoDir, 'other.ts'), 'export const other = 1\n')
-    git(r.repoDir, 'add', '-A')
-    git(r.repoDir, 'commit', '-m', 'человек')
-    git(r.repoDir, 'push', 'origin', 'main')
-    const human = git(r.origin, 'rev-parse', 'main')
-    expect((await rejection(guard.mergeIntoMain(branch))).code).toBe('failed')
+    const commit = (await guard.commitAll(path, 'Ремонтник: случай 4'))!
+    const human = humanCommitOnOrigin(r)
+    expect((await rejection(guard.mergeIntoMain(branch, commit))).code).toBe('diverged')
     expect(git(r.origin, 'rev-parse', 'main')).toBe(human)
   })
 

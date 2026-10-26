@@ -208,6 +208,29 @@ function fixBranch(r: Repo): string {
   return git(r.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/, '')
 }
 
+/** Человек отправил свою правку в основную ветку origin из своей копии. */
+function humanPush(r: Repo): string {
+  const clone = join(r.root, 'human')
+  git(r.root, 'clone', r.origin, clone)
+  git(clone, 'config', 'user.email', 'owner@example.com')
+  git(clone, 'config', 'user.name', 'Owner')
+  writeFileSync(join(clone, 'README.md'), 'человек\n')
+  git(clone, 'add', '-A')
+  git(clone, 'commit', '-m', 'человек')
+  git(clone, 'push', 'origin', 'main')
+  return git(r.origin, 'rev-parse', 'main')
+}
+
+async function pressStop(doctor: DoctorService): Promise<void> {
+  const body = JSON.stringify({ action: 'stop', by: 'telegram:owner' })
+  const stopped = await fetch(`${doctor.url}/v1/control/deploys`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: '/v1/control/deploys', body, secret: 'shared-test-secret' }) },
+    body,
+  })
+  expect(stopped.status).toBe(200)
+}
+
 async function reports(doctor: DoctorService) {
   return doctor.reports.list({ after: 0, limit: 50 })
 }
@@ -341,13 +364,7 @@ describe('лечение до выкатки: deploying → observing → ито
     const model = createScriptedModel()
     scriptCure(model)
     const doctor = await startDoctor(r, model, app, clock)
-    const body = JSON.stringify({ action: 'stop', by: 'telegram:owner' })
-    const stopped = await fetch(`${doctor.url}/v1/control/deploys`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: '/v1/control/deploys', body, secret: 'shared-test-secret' }) },
-      body,
-    })
-    expect(stopped.status).toBe(200)
+    await pressStop(doctor)
 
     await doctor.receiveEvents([priceCrash()])
     const sick = await settledCase(doctor)
@@ -360,6 +377,60 @@ describe('лечение до выкатки: deploying → observing → ито
     expect(last.type).toBe('fix_ready')
     expect(last.short).toContain('стоп-кран')
     expect(last.short).toContain(fixBranch(r))
+  }, 90_000)
+
+  it('основная ветка ушла вперёд за окно → правка держится, но не влита: отчёт без адреса origin зовёт открыть запрос на слияние', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    const doctor = await startDoctor(r, model, app, clock, { mainline: 'merge' })
+    let human: string | undefined
+    clock.beforeWake = async () => {
+      if (app.promotes === 1 && !human) human = humanPush(r)
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await settledCase(doctor)
+
+    expect(healed.state).toBe('healed')
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(human)
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.short).toContain('основная ветка ушла вперёд')
+    expect(last.short).toContain('запрос на слияние')
+    for (const text of [last.short, last.full]) {
+      expect(text).not.toContain(r.root)
+      expect(text).not.toContain('origin.git')
+      expect(text).not.toContain('git push')
+    }
+  }, 90_000)
+
+  it('стоп-кран нажат во время наблюдения → выкатка доходит до конца, но в main не вливает: правка ждёт запроса на слияние', async () => {
+    const r = repo()
+    const app = createFakeDeployApp({ running: r.base })
+    const clock = fakeClock()
+    const model = createScriptedModel()
+    scriptCure(model)
+    const doctor = await startDoctor(r, model, app, clock, { mainline: 'merge' })
+    let stopped = false
+    clock.beforeWake = async () => {
+      if (app.promotes === 1 && !stopped) {
+        stopped = true
+        await pressStop(doctor)
+      }
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await settledCase(doctor)
+
+    expect(healed.state).toBe('healed')
+    expect(app.calls).toContain('confirm')
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(r.base)
+    const last = (await reports(doctor)).at(-1)!
+    expect(last.short).toContain('стоп-кран')
+    expect(last.short).toContain(fixBranch(r))
+    expect(last.short).toContain('запрос на слияние')
   }, 90_000)
 
   it('замок потерян посреди наблюдения → выкатка брошена, приложение не трогает, нужен человек', async () => {
