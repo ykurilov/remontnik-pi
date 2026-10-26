@@ -140,7 +140,7 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T058 [US4] Решение о выкатке — чистая функция в `packages/doctor/src/deploy-gate/`
 - [X] T059 [US4] Источник настройки в `packages/doctor/src/service/config-source.ts`
 - [ ] T060 [US4] Фаза `gated` в задаче лечения; отчёты `report_only` и `needs_human`; при причине в SDK — готовый текст задачи для агента SDK, в `packages/doctor/src/treatment/`
-- [ ] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
+- [X] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
 - [ ] T062 [US4] Интеграционный тест `apps/patient/test/cycle/us4-forbidden.test.ts`: сценарии money, test-edit, «причина в SDK»
 
 **Контрольная точка**: замки на месте и проверены — можно строить выкатку.
