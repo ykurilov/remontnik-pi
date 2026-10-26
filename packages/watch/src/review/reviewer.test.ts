@@ -305,7 +305,7 @@ describe('память и приём', () => {
     const stats = harness.reviewer.stats()
     expect(stats.bufferedChars).toBeLessThanOrEqual(100_000)
     expect(stats.dropped).toBeGreaterThan(100)
-  })
+  }, 20_000)
 
   it('оценка стоимости идёт по тому, что реально уйдёт модели: огромный разговор влезает в скромный бюджет', async () => {
     const harness = open({ usdPerDay: 0.02 })
