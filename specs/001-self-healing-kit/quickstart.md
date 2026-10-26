@@ -10,7 +10,7 @@ Node 22.19+, pnpm, Docker (только для живой группы), Chromiu
 
 ```bash
 pnpm install
-pnpm verify          # сборка → тесты → типы → check-pins → check-public → check-history
+pnpm verify          # тесты → сборка → типы → check-pins → check-public → check-history
 ```
 
 Ожидаемо: всё зелёное; `check-pins` подтверждает точные версии pi-durable и pi-ai; `check-public` и `gitleaks` находят 0 секретов и адресов; `check-history` подтверждает, что `.private/` не была ни в одном коммите и `gitleaks` чист по всей истории (`pnpm check-history --trees` дополнительно гонит `check-public` по дереву каждого коммита).
