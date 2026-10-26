@@ -48,6 +48,14 @@ export function callTool(name: string, args: Record<string, unknown>): Assistant
   return fauxAssistantMessage(fauxToolCall(name, args as Parameters<typeof fauxToolCall>[1]), { stopReason: 'toolUse' })
 }
 
+/** Ответ несколькими вызовами инструментов в одном ходе модели. */
+export function callTools(...calls: [name: string, args: Record<string, unknown>][]): AssistantMessage {
+  return fauxAssistantMessage(
+    calls.map(([name, args]) => fauxToolCall(name, args as Parameters<typeof fauxToolCall>[1])),
+    { stopReason: 'toolUse' },
+  )
+}
+
 /** Ответ, который не приходит, пока запрос не отменят: для проверок перезапуска посреди работы. */
 export const hang: ScriptStep = (_context, signal) =>
   new Promise<AssistantMessage>((_resolve, reject) => {

@@ -8,6 +8,7 @@ import {
   defineDocFamily,
   Harness,
   type HarnessOptions,
+  type HarnessSettings,
   type JsonObject,
   type Registry,
   type ReportInfo,
@@ -112,6 +113,13 @@ export function recordStoreOver(harness: Harness): RecordStore {
   }
 }
 
+/**
+ * Инструменты модели-врача идут по очереди, а не все вызовы хода разом. Иначе команда в верстаке могла бы подменить
+ * часть пути символьной ссылкой между проверкой пути файловым инструментом и самой записью. Команда держит верстак
+ * до конца: контейнер гаснет вместе с ней, фоновые процессы в нём не переживают вызов.
+ */
+export const DOCTOR_HARNESS_SETTINGS = { toolExecution: 'sequential' } as const satisfies HarnessSettings
+
 /** Открывает Harness врача над `stateDir/doctor.sqlite`. */
 export async function openDoctorHarness(options: OpenDoctorHarnessOptions): Promise<DoctorHarness> {
   mkdirSync(options.stateDir, { recursive: true })
@@ -122,6 +130,7 @@ export async function openDoctorHarness(options: OpenDoctorHarnessOptions): Prom
     {
       models: options.models ?? createModels(),
       registry,
+      settings: DOCTOR_HARNESS_SETTINGS,
       onReport: options.onReport,
       ...(options.env ? { env: options.env } : {}),
       ...(options.now ? { now: options.now } : {}),

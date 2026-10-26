@@ -9,7 +9,7 @@ import type { CaseState } from '../case-book/index.js'
 import { createGitGuard, type GitGuard } from '../git-guard/index.js'
 import { startDoctorService, type DoctorService, type DoctorTreatmentOptions } from '../service/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
-import { callTool, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
+import { callTool, callTools, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
 import { createLocalRunner } from '../workbench/index.js'
 import { DOCTOR_TOOL_NAMES } from './index.js'
 
@@ -250,6 +250,22 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(reports.at(-1)).toMatchObject({ type: 'no_cause_found', caseId: 1 })
     expect(reports.at(-1)?.full).toContain('src/price.mjs прочитан')
     expect(reports.at(-1)?.full).not.toContain(LEAKED_KEY)
+  }, 60_000)
+
+  it('инструменты одного хода модели идут по очереди: запись не успевает между проверкой пути и командой', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(
+      callTools(['bash', { command: 'sleep 0.5; test -e src/probe.txt && echo после-записи || echo до-записи' }], ['write', { path: 'src/probe.txt', content: 'x' }]),
+      callTool('finish_diagnosis', { found: false, cause: 'проверка порядка', evidence: [], confidence: 'low' }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    await settledCase(doctor)
+
+    const bash = toolResults(model).find((result) => result.role === 'toolResult' && result.toolName === 'bash')
+    expect(JSON.stringify(bash?.content)).toContain('до-записи')
   }, 60_000)
 
   it('потолок diagnoseUsdPerCase → работа модели остановлена, отчёт no_cause_found', async () => {
