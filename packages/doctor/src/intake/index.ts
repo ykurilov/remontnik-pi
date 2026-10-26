@@ -2,10 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { redactValue } from '@ykurilov/remontnik-core/redact'
-import { verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { DEFAULT_MAX_SKEW_MS, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
-// Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health.
+// Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health; рядом — лента отчётов и стоп-кран.
 
 export const INTAKE_MAX_EVENTS = 50
 export const INTAKE_MAX_BODY_BYTES = 1024 * 1024
@@ -15,11 +15,13 @@ export interface IntakeHandlerOptions {
   secret: string
   /** Записывает принятые события; повтор того же eventId должен быть безопасен. */
   receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }>
-  health(): unknown
+  health(): unknown | Promise<unknown>
   /** Срок на чтение тела; не успел — 408 и соединение закрывается. */
   bodyTimeoutMs?: number
   /** Лента отчётов: `/v1/reports*` отдаются ей. Не задана — этих адресов нет. */
   reportsFeed?: IntakeHandler
+  /** Стоп-кран выкаток: `POST /v1/control/deploys`. Не задан — адреса нет. */
+  deployControls?: IntakeHandler
 }
 
 export type { IntakeHandler }
@@ -47,11 +49,23 @@ function isIncidentEvent(value: unknown): value is IncidentEvent {
   )
 }
 
+/**
+ * Событие позже часов врача дальше допуска подписи — у сторожа сбились часы: время события — время приёма.
+ * Отказ всей пачке тут не годится: сторож слал бы её снова, и с ней застряли бы и верные события.
+ */
+function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
+  return Date.parse(event.occurredAt) > receivedAt + DEFAULT_MAX_SKEW_MS ? { ...event, occurredAt: new Date(receivedAt).toISOString() } : event
+}
+
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
   return async (request, response) => {
     const path = (request.url ?? '/').split('?')[0]
     if (request.method === 'GET' && path === '/health') {
-      sendJson(response, 200, options.health())
+      sendJson(response, 200, await options.health())
+      return
+    }
+    if (options.deployControls && path === '/v1/control/deploys') {
+      await options.deployControls(request, response)
       return
     }
     if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {
@@ -101,7 +115,8 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
 
     // Сторож уже вычистил секреты; врач чистит ещё раз — вдруг сторож старый или чужой.
-    const result = await options.receiveEvents(events.map((event) => redactValue(event)))
+    const receivedAt = Date.now()
+    const result = await options.receiveEvents(events.map((event) => clampFuture(redactValue(event), receivedAt)))
     sendJson(response, 200, { accepted: result.accepted })
   }
 }

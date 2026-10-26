@@ -51,6 +51,7 @@
 | `processName` | string? | процесс первого события (`context.processName`) |
 | `fingerprint` | string | один открытый случай на приложение и отпечаток; новые события склеиваются |
 | `kind`, `where`, `message`, `stack` | как у события | из первого события |
+| `badAnswer` | объект? | только для `bad_answer`: как у события, из первого события; врачу-модели подаётся вычищенным и помеченным как данные, а не поручение |
 | `events` | число | счётчик появлений, с учётом `context.repeats` от сторожа |
 | `firstSeenAt`, `lastSeenAt` | время | |
 | `linkedEventIds` | ULID[] ≤ 50 | последние |
@@ -125,15 +126,38 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | Поле | Тип |
 |---|---|
 | `deploymentId` | число |
-| `caseId` | число |
-| `previousVersion` | строка из `current` до выкатки |
-| `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>` |
+| `caseId`, `appName`, `fingerprint` | случай и его отпечаток |
+| `previousVersion` | полный sha из `current` до выкатки |
+| `lockToken` | случайный знак выкатки в строке замка: по нему врач узнаёт свой замок |
+| `taskId?` | задача pi-durable, которая ведёт выкатку: умерла — замок выкатки брошен |
+| `mainCopy?` | снимок рабочей копии основной ветки в начале: `{ commit, dirty: { путь: sha256 }, files: { путь: sha256 } }`; в `dirty` дописываются файлы своих `promote` и `rollback` |
+| `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>-<deploymentId>` |
 | `candidateVersion` | sha правки |
-| `startedAt`, `promotedAt`, `endedAt` | время |
+| `candidateDir` | рабочая копия правки, где идёт `build` |
+| `stage` | `starting` \| `locked` \| `tagging` \| `building` \| `promoting` \| `observing` \| `rolling_back` \| `confirming` \| `done` — шаг, с которого выкатка продолжится после перезапуска |
+| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?`, `lockWaitReportedAt?`, `leftoverLockReportedAt?` | время; `promotedAt` — когда `current` подтвердил кандидата; `lockWaitReportedAt` — когда позвал человека из-за долгого замка; `leftoverLockReportedAt?` — из-за `<замок>.stale-*` |
 | `baseline` | `{ errorsPerHour, knownFingerprints7d[] }` |
-| `observeUntil` | время конца окна |
-| `outcome` | `in_progress` \| `holding` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` |
-| `rollbackReason` | string? |
+| `observeUntil`, `nextTickAt` | конец окна и следующий тик наблюдения |
+| `observation`, `lastTick` | сбои здоровья подряд, итоги последних проверок, число проверок окна и последний замер ошибок |
+| `promoteRequested` | намерение `promote` записано: дальше по `current` видно, прошёл ли он |
+| `promoteLaunched?` | `promote` запускали (записано прямо перед запуском): только после него новые файлы копии могут быть его |
+| `promoteReturnedAt?` | когда `promote` вернулся: с этой минуты считаются ошибки кандидата |
+| `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` \| `abandoned` (замок потерян посреди выкатки или её задача умерла) |
+| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` \| `main_copy_changed` \| `lock_lost` \| `unconfirmed_version` |
+| `rollbackCause`, `rollbackReason`, `rollbackAttempts`, `nextRollbackAt?` | почему откатывал (в том числе `current_unavailable`, `reverted`, `main_copy_changed`), сколько законченных попыток (не больше 3) и когда следующая |
+| `rollbackLaunches?` | все запуски `rollback`, и прерванные падением врача; записывается до запуска, не больше 6 |
+| `mainCopyChange?` | чем рабочая копия основной ветки разошлась со снимком во время отката |
+| `healthyAfterRollback`, `healthAfterRollback` | здоровье после отката |
+| `supersededBy`, `confirmFailed`, `detail` | версия человека, сбой `confirm`, хвост вывода для отчёта |
+| `abandonedBy?` | какая выкатка сняла замок этой, когда её задача умерла |
+
+Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую. В том же индексе `abandonedVersions` — кандидаты брошенных выкаток (задача умерла или замок потерян), успевших записать намерение `promote`: такая версия не считается прежней, пока владелец её не подтвердит (`deploys confirm`).
+
+### ErrorHour — ошибки приложения по часам (документ `remontnik.error-hour/<app>/<YYYY-MM-DDTHH>`)
+
+`{ minutes: { [минута]: число }, fingerprints: { [fp]: { count, lastAt } }, overflow }` — не больше 200 отпечатков в часе. Пишется книгой случаев вместе с приёмом события. Из него — уровень ошибок до выкатки (больший из «последний час» и «сутки / 24») и известные за 7 дней отпечатки.
+
+Список записанных часов приложения — `remontnik.error-hour-index/<app>`: `{ hours: ["YYYY-MM-DDTHH"], seeded?: true }`. Когда начинается новый час, часы старше 8 дней от самого нового удаляются в той же записи; запоздавшее событие старше этого срока не считается. Часы, записанные до появления списка, врач один раз на приложение находит перебором за 60 дней, вносит в список и удаляет старые; после этого в списке `seeded: true`.
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 
@@ -147,7 +171,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### Controls (документ `remontnik.controls`)
 
-`{ autoDeploy: "on" | "stopped", stoppedBy?, stoppedAt? }`.
+`{ autoDeploy: "on" | "stopped", stoppedBy?, stoppedAt? }`. Меняется командой `remontnik-doctor deploys stop|resume` и подписанным `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`; состояние видно в `/health` (`autoDeploy`).
 
 ### Report — отчёт (документ `remontnik.report/<reportId>`)
 
@@ -158,7 +182,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `type` | `case_received` \| `cause_found` \| `fix_ready` \| `deployed` \| `rolled_back` \| `not_helped` \| `needs_human` \| `no_cause_found` \| `budget_reached` \| `stand_broken` \| `doctor_problem` \| `handed_off` \| `paseo_done` \| `reclaimed` |
 | `short` | string ≤ 1000 (для Telegram) |
 | `full` | Markdown |
-| `screenshots` | пути к снимкам браузера? |
+| `screenshots` | пути к снимкам браузера?, не больше 10 |
 | `telegram` | `{ state: "pending" | "sent" | "failed" | "not_needed", attempts, messageId? }`; `not_needed` — только для журнала и Paseo (например, `case_received`: о сбое владелец уже узнал от сторожа) |
 | `createdAt` | время |
 

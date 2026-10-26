@@ -42,6 +42,12 @@ describe('настройка запуска из окружения', () => {
     expect(plan.runner).toMatchObject({ image: testRemontnikConfig().workbench.image, homesDir: '/srv/remontnik/state/homes' })
   })
 
+  it('секрет владельца — из REMONTNIK_CONTROL_SECRET; не задан — его нет; совпадает с общим — отказ', () => {
+    expect(doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: ' owner-test-secret ' }), testRemontnikConfig()).service.controlSecret).toBe('owner-test-secret')
+    expect(doctorStartPlan(serverEnv(), testRemontnikConfig()).service.controlSecret).toBeUndefined()
+    expect(() => doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: 'shared-test-secret' }), testRemontnikConfig())).toThrow(/REMONTNIK_CONTROL_SECRET/)
+  })
+
   it('приём событий на явном адресе', () => {
     expect(doctorStartPlan(serverEnv({ REMONTNIK_LISTEN_NETWORK: undefined, REMONTNIK_LISTEN: '10.5.0.3:7800' }), testRemontnikConfig()).listen).toEqual({ host: '10.5.0.3', port: 7800 })
   })

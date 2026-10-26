@@ -10,7 +10,10 @@ import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../in
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { confirmAbandonedVersion } from '../deployer/index.js'
+import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
+import { createControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
@@ -23,6 +26,8 @@ import { openDoctorHarness } from './harness.js'
 export interface DoctorServiceOptions {
   stateDir: string
   sharedSecret: string
+  /** Секрет владельца: только им можно снова пустить выкатки после стоп-крана. */
+  controlSecret?: string
   listen: { host: string; port: number }
   telegram: { botToken: string; chatId: string; apiBaseUrl?: string; proxyToken?: string }
   /** Лента отчётов (R13). Не задана — адресов `/v1/reports*` нет. */
@@ -119,6 +124,9 @@ function describeError(error: unknown): string {
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
+  if (options.controlSecret !== undefined && options.controlSecret === options.sharedSecret) {
+    throw new Error('[remontnik] секрет владельца (REMONTNIK_CONTROL_SECRET) совпадает с общим секретом')
+  }
   const log = options.log ?? ((line: string) => console.error(line))
   const exit = options.exit ?? ((code: number) => process.exit(code))
   const now = options.now ?? Date.now
@@ -168,7 +176,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
-  const caseBook = createCaseBook(opened.records)
+  const caseBook = createCaseBook(opened.records, { now })
   const reports = createReports({
     store: opened.records,
     telegram: { client: telegram, chatId: options.telegram.chatId },
@@ -248,13 +256,25 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   }
 
   const feed = options.reportsFeed
+  const controls = createControls(opened.records)
   let intake: IntakeServer
   try {
     intake = await startIntakeServer({
       handler: createIntakeHandler({
         secret: options.sharedSecret,
         receiveEvents,
-        health: () => ({ ok: harnessState === 'open', harness: harnessState, autoDeploy: 'on' }),
+        health: async () => ({
+          ok: harnessState === 'open',
+          harness: harnessState,
+          // Хранилище отказало — состояние стоп-крана неизвестно, но /health всё равно отвечает.
+          autoDeploy: await controls.read().then((read) => read.autoDeploy, () => 'unknown'),
+        }),
+        deployControls: createDeployControlsHandler({
+          controls,
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+          confirmVersion: (version) => confirmAbandonedVersion(opened.records, version),
+        }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),
       host: options.listen.host,

@@ -56,7 +56,7 @@ export class SpoiledCopyError extends Error {
 
 const OUTPUT_TAIL_BYTES = 64 * 1024
 
-interface SpawnSpec {
+export interface SpawnSpec {
   file: string
   args: string[]
   cwd: string
@@ -64,7 +64,7 @@ interface SpawnSpec {
 }
 
 /** `onKill` — дополнительная остановка (контейнер по имени); итог ждёт её, `false` — команда, возможно, ещё идёт. */
-function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0, onKill?: () => Promise<boolean>): Promise<RunResult> {
+export function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0, onKill?: () => Promise<boolean>): Promise<RunResult> {
   return new Promise((resolve) => {
     let output = ''
     let timedOut = false

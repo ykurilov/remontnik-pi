@@ -100,6 +100,8 @@ export interface ChecksInput {
   baseDir: string
   baseCommit: string
   changedPaths: readonly string[]
+  /** Правку может проверить только eval (плохой ответ бота): нет сценариев по карте — eval «не запускался», а не «не нужен». */
+  evalRequired?: boolean
   /**
    * Бронирует деньги на eval и возвращает долю. Зовётся прямо перед первым запуском eval;
    * eval не дошёл до запуска — брони нет.
@@ -345,12 +347,18 @@ export function createChecks(options: ChecksOptions) {
 
   async function runEvalChecks(input: ChecksInput, tests: TestsOutcome, services: Services): Promise<EvalOutcome> {
     const evalConfig = config.checks.eval
-    if (!evalConfig) return { status: 'not_needed', scenarios: [], costUsd: 0 }
+    if (!evalConfig) {
+      return input.evalRequired ? { status: 'not_run', scenarios: [], costUsd: 0, note: 'eval в настройке не задан' } : { status: 'not_needed', scenarios: [], costUsd: 0 }
+    }
     const selection = selectEvalScenarios(
       { evalScope: config.evalScope, closedPaths: config.closedPaths, maxScenarios: evalConfig.maxScenarios },
       input.changedPaths,
     )
-    if (selection.status === 'not_needed') return { status: 'not_needed', scenarios: [], costUsd: 0 }
+    if (selection.status === 'not_needed') {
+      return input.evalRequired
+        ? { status: 'not_run', scenarios: [], costUsd: 0, note: 'карта evalScope не даёт сценариев для изменённых путей' }
+        : { status: 'not_needed', scenarios: [], costUsd: 0 }
+    }
     const truncated = selection.truncated ? { truncated: true } : {}
     if (tests.status !== 'green') return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'тесты не зелёные' }
     const touched = input.changedPaths.filter((path) => isRunnerConfigOrEvalPath(path))

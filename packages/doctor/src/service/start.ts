@@ -95,6 +95,10 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const proxyToken = telegram.proxyTokenEnv ? env[telegram.proxyTokenEnv]?.trim() : undefined
   const model = createDoctorModels(env)
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
+  const sharedSecret = required(env, 'REMONTNIK_SHARED_SECRET')
+  // Секрет владельца снимает стоп-кран выкаток: утечка общего секрета не должна давать того же.
+  const controlSecret = env.REMONTNIK_CONTROL_SECRET?.trim() || undefined
+  if (controlSecret === sharedSecret) throw new Error('REMONTNIK_CONTROL_SECRET совпадает с REMONTNIK_SHARED_SECRET: нужен отдельный секрет владельца')
 
   return {
     listen,
@@ -107,7 +111,8 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
     },
     service: {
       stateDir,
-      sharedSecret: required(env, 'REMONTNIK_SHARED_SECRET'),
+      sharedSecret,
+      ...(controlSecret ? { controlSecret } : {}),
       telegram: {
         botToken: required(env, telegram.botTokenEnv),
         chatId: required(env, chatIdEnv),

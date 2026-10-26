@@ -123,6 +123,24 @@ describe('книга случаев', () => {
     expect((await book.openCaseFor(result.newCases[0]!.fingerprint, 'shop'))?.caseId).toBe(2)
   })
 
+  it('плохой ответ: случай хранит выдержку и пояснение первого события', async () => {
+    const book = createCaseBook(createMemoryRecordStore())
+    const badAnswer = { conversationId: 'talk-1', messageIndex: 1, category: 'fabrication', excerpt: 'Тариф «Макс» стоит 5990 ₽.', explanation: 'Тарифа нет.', confidence: 0.9 }
+    const first = createIncidentEvent({ appName: 'patient', kind: 'bad_answer', where: 'цены тарифов', message: 'выдумка: цены тарифов', badAnswer, occurredAt: new Date(start) })
+    const again = createIncidentEvent({ appName: 'patient', kind: 'bad_answer', where: 'цены тарифов', message: 'выдумка: цены тарифов', badAnswer: { ...badAnswer, conversationId: 'talk-2' }, occurredAt: new Date(start + 1000) })
+
+    await book.recordEvents([first, again])
+
+    expect((await book.getCase(1))?.badAnswer).toEqual(badAnswer)
+    expect((await book.getCase(1))?.events).toBe(2)
+  })
+
+  it('обычный сбой — без badAnswer', async () => {
+    const book = createCaseBook(createMemoryRecordStore())
+    await book.recordEvents([event('order 1 failed')])
+    expect((await book.getCase(1))?.badAnswer).toBeUndefined()
+  })
+
   it('склеенные сторожем повторы (context.repeats) входят в счётчик', async () => {
     const book = createCaseBook(createMemoryRecordStore())
     const collapsed = { ...event('order 1 failed'), context: { processName: 'web', repeats: 4 } }

@@ -5,19 +5,21 @@ import { describeCase } from '../treatment/tools.js'
 // а не в системном промпте (R3: кэш модели).
 
 export function diagnoseMessage(info: TreatmentCaseInfo): string {
-  return [
-    'В рабочем приложении сбой. Найди причину по коду копии и заверши этап вызовом finish_diagnosis.',
-    '',
-    describeCase(info),
-  ].join('\n')
+  const task =
+    info.kind === 'bad_answer'
+      ? 'Бот приложения дал пользователю плохой ответ. Найди место промпта или кода бота, из-за которого так вышло, и заверши этап вызовом finish_diagnosis.'
+      : 'В рабочем приложении сбой. Найди причину по коду копии и заверши этап вызовом finish_diagnosis.'
+  return [task, '', describeCase(info)].join('\n')
 }
 
-export function fixMessage(diagnosis: Diagnosis): string {
-  return [
-    'Причина найдена. Исправь её небольшой правкой и добавь тест, который ловит этот сбой.',
-    'Прогони тесты, затем заверши этап вызовом finish_fix.',
-    '',
-    `Причина: ${diagnosis.cause}`,
-    ...(diagnosis.fixPlan ? [`План: ${diagnosis.fixPlan}`] : []),
-  ].join('\n')
+export function fixMessage(diagnosis: Diagnosis, info: TreatmentCaseInfo): string {
+  const task =
+    info.kind === 'bad_answer'
+      ? [
+          'Причина найдена. Исправь промпт или код бота небольшой правкой.',
+          'Правку проверят сценарии eval по карте промптов; существующие сценарии и тесты не меняй. Тест добавь, если ответ можно проверить без модели.',
+          'Заверши этап вызовом finish_fix.',
+        ]
+      : ['Причина найдена. Исправь её небольшой правкой и добавь тест, который ловит этот сбой.', 'Прогони тесты, затем заверши этап вызовом finish_fix.']
+  return [...task, '', `Причина: ${diagnosis.cause}`, ...(diagnosis.fixPlan ? [`План: ${diagnosis.fixPlan}`] : [])].join('\n')
 }

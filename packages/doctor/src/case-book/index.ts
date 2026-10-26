@@ -1,5 +1,6 @@
-import type { IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
+import type { BadAnswer, IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
+import { countErrorIn, seedErrorHourIndex } from './error-hours.js'
 
 // Книга случаев: события склеиваются по приложению и отпечатку в один открытый случай.
 
@@ -43,6 +44,8 @@ export interface Case {
   where: string
   message: string
   stack: string
+  /** Плохой ответ бота (`bad_answer`): выдержка и пояснение сторожа из первого события. */
+  badAnswer?: BadAnswer
   events: number
   firstSeenAt: string
   lastSeenAt: string
@@ -87,8 +90,16 @@ function occurrences(event: IncidentEvent): number {
   return 1 + (typeof repeats === 'number' && Number.isInteger(repeats) && repeats > 0 ? repeats : 0)
 }
 
-export function createCaseBook(store: RecordStore): CaseBook {
+export interface CaseBookOptions {
+  /** Часы врача: время записи событий. */
+  now?: () => number
+}
+
+export function createCaseBook(store: RecordStore, options: CaseBookOptions = {}): CaseBook {
+  const now = options.now ?? Date.now
   const caseKey = (caseId: number) => String(caseId)
+  /** Приложения, чьи старые часы ошибок уже внесены в список (`seedErrorHourIndex`). */
+  const seededApps = new Set<string>()
 
   async function updateCase(caseId: number, change: (opened: Case) => void, onIndex?: (index: CaseIndex, opened: Case) => void) {
     return store.transaction(async (tx) => {
@@ -106,6 +117,13 @@ export function createCaseBook(store: RecordStore): CaseBook {
       for (const event of events) {
         if (Number.isNaN(Date.parse(event.occurredAt))) throw new Error(`событие ${event.eventId}: неверное время ${event.occurredAt}`)
       }
+      // Опорное время учёта часов — время записи, а не время событий: его пишет сторож, и часы у него бывают неверные.
+      const recordedAt = new Date(now())
+      for (const event of events) {
+        if (seededApps.has(event.appName)) continue
+        await seedErrorHourIndex(store, event.appName, recordedAt)
+        seededApps.add(event.appName)
+      }
       return store.transaction(async (tx) => {
         const index = await tx.doc<CaseIndex>(INDEX.collection, INDEX.key, emptyIndex())
         const recent = new Set(index.recentEventIds)
@@ -116,6 +134,7 @@ export function createCaseBook(store: RecordStore): CaseBook {
           if (recent.has(event.eventId)) continue
           recent.add(event.eventId)
           index.recentEventIds.push(event.eventId)
+          await countErrorIn(tx, event, occurrences(event), recordedAt)
 
           const key = openKey(event.appName, event.fingerprint)
           const openId = index.open[key]
@@ -144,6 +163,7 @@ export function createCaseBook(store: RecordStore): CaseBook {
             where: event.where,
             message: event.message,
             stack: event.stack,
+            ...(event.badAnswer ? { badAnswer: { ...event.badAnswer } } : {}),
             events: occurrences(event),
             firstSeenAt: event.occurredAt,
             lastSeenAt: event.occurredAt,

@@ -107,6 +107,22 @@ describe('POST /v1/events', () => {
     expect(received).toHaveLength(0)
   })
 
+  it('событие из будущего дальше допуска часов подписи записывается временем приёма; в пределах допуска — как есть', async () => {
+    const at = (offsetMs: number) =>
+      createIncidentEvent({ appName: 'patient', kind: 'crash', where: 'src/server.ts:1:1', message: 'boom', occurredAt: new Date(Date.now() + offsetMs) })
+    const skewed = at(60_000)
+    const future = at(60 * 60_000)
+    const body = JSON.stringify({ events: [event(), skewed, future] })
+    const before = Date.now()
+    const response = await post(body, signBody(body, secret))
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ accepted: [expect.any(String), skewed.eventId, future.eventId] })
+    const [, keptSkewed, clamped] = received[0]!
+    expect(keptSkewed!.occurredAt).toBe(skewed.occurredAt)
+    expect(Date.parse(clamped!.occurredAt)).toBeGreaterThanOrEqual(before)
+    expect(Date.parse(clamped!.occurredAt)).toBeLessThanOrEqual(Date.now())
+  })
+
   it('слишком большое тело без Content-Length — 413 по ходу чтения, соединение закрыто', async () => {
     const body = JSON.stringify({ events: [], padding: 'x'.repeat(2 * 1024 * 1024) })
 

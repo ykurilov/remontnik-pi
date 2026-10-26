@@ -155,18 +155,18 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T063 [P] [US3] Тест порядка выкатки `packages/doctor/src/deployer/deploy-sequence.test.ts`: замок → `current` → метка на прежней версии → `build` → `promote` → `current` = кандидат → `health`; без прежней сборки — отказ; сбой после `promote` → `rollback`
-- [ ] T064 [P] [US3] Тест наблюдения `packages/doctor/src/deployer/observer.test.ts` (подменённые часы): 3 провала здоровья, рост частоты ошибок выше множителя и порога, новые отпечатки → откат; тот же отпечаток без ухудшения → `not_helped`; смена `current` → `superseded_by_human`
-- [ ] T065 [P] [US3] Тест замка выкатки `packages/doctor/src/deployer/lock.test.ts`: одна выкатка на приложение; ручная выкатка держит замок — врач ждёт
-- [ ] T066 [P] [US3] Тест стоп-крана `packages/doctor/src/ledgers/controls.test.ts`: стоп блокирует выкатку; команда и HTTP с подписью
+- [X] T063 [P] [US3] Тест порядка выкатки `packages/doctor/src/deployer/deploy-sequence.test.ts`: замок → `current` → метка на прежней версии → `build` → `promote` → `current` = кандидат → `health`; без прежней сборки — отказ; сбой после `promote` → `rollback`
+- [X] T064 [P] [US3] Тест наблюдения `packages/doctor/src/deployer/observer.test.ts` (подменённые часы): 3 провала здоровья, рост частоты ошибок выше множителя и порога, новые отпечатки → откат; тот же отпечаток без ухудшения → `not_helped`; смена `current` → `superseded_by_human`
+- [X] T065 [P] [US3] Тест замка выкатки `packages/doctor/src/deployer/lock.test.ts`: одна выкатка на приложение; ручная выкатка держит замок — врач ждёт
+- [X] T066 [P] [US3] Тест стоп-крана `packages/doctor/src/ledgers/controls.test.ts`: стоп блокирует выкатку; команда и HTTP с подписью
 
 ### Реализация
 
-- [ ] T067 [P] [US3] Запуск команд приложения и файл-замок в `packages/doctor/src/deployer/`
-- [ ] T068 [US3] Наблюдение с `runtime.sleepUntil` и уровнем ошибок до выкатки из книги случаев в `packages/doctor/src/deployer/observer.ts`
-- [ ] T069 [US3] Стоп-кран: документ `remontnik.controls`, `POST /v1/control/deploys`, команды `deploys stop|resume` в `packages/doctor/src/ledgers/controls.ts`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
+- [X] T067 [P] [US3] Запуск команд приложения и файл-замок в `packages/doctor/src/deployer/`
+- [X] T068 [US3] Наблюдение с `runtime.sleepUntil` и уровнем ошибок до выкатки из книги случаев в `packages/doctor/src/deployer/observer.ts`
+- [X] T069 [US3] Стоп-кран: документ `remontnik.controls`, `POST /v1/control/deploys`, команды `deploys stop|resume` в `packages/doctor/src/ledgers/controls.ts`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
 - [ ] T070 [US3] Фазы `deploying` → `observing` → `healed` | `rolled_back` | `not_helped`; после окна — слияние в основную ветку или запрос на слияние по `repo.mainline` через git-замок, в `packages/doctor/src/treatment/`
-- [ ] T071 [US3] Отчёты `deployed`, `rolled_back`, `not_helped` (поле снимков экрана) в `packages/doctor/src/reports/texts.ts`
+- [X] T071 [US3] Отчёты `deployed`, `rolled_back`, `not_helped` (поле снимков экрана) в `packages/doctor/src/reports/texts.ts`
 - [ ] T072 [US3] Интеграционный тест `apps/patient/test/cycle/us3-deploy.test.ts`: crash до `healed` с меткой и прежней сборкой; worse → откат меньше чем за минуту; no-git; stop
 
 **Контрольная точка**: P1 закрыт — самолечение работает целиком на «Пациенте».
@@ -190,7 +190,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 - [X] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
 - [X] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
-- [ ] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
+- [X] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
 - [X] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
 
 ---

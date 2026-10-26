@@ -60,7 +60,9 @@ describe('defineRemontnikConfig', () => {
       errorRateFactor: 3,
       minErrorsToRollback: 5,
       newFingerprintsToRollback: 3,
+      healthWindowTicks: 5,
     })
+    expect(config.deploy).toMatchObject({ buildEnv: [], lockWaitReportMinutes: 30 })
     expect(config.limits).toMatchObject({
       modelUsdPerDay: 5,
       evalUsdPerDay: 5,
@@ -70,6 +72,13 @@ describe('defineRemontnikConfig', () => {
       maxDiffFiles: 15,
     })
     expect(config.handoff).toEqual({ mode: 'self' })
+  })
+
+  it('deploy.buildEnv: только имена переменных; переменные врача REMONTNIK_ сборке не передаются', () => {
+    const withEnv = (buildEnv: string[]) => ({ ...minimalConfig(), deploy: { ...minimalConfig().deploy, buildEnv } })
+    expect(defineRemontnikConfig(withEnv(['NODE_ENV', 'APP_DIR'])).deploy.buildEnv).toEqual(['NODE_ENV', 'APP_DIR'])
+    expect(errorOf(() => defineRemontnikConfig(withEnv(['REMONTNIK_SHARED_SECRET']))).issues.some((issue) => issue.startsWith('deploy.buildEnv'))).toBe(true)
+    expect(errorOf(() => defineRemontnikConfig(withEnv(['A=B']))).issues.some((issue) => issue.startsWith('deploy.buildEnv'))).toBe(true)
   })
 
   it('fixablePaths: по умолчанию src/**, можно свои, пустой список — ошибка', () => {

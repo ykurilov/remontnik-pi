@@ -32,6 +32,25 @@ describe('записи врача на документах pi-durable', () => {
     await second.close()
   })
 
+  it('удалённый документ пропадает и после переоткрытия; его можно создать заново', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'remontnik-records-'))
+    const first = await openDoctorHarness({ stateDir, onReport: () => {} })
+    await first.records.transaction(async (tx) => {
+      await tx.doc('error-hour', 'patient/2026-10-15T10', { minutes: {} })
+    })
+    await first.records.transaction((tx) => tx.retire('error-hour', 'patient/2026-10-15T10'))
+    expect(await first.records.read('error-hour', 'patient/2026-10-15T10')).toBeUndefined()
+    await first.close()
+
+    const second = await openDoctorHarness({ stateDir, onReport: () => {} })
+    expect(await second.records.read('error-hour', 'patient/2026-10-15T10')).toBeUndefined()
+    await second.records.transaction(async (tx) => {
+      await tx.doc('error-hour', 'patient/2026-10-15T10', { minutes: { '1': 1 } })
+    })
+    expect(await second.records.read('error-hour', 'patient/2026-10-15T10')).toEqual({ minutes: { '1': 1 } })
+    await second.close()
+  })
+
   it('незнакомая коллекция — ошибка, а не тихая потеря', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'remontnik-records-'))
     const opened = await openDoctorHarness({ stateDir, onReport: () => {} })
