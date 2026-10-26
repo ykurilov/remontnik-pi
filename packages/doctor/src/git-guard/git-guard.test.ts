@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -190,6 +190,23 @@ describe('git-замок', () => {
     expect(existsSync(path)).toBe(false)
   })
 
+  it('копию с закрытыми правами (папки 000) удаляет целиком, следующий fresh не падает', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const base = await guard.resolve('HEAD')
+    const path = join(r.worktreesDir, 'case-2-candidate')
+    await guard.addWorktree({ path, base, fresh: true })
+    const locked = join(path, 'build', 'cache')
+    mkdirSync(locked, { recursive: true })
+    writeFileSync(join(locked, 'x.bin'), 'x')
+    chmodSync(locked, 0o000)
+    chmodSync(join(path, 'build'), 0o500)
+    await guard.addWorktree({ path, base, fresh: true })
+    expect(existsSync(join(path, 'build'))).toBe(false)
+    await guard.removeWorktree(path)
+    expect(existsSync(path)).toBe(false)
+  })
+
   it('изменённые файлы правки: статус, строки, дифф, режим', async () => {
     const r = repo()
     const guard = guardFor(r)
@@ -279,6 +296,18 @@ describe('git-замок: выход из копии через .git', () => {
     writeFileSync(join(nested, 'x.txt'), 'y\n')
     const error = await rejection(guard.commitAll(path, 'правка'))
     expect(error.code).toBe('escape')
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('вложенный репозиторий в node_modules — тоже «escape»', async () => {
+    const r = repo()
+    const { marker, hook } = trap(r)
+    const { guard, path } = await copyOf(r)
+    const nested = join(path, 'node_modules', 'evil')
+    mkdirSync(nested, { recursive: true })
+    git(nested, 'init', '--quiet')
+    git(nested, 'config', 'core.fsmonitor', hook)
+    expect((await rejection(guard.commitAll(path, 'правка'))).code).toBe('escape')
     expect(existsSync(marker)).toBe(false)
   })
 

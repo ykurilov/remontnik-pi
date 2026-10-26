@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { ChangedFile } from '../changed-files/index.js'
@@ -204,6 +204,27 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
   }
 }
 
+/**
+ * `chmod -R u+rwx` без перехода по ссылкам: команды в копии могли закрыть папки (режим 000), и тогда удаление
+ * копии падает на полпути, а следующая проверочная копия на том же месте не создаётся.
+ */
+function restoreOwnerAccess(path: string): void {
+  let stat
+  try {
+    stat = lstatSync(path)
+  } catch {
+    return
+  }
+  if (stat.isSymbolicLink()) return
+  try {
+    chmodSync(path, (stat.mode & 0o7777) | 0o700)
+  } catch {
+    return
+  }
+  if (!stat.isDirectory()) return
+  for (const name of readdirSync(path)) restoreOwnerAccess(join(path, name))
+}
+
 export function createGitGuard(options: GitGuardOptions): GitGuard {
   const remote = options.remote ?? 'origin'
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -377,11 +398,15 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
   async function removeCopy(path: string): Promise<void> {
     const real = canonical(path)
     if (real === canonical(worktreesDir) || !inside(canonical(worktreesDir), real)) throw new GitGuardError('forbidden', 'git-замок: удалять можно только свои копии')
+    restoreOwnerAccess(path)
     rmSync(path, { recursive: true, force: true })
     await run(['worktree', 'prune'])
   }
 
-  /** Есть ли в рабочем дереве `.git` кроме указателя копии: вложенный репозиторий со своим конфигом. */
+  /**
+   * Есть ли в рабочем дереве `.git` кроме указателя копии: вложенный репозиторий со своим конфигом.
+   * Смотрит везде, и в `node_modules` тоже: законному `.git` внутри копии взяться неоткуда.
+   */
   function nestedGitDirs(copyRoot: string): string[] {
     const found: string[] = []
     const walk = (dir: string, depth: number) => {
@@ -395,7 +420,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       for (const entry of entries) {
         const path = join(dir, entry.name)
         if (entry.name === '.git' && dir !== copyRoot) found.push(relative(copyRoot, path))
-        else if (entry.isDirectory() && entry.name !== '.git' && entry.name !== 'node_modules') walk(path, depth + 1)
+        else if (entry.isDirectory() && entry.name !== '.git') walk(path, depth + 1)
       }
     }
     walk(copyRoot, 0)
