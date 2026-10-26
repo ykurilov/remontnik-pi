@@ -1,4 +1,4 @@
-import type { IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
+import type { BadAnswer, IncidentEvent, IncidentKind } from '@ykurilov/remontnik-core/incident'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
 import { countErrorIn, seedErrorHourIndex } from './error-hours.js'
 
@@ -44,6 +44,8 @@ export interface Case {
   where: string
   message: string
   stack: string
+  /** Плохой ответ бота (`bad_answer`): выдержка и пояснение сторожа из первого события. */
+  badAnswer?: BadAnswer
   events: number
   firstSeenAt: string
   lastSeenAt: string
@@ -161,6 +163,7 @@ export function createCaseBook(store: RecordStore, options: CaseBookOptions = {}
             where: event.where,
             message: event.message,
             stack: event.stack,
+            ...(event.badAnswer ? { badAnswer: { ...event.badAnswer } } : {}),
             events: occurrences(event),
             firstSeenAt: event.occurredAt,
             lastSeenAt: event.occurredAt,

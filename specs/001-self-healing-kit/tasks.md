@@ -139,9 +139,9 @@ description: "Задачи реализации Ремонтника Pi"
 - [X] T057 [P] [US4] Осмотр диффа в `packages/doctor/src/diff-inspector/`
 - [X] T058 [US4] Решение о выкатке — чистая функция в `packages/doctor/src/deploy-gate/`
 - [X] T059 [US4] Источник настройки в `packages/doctor/src/service/config-source.ts`
-- [ ] T060 [US4] Фаза `gated` в задаче лечения; отчёты `report_only` и `needs_human`; при причине в SDK — готовый текст задачи для агента SDK, в `packages/doctor/src/treatment/`
+- [X] T060 [US4] Фаза `gated` в задаче лечения; отчёты `report_only` и `needs_human`; при причине в SDK — готовый текст задачи для агента SDK, в `packages/doctor/src/treatment/`
 - [X] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
-- [ ] T062 [US4] Интеграционный тест `apps/patient/test/cycle/us4-forbidden.test.ts`: сценарии money, test-edit, «причина в SDK»
+- [X] T062 [US4] Интеграционный тест `apps/patient/test/cycle/us4-forbidden.test.ts`: сценарии money, test-edit, «причина в SDK»
 
 **Контрольная точка**: замки на месте и проверены — можно строить выкатку.
 
@@ -190,7 +190,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 - [X] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
 - [X] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
-- [ ] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
+- [X] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
 - [X] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
 
 ---
