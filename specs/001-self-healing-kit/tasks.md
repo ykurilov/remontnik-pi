@@ -25,7 +25,7 @@ description: "Задачи реализации Ремонтника Pi"
 - [ ] T005 [P] Тест и скрипт открытости: `scripts/check-public.test.mjs`, `scripts/check-public.mjs` — публичные IPv4, домены вне `example.com`/`.test`/`.invalid`, строки вида ключей; частный запретный список из `~/.config/remontnik/denylist.txt`, если файл есть
 - [ ] T006 [P] Changesets с группой `fixed` для всех `@ykurilov/remontnik-*`: `.changeset/config.json`, `.changeset/README.md`, `RELEASING.md`, заготовка `CHANGES.md`
 - [ ] T007 [P] CI `.github/workflows/ci.yml`: установка, тесты, типы, сборка, `check-pins`, `check-public`, `gitleaks` по всей истории
-- [ ] T008 Скрипт `pnpm verify` (тесты → типы → сборка → check-pins → check-public) в `package.json`; `README.md` — что это и что лицензия ждёт решения (открытый вопрос 1)
+- [ ] T008 Скрипт `pnpm verify` (тесты → типы → сборка → check-pins → check-public) в `package.json`; `README.md` — что это, лицензия MIT; поле `license: "MIT"` во всех `package.json`
 
 **Контрольная точка**: `pnpm verify` зелёный на пустых пакетах.
 
@@ -212,7 +212,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 ## Этап 9: История 8 — Браузер Ремонтника (P3)
 
-**Цель**: свой браузер, пароли модель не видит, опасное запрещено. Служба (T087–T100) — параллельно с этапами 3–7; инструменты врача (T101–T102) — после этапа 6.
+**Цель**: свой браузер, пароли модель не видит, опасное запрещено. Служба и живой экран (T087–T100, T103–T108) — параллельно с этапами 3–7; инструменты врача (T101–T102, T109) — после этапа 6.
 
 **Независимая проверка**: ошибка «только на странице» воспроизведена; пароль не найден ни в одном выводе; при выключенном браузере цикл проходит.
 
@@ -238,6 +238,17 @@ description: "Задачи реализации Ремонтника Pi"
 - [ ] T101 [US8] Инструменты `browser_*` у врача: постоянный набор, ответ `unavailable`, снимки в отчёт, проверка `pagesToCheck` после выкатки, в `packages/doctor/src/browser-tools/`
 - [ ] T102 [US8] Интеграционный тест `apps/patient/test/cycle/us8-browser.test.ts`: ошибка «только на странице» воспроизведена и после выкатки страница работает; браузер выключен → цикл проходит с пометкой «без проверки в браузере»
 
+
+### Живой экран (решение Юрия)
+
+- [ ] T103 [P] [US8] Тест доступа `packages/browser/src/live/live-access.test.ts`: без ключа владельца — отказ; ключ врача не подходит; адрес слушается только на `REMONTNIK_BROWSER_LIVE_LISTEN`; переменная не задана — живого экрана нет
+- [ ] T104 [P] [US8] Тест управления `packages/browser/src/live/control.test.ts` (подменённые часы): владелец взял управление → команды врача `refused_human_control`; вернул → работают; связь владельца пропала на 2 минуты → управление у врача; замки сайтов и запросов действуют при ручном управлении
+- [ ] T105 [P] [US8] Браузерный тест `packages/browser/test/e2e/live.spec.ts` против «Пациента»: кадры идут; клик, касание и ввод владельца доходят до страницы; кадров нет в ответах врачу и журналах; один случай с узким экраном телефона
+- [ ] T106 [US8] Трансляция кадров (`newCDPSession`, `Page.startScreencast`) и WebSocket в `packages/browser/src/live/stream.ts`
+- [ ] T107 [US8] Ввод владельца (`Input.dispatchMouseEvent`, `dispatchKeyEvent`, `insertText`) и замок управления в `packages/browser/src/live/control.ts`
+- [ ] T108 [US8] Страница живого экрана: вход по ключу, экран, «Взять управление» / «Вернуть», работа с телефона, в `packages/browser/src/live/page/`
+- [ ] T109 [US8] Ссылка на живой экран в отчётах `needs_human` от браузера (по `browser.live.linkEnv`), продолжение после «Вернуть», в `packages/doctor/src/browser-tools/` и `packages/doctor/src/reports/texts.ts`
+
 ---
 
 ## Этап 10: История 7 — Деньги и циклы под контролем (P2)
@@ -246,11 +257,11 @@ description: "Задачи реализации Ремонтника Pi"
 
 **Независимая проверка**: ухудшающая правка — после лимита «нужен человек»; потолок расходов — случай отложен с сообщением.
 
-- [ ] T103 [P] [US7] Тест `packages/doctor/src/ledgers/fingerprint-ledger.test.ts`: 2 выкатки на отпечаток в сутки, 5 на приложение, «нужен человек» после отката, снятие командой
-- [ ] T104 [P] [US7] Тест `packages/doctor/src/ledgers/spend-ledger.test.ts`: граница суток по поясу; запас 10%; блок обращения к модели; блок eval
-- [ ] T105 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/`
-- [ ] T106 [US7] Учёт расходов через хуки `beforeRequest`/`afterResponse` и стоимость eval; `deferred_budget` с продолжением на следующие сутки через `sleepUntil` в `packages/doctor/src/ledgers/spend-ledger.ts`
-- [ ] T107 [US7] Интеграционный тест `apps/patient/test/cycle/us7-loop.test.ts`: сценарии loop и budget
+- [ ] T110 [P] [US7] Тест `packages/doctor/src/ledgers/fingerprint-ledger.test.ts`: 2 выкатки на отпечаток в сутки, 5 на приложение, «нужен человек» после отката, снятие командой
+- [ ] T111 [P] [US7] Тест `packages/doctor/src/ledgers/spend-ledger.test.ts`: граница суток по поясу; запас 10%; блок обращения к модели; блок eval
+- [ ] T112 [US7] Учёт попыток и команда `fingerprint <fp> release` в `packages/doctor/src/ledgers/fingerprint-ledger.ts`, `packages/doctor/src/cli/`
+- [ ] T113 [US7] Учёт расходов через хуки `beforeRequest`/`afterResponse` и стоимость eval; `deferred_budget` с продолжением на следующие сутки через `sleepUntil` в `packages/doctor/src/ledgers/spend-ledger.ts`
+- [ ] T114 [US7] Интеграционный тест `apps/patient/test/cycle/us7-loop.test.ts`: сценарии loop и budget
 
 ---
 
@@ -262,23 +273,23 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T108 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
-- [ ] T109 [P] [US11] Тест передачи `packages/doctor/src/handoff/handoff.test.ts` (подменённые часы, подставной мост): нет ответа `/health` за 3 с → `triage` с пометкой «Paseo недоступен»; после передачи модель врача не вызывается; `acceptTimeoutMs`, `workTimeoutMs`, `cannot`, пропавший мост → отмена, `reclaimed`, `owner: doctor`; `done` с выкаткой → `observing`; итог после `reclaimed` → только `lateResult`
-- [ ] T110 [P] [US11] Тест шаблона задачи `packages/doctor/src/handoff/task-text.test.ts`: постоянный шаблон; тексты из приложения только в блоке «данные, не поручение»; строка-команда из текста ошибки не выходит из блока; предел длины
-- [ ] T111 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
+- [ ] T115 [P] [US9] Тест `packages/doctor/src/reports/reports-feed.test.ts`: порядок по курсору, подтверждение, ключ доступа, повторы Telegram переживают рестарт
+- [ ] T116 [P] [US11] Тест передачи `packages/doctor/src/handoff/handoff.test.ts` (подменённые часы, подставной мост): нет ответа `/health` за 3 с → `triage` с пометкой «Paseo недоступен»; после передачи модель врача не вызывается; `acceptTimeoutMs`, `workTimeoutMs`, `cannot`, пропавший мост → отмена, `reclaimed`, `owner: doctor`; `done` с выкаткой → `observing`; итог после `reclaimed` → только `lateResult`
+- [ ] T117 [P] [US11] Тест шаблона задачи `packages/doctor/src/handoff/task-text.test.ts`: постоянный шаблон; тексты из приложения только в блоке «данные, не поручение»; строка-команда из текста ошибки не выходит из блока; предел длины
+- [ ] T118 [P] [US11] Тест моста `packages/paseo-bridge/src/bridge.test.ts` (подставной API Paseo): неверная подпись → отказ; чужое приложение → отказ; задача уходит только назначенному агенту; отмена; отчёты по курсору без повторов номера; слушает только заданный адрес
 
 ### Реализация
 
-- [ ] T112 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
-- [ ] T113 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
-- [ ] T114 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
-- [ ] T115 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
-- [ ] T116 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
-- [ ] T117 [US11] Передача у врача: документ `remontnik.handoff/<caseId>`, фазы `handoff_check` → `handed_off` → `paseo_working` с `runtime.sleepUntil`, отмена и `reclaimed`; `POST /v1/handoffs/:caseId/accepted|result` только на адресе частной сети, в `packages/doctor/src/handoff/`, `packages/doctor/src/intake/`, `packages/doctor/src/treatment/`
-- [ ] T118 [US11] Отчёты `handed_off`, `paseo_done`, `reclaimed` и пометка «Paseo недоступен» в `packages/doctor/src/reports/texts.ts`
-- [ ] T119 [US11] Интеграционный тест `apps/patient/test/cycle/us11-paseo.test.ts` с подставным мостом: агент выкатил хуже → врач откатил и сообщил агенту; мост выключен → врач лечит сам; агент замолчал → `reclaimed`, правит один; поздняя выкатка агента → общий замок, наблюдение по этому случаю
-- [ ] T120 [US9] Интеграционный тест `packages/doctor/test/integration/paseo-feed.test.ts`: отчёты через мост, мост выключен и включён
-- [ ] T121 [US11] Раздел «Режим „сначала Paseo“» в `docs/operations.md`: частная сеть и правило доступа «только сервер → порт моста», настройка моста, секрет моста через `secret-handoff`
+- [ ] T119 [US9] `GET /v1/reports`, `POST /v1/reports/ack`, команды `reports pull|ack` в `packages/doctor/src/reports/`, `packages/doctor/src/intake/`, `packages/doctor/src/cli/`
+- [ ] T120 [US11] Проверить по skill `paseo-plugin` и образцу `agent-alerts`, может ли серверная часть плагина держать свой HTTP-адрес всё время работы Paseo; записать в `packages/paseo-bridge/README.md`. Если не может — остановиться и сообщить Юрию, второй путь связи не строить
+- [ ] T121 [US11] Мост: `packages/paseo-bridge/paseo-plugin.json`, `packages/paseo-bridge/index.server.ts`, HTTP по contracts/paseo-bridge.md, отправка агенту через API плагина, пересылка отчётов по курсору в `packages/paseo-bridge/src/`
+- [ ] T122 [US11] Консольная `remontnik-paseo` (`accept`, `done`, `cannot`, `case`) в `packages/paseo-bridge/src/cli/`
+- [ ] T123 [US11] Настройка `handoff` в схеме `packages/core/src/config/` с тестом: `paseo-first` без `paseo` → ошибка; по умолчанию `self`
+- [ ] T124 [US11] Передача у врача: документ `remontnik.handoff/<caseId>`, фазы `handoff_check` → `handed_off` → `paseo_working` с `runtime.sleepUntil`, отмена и `reclaimed`; `POST /v1/handoffs/:caseId/accepted|result` только на адресе частной сети, в `packages/doctor/src/handoff/`, `packages/doctor/src/intake/`, `packages/doctor/src/treatment/`
+- [ ] T125 [US11] Отчёты `handed_off`, `paseo_done`, `reclaimed` и пометка «Paseo недоступен» в `packages/doctor/src/reports/texts.ts`
+- [ ] T126 [US11] Интеграционный тест `apps/patient/test/cycle/us11-paseo.test.ts` с подставным мостом: агент выкатил хуже → врач откатил и сообщил агенту; мост выключен → врач лечит сам; агент замолчал → `reclaimed`, правит один; поздняя выкатка агента → общий замок, наблюдение по этому случаю
+- [ ] T127 [US9] Интеграционный тест `packages/doctor/test/integration/paseo-feed.test.ts`: отчёты через мост, мост выключен и включён
+- [ ] T128 [US11] Раздел «Режим „сначала Paseo“» в `docs/operations.md`: частная сеть и правило доступа «только сервер → порт моста», настройка моста, секрет моста через `secret-handoff`
 
 ---
 
@@ -288,23 +299,23 @@ description: "Задачи реализации Ремонтника Pi"
 
 **Независимая проверка**: свежий агент по `docs/getting-started.md` подключает набор к копии «Пациента», первый случай проходит весь цикл.
 
-- [ ] T122 [P] [US10] Шаблон `deploy/compose.remontnik.yml` и `deploy/doctor.Dockerfile`: врач с сокетом Docker, верстак без сокета, без секретов и без сети приложения, тома состояния
-- [ ] T123 [P] [US10] `docs/getting-started.md` по contracts/app-integration.md: пакеты, сторож, настройка, команды, окружение через `secret-handoff`, по желанию — режим «сначала Paseo», правила GitHub через `gh api`, вход браузера через `logins add --password-stdin`
-- [ ] T124 [P] [US10] `docs/configuration.md`, `docs/security.md` (модель паролей и остаток риска, верстак, ключи eval), обновить `README.md`
-- [ ] T125 [US10] Команда `remontnik-doctor check-config` с тестом в `packages/doctor/src/cli/check-config.ts`
-- [ ] T126 [US10] Проверка подключения свежим агентом (SC-012) на копии «Пациента»; итог записать в `specs/001-self-healing-kit/checklists/install-run.md`
-- [ ] T127 [US10] Первая запись changeset и раздел 0.1.0 «Как подключить» в `CHANGES.md`; публикация — только после `LICENSE` (открытый вопрос 1)
-- [ ] T128 [US10] Вне репозитория: передать агенту первого приложения задачу подключения из частной папки `.private/` через `send_agent_prompt` — после выпуска 0.1.0 и ответов на вопросы 2, 3, 5, 8
+- [ ] T129 [P] [US10] Шаблон `deploy/compose.remontnik.yml` и `deploy/doctor.Dockerfile`: врач с сокетом Docker, верстак без сокета, без секретов и без сети приложения, тома состояния
+- [ ] T130 [P] [US10] `docs/getting-started.md` по contracts/app-integration.md: пакеты, сторож, настройка, команды, окружение через `secret-handoff`, по желанию — режим «сначала Paseo», правила GitHub через `gh api`, вход браузера через `logins add --password-stdin`
+- [ ] T131 [P] [US10] `docs/configuration.md`, `docs/security.md` (модель паролей и остаток риска, верстак, ключи eval), обновить `README.md`
+- [ ] T132 [US10] Команда `remontnik-doctor check-config` с тестом в `packages/doctor/src/cli/check-config.ts`
+- [ ] T133 [US10] Проверка подключения свежим агентом (SC-012) на копии «Пациента»; итог записать в `specs/001-self-healing-kit/checklists/install-run.md`
+- [ ] T134 [US10] Первая запись changeset и раздел 0.1.0 «Как подключить» в `CHANGES.md`
+- [ ] T135 [US10] Вне репозитория: передать агенту первого приложения задачу подключения из частной папки `.private/` через `send_agent_prompt` — после выпуска 0.1.0
 
 ---
 
 ## Этап 13: Полировка
 
-- [ ] T129 Живая группа `pnpm test:live` на iMac: Docker-сборка врача, браузера, верстака; «Пациент» в контейнерах; настоящий DeepSeek; случай crash до `healed`
-- [ ] T130 Отдельный агент-ревьюер безопасности: побег из верстака, секреты в журналах, подпись запросов, хранилище входов, мост Paseo (подписи, шаблон задачи, адрес только в частной сети)
-- [ ] T131 [P] Замер горячего пути сторожа ≤ 1 мс на событие `packages/watch/test/perf/capture.bench.ts`
-- [ ] T132 [P] `check-public` и `gitleaks` по всей истории; `.private/` не в git
-- [ ] T133 Полный прогон всех тестов и браузерных (≤ 5 минут) и проверка всех сценариев [quickstart.md](./quickstart.md)
+- [ ] T136 Живая группа `pnpm test:live` на iMac: Docker-сборка врача, браузера, верстака; «Пациент» в контейнерах; настоящий DeepSeek; случай crash до `healed`
+- [ ] T137 Отдельный агент-ревьюер безопасности: побег из верстака, секреты в журналах, подпись запросов, хранилище входов, мост Paseo (подписи, шаблон задачи, адрес только в частной сети)
+- [ ] T138 [P] Замер горячего пути сторожа ≤ 1 мс на событие `packages/watch/test/perf/capture.bench.ts`
+- [ ] T139 [P] `check-public` и `gitleaks` по всей истории; `.private/` не в git
+- [ ] T140 Полный прогон всех тестов и браузерных (≤ 5 минут) и проверка всех сценариев [quickstart.md](./quickstart.md)
 
 ---
 
@@ -317,9 +328,9 @@ description: "Задачи реализации Ремонтника Pi"
 - Рядом с ним:
   - модули этапа 5 (T052–T058) — параллельно с этапом 4;
   - этап 7 (US6) — после этапа 3, параллельно с 4–6;
-  - служба браузера (T087–T100) — после этапа 2, параллельно с 3–7; инструменты врача (T101–T102) — после этапа 6;
+  - служба браузера и живой экран (T087–T100, T103–T108) — после этапа 2, параллельно с 3–7; инструменты врача (T101–T102, T109) — после этапа 6;
   - этап 10 (US7) — после этапа 6, параллельно с этапом 8;
-  - мост Paseo (T111, T113–T115) — после этапа 2, параллельно с 3–8; передача у врача (T109–T110, T116–T119) — после этапа 8: она правит ту же папку `treatment/`.
+  - мост Paseo (T118, T120–T122) — после этапа 2, параллельно с 3–8; передача у врача (T116–T117, T123–T126) — после этапа 8: она правит ту же папку `treatment/`.
 
 ### Внутри истории
 
@@ -334,7 +345,7 @@ description: "Задачи реализации Ремонтника Pi"
 ```text
 Агент А (основной путь): этап 3 → этап 4 → встраивание этапа 5 → этап 6 → …
 Агент Б: T052–T058 (замки) → этап 7 (чтение разговоров)
-Агент В: T087–T100 (служба браузера) → T111, T113–T115 (мост Paseo)
+Агент В: T087–T100, T103–T108 (браузер и живой экран) → T118, T120–T122 (мост Paseo)
 ```
 
 Каждый — в своей копии кода (`git worktree`). Результаты вливаются по одному с прогоном тестов после каждого.
@@ -360,10 +371,10 @@ description: "Задачи реализации Ремонтника Pi"
 | 6 · US3 | T063–T072 | 60 |
 | 7 · US6 | T073–T080 | 40 |
 | 8 · US5 | T081–T086 | 45 |
-| 9 · US8 | T087–T102 | 105 |
-| 10 · US7 | T103–T107 | 25 |
-| 11 · US9 + US11 | T108–T121 | 95 |
-| 12 · US10 | T122–T128 | 35 |
-| 13 | T129–T133 | 40 |
-| **Сумма** | **133 задачи** | **≈ 660 (≈ 11 ч)** |
+| 9 · US8 | T087–T109 | 195 |
+| 10 · US7 | T110–T114 | 25 |
+| 11 · US9 + US11 | T115–T128 | 95 |
+| 12 · US10 | T129–T135 | 35 |
+| 13 | T136–T140 | 40 |
+| **Сумма** | **140 задач** | **≈ 750 (≈ 12,5 ч)** |
 | **С учётом параллельных** | | **≈ 430 (≈ 7 ч)** |

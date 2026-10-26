@@ -12,7 +12,7 @@ export default defineRemontnikConfig({
   },
   repo: {
     mainBranch: string,               // например "main"
-    mainline: "merge" | "pull-request", // как правка попадает в основную ветку (открытый вопрос 3)
+    mainline?: "merge" | "pull-request", // как правка попадает в основную ветку; по умолчанию "merge"
   },
   workbench: {
     image: string,                    // образ разработки приложения (Node, pnpm)
@@ -95,6 +95,10 @@ export default defineRemontnikConfig({
     allowedMutations: Array<{ method: string; pathPattern: string }>,
     pagesToCheck: Array<{ url: string; expectText?: string }>,
     loginEntryId?: number,
+    live?: {                          // живой экран, R12; только при частной сети
+      enabled: boolean,
+      linkEnv: string,                // имя переменной с адресом живого экрана в частной сети — для ссылок в отчётах
+    },
   },
 });
 ```

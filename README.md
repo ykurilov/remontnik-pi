@@ -5,3 +5,7 @@
 Работает на сервере рядом с приложением, без Paseo. Построен на [@earendil-works/pi-durable](https://github.com/earendil-works/pi/tree/main/packages/durable).
 
 Подключается к приложению как набор пакетов `@ykurilov/remontnik-*`.
+
+## Лицензия
+
+[MIT](./LICENSE)

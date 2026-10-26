@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями).
+`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран).
 
 ## HTTP `POST /v1/<команда>` с `Authorization: Bearer`
 
@@ -28,6 +28,18 @@
 `danger`: `none` \| `submit` \| `send` \| `pay` \| `delete` \| `publish`. `send`, `pay`, `delete`, `publish` отклоняются всегда.
 
 Любой ответ при капче или запросе кода: `{ ok: false, code: "needs_human", message }`.
+
+## Живой экран (только для владельца)
+
+Отдельный адрес службы, слушает только `REMONTNIK_BROWSER_LIVE_LISTEN` (адрес частной сети). Не включается, если переменная не задана. Ключ — `REMONTNIK_BROWSER_OWNER_TOKEN`, ключ врача сюда не подходит.
+
+| Адрес | Что делает |
+|---|---|
+| `GET /live?profile=<профиль>` | страница: вход по ключу владельца (куки `HttpOnly`, `SameSite=Strict`), экран, кнопки «Взять управление» / «Вернуть»; работает с телефона |
+| `WS /live/stream?profile=` | кадры JPEG от сервера; от владельца — мышь, касания, клавиши, текст (только при взятом управлении) |
+| `POST /live/control` | `{ profile, action: "take" \| "release" }` |
+
+Пока управление у владельца, команды врача по HTTP отвечают `{ ok: false, code: "refused_human_control" }`. Связь владельца пропала на 2 минуты — управление возвращается врачу. Кадры не пишутся в журналы и не отдаются по командам врача.
 
 ## Консольная `remontnik-browser`
 

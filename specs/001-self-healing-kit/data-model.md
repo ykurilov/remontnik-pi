@@ -172,7 +172,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### ActionResult
 
-`{ ok: true, ... } | { ok: false, code: "refused_danger" | "refused_origin" | "refused_mutation" | "needs_human" | "not_found" | "unavailable" | "timeout", message }`.
+`{ ok: true, ... } | { ok: false, code: "refused_danger" | "refused_origin" | "refused_mutation" | "refused_human_control" | "needs_human" | "not_found" | "unavailable" | "timeout", message }`.
 
 ## Настройка приложения
 
