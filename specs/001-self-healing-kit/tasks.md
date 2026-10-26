@@ -18,14 +18,14 @@ description: "Задачи реализации Ремонтника Pi"
 
 **Цель**: монорепозиторий, проверки открытости, выпуск.
 
-- [ ] T001 Создать корень pnpm-монорепозитория: `package.json` (`packageManager` pnpm, `engines.node` `>=22.19`, скрипты `test`, `typecheck`, `build`, `verify`), `pnpm-workspace.yaml`, `tsconfig.base.json`, `.nvmrc`, `vitest.config.ts`
-- [ ] T002 [P] Создать заготовки пакетов `packages/core/package.json`, `packages/watch/package.json`, `packages/doctor/package.json`, `packages/browser/package.json`, `packages/paseo-bridge/package.json` с `exports`; в `packages/doctor/package.json` — `@earendil-works/pi-durable`, `@earendil-works/pi-ai`, `@earendil-works/chord` ровно `1.4.0`
-- [ ] T003 [P] Создать заготовку учебного приложения `apps/patient/package.json`
-- [ ] T004 [P] Тест и скрипт точных версий: `scripts/check-pins.test.mjs`, `scripts/check-pins.mjs` — падает, если у pi-durable, pi-ai, chord появился `^`/`~`, или в репозитории есть настройки Dependabot/Renovate
-- [ ] T005 [P] Тест и скрипт открытости: `scripts/check-public.test.mjs`, `scripts/check-public.mjs` — публичные IPv4, домены вне `example.com`/`.test`/`.invalid`, строки вида ключей; частный запретный список из `~/.config/remontnik/denylist.txt`, если файл есть
-- [ ] T006 [P] Changesets с группой `fixed` для всех `@ykurilov/remontnik-*`: `.changeset/config.json`, `.changeset/README.md`, `RELEASING.md`, заготовка `CHANGES.md`
-- [ ] T007 [P] CI `.github/workflows/ci.yml`: установка, тесты, типы, сборка, `check-pins`, `check-public`, `gitleaks` по всей истории
-- [ ] T008 Скрипт `pnpm verify` (тесты → типы → сборка → check-pins → check-public) в `package.json`; `README.md` — что это, лицензия MIT; поле `license: "MIT"` во всех `package.json`
+- [X] T001 Создать корень pnpm-монорепозитория: `package.json` (`packageManager` pnpm, `engines.node` `>=22.19`, скрипты `test`, `typecheck`, `build`, `verify`), `pnpm-workspace.yaml`, `tsconfig.base.json`, `.nvmrc`, `vitest.config.ts`
+- [X] T002 [P] Создать заготовки пакетов `packages/core/package.json`, `packages/watch/package.json`, `packages/doctor/package.json`, `packages/browser/package.json`, `packages/paseo-bridge/package.json` с `exports`; в `packages/doctor/package.json` — `@earendil-works/pi-durable`, `@earendil-works/pi-ai`, `@earendil-works/chord` ровно `1.4.0`
+- [X] T003 [P] Создать заготовку учебного приложения `apps/patient/package.json`
+- [X] T004 [P] Тест и скрипт точных версий: `scripts/check-pins.test.mjs`, `scripts/check-pins.mjs` — падает, если у pi-durable, pi-ai, chord появился `^`/`~`, или в репозитории есть настройки Dependabot/Renovate
+- [X] T005 [P] Тест и скрипт открытости: `scripts/check-public.test.mjs`, `scripts/check-public.mjs` — публичные IPv4, домены вне `example.com`/`.test`/`.invalid`, строки вида ключей; частный запретный список из `~/.config/remontnik/denylist.txt`, если файл есть
+- [X] T006 [P] Changesets с группой `fixed` для всех `@ykurilov/remontnik-*`: `.changeset/config.json`, `.changeset/README.md`, `RELEASING.md`, заготовка `CHANGES.md`
+- [X] T007 [P] CI `.github/workflows/ci.yml`: установка, тесты, типы, сборка, `check-pins`, `check-public`, `gitleaks` по всей истории
+- [X] T008 Скрипт `pnpm verify` (тесты → типы → сборка → check-pins → check-public) в `package.json`; `README.md` — что это, лицензия MIT; поле `license: "MIT"` во всех `package.json`
 
 **Контрольная точка**: `pnpm verify` зелёный на пустых пакетах.
 

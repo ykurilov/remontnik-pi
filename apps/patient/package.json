@@ -1,0 +1,12 @@
+{
+  "name": "remontnik-patient",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Ремонтник Pi: учебное приложение «Пациент»",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
