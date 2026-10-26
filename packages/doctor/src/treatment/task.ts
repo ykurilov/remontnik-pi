@@ -5,6 +5,8 @@ import {
   configure,
   defineExtension,
   defineTask,
+  GenerationTask,
+  hook,
   UsageDoc,
   type ConversationId,
   type Extension,
@@ -15,17 +17,18 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
-import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
+import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import type { Deployer, DeployRequest, Deployment, DeployStep } from '../deployer/deploy-sequence.js'
 import { GitGuardError, slugify, type GitGuard, type GitGuardErrorCode } from '../git-guard/index.js'
 import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
-import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
+import { diagnoseMessage, fixMessage, resumeMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
 import { matchesAnyMask } from '../path-mask/index.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 import type { ReportType, Reports } from '../reports/index.js'
+import { budgetDeferredReport } from '../reports/budget-texts.js'
 import { agentChatSdkReport, agentChatSdkTask, gateReport } from '../reports/gate-texts.js'
 import {
   causeFoundReport,
@@ -40,19 +43,27 @@ import {
 import { durableTxOf, recordFamilyOf, recordTransactionOver, runDeploymentInTask } from '../service/harness.js'
 import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
-import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeploysYet, type DeployControls, type FixInspection } from './gate.js'
+import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeployControls, type DeployControls, type FixInspection } from './gate.js'
+import { deployAttemptsOf, LEDGER, type FingerprintLedger } from '../ledgers/fingerprint-ledger.js'
+import type { ModelBudget } from '../ledgers/model-budget.js'
 import {
-  closeInterruptedEval,
+  caseLimitUsdOf,
+  closeCaseEvalIn,
   emptySpendDay,
-  evalCaseBudgetUsd,
+  evalSpentUsd,
+  joinEvalQueueIn,
+  leaveEvalQueueIn,
   modelSpentUsd,
+  nextDayStartMs,
   recordEvalObserved,
+  reserveEvalIn,
   settleEvalWithProxyFact,
   spendDayKey,
   type CaseSpend,
   type EvalReservation,
+  type ModelBlock,
   type SpendDay,
-} from './spend.js'
+} from '../ledgers/spend-ledger.js'
 import { doctorToolGuard, doctorTools } from './tools.js'
 
 // Задача лечения `remontnik.treatment` (R1). Фазы — чекпойнты pi-durable: перезапуск врача продолжает
@@ -72,7 +83,9 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // защищённые пути (тесты, eval, зависимости, сборку, Ремонтника) или похожа на подделку проверки, идёт в `gated`
 // без проверок и не отправляется. Причина в Agent Chat SDK — правки нет, отчёт с задачей для агента SDK.
 // Подменённая копия (git-замок: `escape`) — попытка выхода из верстака: случай останавливается.
-// Расход модели и eval пишется в дневной учёт (`spend.ts`) по ходу работы.
+// Каждый запрос модели бронирует наибольшую цену до отправки (`ledgers/model-budget.ts`); денег на бронь нет —
+// запрос не уходит, ход разговора кончается отказом. Отказ по дню — случай `deferred_budget`: задача спит до начала
+// следующих суток (с запасом в минуту) и продолжает тот же этап (модели — просьба продолжить). Отказ по случаю — отчёт.
 // Плохой ответ бота (`bad_answer`) лечится так же: выдержка разговора идёт модели вычищенной и помеченной как данные,
 // правку проверяет eval по карте `evalScope`; карта не даёт сценариев — eval «не запускался», и выкатки нет.
 //
@@ -90,6 +103,10 @@ type Treating = {
   worktreePath: string
   /** Потолок расходов модели на случай. */
   limitUsd: number
+  /** Сколько раз случай откладывался до следующих суток. */
+  resumes?: number
+  /** Сутки последнего переноса: второй перенос в те же сутки идёт без нового отчёта. */
+  deferredDay?: string
 }
 
 export type TreatmentState =
@@ -148,13 +165,15 @@ export interface TreatmentDeps {
   /** Службы для тестов (`checks.services`). */
   checksServices?: Pick<CaseServices, 'up'>
   evalBaseCache: EvalBaseCache
-  /** Стоп-кран, учёт выкаток, перенос на свежий main. Нет — выкаток ещё не было (`noDeploysYet`). */
+  /** Стоп-кран и перенос на свежий main. Нет — выкатки ещё нет (`noDeployControls`). Попытки — из учёта по отпечатку. */
   deployControls?: DeployControls
   /** Выкатчик приложения. Нет — решение `deploy` закрывается отчётом «правка готова». */
   deployer?: Deployer
   appDescription?: string
-  /** Как часто сверять расход модели с потолком. */
-  budgetPollMs: number
+  /** Бронь запросов модели: хук привязывает запрос к случаю. */
+  modelBudget: Pick<ModelBudget, 'bind'>
+  /** Запуск врача: брони eval мёртвого запуска закрываются. */
+  boot: string
   /** Новый отчёт записан: пора отправлять. */
   onReport(): void
   now(): number
@@ -167,7 +186,8 @@ export interface Treatment {
 }
 
 type Runtime = TaskRuntime<TreatmentInput, TreatmentState, TreatmentResult, object>
-type ConverseStatus = 'answered' | 'failed' | 'budget' | 'day_budget'
+type ConverseStatus = 'answered' | 'failed' | ModelBlock
+type Stage = 'diagnose' | 'fix'
 type Base = { commit: string; running: boolean }
 type DeployPhase = Extract<TreatmentState, { phase: 'deploying' | 'observing' }>
 type DeploySleep = Extract<DeployStep, { kind: 'sleep' }>
@@ -182,6 +202,10 @@ const MERGE_FAILURES: Record<GitGuardErrorCode, string> = {
 }
 const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
+/** Остаток eval на сегодня держат чужие брони: через сколько спросить снова. */
+const EVAL_WAIT_MS = 60_000
+/** Задача просыпается чуть позже начала новых суток: часы и таймер не должны оставить её в старых. */
+export const RESUME_MARGIN_MS = 60_000
 
 function spentUsd(usage: UsageState | undefined): number {
   if (!usage) return 0
@@ -223,7 +247,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /** Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo. */
-  async function redactedReport(text: ReportText, baseRunning: boolean): Promise<{ short: string; full: string }> {
+  async function redactedReport(text: ReportText, baseRunning: boolean): Promise<ReportText> {
     const knownSecrets = knownSecretsOf(await deps.loadConfig())
     return {
       short: redactSecrets(text.short, { knownSecrets }),
@@ -232,7 +256,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /** Отчёт и состояние случая внутри фиксации задачи. */
-  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: { short: string; full: string }): Promise<number> {
+  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: ReportText): Promise<number> {
     const opened = await setCaseStateIn(records, caseId, state)
     const report = await deps.reports.addIn(records, { type, caseId, ...text, telegram: 'pending' })
     opened.reportIds.push(report.reportId)
@@ -259,75 +283,75 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /**
-   * Записывает расход модели по случаю в дневной учёт (приращением к уже записанному) и возвращает расход модели за день.
+   * Дневной бюджет кончился: случай `deferred_budget`, отчёт и сон задачи до начала следующих суток — одной фиксацией.
+   * Проснувшись, задача продолжает тот же этап. Второй перенос в те же сутки — без нового отчёта.
    */
-  async function recordModelSpend(runtime: Runtime, caseId: number, caseTotalUsd: number, timeZone: string, context: Context): Promise<number> {
-    let dayTotal = 0
+  async function deferToNextDay(runtime: Runtime, caseId: number, checkpoint: Extract<TreatmentState, Treating>, what: 'model' | 'eval', context: Context): Promise<void> {
+    const config = await deps.loadConfig()
+    const now = deps.now()
+    const today = spendDayKey(now, config.app.timeZone)
+    const again = checkpoint.deferredDay === today
+    const resumeAt = nextDayStartMs(now, config.app.timeZone) + RESUME_MARGIN_MS
+    const day = (await runtime.snapshot(recordFamilyOf('spend'), spendDayKey(now, config.app.timeZone), context)) as unknown as SpendDay | undefined
+    const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
+    const text = budgetDeferredReport({
+      case: doc.case,
+      what,
+      spentUsd: what === 'model' ? modelSpentUsd(day) : evalSpentUsd(day),
+      limitUsd: what === 'model' ? config.limits.doctorModelUsdPerDay : config.limits.evalUsdPerDay,
+      resumeAt: nextDayStartMs(now, config.app.timeZone),
+      timeZone: config.app.timeZone,
+    })
+    const { short, full } = await redactedReport(text, checkpoint.baseRunning)
     await runtime.commit(async (tx) => {
       const records = recordTransactionOver(tx)
-      const day = await records.doc<SpendDay>('spend', spendDayKey(deps.now(), timeZone), emptySpendDay())
-      const recorded = await records.doc<CaseSpend>('spend-case', caseKey(caseId), { recordedModelUsd: 0 })
-      const delta = caseTotalUsd - recorded.recordedModelUsd
-      if (delta > 0) {
-        day.model[caseKey(caseId)] = (day.model[caseKey(caseId)] ?? 0) + delta
-        recorded.recordedModelUsd = caseTotalUsd
+      const opened = await caseIn(records, caseId)
+      opened.state = 'deferred_budget'
+      if (!again) {
+        const report = await deps.reports.addIn(records, { type: 'budget_reached', caseId, short, full, telegram: 'pending' })
+        opened.reportIds.push(report.reportId)
       }
-      dayTotal = modelSpentUsd(day)
+      // Отложенный случай сегодня eval не ждёт: его доля остатка дня не бережётся.
+      await leaveEvalQueueIn(records, caseKey(caseId))
+      return { status: 'sleeping', until: resumeAt, checkpoint: { ...checkpoint, resumes: (checkpoint.resumes ?? 0) + 1, deferredDay: today } }
+    }, context)
+    if (!again) deps.onReport()
+  }
+
+  /** Задача проснулась после переноса: случай снова в работе на своём этапе. */
+  async function backFromDeferral(runtime: Runtime, caseId: number, state: CaseState, context: Context): Promise<void> {
+    if ((await readCase(runtime, caseId, context)).state !== 'deferred_budget') return
+    await runtime.commit(async (tx) => {
+      ;(await caseIn(recordTransactionOver(tx), caseId)).state = state
       return undefined
     }, context)
-    return dayTotal
   }
 
   /**
-   * Один этап работы модели. Пока она работает, расход пишется в дневной учёт и сверяется с потолками
-   * случая и дня; превысила — разговор прерывается. После перезапуска тот же `requestId` находит тот же запрос.
+   * Один этап работы модели. Каждый запрос бронирует деньги до отправки; не хватило — ход кончается отказом, и учёт
+   * случая говорит, чей потолок. После перезапуска тот же `requestId` находит тот же запрос. После переноса на
+   * следующие сутки этап продолжается просьбой продолжить — новым запросом, и он тоже переживает перезапуск.
    */
   async function converse(
     runtime: Runtime,
     treating: Treating,
     caseId: number,
-    requestId: string,
+    stage: Stage,
     content: string,
     context: Context,
   ): Promise<{ status: ConverseStatus; spentUsd: number }> {
-    const config = await deps.loadConfig()
-    const spent = async () => spentUsd(await runtime.snapshot(UsageDoc, treating.conversationId, context))
-    const overLimit = async (): Promise<'budget' | 'day_budget' | undefined> => {
-      const total = await spent()
-      const today = await recordModelSpend(runtime, caseId, total, config.app.timeZone, context)
-      if (total >= treating.limitUsd) return 'budget'
-      return today >= config.limits.modelUsdPerDay ? 'day_budget' : undefined
-    }
-    const before = await overLimit()
-    if (before) return { status: before, spentUsd: await spent() }
     const handle = await runtime.conversation(treating.conversationId, context)
     if (!handle) throw new Error('разговор модели пропал')
-    const submission = await handle.submit({ type: 'input', content, requestId }, context)
-
-    let settled = false
-    let stopped: 'budget' | 'day_budget' | undefined
-    const watcher = (async () => {
-      while (!settled && !runtime.signal.aborted) {
-        await new Promise<void>((resolve) => runtime.setTimer(resolve, deps.budgetPollMs))
-        if (settled || runtime.signal.aborted) return
-        stopped = await overLimit()
-        if (stopped) {
-          await handle.abort(context)
-          return
-        }
-      }
-    })().catch((error: unknown) => runtime.report(error))
-    try {
-      const record = await submission.wait(context)
-      settled = true
-      await watcher
-      const total = await spent()
-      await recordModelSpend(runtime, caseId, total, config.app.timeZone, context)
-      if (stopped) return { status: stopped, spentUsd: total }
-      return { status: record.status === 'done' ? 'answered' : 'failed', spentUsd: total }
-    } finally {
-      settled = true
-    }
+    // С каким числом переносов этап впервые спросил модель: пока оно то же, запрос — исходный.
+    const resumes = treating.resumes ?? 0
+    const started = (await runtime.memo<number>(`started:${stage}`, context)) ?? (await runtime.memo<number>(`started:${stage}`, resumes, context))
+    const request =
+      started === resumes ? { requestId: `${stage}:${caseId}`, content } : { requestId: `${stage}:${caseId}:resume-${resumes}`, content: resumeMessage() }
+    const record = await (await handle.submit({ type: 'input', ...request }, context)).wait(context)
+    const spent = spentUsd(await runtime.snapshot(UsageDoc, treating.conversationId, context))
+    if (record.status === 'done') return { status: 'answered', spentUsd: spent }
+    const caseSpend = (await runtime.snapshot(recordFamilyOf('spend-case'), caseKey(caseId), context)) as unknown as CaseSpend | undefined
+    return { status: caseSpend?.refused ?? 'failed', spentUsd: spent }
   }
 
   /** Основа лечения: рабочая версия, если её удалось узнать и она есть в origin; иначе — основная ветка. */
@@ -340,24 +364,18 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return { commit: await deps.guard.resolve(`origin/${config.repo.mainBranch}`), running: false }
   }
 
-  /** Бронь eval: доля случая, не больше остатка дня. Брони прогонов, прерванных перезапуском, закрываются фактом прокси. */
-  async function reserveEval(runtime: Runtime, caseId: number, config: RemontnikConfig, context: Context): Promise<{ day: string; id: string; budgetUsd: number }> {
+  /**
+   * Бронь eval: доля случая, не больше остатка дня, поровну с другими ждущими (`reserveEvalIn`).
+   * Брони прогонов, прерванных перезапуском, закрываются фактом прокси.
+   */
+  async function reserveEval(runtime: Runtime, caseId: number, config: RemontnikConfig, context: Context) {
     const dayKey = spendDayKey(deps.now(), config.app.timeZone)
-    let reservation = { day: dayKey, id: '', budgetUsd: 0 }
+    let reserved: Awaited<ReturnType<typeof reserveEvalIn>> = { admission: { kind: 'wait' } }
     await runtime.commit(async (tx) => {
-      const day = await recordTransactionOver(tx).doc<SpendDay>('spend', dayKey, emptySpendDay())
-      let attempt = 0
-      while (day.eval[`case-${caseId}-${attempt}`]) {
-        closeInterruptedEval(day.eval[`case-${caseId}-${attempt}`]!)
-        attempt += 1
-      }
-      const id = `case-${caseId}-${attempt}`
-      const budgetUsd = evalCaseBudgetUsd(day, config.limits)
-      day.eval[id] = { reservedUsd: budgetUsd }
-      reservation = { day: dayKey, id, budgetUsd }
+      reserved = await reserveEvalIn(recordTransactionOver(tx), { dayKey, caseKey: caseKey(caseId), now: deps.now(), boot: deps.boot, limits: config.limits })
       return undefined
     }, context)
-    return reservation
+    return { day: dayKey, ...reserved }
   }
 
   async function updateReservation(runtime: Runtime, reservation: { day: string; id: string }, context: Context, change: (item: EvalReservation) => void): Promise<void> {
@@ -545,7 +563,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           bashTimeoutSeconds,
           base: base.running ? 'running' : 'main',
         })
-        const limitUsd = config.limits.diagnoseUsdPerCase ?? config.limits.modelUsdPerDay
+        const limitUsd = caseLimitUsdOf(config.limits)
 
         await runtime.commit(async (tx) => {
           const existing = (await tx.scanConversations({ ownerTaskId: task.id }, 1)).items[0]
@@ -583,18 +601,19 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       diagnosing: async (task, runtime, context) => {
         const { caseId } = task.input
         const treating = task.state.checkpoint
+        await backFromDeferral(runtime, caseId, 'diagnosing', context)
         let doc = await treatmentDoc(runtime, treating.conversationId, context)
         let run: { status: ConverseStatus; spentUsd: number } | undefined
         if (!doc.diagnosis) {
-          run = await converse(runtime, treating, caseId, `diagnose:${caseId}`, diagnoseMessage(doc.case), context)
+          run = await converse(runtime, treating, caseId, 'diagnose', diagnoseMessage(doc.case), context)
           doc = await treatmentDoc(runtime, treating.conversationId, context)
         }
         const diagnosis = doc.diagnosis
+        if (!diagnosis && run?.status === 'day_budget') return deferToNextDay(runtime, caseId, treating, 'model', context)
         if (!diagnosis?.found) {
-          const reason = run?.status === 'budget' || run?.status === 'day_budget' ? run.status : diagnosis ? 'not_found' : 'no_answer'
+          const reason = run?.status === 'budget' ? run.status : diagnosis ? 'not_found' : 'no_answer'
           const spent = run?.spentUsd ?? spentUsd(await runtime.snapshot(UsageDoc, treating.conversationId, context))
-          const limitUsd = reason === 'day_budget' ? (await deps.loadConfig()).limits.modelUsdPerDay : treating.limitUsd
-          const text = noCauseFoundReport({ case: doc.case, reason, spentUsd: spent, limitUsd, ...(diagnosis ? { diagnosis } : {}) })
+          const text = noCauseFoundReport({ case: doc.case, reason, spentUsd: spent, limitUsd: treating.limitUsd, ...(diagnosis ? { diagnosis } : {}) })
           await finish(runtime, caseId, 'no_cause_found', 'no_cause_found', text, { outcome: 'no_cause_found' }, context, treating.baseRunning)
           return
         }
@@ -613,16 +632,18 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       fixing: async (task, runtime, context) => {
         const { caseId } = task.input
         const { diagnosis, phase: _phase, ...treating } = task.state.checkpoint
+        await backFromDeferral(runtime, caseId, 'fixing', context)
         await stopOnBrokenWorkbench(runtime, caseId, treating, context, async () => {
           // Копия, испорченная ещё при диагнозе, — не работаем в ней дальше; испорченная правкой — не коммитим.
           assertWorkbenchIntact(treating)
           let doc = await treatmentDoc(runtime, treating.conversationId, context)
           let run: { status: ConverseStatus } | undefined
           if (!doc.fix) {
-            run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis, doc.case), context)
+            run = await converse(runtime, treating, caseId, 'fix', fixMessage(diagnosis, doc.case), context)
             doc = await treatmentDoc(runtime, treating.conversationId, context)
           }
           const fix = doc.fix
+          if (!fix && run?.status === 'day_budget') return deferToNextDay(runtime, caseId, task.state.checkpoint, 'model', context)
           assertWorkbenchIntact(treating)
           let fixCommit: string | undefined
           if (fix) {
@@ -632,7 +653,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             fixCommit = head === treating.baseCommit ? undefined : await runtime.memo('fixCommit', head, context)
           }
           if (!fix || !fixCommit) {
-            const reason = fix ? 'no_changes' : run?.status === 'budget' || run?.status === 'day_budget' ? run.status : 'no_answer'
+            const reason = fix ? 'no_changes' : run?.status === 'budget' ? run.status : 'no_answer'
             const text = causeFoundReport({ case: doc.case, diagnosis, reason })
             await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found' }, context, treating.baseRunning)
             return
@@ -653,10 +674,20 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       verifying: async (task, runtime, context) => {
         const { caseId } = task.input
         const checkpoint = task.state.checkpoint
+        await backFromDeferral(runtime, caseId, 'verifying', context)
         const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
         const config = await deps.loadConfig()
 
         let checks = (await runtime.memo<JsonValue>('checks', context)) as ChecksResult | undefined
+        // Eval не пустили: остаток дня держат чужие брони (`wait`) или денег до конца суток нет (`next_day`).
+        let evalHeld: 'wait' | 'next_day' | undefined
+        if (!checks && config.checks.eval && selectEvalScenarios({ ...config, maxScenarios: config.checks.eval.maxScenarios }, checkpoint.changedPaths).status !== 'not_needed') {
+          // Случай вот-вот попросит eval: другие случаи оставляют ему долю остатка дня.
+          await runtime.commit(async (tx) => {
+            await joinEvalQueueIn(recordTransactionOver(tx), caseKey(caseId), deps.now())
+            return undefined
+          }, context)
+        }
         if (!checks) await stopOnBrokenWorkbench(runtime, caseId, checkpoint, context, async () => {
           // Проверки идут в своих копиях на закоммиченной правке и на основе: мусор модели в верстаке им не мешает.
           const closed = (await deps.guard.listFiles(checkpoint.baseCommit)).filter((file) => matchesAnyMask(config.closedPaths, file))
@@ -666,7 +697,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed, fresh: true })
           await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed, fresh: true })
           // Бронь — прямо перед запуском eval: открытая бронь всегда закрывается в finally или после перезапуска.
-          let reservation: { day: string; id: string; budgetUsd: number } | undefined
+          let reservation: { day: string; id: string } | undefined
           let evalSpend: ReturnType<typeof evalSpendRecorder> | undefined
           let settled = false
           try {
@@ -687,9 +718,14 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               // Правку плохого ответа проверяет только eval: без сценариев по карте её нечем проверить.
               evalRequired: doc.case.kind === 'bad_answer',
               reserveEval: async () => {
-                reservation = await reserveEval(runtime, caseId, config, context)
+                const reserved = await reserveEval(runtime, caseId, config, context)
+                if (reserved.admission.kind !== 'reserve' || !reserved.id) {
+                  evalHeld = reserved.admission.kind === 'reserve' ? undefined : reserved.admission.kind
+                  return 0
+                }
+                reservation = { day: reserved.day, id: reserved.id }
                 evalSpend = evalSpendRecorder(runtime, reservation, context)
-                return reservation.budgetUsd
+                return reserved.admission.usd
               },
               onEvalSpend: (spend) => evalSpend!.record(spend),
             })
@@ -698,7 +734,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               await updateReservation(runtime, reservation, context, (item) => (item.actualUsd = result.eval.costUsd))
             }
             settled = true
-            checks = (await runtime.memo('checks', result as unknown as JsonValue, context)) as unknown as ChecksResult
+            // Не пустили к eval — итог не запоминается: после ожидания проверки идут заново.
+            if (!evalHeld) checks = (await runtime.memo('checks', result as unknown as JsonValue, context)) as unknown as ChecksResult
           } finally {
             // Проверка упала: бронь закрывается тем, что досчитал прокси, а не сгорает целиком.
             if (!settled && reservation) {
@@ -708,8 +745,17 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             }
             await deps.guard.removeWorktree(candidateDir).catch(() => {})
             await deps.guard.removeWorktree(baseDir).catch(() => {})
+            if (!evalHeld) {
+              await runtime.commit(async (tx) => {
+                await leaveEvalQueueIn(recordTransactionOver(tx), caseKey(caseId))
+                return undefined
+              }, context).catch((error: unknown) => runtime.report(error))
+            }
           }
         })
+        if (evalHeld === 'next_day') return deferToNextDay(runtime, caseId, checkpoint, 'eval', context)
+        // Случай остаётся в очереди eval со свежей отметкой и спрашивает снова.
+        if (evalHeld === 'wait') return runtime.sleepUntil(deps.now() + EVAL_WAIT_MS, checkpoint, context)
         // Копия проверки испорчена: отчёт уже записан.
         if (!checks) return
 
@@ -735,8 +781,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const config = await deps.loadConfig()
         const sick = await readCase(runtime, caseId, context)
         const spendDay = (await runtime.snapshot(recordFamilyOf('spend'), spendDayKey(deps.now(), config.app.timeZone), context)) as unknown as SpendDay | undefined
-        const controls = deps.deployControls ? await deps.deployControls.read({ caseId, fingerprint: sick.fingerprint, config }) : noDeploysYet(config)
-        const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
+        const controls = deps.deployControls ? await deps.deployControls.read({ caseId, fingerprint: sick.fingerprint, config }) : noDeployControls()
+        const ledger = (await runtime.snapshot(recordFamilyOf(LEDGER.collection), LEDGER.key, context)) as unknown as FingerprintLedger | undefined
+        const attempts = deployAttemptsOf(ledger, { fingerprint: sick.fingerprint, now: deps.now(), timeZone: config.app.timeZone, limits: config.limits })
+        const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
         const closing = closingOf(gate, checks)
         const sdkPackage = agentChatSdkPackage(diagnosis, inspection)
         const result = {
@@ -784,13 +832,35 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         await deployStep(runtime, task.input.caseId, task.state.checkpoint, deps.deployer, context)
       },
     },
-    abort: (_task, runtime, context) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),
+    // Снятая задача не держит брони eval и место в очереди: за сегодня и вчера (прогон мог начаться до полуночи).
+    abort: async (task, runtime, context) => {
+      const { timeZone } = (await deps.loadConfig()).app
+      const now = deps.now()
+      const dayKeys = [...new Set([spendDayKey(now - 24 * 3_600_000, timeZone), spendDayKey(now, timeZone)])]
+      await runtime.commit(async (tx) => {
+        await closeCaseEvalIn(recordTransactionOver(tx), { caseKey: caseKey(task.input.caseId), dayKeys })
+        return { status: 'terminal', outcome: { status: 'aborted' } }
+      }, context)
+    },
+  })
+
+  /**
+   * Привязка запроса к случаю для брони: хук получает исполнение генерации, чей `signal` затем уходит в `streamSimple`.
+   * Отказать в запросе хук не может (pi-durable только сообщает его ошибки) — отказывает бронь в моделях врача.
+   */
+  const budgetHook = hook(GenerationTask, {
+    beforeRequest: async (_request, api, context) => {
+      const doc = await api.snapshot(TreatmentDoc, api.conversationId, context)
+      const { signal } = api as unknown as { signal?: AbortSignal }
+      if (doc?.case && signal) deps.modelBudget.bind(signal, doc.case.caseId)
+      return undefined
+    },
   })
 
   const extension: Extension = defineExtension({
     name: 'remontnik.doctor',
     tools: [...doctorTools()],
-    hooks: [doctorToolGuard],
+    hooks: [doctorToolGuard, budgetHook],
     tasks: [task],
   })
 

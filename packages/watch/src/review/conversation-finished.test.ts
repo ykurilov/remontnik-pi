@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { defineRemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { startFakeModel, startFakeTelegram, type FakeModelServer, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
@@ -64,7 +65,7 @@ function openWatch(overrides: Partial<WatchOptions> = {}): Watch {
       primary: { baseUrl: model.baseUrl, apiKey: 'test-primary-key', model: 'deepseek-flash' },
       fallback: { baseUrl: model.baseUrl, apiKey: 'test-fallback-key', model: 'deepseek/deepseek-v4.1-flash-1017' },
     },
-    review: { botDescription: BOT_DESCRIPTION, usdPerDay: 1, summaryDelayMs: 30, places: PLACES },
+    review: { botDescription: BOT_DESCRIPTION, limits: { watchModelUsdPerDay: 1 }, summaryDelayMs: 30, places: PLACES },
     ...overrides,
   })
   watches.push(watch)
@@ -186,7 +187,7 @@ describe('watch.conversationFinished', () => {
   })
 
   it('бюджет исчерпан: лишние разговоры не читаются, владелец получает «отложено N»', async () => {
-    const watch = openWatch({ review: { botDescription: BOT_DESCRIPTION, usdPerDay: 0.0035, summaryDelayMs: 30 } })
+    const watch = openWatch({ review: { botDescription: BOT_DESCRIPTION, limits: { watchModelUsdPerDay: 0.0035 }, summaryDelayMs: 30 } })
     model.replyNext({ findings: [] }, { costUsd: 0.003 })
 
     for (const id of ['a', 'b', 'c']) watch.conversationFinished({ id, messages: talk('5990') })
@@ -254,8 +255,34 @@ describe('watch.conversationFinished', () => {
     expect(readdirSync(dir).filter((name) => name.startsWith('review-spend-'))).toHaveLength(1)
   })
 
+  it('потолок сторожа — свой, из настройки `limits.watchModelUsdPerDay`: потолок врача на него не влияет', async () => {
+    const { limits } = defineRemontnikConfig({
+      app: { name: 'patient' },
+      repo: { mainBranch: 'main' },
+      workbench: { image: 'node:22', install: 'true' },
+      checks: { test: 'true' },
+      evalScope: [],
+      closedPaths: [],
+      forbidden: { schema: ['<нет>'], money: ['<нет>'], access: ['<нет>'] },
+      deploy: {
+        commands: { build: 'b', promote: 'p', confirm: 'c', rollback: 'r', current: 'v', health: 'h' },
+        lockFile: '.deploy/deploy.lock',
+      },
+      reports: { telegram: { botTokenEnv: 'ALERT_BOT_TOKEN' } },
+      limits: { watchModelUsdPerDay: 0.0035, doctorModelUsdPerDay: 4 },
+    })
+    const watch = openWatch({ review: { botDescription: BOT_DESCRIPTION, limits, summaryDelayMs: 30 } })
+    model.replyNext({ findings: [] }, { costUsd: 0.003 })
+
+    for (const id of ['a', 'b']) watch.conversationFinished({ id, messages: talk('5990') })
+    await until(() => telegram.messages.some((message) => message.text.includes('отложено 1')))
+
+    expect(model.requests).toHaveLength(1)
+    expect(watch.stats().review?.usdPerDay).toBe(0.0035)
+  })
+
   it('веб и фоновый работник одного приложения делят один суточный бюджет', async () => {
-    const budget = { botDescription: BOT_DESCRIPTION, usdPerDay: 0.0035, summaryDelayMs: 30, places: PLACES }
+    const budget = { botDescription: BOT_DESCRIPTION, limits: { watchModelUsdPerDay: 0.0035 }, summaryDelayMs: 30, places: PLACES }
     const web = openWatch({ processName: 'web', review: budget })
     const worker = openWatch({ processName: 'worker', review: budget })
     model.replyNext({ findings: [] }, { costUsd: 0.003 })

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
@@ -8,10 +9,13 @@ import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
+import { createModelBudget } from '../ledgers/model-budget.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
 import { confirmAbandonedVersion, type Deployer } from '../deployer/index.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
+import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
+import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
@@ -26,7 +30,7 @@ import { openDoctorHarness } from './harness.js'
 export interface DoctorServiceOptions {
   stateDir: string
   sharedSecret: string
-  /** Секрет владельца: только им можно снова пустить выкатки после стоп-крана. */
+  /** Секрет владельца: только им можно снова пустить выкатки после стоп-крана и снять «нужен человек» по отпечатку. Не задан — по HTTP нельзя. */
   controlSecret?: string
   listen: { host: string; port: number }
   telegram: { botToken: string; chatId: string; apiBaseUrl?: string; proxyToken?: string }
@@ -74,7 +78,6 @@ export interface DoctorTreatmentOptions {
   /** Службы для тестов (`checks.services`) в сети проверок случая; без них такие проверки не запускаются. */
   services?: Pick<CaseServices, 'up'>
   appDescription?: string
-  budgetPollMs?: number
   /** Выкатчик приложения (`createServerDeployer`). Не задан — врач правку не выкатывает, а сообщает «правка готова». */
   deployer?: Deployer
 }
@@ -93,7 +96,6 @@ export interface DoctorService {
 }
 
 const REPORT_PUMP_INTERVAL_MS = 5_000
-const BUDGET_POLL_MS = 1_000
 const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
   task_parked: 'остановлена после повторных сбоев',
   task_faulted: 'упала',
@@ -128,9 +130,8 @@ function describeError(error: unknown): string {
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
-  if (options.controlSecret !== undefined && options.controlSecret === options.sharedSecret) {
-    throw new Error('[remontnik] секрет владельца (REMONTNIK_CONTROL_SECRET) совпадает с общим секретом')
-  }
+  // До открытия хранилища: равные секреты — приложение получило бы права владельца.
+  assertOwnerSecrets({ secret: options.sharedSecret, controlSecret: options.controlSecret })
   const log = options.log ?? ((line: string) => console.error(line))
   const exit = options.exit ?? ((code: number) => process.exit(code))
   const now = options.now ?? Date.now
@@ -173,13 +174,18 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   const treatmentOptions = options.treatment
   const runners = treatmentOptions ? isolatedRunners(treatmentOptions) : undefined
   const onWake = options.onWake
+  // Свой у каждого запуска: брони модели и eval мёртвого запуска врача закрываются при следующих.
+  const boot = randomUUID()
+  const modelBudget = treatmentOptions
+    ? createModelBudget({ models: treatmentOptions.models, boot, now, report: (error) => log(`[врач] учёт расходов модели: ${describeError(error)}`), log: (line) => log(`[врач] ${line}`) })
+    : undefined
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(onWake ? { onWake: (wake: Wake) => onWake(wake, () => harnessState === 'open' && opened.harness.resume()) } : {}),
-    ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
+    ...(modelBudget && runners ? { models: modelBudget.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
   const caseBook = createCaseBook(opened.records, { now })
@@ -205,7 +211,8 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   }
 
   let treatment: Treatment | undefined
-  if (treatmentOptions && runners) {
+  if (treatmentOptions && runners && modelBudget) {
+    modelBudget.attach({ records: opened.records, loadConfig: treatmentOptions.loadConfig })
     treatment = createTreatment({
       reports,
       guard: treatmentOptions.guard,
@@ -222,7 +229,8 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       ...(treatmentOptions.deployer ? { deployer: treatmentOptions.deployer } : {}),
-      budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
+      modelBudget,
+      boot,
       onReport: pump,
       now,
     })
@@ -281,6 +289,11 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           secret: options.sharedSecret,
           ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
           confirmVersion: (version) => confirmAbandonedVersion(opened.records, version),
+        }),
+        fingerprintRelease: createFingerprintReleaseHandler({
+          records: opened.records,
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
         }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),

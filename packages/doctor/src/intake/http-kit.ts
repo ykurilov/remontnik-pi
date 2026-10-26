@@ -70,3 +70,13 @@ export function readLimitedBody(request: IncomingMessage, limit: number, timeout
     request.on('aborted', onAbort)
   })
 }
+
+/**
+ * Секреты команд владельца — одна проверка для службы врача и для каждого обработчика команд владельца.
+ * Общий секрет есть у приложения и кнопок Telegram: равный ему секрет владельца отдал бы приложению права владельца.
+ */
+export function assertOwnerSecrets(secrets: { secret: string; controlSecret?: string | undefined }): void {
+  if (secrets.secret === '') throw new Error('[remontnik] общий секрет пуст')
+  if (secrets.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
+  if (secrets.controlSecret === secrets.secret) throw new Error('[remontnik] секрет владельца (REMONTNIK_CONTROL_SECRET) совпадает с общим секретом')
+}

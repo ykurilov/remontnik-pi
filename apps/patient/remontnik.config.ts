@@ -38,6 +38,6 @@ export default defineRemontnikConfig({
     },
     lockFile: '.remontnik/deploy.lock',
   },
-  review: { botDescription: BOT_DESCRIPTION, usdPerDay: 0.5 },
+  review: { botDescription: BOT_DESCRIPTION },
   reports: { telegram: { botTokenEnv: 'PATIENT_ALERT_BOT_TOKEN', chatIdEnv: 'PATIENT_ALERT_CHAT_ID' } },
 })

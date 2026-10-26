@@ -63,8 +63,10 @@ describe('defineRemontnikConfig', () => {
       healthWindowTicks: 5,
     })
     expect(config.deploy).toMatchObject({ buildEnv: [], lockWaitReportMinutes: 30 })
+    // Модель: у сторожа и у врача по своему потолку, в сумме $5; общего счётчика нет.
     expect(config.limits).toMatchObject({
-      modelUsdPerDay: 5,
+      watchModelUsdPerDay: 1,
+      doctorModelUsdPerDay: 4,
       evalUsdPerDay: 5,
       autoDeploysPerFingerprintPerDay: 2,
       autoDeploysPerDay: 5,
@@ -72,6 +74,12 @@ describe('defineRemontnikConfig', () => {
       maxDiffFiles: 15,
     })
     expect(config.handoff).toEqual({ mode: 'self' })
+  })
+
+  it('потолок модели — только раздельный: общий `modelUsdPerDay` и `review.usdPerDay` не принимаются', () => {
+    expect(() => defineRemontnikConfig({ ...minimalConfig(), limits: { modelUsdPerDay: 5 } } as never)).toThrow()
+    expect(() => defineRemontnikConfig({ ...minimalConfig(), review: { botDescription: 'бот', usdPerDay: 1 } } as never)).toThrow()
+    expect(defineRemontnikConfig({ ...minimalConfig(), limits: { watchModelUsdPerDay: 0.5, doctorModelUsdPerDay: 4.5 } }).limits).toMatchObject({ watchModelUsdPerDay: 0.5, doctorModelUsdPerDay: 4.5 })
   })
 
   it('deploy.buildEnv: только имена переменных; переменные врача REMONTNIK_ сборке не передаются', () => {

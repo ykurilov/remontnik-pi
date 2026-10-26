@@ -20,6 +20,8 @@ export interface IntakeHandlerOptions {
   bodyTimeoutMs?: number
   /** Лента отчётов: `/v1/reports*` отдаются ей. Не задана — этих адресов нет. */
   reportsFeed?: IntakeHandler
+  /** Снятие «нужен человек» по отпечатку: `POST /v1/control/fingerprints`. Не задано — адреса нет. */
+  fingerprintRelease?: IntakeHandler
   /** Стоп-кран выкаток: `POST /v1/control/deploys`. Не задан — адреса нет. */
   deployControls?: IntakeHandler
 }
@@ -66,6 +68,10 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
     if (options.deployControls && path === '/v1/control/deploys') {
       await options.deployControls(request, response)
+      return
+    }
+    if (options.fingerprintRelease && path === '/v1/control/fingerprints') {
+      await options.fingerprintRelease(request, response)
       return
     }
     if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {

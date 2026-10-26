@@ -305,7 +305,7 @@ describe('лечение до выкатки: deploying → observing → ито
 
     // Новые потолки сделали бы выкатку невозможной, если бы решение считалось заново.
     rmSync(r.lockPath)
-    const second = await startDoctor(r, createScriptedModel(), app, clock, { limits: { modelUsdPerDay: 0.001 } })
+    const second = await startDoctor(r, createScriptedModel(), app, clock, { limits: { autoDeploysPerDay: 0 } })
     const healed = await settledCase(second)
 
     expect(healed.state).toBe('healed')
