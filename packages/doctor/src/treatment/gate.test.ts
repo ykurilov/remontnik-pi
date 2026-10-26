@@ -14,6 +14,7 @@ function file(path: string, patch = '@@ -1 +1 @@\n-old\n+new\n', status: Changed
   return { path, status, added: 1, removed: status === 'added' ? 0 : 1, patch }
 }
 
+const appIncident = { where: 'src/price.ts:5:3', stack: 'Error: x\n    at price (src/price.ts:5:3)' }
 const fixInSrc = [file('src/price.ts'), file('test/default-plan.test.ts', '@@ -0,0 +1 @@\n+test\n', 'added')]
 
 function checks(overrides: { tests?: Partial<ChecksResult['tests']>; eval?: Partial<ChecksResult['eval']> } = {}): ChecksResult {
@@ -26,12 +27,12 @@ function checks(overrides: { tests?: Partial<ChecksResult['tests']>; eval?: Part
 function facts(files: ChangedFile[], ...rest: [result?: ChecksResult | undefined, day?: ReturnType<typeof emptySpendDay>]) {
   const result = rest.length > 0 ? rest[0] : checks()
   const day = rest[1] ?? emptySpendDay()
-  return deployFactsOf({ inspection: inspectFix(config, files), checks: result, controls: noDeploysYet(config), spendDay: day, limits: config.limits })
+  return deployFactsOf({ inspection: inspectFix(config, files, appIncident), checks: result, controls: noDeploysYet(config), spendDay: day, limits: config.limits })
 }
 
 describe('осмотр правки: одно место для фактов о диффе', () => {
   it('правка в src с новым тестом — чистая, её можно проверять', () => {
-    const inspection = inspectFix(config, fixInSrc)
+    const inspection = inspectFix(config, fixInSrc, appIncident)
     expect(inspection.forbiddenZones).toEqual([])
     expect(inspection.protectedChanges).toEqual([])
     expect(inspection.diff.suspicious).toEqual([])
@@ -39,19 +40,19 @@ describe('осмотр правки: одно место для фактов о 
   })
 
   it('правка в оплате — запретная зона, но проверять её можно: человеку нужна проверенная правка', () => {
-    const inspection = inspectFix(config, [file('src/payments/charge.ts')])
+    const inspection = inspectFix(config, [file('src/payments/charge.ts')], appIncident)
     expect(inspection.forbiddenZones.map((hit) => hit.zone)).toEqual(['money'])
     expect(fixCanBeChecked(inspection)).toBe(true)
   })
 
   it('изменён существующий тест — проверять нельзя: модель подделала бы собственную проверку', () => {
-    const inspection = inspectFix(config, [file('src/price.ts'), file('test/price.test.ts')])
+    const inspection = inspectFix(config, [file('src/price.ts'), file('test/price.test.ts')], appIncident)
     expect(inspection.diff.existingTestChanges.map((change) => change.path)).toEqual(['test/price.test.ts'])
     expect(fixCanBeChecked(inspection)).toBe(false)
   })
 
   it('подозрительный код — проверять нельзя', () => {
-    const inspection = inspectFix(config, [file('src/price.ts', '@@ -1 +1 @@\n-a\n+const key = process.env.SECRET\n')])
+    const inspection = inspectFix(config, [file('src/price.ts', '@@ -1 +1 @@\n-a\n+const key = process.env.SECRET\n')], appIncident)
     expect(inspection.diff.suspicious.map((finding) => finding.signal)).toContain('environment_access')
     expect(fixCanBeChecked(inspection)).toBe(false)
   })
@@ -115,18 +116,49 @@ describe('факты для decideDeploy', () => {
 describe('причина в Agent Chat SDK', () => {
   const diagnosis = { found: true, cause: 'SDK теряет ход', evidence: [], confidence: 'high' as const }
 
+  const appStack = 'Error: x\n    at price (src/price.ts:5:3)'
+
   it('диагноз называет пакет SDK → его имя', () => {
-    expect(agentChatSdkPackage(config, { ...diagnosis, causeInPackage: '@ykurilov/agent-chat-core' })).toBe('@ykurilov/agent-chat-core')
+    expect(agentChatSdkPackage({ ...diagnosis, causeInPackage: '@ykurilov/agent-chat-core' })).toBe('@ykurilov/agent-chat-core')
   })
 
   it('другой пакет или пакет не назван → не SDK', () => {
-    expect(agentChatSdkPackage(config, { ...diagnosis, causeInPackage: 'left-pad' })).toBeUndefined()
-    expect(agentChatSdkPackage(config, diagnosis)).toBeUndefined()
+    expect(agentChatSdkPackage({ ...diagnosis, causeInPackage: 'left-pad' })).toBeUndefined()
+    expect(agentChatSdkPackage(diagnosis)).toBeUndefined()
   })
 
+  it.each([' @ykurilov/agent-chat-core', '@ykurilov/agent-chat-core/dist', '@ykurilov/agent-chat-*', '@ykurilov/Agent-Chat-core', '@ykurilov/agent-chat-', 'agent-chat-core'])(
+    'имя пакета не по форме @ykurilov/agent-chat-<имя> (%j) — как будто не назван',
+    (named) => {
+      expect(agentChatSdkPackage({ ...diagnosis, causeInPackage: named })).toBeUndefined()
+    },
+  )
+
   it('правка лезет в SDK (патч пакета) → SDK, даже если диагноз его не назвал', () => {
-    const inspection = inspectFix(config, [file('patches/@ykurilov+agent-chat-server+1.2.0.patch', '@@ -0,0 +1 @@\n+x\n', 'added')])
-    expect(agentChatSdkPackage(config, diagnosis, inspection)).toBe('@ykurilov/agent-chat-server')
+    const inspection = inspectFix(config, [file('patches/@ykurilov+agent-chat-server+1.2.0.patch', '@@ -0,0 +1 @@\n+x\n', 'added')], { where: 'src/price.ts:5', stack: appStack })
+    expect(agentChatSdkPackage(diagnosis, inspection)).toBe('@ykurilov/agent-chat-server')
+  })
+
+  it.each([
+    ['верхний кадр стека в node_modules SDK', 'src/bot/bot.ts:40', 'Error: lost\n    at finishTurn (node_modules/@ykurilov/agent-chat-core/dist/turn.js:88:11)\n    at reply (src/bot/bot.ts:40:7)'],
+    ['верхний кадр в пакете SDK у pnpm', 'src/bot/bot.ts:40', 'Error: lost\n    at /srv/app/node_modules/.pnpm/@ykurilov+agent-chat-core@1.4.0/node_modules/@ykurilov/agent-chat-core/dist/turn.js:88:11'],
+    ['место сбоя в SDK', 'node_modules/@ykurilov/agent-chat-core/dist/turn.js:88:11', ''],
+  ])('%s, модель пакет не назвала → SDK по стеку; выкатки нет без человека', (_what, where, stack) => {
+    const inspection = inspectFix(config, fixInSrc, { where, stack })
+    expect(agentChatSdkPackage(diagnosis, inspection)).toBe('@ykurilov/agent-chat-core')
+    const decision = decideDeploy(deployFactsOf({ inspection, checks: checks(), controls: noDeploysYet(config), spendDay: emptySpendDay(), limits: config.limits }))
+    expect(decision.verdict).toBe('report_only')
+    expect(decision.reasons.map((reason) => reason.code)).toEqual(['forbidden_zone'])
+    expect(closingOf(decision, checks()).kind).toBe('needs_human')
+  })
+
+  it('SDK только глубже в стеке, сбой в коде приложения → не SDK, выкатка возможна', () => {
+    const inspection = inspectFix(config, fixInSrc, {
+      where: 'src/bot/bot.ts:40:7',
+      stack: 'Error: x\n    at reply (src/bot/bot.ts:40:7)\n    at runTurn (node_modules/@ykurilov/agent-chat-core/dist/turn.js:12:3)',
+    })
+    expect(agentChatSdkPackage(diagnosis, inspection)).toBeUndefined()
+    expect(inspection.forbiddenZones).toEqual([])
   })
 })
 

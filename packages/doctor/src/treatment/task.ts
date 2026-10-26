@@ -437,7 +437,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           await finish(runtime, caseId, 'no_cause_found', 'no_cause_found', text, { outcome: 'no_cause_found' }, context, treating.baseRunning)
           return
         }
-        const sdkPackage = agentChatSdkPackage(await deps.loadConfig(), diagnosis)
+        const sdkPackage = agentChatSdkPackage(diagnosis)
         if (sdkPackage) {
           const text = agentChatSdkReport({ case: doc.case, stack: doc.case.stack, diagnosis, packageName: sdkPackage })
           await finish(runtime, caseId, 'report_only', 'needs_human', text, { outcome: 'needs_human', why: 'agent_chat_sdk', sdkPackage }, context, treating.baseRunning)
@@ -478,7 +478,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           }
           const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
           const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
-          const inspection = inspectFix(await deps.loadConfig(), files)
+          const inspection = inspectFix(await deps.loadConfig(), files, doc.case)
           const fixed = { diagnosis, fix, fixCommit, changedPaths, inspection }
           // Правке нельзя доверить собственную проверку: без проверок и без отправки — сразу к решению.
           const next = fixCanBeChecked(inspection) ? ({ phase: 'verifying', ...fixed } as const) : ({ phase: 'gated', ...fixed, pushed: false } as const)
@@ -574,7 +574,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const controls = deps.deployControls ? await deps.deployControls.read({ caseId, fingerprint: sick.fingerprint, config }) : noDeploysYet(config)
         const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
         const closing = closingOf(gate, checks)
-        const sdkPackage = agentChatSdkPackage(config, diagnosis, inspection)
+        const sdkPackage = agentChatSdkPackage(diagnosis, inspection)
         const result = {
           branch: checkpoint.branch,
           fixCommit: checkpoint.fixCommit,
@@ -590,6 +590,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         switch (closing.kind) {
           case 'deploy':
             // Этап 6 подключает здесь выкатку; пока решение `deploy` закрывается отчётом «правка готова».
+            // Перед выкаткой решение надо зафиксировать в чекпойнте: при повторе фазы оно сейчас считается заново.
             return close(fixReadyReport({ ...ready, checks: checks! }), { outcome: 'fix_ready' })
           case 'not_deployed':
             return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate }), { outcome: 'fix_ready' })

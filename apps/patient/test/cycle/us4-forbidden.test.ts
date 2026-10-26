@@ -276,4 +276,37 @@ describe('история 4 на «Пациенте»: запретные зон�
     expect(report.full).toContain(`finishTurn (node_modules/${SDK_PACKAGE}/dist/turn.js:88:11)`)
     expect(report.full).toContain('Сохранять состояние хода до завершения потока')
   }, 90_000)
+
+  it('причина в SDK по стеку: модель пакет не назвала и правит приложение — правка не выкачена, в отчёте задача для агента SDK', async () => {
+    const r = sickPatientRepo()
+    const tools = readFileSync(join(r.repoDir, 'src/bot/tools.ts'), 'utf8')
+    const model = createScriptedModel()
+    model.script(
+      callTool('case_info', {}),
+      callTool('finish_diagnosis', {
+        found: true,
+        cause: 'Ход теряется, когда поток ответа обрывается',
+        evidence: ['src/bot/bot.ts:40 — ответ отдаётся в поток без проверки обрыва'],
+        confidence: 'low',
+      }),
+      callTool('write', { path: 'src/bot/tools.ts', content: `${tools}\n// Ремонтник: обход обрыва потока\n` }),
+      callTool('finish_fix', { summary: 'Обход обрыва потока в коде бота', testsAdded: [] }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([sdkCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('report_only')
+    expect(model.pending()).toBe(0)
+    expect(readdirSync(r.deployMarks)).toEqual(['current'])
+    const report = await lastReport(doctor)
+    expect(report.type).toBe('needs_human')
+    expect(report.short).toContain('не выкачена')
+    expect(report.short).toContain('Agent Chat SDK')
+    expect(report.full).toContain('agent_chat_sdk')
+    expect(report.full).toContain('Задача для агента Agent Chat SDK')
+    expect(report.full).toContain(SDK_PACKAGE)
+    expect(report.full).toContain(`finishTurn (node_modules/${SDK_PACKAGE}/dist/turn.js:88:11)`)
+  }, 90_000)
 })

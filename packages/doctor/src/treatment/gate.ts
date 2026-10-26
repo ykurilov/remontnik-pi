@@ -5,7 +5,6 @@ import type { ChecksResult } from '../checks/index.js'
 import type { DeployFacts, GateDecision, GateReasonCode } from '../deploy-gate/index.js'
 import { inspectDiff, type DiffInspection } from '../diff-inspector/index.js'
 import { findForbiddenZones, type ForbiddenZoneHit } from '../forbidden-zones/index.js'
-import { matchesMask } from '../path-mask/index.js'
 import type { ReportType } from '../reports/index.js'
 import type { Diagnosis } from './doc.js'
 import { findProtectedChanges, type ProtectedChange } from './protected-changes.js'
@@ -15,6 +14,8 @@ import { evalSpentUsd, modelSpentUsd, type SpendDay } from './spend.js'
 // Осмотр диффа делается один раз, после коммита правки. Если правке нельзя доверить собственную проверку
 // (защищённые пути, подозрительный код), проверки не запускаются и ветка не отправляется: решение получает
 // «тесты и eval не запускались» и, как и при любом другом отказе, закрывает случай отчётом.
+// Сбой, брошенный в коде Agent Chat SDK (место сбоя или верхний кадр стека), считается запретной зоной
+// `agent_chat_sdk`, даже если модель SDK не назвала: правку в приложении выкатывает только человек.
 
 /** Всё, что код знает о диффе правки. */
 export interface FixInspection {
@@ -38,13 +39,29 @@ export interface GateClosing {
 }
 
 const SDK_PACKAGE_PREFIX = '@ykurilov/agent-chat-'
-const SDK_PACKAGE_IN_PATH = /@ykurilov(?:\/|\+|__)(agent-chat-[a-z0-9-]+)/i
+const SDK_PACKAGE_NAME = /^@ykurilov\/agent-chat-[a-z0-9-]+$/
+const SDK_PACKAGE_IN_PATH = /@ykurilov(?:\/|\+|__)(agent-chat-[a-z0-9-]+)/
+const STACK_FRAME = /^\s*at\s+(.*)$/
 /** Правка готова и проверена; выкатке мешает только состояние врача, а не сама правка. */
 const OPERATIONAL: readonly GateReasonCode[] = ['stop_switch', 'attempts_exhausted', 'budget_exhausted', 'rebase_conflict']
 
-export function inspectFix(config: RemontnikConfig, files: readonly ChangedFile[]): FixInspection {
+/** Место сбоя в коде Agent Chat SDK: `where` или верхний кадр стека. Кадры SDK глубже — обычный путь вызова. */
+function sdkFrameOf(incident: { where: string; stack: string }): { location: string; packageName: string } | undefined {
+  const topFrame = incident.stack.split('\n').flatMap((line) => STACK_FRAME.exec(line)?.[1] ?? [])[0]
+  for (const location of [incident.where, topFrame]) {
+    const found = location ? SDK_PACKAGE_IN_PATH.exec(location) : null
+    if (location && found) return { location: location.trim(), packageName: `@ykurilov/${found[1]}` }
+  }
+  return undefined
+}
+
+export function inspectFix(config: RemontnikConfig, files: readonly ChangedFile[], incident: { where: string; stack: string }): FixInspection {
+  const sdkFrame = sdkFrameOf(incident)
   return {
-    forbiddenZones: findForbiddenZones(config, files),
+    forbiddenZones: [
+      ...findForbiddenZones(config, files),
+      ...(sdkFrame ? [{ path: sdkFrame.location, zone: 'agent_chat_sdk' as const, rule: `стек случая: сбой в коде ${sdkFrame.packageName}` }] : []),
+    ],
     protectedChanges: findProtectedChanges(config, files),
     diff: inspectDiff(files, config.limits, {
       knownHosts: config.browser?.allowedOrigins ?? [],
@@ -106,13 +123,13 @@ export function deployFactsOf(input: {
 }
 
 /**
- * Пакет Agent Chat SDK, в котором причина: его назвал диагноз или в него полезла правка. SDK врач не правит —
+ * Пакет Agent Chat SDK, в котором причина: его назвал диагноз, на него указывает стек или в него полезла правка. SDK врач не правит —
  * пишет задачу для агента SDK. Модель может только остановить лечение, но не разрешить выкатку.
  */
-export function agentChatSdkPackage(config: RemontnikConfig, diagnosis: Diagnosis, inspection?: FixInspection): string | undefined {
-  const named = diagnosis.causeInPackage?.trim()
-  const sdkPatterns = config.forbidden.builtIn.protectedPackages.filter((pattern) => pattern.startsWith(SDK_PACKAGE_PREFIX))
-  if (named && sdkPatterns.some((pattern) => matchesMask(pattern, named))) return named
+export function agentChatSdkPackage(diagnosis: Diagnosis, inspection?: FixInspection): string | undefined {
+  // Имя не по форме пакета SDK считается неназванным.
+  const named = diagnosis.causeInPackage
+  if (named !== undefined && SDK_PACKAGE_NAME.test(named)) return named
   const hit = inspection?.forbiddenZones.find((zone) => zone.zone === 'agent_chat_sdk')
   if (!hit) return undefined
   const found = SDK_PACKAGE_IN_PATH.exec(hit.path) ?? SDK_PACKAGE_IN_PATH.exec(hit.rule)
