@@ -110,3 +110,24 @@
 - `testRemontnikConfig()` — рабочая настройка приложения;
 - `createScriptedModel()` — модель по сценарию поверх подставного поставщика pi-ai: `script(...)` задаёт ответы
   (`callTool`, `say`, `hang`), `requests` хранит, что модель получила, `costPerResponseUsd` задаёт цену ответа.
+- `createFakeDeployApp()` — подставное приложение с командами выкатки в памяти;
+- `seedDoctorRecords()` — готовые записи в хранилище врача.
+
+### Тест полного цикла
+
+Полный цикл «сбой → случай → правка → выкатка» собирается из таких частей (рабочий пример — [`examples/cycle-test/crash-cycle.test.ts`](../../examples/cycle-test/crash-cycle.test.ts)):
+
+- `createGitGuard({ repoDir, worktreesDir, mainBranch, mainline, author })` — git-замок над рабочей копией основной ветки;
+- `createServerDeployer({ guard, loadConfig, env })` — выкатка вашими командами из `deploy.commands`; `loadConfig` возвращает настройку (`async () => config`);
+- `createLocalRunner()` — запуск команд правки в обычной папке, без Docker. Врач соглашается на него только с `allowUnisolatedRunner: true` в `treatment`: только для тестов;
+- `startDoctorService({ stateDir, sharedSecret, listen, telegram, treatment, now, onWake, exit, log })` — врач в процессе теста. `treatment` получает `guard`, `loadConfig`, `worktreesDir`, `models` и `model` от `createScriptedModel()`, `runner`, `allowUnisolatedRunner`, `deployer`. Возвращает `url`, `caseBook` (`getCase(номер)` с полем `state`) и `close()`;
+- `now` и `onWake` — часы врача. Спящие задачи (окно наблюдения) просыпаются по `onWake(wake, resume)`: вызовите `resume()` сразу, а `now` сдвиньте вперёд до `wake.at`, и окно наблюдения проходит за секунды.
+
+Подставная модель отвечает по сценарию `model.script(...)`. Инструменты, которые она может звать:
+
+- `read { path }`, `write { path, content }`, `edit`, `bash` — работа с копией правки;
+- `case_info {}` — сведения о случае;
+- `finish_diagnosis { found, cause, evidence: string[], confidence: 'low'|'medium'|'high', fixPlan?, causeInPackage? }` — итог диагноза;
+- `finish_fix { summary, testsAdded: string[], notes? }` — итог правки. Тест, добавленный правкой, должен быть в `testsAdded`.
+
+Случай доходит до итогового состояния (`healed`, `rolled_back`, `needs_human` и так далее): ждите его опросом `caseBook.getCase(1)`.
