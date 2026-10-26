@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
 import { createCaseServices, type CaseServices } from '../case-services/index.js'
+import { createServerDeployer } from '../deployer/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
@@ -100,6 +101,16 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
   const controlSecret = env.REMONTNIK_CONTROL_SECRET?.trim() || undefined
   if (controlSecret === sharedSecret) throw new Error('REMONTNIK_CONTROL_SECRET совпадает с REMONTNIK_SHARED_SECRET: нужен отдельный секрет владельца')
 
+  const guard = createGitGuard({
+    repoDir,
+    worktreesDir,
+    mainBranch: config.repo.mainBranch,
+    mainline: config.repo.mainline,
+    author: { name: env.REMONTNIK_GIT_AUTHOR_NAME?.trim() || 'Ремонтник', email: env.REMONTNIK_GIT_AUTHOR_EMAIL?.trim() || 'remontnik@example.invalid' },
+    env: gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()),
+  })
+  const loadConfig = async () => (await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch: config.repo.mainBranch })).config
+
   return {
     listen,
     gateway,
@@ -121,15 +132,10 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
       },
       ...(reportsToken ? { reportsFeed: { token: reportsToken } } : {}),
       treatment: {
-        guard: createGitGuard({
-          repoDir,
-          worktreesDir,
-          mainBranch: config.repo.mainBranch,
-          mainline: config.repo.mainline,
-          author: { name: env.REMONTNIK_GIT_AUTHOR_NAME?.trim() || 'Ремонтник', email: env.REMONTNIK_GIT_AUTHOR_EMAIL?.trim() || 'remontnik@example.invalid' },
-          env: gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()),
-        }),
-        loadConfig: async () => (await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch: config.repo.mainBranch })).config,
+        guard,
+        loadConfig,
+        // Решение «выкатывать» выкатывает правку; без выкатчика оно закрывалось бы только отчётом.
+        deployer: createServerDeployer({ guard, loadConfig, env }),
         worktreesDir,
         models: model.models,
         model: model.model,

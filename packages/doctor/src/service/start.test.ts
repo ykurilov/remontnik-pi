@@ -2,9 +2,16 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { testRemontnikConfig } from '../testing/config.js'
+import { startDoctorService } from './index.js'
 import { caseWorkbenchEnv, doctorStartPlan, parseListen, startDoctorFromEnv, type DoctorEnv } from './start.js'
+
+// Настоящая служба, но видно, с чем её подняли.
+vi.mock('./index.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./index.js')>()
+  return { ...original, startDoctorService: vi.fn(original.startDoctorService) }
+})
 
 // Боевой запуск врача: окружение сервера → служба с исполнителем в контейнере, сетями случая, зеркалом реестра
 // и прокси eval; приём событий — только в сети приложения.
@@ -120,13 +127,16 @@ describe('старт врача', () => {
     return { docker, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) }
   }
 
-  it('приём событий — только на адресе врача в сети приложения; старые сети случая удаляются', async () => {
+  it('приём событий — только на адресе врача в сети приложения; старые сети случая удаляются; выкатчик подключён', async () => {
     const repoDir = appRepo()
     const fake = fakeDocker({ 'remontnik-app': '127.0.0.1', 'remontnik-outside': '10.9.0.5' })
     const env = serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: join(repoDir, '..', 'state'), REMONTNIK_LISTEN_PORT: '0' })
     const doctor = await startDoctorFromEnv(env, { docker: fake.docker })
     try {
       expect(doctor.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+      // Выкатчик врача: без него решение «выкатывать» закрывалось бы только отчётом.
+      const started = vi.mocked(startDoctorService).mock.lastCall![0]
+      expect(started.treatment.deployer?.step).toBeTypeOf('function')
       expect(fake.calls()).toEqual(expect.arrayContaining(['inspect --format {{json .NetworkSettings.Networks}} remontnik-doctor', 'network rm stale-network-id']))
       // Контейнеры верстака прошлого запуска убиваются раньше, чем удаляются их сети; их копии испорчены.
       const calls = fake.calls()
