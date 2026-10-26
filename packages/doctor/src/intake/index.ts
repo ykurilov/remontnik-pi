@@ -24,6 +24,8 @@ export interface IntakeHandlerOptions {
   fingerprintRelease?: IntakeHandler
   /** Стоп-кран выкаток: `POST /v1/control/deploys`. Не задан — адреса нет. */
   deployControls?: IntakeHandler
+  /** Снова поставить случай в работу: `POST /v1/control/cases`. Не задано — адреса нет. */
+  caseRetry?: IntakeHandler
 }
 
 export type { IntakeHandler }
@@ -68,6 +70,10 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
     if (options.deployControls && path === '/v1/control/deploys') {
       await options.deployControls(request, response)
+      return
+    }
+    if (options.caseRetry && path === '/v1/control/cases') {
+      await options.caseRetry(request, response)
       return
     }
     if (options.fingerprintRelease && path === '/v1/control/fingerprints') {

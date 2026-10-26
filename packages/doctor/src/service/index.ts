@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { Models } from '@earendil-works/pi-ai'
-import type { ReportInfo, Storage, Wake } from '@earendil-works/pi-durable'
+import type { ReportInfo, Storage, TaskId, Wake } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
@@ -14,19 +16,22 @@ import { createModelBudget } from '../ledgers/model-budget.js'
 import { GIT_GUARD_REASONS, GitGuardError, type GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
 import { confirmAbandonedVersion, type Deployer } from '../deployer/index.js'
+import { createCaseRetryHandler } from '../intake/case-retry.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls, readControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
-import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
+import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, TREATMENT_TASK_NAME, type Treatment, type TreatmentInput } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
+import { createCaseRetry } from './case-retry.js'
 import { createCurrentVersionReader } from './current-version.js'
-import { openDoctorHarness } from './harness.js'
+import { openDoctorHarness, type DoctorHarness } from './harness.js'
 
 // Каркас врача: хранилище pi-durable, приём событий, книга случаев, отчёты и Telegram.
-// Отказ хранилища закрывает Harness; тогда врач шлёт тревогу напрямую и выходит с кодом 1 — его перезапустит systemd.
+// Отказ хранилища закрывает Harness; тогда врач шлёт тревогу напрямую, оставляет пометку в папке состояния и выходит
+// с кодом 1 — его перезапустит systemd. После перезапуска пометка становится отчётом doctor_problem.
 
 export interface DoctorServiceOptions {
   stateDir: string
@@ -103,6 +108,17 @@ const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
   migration_failed: 'не перенесена на новую версию',
   task_outdated: 'не может продолжиться: её код сменился',
 }
+/** После этих сбоев задачу лечения владелец ставит в работу снова командой `case <id> retry`. */
+const RETRYABLE_REPORTS: readonly ReportInfo['type'][] = ['task_parked', 'task_faulted']
+/** Пометка об отказе хранилища: переживает выход врача, после перезапуска — отчёт doctor_problem. */
+const STORAGE_FAILURE_MARK = 'storage-failure.json'
+
+interface StorageFailureMark {
+  at: string
+  reason: string
+  /** Тревога ушла в Telegram: отчёт после перезапуска её не повторяет. */
+  telegramSent: boolean
+}
 
 /** Модель и проверки идут только в контейнере; локальный исполнитель — лишь по явному разрешению тестов. */
 function isolatedRunners(options: DoctorTreatmentOptions): { runner: CommandRunner; checksRunner: CommandRunner } {
@@ -144,6 +160,32 @@ function problemReason(error: unknown): string {
   return redactSecrets(describeError(error).replace(ADDRESS, '<адрес>'))
 }
 
+/** Отказ хранилища прошлого запуска — отчётом doctor_problem: в ленте Paseo и, если тревога не ушла, в Telegram. */
+async function reportStorageFailure(stateDir: string, reports: Reports, log: (line: string) => void): Promise<void> {
+  const path = join(stateDir, STORAGE_FAILURE_MARK)
+  if (!existsSync(path)) return
+  let mark: StorageFailureMark
+  try {
+    mark = JSON.parse(readFileSync(path, 'utf8')) as StorageFailureMark
+  } catch (error) {
+    // Пометка недописана: врач умер посреди записи. Причина неизвестна, но об отказе владелец узнает.
+    log(`[врач] пометка об отказе хранилища не прочитана: ${describeError(error)}`)
+    mark = { at: 'время неизвестно', reason: 'причина неизвестна', telegramSent: false }
+  }
+  try {
+    await reports.add({
+      type: 'doctor_problem',
+      short: `Врач перезапустился после отказа хранилища (${mark.reason}, ${mark.at}).`,
+      telegram: mark.telegramSent ? 'not_needed' : 'pending',
+    })
+  } catch (error) {
+    // Пометка остаётся до следующего запуска.
+    log(`[врач] отчёт об отказе хранилища не записан: ${describeError(error)}`)
+    return
+  }
+  rmSync(path, { force: true })
+}
+
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
@@ -160,12 +202,15 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   let harnessState: 'open' | 'failed' | 'closed' = 'open'
   let closing = false
   let reportsRef: Reports | null = null
+  let openedRef: DoctorHarness | null = null
 
-  const sendDirect = async (text: string) => {
+  const sendDirect = async (text: string): Promise<boolean> => {
     try {
       await telegram.sendMessage(options.telegram.chatId, text)
+      return true
     } catch (error) {
       log(`[врач] Telegram недоступен: ${describeError(error)}`)
+      return false
     }
   }
 
@@ -174,18 +219,33 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     reportsRef.pump().catch((error: unknown) => log(`[врач] отчёты не отправлены: ${describeError(error)}`))
   }
 
+  /** Случай задачи лечения; `undefined` — задача не лечения или хранилище недоступно. */
+  async function caseOfTask(task: { id: TaskId; kind: string }): Promise<number | undefined> {
+    if (task.kind !== TREATMENT_TASK_NAME || !openedRef || harnessState !== 'open') return undefined
+    const found = await openedRef.harness.getTask(task.id, BACKGROUND_CONTEXT).catch(() => undefined)
+    const caseId = (found?.input as TreatmentInput | undefined)?.caseId
+    return typeof caseId === 'number' ? caseId : undefined
+  }
+
   function handleHarnessReport(error: unknown, info: ReportInfo): void {
     log(`[врач] pi-durable: ${info.type}: ${describeError(error)}`)
     const what = TASK_REPORTS[info.type]
     if (!what || !('task' in info) || !info.task) return
-    const short = `Врач: задача ${info.task.kind} (${info.task.id}) ${what}: ${problemReason(error)}`
-    if (!reportsRef || harnessState !== 'open') {
-      void sendDirect(short)
-      return
-    }
-    reportsRef
-      .add({ type: 'doctor_problem', short, telegram: 'pending' })
-      .then(pump, () => sendDirect(short))
+    const task = info.task
+    void caseOfTask(task).then((caseId) => {
+      const short =
+        caseId === undefined
+          ? `Врач: задача ${task.kind} (${task.id}) ${what}: ${problemReason(error)}`
+          : `Врач: лечение случая ${caseId} ${what}: ${problemReason(error)}.` +
+            (RETRYABLE_REPORTS.includes(info.type) ? ` Снова в работу: remontnik-doctor case ${caseId} retry` : '')
+      if (!reportsRef || harnessState !== 'open') {
+        void sendDirect(short)
+        return
+      }
+      reportsRef
+        .add({ type: 'doctor_problem', ...(caseId === undefined ? {} : { caseId }), short, telegram: 'pending' })
+        .then(pump, () => sendDirect(short))
+    })
   }
 
   const treatmentOptions = options.treatment
@@ -208,6 +268,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     ...(modelBudget && runners ? { models: modelBudget.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
+  openedRef = opened
   const caseBook = createCaseBook(opened.records, { now })
   const reports = createReports({
     store: opened.records,
@@ -217,6 +278,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     onSendError: (error, report) => log(`[врач] отчёт ${report.reportId} не ушёл в Telegram: ${describeError(error)}`),
   })
   reportsRef = reports
+  await reportStorageFailure(options.stateDir, reports, log)
 
   let evalProxy: EvalProxy | undefined
   let ownEvalProxy: EvalProxy | undefined
@@ -267,9 +329,20 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     }
     harnessState = 'failed'
     if (closing) return
-    const text = `Врач остановился: хранилище отказало (${describeError(end.error)}). Перезапускаюсь.`
-    log(`[врач] ${text}`)
-    await sendDirect(text)
+    log(`[врач] хранилище отказало: ${describeError(end.error)}`)
+    const reason = problemReason(end.error)
+    const mark: StorageFailureMark = { at: new Date(now()).toISOString(), reason, telegramSent: false }
+    const writeMark = () => {
+      try {
+        writeFileSync(join(options.stateDir, STORAGE_FAILURE_MARK), JSON.stringify(mark))
+      } catch (error) {
+        log(`[врач] пометка об отказе хранилища не записана: ${describeError(error)}`)
+      }
+    }
+    // Пометка до отправки: если врач умрёт посреди неё, после перезапуска владелец всё равно узнает.
+    writeMark()
+    mark.telegramSent = await sendDirect(`Врач остановился: хранилище отказало (${reason}). Перезапускаюсь.`)
+    if (mark.telegramSent) writeMark()
     exit(1)
   })
 
@@ -310,6 +383,11 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           secret: options.sharedSecret,
           ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
           confirmVersion: (version) => confirmAbandonedVersion(opened.records, version),
+        }),
+        caseRetry: createCaseRetryHandler({
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+          retryCase: createCaseRetry({ harness: opened.harness, records: opened.records, ...(treatment ? { treatment } : {}), now }),
         }),
         fingerprintRelease: createFingerprintReleaseHandler({
           records: opened.records,

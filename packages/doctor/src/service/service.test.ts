@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync } from 'node:fs'
+import { mkdtempSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
@@ -163,5 +163,23 @@ describe('каркас врача', () => {
     await until(() => exit.mock.calls.length === 1)
     expect(exit).toHaveBeenCalledWith(1)
     expect(telegram.messages.some((item) => item.text.includes('disk I/O error'))).toBe(true)
+
+    // После перезапуска отказ виден и в ленте отчётов; в Telegram тревога второй раз не идёт.
+    await service.close()
+    const restarted = await start()
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toMatchObject({ telegram: { state: 'not_needed' } })
+    expect(problems[0]?.short).toContain('disk I/O error')
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
+  })
+
+  it('тревога об отказе хранилища не ушла → после перезапуска отчёт doctor_problem идёт в Telegram', async () => {
+    writeFileSync(join(stateDir, 'storage-failure.json'), JSON.stringify({ at: '2026-10-26T10:00:00.000Z', reason: 'disk I/O error', telegramSent: false }))
+
+    await start()
+
+    await until(() => telegram.messages.some((item) => item.text.includes('отказа хранилища')))
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
   })
 })

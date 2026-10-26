@@ -124,8 +124,9 @@ export function slugify(text: string): string {
   return slug || 'fix'
 }
 
-export function treatmentBranch(caseId: number, slug: string): string {
-  return `${TREATMENT_BRANCH_PREFIX}${caseId}-${slugify(slug)}`
+/** Ветка лечения случая; у повторной попытки (`case <id> retry` после падения задачи) — своя, с `-r<номер>`. */
+export function treatmentBranch(caseId: number, slug: string, attempt = 1): string {
+  return `${TREATMENT_BRANCH_PREFIX}${caseId}-${slugify(slug)}${attempt > 1 ? `-r${attempt}` : ''}`
 }
 
 const ALWAYS_FORBIDDEN_FLAGS = new Set([
