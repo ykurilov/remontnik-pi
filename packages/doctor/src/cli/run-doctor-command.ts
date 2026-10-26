@@ -1,4 +1,5 @@
 import { UsageError, type DoctorCommandIo } from './command-io.js'
+import { fingerprintCommand, FINGERPRINT_USAGE } from './fingerprint-commands.js'
 import { reportsCommand, REPORTS_USAGE } from './reports-commands.js'
 
 // Консольная `remontnik-doctor`: разбор команды и вызов нужной. Каждая группа команд — свой файл со своей справкой.
@@ -9,9 +10,10 @@ type CommandGroup = (args: string[], io: DoctorCommandIo) => Promise<number>
 
 const COMMAND_GROUPS: Readonly<Record<string, CommandGroup>> = {
   reports: reportsCommand,
+  fingerprint: fingerprintCommand,
 }
 
-const USAGE = `Использование:\n${REPORTS_USAGE}`
+const USAGE = `Использование:\n${REPORTS_USAGE}${FINGERPRINT_USAGE}`
 
 export async function runDoctorCommand(argv: string[], io: DoctorCommandIo): Promise<number> {
   const [group, ...args] = argv

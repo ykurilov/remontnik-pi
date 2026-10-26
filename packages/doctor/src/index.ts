@@ -17,6 +17,17 @@ export {
   type TreatmentOutcome,
   type TreatmentResult,
 } from './treatment/index.js'
+export {
+  LEDGER,
+  deployAttemptsOf,
+  readDeployAttempts,
+  recordAutoDeployIn,
+  recordRollbackIn,
+  releaseFingerprint,
+  type DeployAttemptLimits,
+  type FingerprintLedger,
+} from './ledgers/fingerprint-ledger.js'
+export { emptySpendDay, nextDayStartMs, spendDayKey, type SpendDay } from './ledgers/spend-ledger.js'
 export { createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
 export { createEvalProxy, type EvalProxy, type EvalProxyOptions } from './eval-proxy/index.js'
 export { runDoctorCommand, type DoctorCommandIo } from './cli/run-doctor-command.js'

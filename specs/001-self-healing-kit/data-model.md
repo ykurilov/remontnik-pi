@@ -138,11 +138,13 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 
-`{ [fingerprint]: { autoDeploys: { at, deploymentId }[], rolledBackAt?, needsHuman: boolean } }` + `{ deploysToday: { day, count } }`. Снятие `needsHuman` — только командой владельца.
+`{ fingerprints: { [fingerprint]: { autoDeploys: { at, deploymentId }[], rolledBackAt?, needsHuman: boolean, releasedBy?, releasedAt? } }, deploysToday: { day, count } }`, ключ `main`. Сутки — в поясе приложения; в `autoDeploys` хранятся только последние двое суток. Выкатка пишет `recordAutoDeployIn` перед автовыкаткой (повтор того же `deploymentId` не считается) и `recordRollbackIn` после отката; допуск читает факты `attempts` из этого документа. Снятие `needsHuman` — только командой владельца (`fingerprint <fp> release`, секрет владельца).
 
 ### SpendLedger (документ `remontnik.spend`)
 
-`{ day, modelUsd, evalUsd, limits: { modelUsd, evalUsd } }`. Перед каждым обращением к модели и перед каждым прогоном eval — проверка; учёт с запасом 10% (R1).
+Документ на сутки, ключ — дата в поясе приложения (`YYYY-MM-DD`): `{ model: { [caseKey]: usd }, eval: { [reservationId]: EvalReservation } }`. Перед каждым обращением к модели и перед каждым прогоном eval — проверка; доступно 90% дневного потолка (запас 10%, R1). Потолок модели достигнут — запрос не уходит, случай `deferred_budget` с отчётом `budget_reached` и продолжает тот же этап с начала следующих суток (`sleepUntil`). Отдельный от учёта сторожа.
+
+Очередь eval (документ `remontnik.eval-queue`, ключ `main`): `{ waiting: { [caseKey]: since } }` — случаи, которым скоро понадобится eval. Остаток дня делится поровну между ждущими и идущими; отметки старше 2 часов не считаются. Доли нет сейчас — случай ждёт минуту и пробует снова; денег на сутки нет — `deferred_budget` до следующих суток.
 
 Бронь eval случая: `{ reservedUsd, actualUsd?, observedUsd?, inFlightUsd? }`. Бронируется доля случая (`limits.evalUsdPerCase`, не больше остатка дня) прямо перед запуском команды eval. `observedUsd` (факт) и `inFlightUsd` (брони запросов в пути) пишет прокси врача по ходу прогона; бронь запроса записывается до его отправки поставщику. Обрыв или перезапуск закрывают бронь суммой `observedUsd + inFlightUsd`; ничего не записано — нулём.
 

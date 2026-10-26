@@ -48,6 +48,10 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   spend: recordFamily('remontnik.spend'),
   /** Сколько расхода модели по случаю уже записано в дни. */
   'spend-case': recordFamily('remontnik.spend-case'),
+  /** Случаи, которые ждут eval: остаток дня делится между ними. */
+  'eval-queue': recordFamily('remontnik.eval-queue'),
+  /** Учёт выкаток по отпечатку: пределы в сутки и «нужен человек» после отката. */
+  ledger: recordFamily('remontnik.ledger'),
 }
 
 /** Семейство документов коллекции записей: для чтения из задач pi-durable (`runtime.snapshot`). */

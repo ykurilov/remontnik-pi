@@ -3,8 +3,9 @@ import type { ChangedFile } from '../changed-files/index.js'
 import type { ChecksResult } from '../checks/index.js'
 import { decideDeploy } from '../deploy-gate/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
-import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeploysYet } from './gate.js'
-import { emptySpendDay } from './spend.js'
+import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeployControls } from './gate.js'
+import { deployAttemptsOf } from '../ledgers/fingerprint-ledger.js'
+import { emptySpendDay } from '../ledgers/spend-ledger.js'
 
 // Фаза `gated`: факты правки собирает код, решает `decideDeploy`, итог случая выбирается по решению.
 
@@ -13,6 +14,8 @@ const config = testRemontnikConfig()
 function file(path: string, patch = '@@ -1 +1 @@\n-old\n+new\n', status: ChangedFile['status'] = 'modified'): ChangedFile {
   return { path, status, added: 1, removed: status === 'added' ? 0 : 1, patch }
 }
+
+const noAttempts = deployAttemptsOf(undefined, { fingerprint: 'fp', now: 0, timeZone: 'UTC', limits: config.limits })
 
 const appIncident = { where: 'src/price.ts:5:3', stack: 'Error: x\n    at price (src/price.ts:5:3)' }
 const fixInSrc = [file('src/price.ts'), file('test/default-plan.test.ts', '@@ -0,0 +1 @@\n+test\n', 'added')]
@@ -27,7 +30,7 @@ function checks(overrides: { tests?: Partial<ChecksResult['tests']>; eval?: Part
 function facts(files: ChangedFile[], ...rest: [result?: ChecksResult | undefined, day?: ReturnType<typeof emptySpendDay>]) {
   const result = rest.length > 0 ? rest[0] : checks()
   const day = rest[1] ?? emptySpendDay()
-  return deployFactsOf({ inspection: inspectFix(config, files, appIncident), checks: result, controls: noDeploysYet(config), spendDay: day, limits: config.limits })
+  return deployFactsOf({ inspection: inspectFix(config, files, appIncident), checks: result, controls: noDeployControls(), attempts: noAttempts, spendDay: day, limits: config.limits })
 }
 
 describe('осмотр правки: одно место для фактов о диффе', () => {
@@ -98,18 +101,20 @@ describe('факты для decideDeploy', () => {
     expect(decideDeploy(result).reasons.map((reason) => reason.code)).toEqual(['budget_exhausted'])
   })
 
-  it('до этапа выкатки: стоп-крана нет, выкаток не было, лимиты из настройки', () => {
-    expect(noDeploysYet(config)).toEqual({
-      stopSwitch: false,
-      attempts: {
-        autoDeploysForFingerprint: 0,
-        maxPerFingerprintPerDay: config.limits.autoDeploysPerFingerprintPerDay,
-        autoDeploysToday: 0,
-        maxPerDay: config.limits.autoDeploysPerDay,
-        needsHumanAfterRollback: false,
-      },
-      rebase: 'clean',
-    })
+  it('до этапа выкатки: стоп-крана нет, перенос не нужен', () => {
+    expect(noDeployControls()).toEqual({ stopSwitch: false, rebase: 'clean' })
+  })
+
+  it('попытки выкатки — из учёта по отпечатку: после отката нужен человек', () => {
+    const now = Date.UTC(2026, 10, 2, 12)
+    const ledger = {
+      fingerprints: { fp: { autoDeploys: [{ at: new Date(now - 3_600_000).toISOString(), deploymentId: 1 }], needsHuman: true } },
+      deploysToday: { day: '2026-11-02', count: 1 },
+    }
+    const attempts = deployAttemptsOf(ledger, { fingerprint: 'fp', now, timeZone: 'UTC', limits: config.limits })
+    const result = deployFactsOf({ inspection: inspectFix(config, fixInSrc, appIncident), checks: checks(), controls: noDeployControls(), attempts, spendDay: emptySpendDay(), limits: config.limits })
+    expect(result.attempts).toMatchObject({ autoDeploysForFingerprint: 1, autoDeploysToday: 1, needsHumanAfterRollback: true })
+    expect(decideDeploy(result).reasons.map((reason) => reason.code)).toEqual(['needs_human_after_rollback'])
   })
 })
 
@@ -146,7 +151,7 @@ describe('причина в Agent Chat SDK', () => {
   ])('%s, модель пакет не назвала → SDK по стеку; выкатки нет без человека', (_what, where, stack) => {
     const inspection = inspectFix(config, fixInSrc, { where, stack })
     expect(agentChatSdkPackage(diagnosis, inspection)).toBe('@ykurilov/agent-chat-core')
-    const decision = decideDeploy(deployFactsOf({ inspection, checks: checks(), controls: noDeploysYet(config), spendDay: emptySpendDay(), limits: config.limits }))
+    const decision = decideDeploy(deployFactsOf({ inspection, checks: checks(), controls: noDeployControls(), attempts: noAttempts, spendDay: emptySpendDay(), limits: config.limits }))
     expect(decision.verdict).toBe('report_only')
     expect(decision.reasons.map((reason) => reason.code)).toEqual(['forbidden_zone'])
     expect(closingOf(decision, checks()).kind).toBe('needs_human')

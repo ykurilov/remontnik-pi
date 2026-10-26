@@ -9,6 +9,7 @@ import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../in
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
@@ -22,6 +23,8 @@ import { openDoctorHarness } from './harness.js'
 export interface DoctorServiceOptions {
   stateDir: string
   sharedSecret: string
+  /** Секрет владельца: только им снимается «нужен человек» по отпечатку. Не задан — снять по HTTP нельзя. */
+  controlSecret?: string
   listen: { host: string; port: number }
   telegram: { botToken: string; chatId: string; apiBaseUrl?: string; proxyToken?: string }
   /** Лента отчётов (R13). Не задана — адресов `/v1/reports*` нет. */
@@ -247,6 +250,11 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
         secret: options.sharedSecret,
         receiveEvents,
         health: () => ({ ok: harnessState === 'open', harness: harnessState, autoDeploy: 'on' }),
+        fingerprintRelease: createFingerprintReleaseHandler({
+          records: opened.records,
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+        }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),
       host: options.listen.host,

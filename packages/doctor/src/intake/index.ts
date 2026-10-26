@@ -20,6 +20,8 @@ export interface IntakeHandlerOptions {
   bodyTimeoutMs?: number
   /** Лента отчётов: `/v1/reports*` отдаются ей. Не задана — этих адресов нет. */
   reportsFeed?: IntakeHandler
+  /** Снятие «нужен человек» по отпечатку: `POST /v1/control/fingerprints`. Не задано — адреса нет. */
+  fingerprintRelease?: IntakeHandler
 }
 
 export type { IntakeHandler }
@@ -52,6 +54,10 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     const path = (request.url ?? '/').split('?')[0]
     if (request.method === 'GET' && path === '/health') {
       sendJson(response, 200, options.health())
+      return
+    }
+    if (options.fingerprintRelease && path === '/v1/control/fingerprints') {
+      await options.fingerprintRelease(request, response)
       return
     }
     if (options.reportsFeed && (path === '/v1/reports' || path === '/v1/reports/ack')) {

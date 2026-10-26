@@ -8,7 +8,7 @@ import { findForbiddenZones, type ForbiddenZoneHit } from '../forbidden-zones/in
 import type { ReportType } from '../reports/index.js'
 import type { Diagnosis } from './doc.js'
 import { findProtectedChanges, type ProtectedChange } from './protected-changes.js'
-import { evalSpentUsd, modelSpentUsd, type SpendDay } from './spend.js'
+import { evalSpentUsd, modelSpentUsd, type SpendDay } from '../ledgers/spend-ledger.js'
 
 // Фаза `gated` лечения (R6, FR-020): факты о правке собирает код, выкатывать или нет — решает только `decideDeploy`.
 // Осмотр диффа делается один раз, после коммита правки. Если правке нельзя доверить собственную проверку
@@ -24,8 +24,8 @@ export interface FixInspection {
   diff: DiffInspection
 }
 
-/** Стоп-кран, учёт выкаток и перенос правки на свежую основную ветку — их даёт выкатка (этап 6). */
-export type DeployControlFacts = Pick<DeployFacts, 'stopSwitch' | 'attempts' | 'rebase'>
+/** Стоп-кран и перенос правки на свежую основную ветку — их даёт выкатка (этап 6). Попытки — учёт по отпечатку (`ledgers/fingerprint-ledger.ts`). */
+export type DeployControlFacts = Pick<DeployFacts, 'stopSwitch' | 'rebase'>
 
 export interface DeployControls {
   read(input: { caseId: number; fingerprint: string; config: RemontnikConfig }): Promise<DeployControlFacts>
@@ -75,19 +75,9 @@ export function fixCanBeChecked(inspection: FixInspection): boolean {
   return inspection.protectedChanges.length === 0 && inspection.diff.suspicious.length === 0
 }
 
-/** Пока выкатки нет: стоп-крана нет, выкаток не было, перенос не нужен. Решение `deploy` закрывается отчётом. */
-export function noDeploysYet(config: RemontnikConfig): DeployControlFacts {
-  return {
-    stopSwitch: false,
-    attempts: {
-      autoDeploysForFingerprint: 0,
-      maxPerFingerprintPerDay: config.limits.autoDeploysPerFingerprintPerDay,
-      autoDeploysToday: 0,
-      maxPerDay: config.limits.autoDeploysPerDay,
-      needsHumanAfterRollback: false,
-    },
-    rebase: 'clean',
-  }
+/** Пока выкатки нет: стоп-крана нет, перенос не нужен. Решение `deploy` закрывается отчётом. */
+export function noDeployControls(): DeployControlFacts {
+  return { stopSwitch: false, rebase: 'clean' }
 }
 
 export function deployFactsOf(input: {
@@ -95,6 +85,8 @@ export function deployFactsOf(input: {
   /** Нет — проверки не запускались. */
   checks: ChecksResult | undefined
   controls: DeployControlFacts
+  /** Учёт попыток по отпечатку. */
+  attempts: DeployFacts['attempts']
   spendDay: SpendDay
   limits: RemontnikConfig['limits']
 }): DeployFacts {
@@ -113,6 +105,7 @@ export function deployFactsOf(input: {
     protectedChanges: inspection.protectedChanges.filter((change) => !named.has(change.path)),
     diff: inspection.diff,
     ...input.controls,
+    attempts: input.attempts,
     spend: {
       modelUsd: modelSpentUsd(input.spendDay),
       modelLimitUsd: input.limits.modelUsdPerDay,
