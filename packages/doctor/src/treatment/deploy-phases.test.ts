@@ -478,7 +478,7 @@ describe('лечение до выкатки: deploying → observing → ито
       if (!next) throw new Error(`нет ответа для случая ${caseId}`)
       return typeof next === 'function' ? next(context, undefined) : next
     }
-    model.script(...Array.from({ length: 10 }, () => routed))
+    model.script(...Object.values(answers).flatMap((steps) => steps.map(() => routed)))
     const doctor = await startDoctor(r, model, app, clock, { limits: { autoDeploysPerFingerprintPerDay: 1 } })
     const first = priceCrash()
     // Тот же сбой во втором приложении: свой случай, но отпечаток тот же.

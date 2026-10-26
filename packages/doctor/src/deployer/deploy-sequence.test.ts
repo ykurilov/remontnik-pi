@@ -469,6 +469,29 @@ describe('итоги наблюдения', () => {
   })
 })
 
+describe('подтверждение правки', () => {
+  it('врач упал посреди confirm, пока лежал, приложение вернулось к прежней версии → без отката и без confirm, причина своими словами', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    let crashed = false
+    const r = rig({
+      app,
+      crashBefore: (name) => {
+        if (name !== 'confirm' || crashed) return false
+        crashed = true
+        // Врач умер, не дождавшись confirm; кто-то вернул приложение к прежней версии.
+        app.humanDeploys(PREV)
+        return true
+      },
+    })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'superseded_by_human', supersededBy: PREV, revertedAfterConfirm: true })
+    expect(count(app.calls, 'rollback')).toBe(0)
+    expect(count(app.calls, 'confirm')).toBe(0)
+    expect(app.running).toBe(PREV)
+    expect(existsSync(r.lockPath)).toBe(false)
+  })
+})
+
 describe('рабочая копия основной ветки', () => {
   it('изменена ещё до выкатки — отказ, сборки нет', async () => {
     const app = createFakeDeployApp({ running: PREV, previous: OLDER })

@@ -1,4 +1,3 @@
-import { join } from 'node:path'
 import { checkPages, createBrowserTools, takeCaseScreenshotsIn, withPageCheck, type BrowserClient, type PageCheck } from '../browser-tools/index.js'
 import type { JsonValue } from '@earendil-works/chord'
 import type { Context } from '@earendil-works/chord/context'
@@ -42,7 +41,7 @@ import {
   type ReportText,
 } from '../reports/texts.js'
 import { durableTxOf, recordFamilyOf, recordTransactionOver, runDeploymentInTask } from '../service/harness.js'
-import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
+import { createWorkbench, SpoiledCopyError, workbenchPath, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
 import {
   agentChatSdkPackage,
@@ -103,7 +102,11 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // Модель работает в отдельном разговоре, которым владеет задача: системный промпт и набор инструментов
 // постоянны для основы, сведения о случае — в сообщениях.
 
-export type TreatmentInput = { caseId: number }
+/** Вид задачи лечения в pi-durable: по нему отчёт о её сбое находит случай. */
+export const TREATMENT_TASK_NAME = 'remontnik.treatment'
+
+/** `attempt` — номер попытки лечения случая: новая после `case <id> retry` упавшей задачи, со своей копией и веткой. */
+export type TreatmentInput = { caseId: number; attempt?: number }
 
 type Treating = {
   conversationId: ConversationId
@@ -196,6 +199,8 @@ export interface Treatment {
   extension: Extension
   /** Внутри транзакции нового случая: разговор случая и задача лечения появляются вместе со случаем. */
   startIn(tx: RecordTransaction, opened: Case): Promise<void>
+  /** Внутри транзакции: новая попытка лечения открытого случая, чья задача упала. Возвращает номер попытки. */
+  restartIn(tx: RecordTransaction, opened: Case): Promise<number>
 }
 
 type Runtime = TaskRuntime<TreatmentInput, TreatmentState, TreatmentResult, object>
@@ -456,7 +461,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   /**
    * Правка осталась работать — ветка уходит в основную: `merge` — git-замком, проверенной ревизией и только вперёд,
    * `pull-request` — ждёт запроса на слияние. Стоп-кран, нажатый за окно, слияние останавливает: правка ждёт человека.
-   * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз.
+   * Повтор после перезапуска безопасен: правку, уже лежащую в основной ветке, git-замок не отправляет второй раз, а
+   * итог — «влил», даже если стоп-кран нажали, пока врач лежал после слияния.
    */
   async function settleMainline(runtime: Runtime, checkpoint: DeployPhase, context: Context): Promise<MainlineResult> {
     const config = await deps.loadConfig()
@@ -465,7 +471,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     try {
       if (!checkpoint.pushed) await deps.guard.push(branch)
       if (config.repo.mainline !== 'merge') return { kind: 'pull_request', branch }
-      if (controls?.autoDeploy === 'stopped') return { kind: 'stopped', branch }
+      if (controls?.autoDeploy === 'stopped') {
+        return (await deps.guard.isInMainline(checkpoint.fixCommit)) ? { kind: 'merged', into: config.repo.mainBranch } : { kind: 'stopped', branch }
+      }
       await deps.guard.mergeIntoMain(branch, checkpoint.fixCommit)
       return { kind: 'merged', into: config.repo.mainBranch }
     } catch (error) {
@@ -512,9 +520,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
    * выкачена, одной фиксацией — случай `observing`, отчёт «выкатил, наблюдаю» и чекпойнт `observing`.
    * Конец выкатки закрывает случай её отчётом.
    */
-  async function deployStep(runtime: Runtime, caseId: number, checkpoint: DeployPhase, deployer: Deployer, context: Context): Promise<void> {
+  async function deployStep(runtime: Runtime, input: TreatmentInput, checkpoint: DeployPhase, deployer: Deployer, context: Context): Promise<void> {
+    const { caseId } = input
     const sick = await readCase(runtime, caseId, context)
-    const candidateDir = join(deps.worktreesDir, `case-${caseId}-deploy`)
+    const candidateDir = `${workbenchPath(deps.worktreesDir, caseId, input.attempt)}-deploy`
     // Копия правки нужна только для сборки: в наблюдении её уже нет.
     if (checkpoint.phase === 'deploying') await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit })
     const request: DeployRequest = { caseId, appName: sick.appName, fingerprint: sick.fingerprint, candidateVersion: checkpoint.fixCommit, candidateDir }
@@ -583,7 +592,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   const task = defineTask<TreatmentInput, TreatmentState, TreatmentResult>({
-    name: 'remontnik.treatment',
+    name: TREATMENT_TASK_NAME,
     version: 1,
     initial: () => ({ phase: 'triage' }),
     phases: {
@@ -601,6 +610,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           slug: slugify(sick.message),
           baseCommit,
           closedPaths: config.closedPaths,
+          ...(task.input.attempt ? { attempt: task.input.attempt } : {}),
         })
         const bashTimeoutSeconds = Math.max(1, Math.ceil(config.workbench.bashTimeoutMs / 1000))
         const instructions = buildSystemPrompt({
@@ -739,8 +749,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         if (!checks) await stopOnBrokenWorkbench(runtime, caseId, checkpoint, context, async () => {
           // Проверки идут в своих копиях на закоммиченной правке и на основе: мусор модели в верстаке им не мешает.
           const closed = (await deps.guard.listFiles(checkpoint.baseCommit)).filter((file) => matchesAnyMask(config.closedPaths, file))
-          const candidateDir = join(deps.worktreesDir, `case-${caseId}-candidate`)
-          const baseDir = join(deps.worktreesDir, `case-${caseId}-base`)
+          const copyPath = workbenchPath(deps.worktreesDir, caseId, task.input.attempt)
+          const candidateDir = `${copyPath}-candidate`
+          const baseDir = `${copyPath}-base`
           // Копии проверок всегда заново: после сбоя в старых мог остаться мусор прошлого прогона.
           await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed, fresh: true })
           await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed, fresh: true })
@@ -899,12 +910,12 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
       deploying: async (task, runtime, context) => {
         if (!deps.deployer) throw new Error('выкатка начата, а выкатчика у врача нет')
-        await deployStep(runtime, task.input.caseId, task.state.checkpoint, deps.deployer, context)
+        await deployStep(runtime, task.input, task.state.checkpoint, deps.deployer, context)
       },
 
       observing: async (task, runtime, context) => {
         if (!deps.deployer) throw new Error('выкатка начата, а выкатчика у врача нет')
-        await deployStep(runtime, task.input.caseId, task.state.checkpoint, deps.deployer, context)
+        await deployStep(runtime, task.input, task.state.checkpoint, deps.deployer, context)
       },
     },
     // Снятая задача не держит брони eval и место в очереди: за сегодня и вчера (прогон мог начаться до полуночи).
@@ -950,15 +961,25 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     tasks: [task],
   })
 
+  async function startTreatmentIn(records: RecordTransaction, opened: Case, input: TreatmentInput): Promise<void> {
+    const tx = durableTxOf(records)
+    if (!tx) throw new Error('лечение запускается только в транзакции записей на pi-durable')
+    const conversation = await tx.createConversation({ ownership: { kind: 'ownerless' } })
+    const taskId = await tx.createTask(task, input, { ownership: { kind: 'conversation' }, conversationId: conversation.id, background: true })
+    opened.treatmentTaskId = String(taskId)
+    opened.state = 'triage'
+  }
+
   return {
     extension,
     async startIn(records, opened) {
-      const tx = durableTxOf(records)
-      if (!tx) throw new Error('лечение запускается только в транзакции записей на pi-durable')
-      const conversation = await tx.createConversation({ ownership: { kind: 'ownerless' } })
-      const taskId = await tx.createTask(task, { caseId: opened.caseId }, { ownership: { kind: 'conversation' }, conversationId: conversation.id, background: true })
-      opened.treatmentTaskId = String(taskId)
-      opened.state = 'triage'
+      await startTreatmentIn(records, opened, { caseId: opened.caseId })
+    },
+    async restartIn(records, opened) {
+      const attempt = (opened.treatmentAttempt ?? 1) + 1
+      await startTreatmentIn(records, opened, { caseId: opened.caseId, attempt })
+      opened.treatmentAttempt = attempt
+      return attempt
     },
   }
 }

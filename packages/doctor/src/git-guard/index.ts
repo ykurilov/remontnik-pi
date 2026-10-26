@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { ChangedFile } from '../changed-files/index.js'
@@ -17,6 +17,15 @@ import type { ChangedFile } from '../changed-files/index.js'
 export const TREATMENT_BRANCH_PREFIX = 'remontnik/'
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+/**
+ * Замки веток origin и `packed-refs.lock` общие с человеком: ими пользуется его fetch, gc и ручная выкатка. Живой git
+ * держит их, только пока пишет ветки, — доли секунды, у больших fetch и gc секунды; сам git ждёт `packed-refs.lock`
+ * всего секунду. Свой git врач убивает через `DEFAULT_TIMEOUT_MS`. Десять минут с запасом больше всего этого: замок
+ * старше брошен, моложе — может быть живым, и его врач не трогает.
+ */
+export const STALE_SHARED_LOCK_MS = 10 * 60_000
+/** Отметка в gitdir копии: `checkout` закончен. Копия без неё недосоздана — врач упал посреди создания. */
+const COPY_READY_MARK = 'remontnik-ready'
 
 /** `diverged` — основная ветка origin ушла вперёд мимо правки: влить её вперёд нельзя. */
 export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape' | 'diverged'
@@ -99,6 +108,15 @@ export interface GitGuard {
    * Рабочую копию основной ветки не трогает: её держат выкатки, и смена копии посреди чужой выкатки — её отказ.
    */
   mergeIntoMain(branch: string, commit: string): Promise<void>
+  /** Ревизия `commit` уже в основной ветке origin (по свежему fetch). */
+  isInMainline(commit: string): Promise<boolean>
+  /**
+   * Замки git, брошенные убитым врачом (его git убит вместе с ним): в gitdir копий врача, у веток и меток `remontnik/…`.
+   * Замки веток origin и `packed-refs.lock` — общие с человеком — только старше `STALE_SHARED_LOCK_MS`. Только на
+   * старте врача, пока его git не идёт. Замки основной копии (индекс, её ветки) не трогает. Копию, где ещё может писать живой git (`inUse`:
+   * её контейнер не удалось убрать), не трогает тоже. Возвращает убранные пути относительно общего gitdir.
+   */
+  clearStaleLocks(options?: { inUse?: (copyDir: string) => boolean }): Promise<string[]>
 }
 
 const TRANSLIT: Record<string, string> = {
@@ -118,8 +136,9 @@ export function slugify(text: string): string {
   return slug || 'fix'
 }
 
-export function treatmentBranch(caseId: number, slug: string): string {
-  return `${TREATMENT_BRANCH_PREFIX}${caseId}-${slugify(slug)}`
+/** Ветка лечения случая; у повторной попытки (`case <id> retry` после падения задачи) — своя, с `-r<номер>`. */
+export function treatmentBranch(caseId: number, slug: string, attempt = 1): string {
+  return `${TREATMENT_BRANCH_PREFIX}${caseId}-${slugify(slug)}${attempt > 1 ? `-r${attempt}` : ''}`
 }
 
 const ALWAYS_FORBIDDEN_FLAGS = new Set([
@@ -259,6 +278,8 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
   const policy: Policy = { repoDir, worktreesDir, mainBranch: options.mainBranch, mainline: options.mainline, remote }
   const knownSecrets = Object.values(options.env ?? {}).filter((value) => value.length >= 6)
   const clean = (text: string) => redactSecrets(text, { knownSecrets })
+  /** Очередь создания копий: см. `addWorktree`. */
+  let copyLine: Promise<void> = Promise.resolve()
 
   function canonical(path: string): string {
     // Ссылки не должны уводить проверку пути в сторону: сравниваем настоящие пути.
@@ -412,6 +433,38 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     }
   }
 
+  /** Основная ветка origin сейчас: fetch и её ревизия. */
+  /**
+   * Брошенные замки веток origin и `packed-refs.lock` (см. `STALE_SHARED_LOCK_MS`): перед каждым fetch, чтобы замок,
+   * ещё молодой на старте врача, не держал fetch вечно. Возвращает убранные пути относительно общего gitdir.
+   */
+  function dropStaleSharedLocks(): string[] {
+    const removed: string[] = []
+    const remotes = join(commonGitDir, 'refs/remotes', remote)
+    const locks = [
+      ...(existsSync(remotes) ? readdirSync(remotes, { recursive: true, encoding: 'utf8' }).filter((file) => file.endsWith('.lock')).map((file) => join(remotes, file)) : []),
+      join(commonGitDir, 'packed-refs.lock'),
+    ]
+    for (const lock of locks) {
+      let age: number
+      try {
+        age = Date.now() - statSync(lock).mtimeMs
+      } catch {
+        continue
+      }
+      if (age < STALE_SHARED_LOCK_MS) continue
+      rmSync(lock, { force: true })
+      removed.push(relative(commonGitDir, lock))
+    }
+    return removed
+  }
+
+  async function fetchedMainline(): Promise<string> {
+    dropStaleSharedLocks()
+    await run(['fetch', remote])
+    return (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
+  }
+
   async function tagExists(name: string): Promise<boolean> {
     try {
       await run(['rev-parse', '--verify', '--quiet', `refs/tags/${name}`])
@@ -431,6 +484,28 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     const staged = gitlinks(await run(['ls-files', '--stage', '-z'], { cwd }))
     const committed = new Set(gitlinks(await run(['ls-tree', '-r', '-z', 'HEAD'], { cwd })))
     return staged.filter((path) => !committed.has(path))
+  }
+
+  /** Новая копия: ветка или отделённая голова, sparse без исключённых файлов. Уже готовая копия остаётся. */
+  async function addCopy(add: AddWorktreeOptions): Promise<void> {
+    const path = resolve(add.path)
+    if (add.fresh) await removeCopy(path)
+    else if (existsSync(path)) {
+      if (existsSync(join(verifiedGitDir(path), COPY_READY_MARK))) return
+      // Врач упал посреди создания копии: в ней нет файлов или только часть. Её ветка (если была) осталась.
+      await removeCopy(path)
+    }
+    const target =
+      add.branch === undefined
+        ? ['--detach', path, add.base]
+        : (await branchExists(add.branch))
+          ? [path, add.branch]
+          : ['-b', add.branch, path, add.base]
+    await run(['worktree', 'add', '--no-checkout', ...target])
+    const patterns = ['/*', ...(add.exclude ?? []).map((file) => `!/${escapeSparsePath(file)}`)]
+    await run(['sparse-checkout', 'set', '--no-cone', '--stdin'], { cwd: path }, `${patterns.join('\n')}\n`)
+    await run(['checkout'], { cwd: path })
+    writeFileSync(join(verifiedGitDir(path), COPY_READY_MARK), '')
   }
 
   /** Удаляет копию целиком (с мусором проверок) и забывает её в git. Только внутри папки копий. */
@@ -485,6 +560,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     },
 
     async fetch() {
+      dropStaleSharedLocks()
       await run(['fetch', remote])
     },
 
@@ -492,24 +568,14 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       return (await run(['rev-parse', '--verify', `${ref}^{commit}`], resolveOptions)).trim()
     },
 
-    async addWorktree(add) {
-      const path = resolve(add.path)
-      if (add.fresh) await removeCopy(path)
-      else if (existsSync(path)) {
-        verifiedGitDir(path)
-        return
-      }
-      const target =
-        add.branch === undefined
-          ? ['--detach', path, add.base]
-          : (await branchExists(add.branch))
-            ? [path, add.branch]
-            : ['-b', add.branch, path, add.base]
-      await run(['worktree', 'add', '--no-checkout', ...target])
-      const patterns = ['/*', ...(add.exclude ?? []).map((file) => `!/${escapeSparsePath(file)}`)]
-      await run(['sparse-checkout', 'set', '--no-cone', '--stdin'], { cwd: path }, `${patterns.join('\n')}\n`)
-      await run(['checkout'], { cwd: path })
+    // Копии — по одной: первый `sparse-checkout set` пишет общий `.git/config`, и вторая копия в ту же минуту
+    // спотыкалась бы о его замок.
+    addWorktree: (add) => {
+      const added = copyLine.then(() => addCopy(add))
+      copyLine = added.catch(() => {})
+      return added
     },
+
 
     removeWorktree: (path) => removeCopy(resolve(path)),
 
@@ -525,6 +591,34 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
 
     async changedFiles(cwd, base) {
       return readChangedFiles((args) => run(args, { cwd }), base)
+    },
+
+    async clearStaleLocks(clearOptions = {}) {
+      const removed: string[] = []
+      const drop = (path: string) => {
+        rmSync(path, { force: true })
+        removed.push(relative(commonGitDir, path))
+      }
+      const ownDir = canonical(worktreesDir)
+      const admins = join(commonGitDir, 'worktrees')
+      for (const name of existsSync(admins) ? readdirSync(admins) : []) {
+        const admin = join(admins, name)
+        let copy: string
+        try {
+          copy = canonical(dirname(readFileSync(join(admin, 'gitdir'), 'utf8').trim()))
+        } catch {
+          continue
+        }
+        if (!inside(ownDir, copy)) continue
+        // Путь копии — как его знает врач, а не настоящий: по нему исполнитель помнит испорченные копии.
+        if (clearOptions.inUse?.(join(worktreesDir, relative(ownDir, copy)))) continue
+        for (const file of readdirSync(admin)) if (file.endsWith('.lock')) drop(join(admin, file))
+      }
+      for (const own of [join(commonGitDir, 'refs/heads', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/tags', TREATMENT_BRANCH_PREFIX)]) {
+        if (!existsSync(own)) continue
+        for (const file of readdirSync(own, { recursive: true, encoding: 'utf8' })) if (file.endsWith('.lock')) drop(join(own, file))
+      }
+      return [...removed, ...dropStaleSharedLocks()]
     },
 
     async commitAll(cwd, message) {
@@ -566,12 +660,16 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: вливать можно только ревизию по её полному id')
       const head = (await run(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`])).trim()
       if (head !== commit) throw new GitGuardError('forbidden', `git-замок: ветка ${branch} ушла с проверенной ревизии`)
-      await run(['fetch', remote])
-      const mainline = (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
+      const mainline = await fetchedMainline()
       if (await isAncestor(commit, mainline)) return
       if (!(await isAncestor(mainline, commit))) throw new GitGuardError('diverged', `git-замок: основная ветка ${options.mainBranch} ушла вперёд мимо правки`)
       // Обычный push без `+`: origin примет его, только если основная ветка всё ещё предок правки.
       await run(['push', remote, `${commit}:refs/heads/${options.mainBranch}`])
+    },
+
+    async isInMainline(commit) {
+      if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: ревизия — по её полному id')
+      return isAncestor(commit, await fetchedMainline())
     },
   }
 }

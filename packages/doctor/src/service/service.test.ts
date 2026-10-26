@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync } from 'node:fs'
+import { mkdtempSync, existsSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
@@ -163,5 +163,53 @@ describe('каркас врача', () => {
     await until(() => exit.mock.calls.length === 1)
     expect(exit).toHaveBeenCalledWith(1)
     expect(telegram.messages.some((item) => item.text.includes('disk I/O error'))).toBe(true)
+
+    // После перезапуска отказ виден и в ленте отчётов; в Telegram тревога второй раз не идёт.
+    await service.close()
+    const restarted = await start()
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toMatchObject({ telegram: { state: 'not_needed' } })
+    expect(problems[0]?.short).toContain('disk I/O error')
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
+  })
+
+  it('врач упал между отчётом об отказе хранилища и удалением пометки → после перезапуска отчёт не повторяется', async () => {
+    const mark = JSON.stringify({ id: 'mark-1', at: '2026-10-26T10:00:00.000Z', reason: 'disk I/O error', telegramSent: true })
+    writeFileSync(join(stateDir, 'storage-failure.json'), mark)
+    const first = await start()
+    await first.close()
+    // Пометка осталась: врача убили сразу после записи отчёта.
+    writeFileSync(join(stateDir, 'storage-failure.json'), mark)
+
+    const restarted = await start()
+
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(1)
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
+  })
+
+  it('два отказа хранилища подряд с недописанной пометкой → два отчёта, а не один общий', async () => {
+    const markPath = join(stateDir, 'storage-failure.json')
+    // Врач умирал посреди записи пометки: оба раза файл пустой, различаются только временем.
+    writeFileSync(markPath, '')
+    utimesSync(markPath, new Date('2026-10-26T10:00:00Z'), new Date('2026-10-26T10:00:00Z'))
+    await (await start()).close()
+    writeFileSync(markPath, '')
+    utimesSync(markPath, new Date('2026-10-26T11:00:00Z'), new Date('2026-10-26T11:00:00Z'))
+
+    const restarted = await start()
+
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(2)
+  })
+
+  it('тревога об отказе хранилища не ушла → после перезапуска отчёт doctor_problem идёт в Telegram', async () => {
+    writeFileSync(join(stateDir, 'storage-failure.json'), JSON.stringify({ at: '2026-10-26T10:00:00.000Z', reason: 'disk I/O error', telegramSent: false }))
+
+    await start()
+
+    await until(() => telegram.messages.some((item) => item.text.includes('отказа хранилища')))
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
   })
 })

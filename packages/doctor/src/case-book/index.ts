@@ -55,6 +55,11 @@ export interface Case {
   linkedEventIds: string[]
   state: CaseState
   treatmentTaskId?: string
+  /** Номер попытки лечения: больше 1 после `case <id> retry` упавшей задачи. */
+  treatmentAttempt?: number
+  /** Кто и когда последним снова поставил случай в работу (`case <id> retry`). */
+  retriedBy?: string
+  retriedAt?: string
   reportIds: number[]
 }
 

@@ -493,19 +493,20 @@ describe('контейнеры верстака после падения вра
     expect(wrapper).toContain('kill -KILL -1')
   })
 
-  /** Подставной docker со «старыми» контейнерами верстака: `ps` их выдаёт, `rm` записывает. */
-  function orphanDocker(root: string, rows: string[]) {
+  /** Подставной docker со «старыми» контейнерами верстака: `ps` их выдаёт, `rm` записывает; `stuck` не удаляются. */
+  function orphanDocker(root: string, rows: string[], stuck: string[] = []) {
     const log = join(root, 'orphan-docker.log')
     const docker = join(root, 'orphan-docker')
+    const stuckCases = stuck.map((id) => `  "rm -f ${id}") echo 'Error response from daemon: could not kill' >&2; exit 1;;`)
     writeFileSync(
       docker,
-      ['#!/bin/sh', `echo "$*" >> '${log}'`, 'case "$1" in', `  ps) printf '%s\n' ${rows.map((row) => `'${row}'`).join(' ')};;`, 'esac', 'exit 0', ''].join('\n'),
+      ['#!/bin/sh', `echo "$*" >> '${log}'`, 'case "$*" in', ...stuckCases, 'esac', 'case "$1" in', `  ps) printf '%s\n' ${rows.map((row) => `'${row}'`).join(' ')};;`, 'esac', 'exit 0', ''].join('\n'),
       { mode: 0o755 },
     )
     return { docker, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) }
   }
 
-  it('на старте врача контейнеры с меткой верстака убиваются, а копии, где команда шла, помечаются испорченными', async () => {
+  it('на старте врача контейнеры с меткой верстака удаляются: оборванная команда копию не портит, лечение продолжается в ней', async () => {
     const b = await bench()
     const homesDir = join(b.root, 'homes')
     // Метку копии ставит сам исполнитель: берём её из настоящего `docker create`.
@@ -519,10 +520,23 @@ describe('контейнеры верстака после падения вра
     expect(orphans.calls()[0]).toBe('ps -a --filter label=remontnik.workbench=1 --format {{.ID}} {{.State}} {{.Label "remontnik.copy"}}')
     expect(orphans.calls()).toEqual(expect.arrayContaining(['rm -f aaa', 'rm -f bbb']))
     expect(removed).toEqual(['aaa', 'bbb'])
-    // Команда в копии оборвана на середине — копии больше не доверяют. Контейнер, который не начинал, копию не портит.
+    // Контейнера больше нет — команда в копии мертва: модель увидит её прерванной и продолжит в той же копии.
     const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir, docker: fake.docker })
-    expect(runner.spoiled(b.workbench.path)).toBe(true)
+    expect(runner.spoiled(b.workbench.path)).toBe(false)
     expect(existsSync(join(homesDir, `${other}.spoiled`))).toBe(false)
+  })
+
+  it('старый контейнер с идущей командой не удалился → его копия испорчена: команда, возможно, ещё пишет в неё', async () => {
+    const b = await bench()
+    const homesDir = join(b.root, 'homes')
+    const fake = fakeDocker(b.root)
+    await createDockerRunner({ image: 'example.test/app-dev:1', homesDir, docker: fake.docker }).run('ls', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
+    const copy = fake.calls()[0]!.find((arg) => arg.startsWith('remontnik.copy='))!.slice('remontnik.copy='.length)
+    const lines: string[] = []
+    const orphans = orphanDocker(b.root, [`aaa running ${copy}`], ['aaa'])
+    expect(await removeOrphanWorkbenches({ homesDir, docker: orphans.docker, log: (line) => lines.push(line) })).toEqual([])
+    expect(createDockerRunner({ image: 'example.test/app-dev:1', homesDir, docker: fake.docker }).spoiled(b.workbench.path)).toBe(true)
+    expect(lines.join('\n')).toContain('aaa')
   })
 
   it('старых контейнеров нет — ничего не удаляется', async () => {

@@ -282,8 +282,9 @@ function spoiledMarkOf(homesDir: string, key: string): string {
 }
 
 /**
- * Контейнеры верстака прошлого запуска врача (врач упал, `--rm` их не убрал): убить и удалить. Если команда в
- * контейнере уже шла, она оборвана на середине — копия помечается испорченной. Возвращает ID удалённых.
+ * Контейнеры верстака прошлого запуска врача (врач упал, `--rm` их не убрал): убить и удалить. Команда в удалённом
+ * контейнере мертва: копия цела, а модель увидит команду прерванной и продолжит в той же копии. Не удалился контейнер,
+ * где команда уже шла, — она, возможно, ещё пишет в копию: копия помечается испорченной. Возвращает ID удалённых.
  */
 export async function removeOrphanWorkbenches(options: { homesDir: string; docker?: string; log?: (line: string) => void }): Promise<string[]> {
   const docker = options.docker ?? 'docker'
@@ -294,13 +295,16 @@ export async function removeOrphanWorkbenches(options: { homesDir: string; docke
   for (const line of listed.output.split('\n')) {
     const [id, state, key] = line.trim().split(/\s+/)
     if (!id) continue
+    const killed = await step(['rm', '-f', id])
+    if (killed.exitCode === 0) {
+      removed.push(id)
+      continue
+    }
+    options.log?.(`[врач] старый контейнер верстака ${id} не удалился: ${killed.output.trim().slice(-300)}`)
     if (state !== 'created' && key && /^[0-9a-f]{16}$/.test(key)) {
       mkdirSync(options.homesDir, { recursive: true })
       writeFileSync(spoiledMarkOf(options.homesDir, key), `${id}\n`)
     }
-    const killed = await step(['rm', '-f', id])
-    if (killed.exitCode === 0) removed.push(id)
-    else options.log?.(`[врач] старый контейнер верстака ${id} не удалился: ${killed.output.trim().slice(-300)}`)
   }
   return removed
 }

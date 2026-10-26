@@ -34,6 +34,8 @@ export interface WorkbenchOptions {
   slug: string
   baseCommit: string
   closedPaths: readonly string[]
+  /** Номер попытки лечения: у повторной своя копия и ветка. */
+  attempt?: number
 }
 
 export interface Workbench {
@@ -42,14 +44,15 @@ export interface Workbench {
   baseCommit: string
 }
 
-export function workbenchPath(worktreesDir: string, caseId: number): string {
-  return join(worktreesDir, `case-${caseId}`)
+/** Копия случая; у повторной попытки — своя (`case-<id>-r<номер>`), копии проверок и сборки — рядом с суффиксами. */
+export function workbenchPath(worktreesDir: string, caseId: number, attempt = 1): string {
+  return join(worktreesDir, attempt > 1 ? `case-${caseId}-r${attempt}` : `case-${caseId}`)
 }
 
 /** Создаёт копию для случая или отдаёт уже созданную (после перезапуска врача правки модели сохраняются). */
 export async function createWorkbench(options: WorkbenchOptions): Promise<Workbench> {
-  const path = workbenchPath(options.worktreesDir, options.caseId)
-  const branch = treatmentBranch(options.caseId, options.slug)
+  const path = workbenchPath(options.worktreesDir, options.caseId, options.attempt)
+  const branch = treatmentBranch(options.caseId, options.slug, options.attempt)
   const closed = (await options.guard.listFiles(options.baseCommit)).filter((file) => matchesAnyMask(options.closedPaths, file))
   await options.guard.addWorktree({ path, branch, base: options.baseCommit, exclude: closed })
   const leaked = closed.filter((file) => existsSync(join(path, file)))

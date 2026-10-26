@@ -187,6 +187,13 @@ describe('тексты отчётов выкатки', () => {
     expect(human.short).toContain('d'.repeat(12))
   })
 
+  it('правку уже подтверждали, а приложение вернулось к прежней версии — так и сказано, а не «человек выкатил своё»', () => {
+    const back = report({ outcome: 'superseded_by_human', supersededBy: base.previousVersion, revertedAfterConfirm: true } as Partial<Deployment>)
+    expect(back.type).toBe('needs_human')
+    expect(back.short).toContain('приложение вернулось к прежней версии')
+    expect(back.short).not.toContain('выкатил свою версию')
+  })
+
   it('выкатку бросили (замок потерян или задача умерла) — нужен человек, кандидат назван', () => {
     const lost = report({ outcome: 'abandoned', stage: 'done', detail: 'замок выкатки потерян: в файле замка manual deploy' })
     expect(lost.type).toBe('needs_human')

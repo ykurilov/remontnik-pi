@@ -111,7 +111,8 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `gate` | `GateDecision` |
 | `spendUsd` | число |
 | `phase` | имя фазы задачи |
-| `pendingEffect` | `EffectIntent?` — намерение внешнего действия, записанное до его выполнения |
+| `pendingEffect` | отдельного поля нет: внешние действия переживают падение врача по-своему. Метка прежней версии, push и слияние — повторяемы (git сам отвечает «уже есть»); `promote` и `rollback` — шаги документа `deployment/<id>`: намерение записано до действия, после перезапуска шаг сверяется с `current` сервера, а не с памятью (`deployer/deploy-sequence.ts`) |
+| `attempt` | номер попытки лечения: 1, после `case <id> retry` упавшей задачи — следующий; у попытки своя копия `case-<id>-r<N>` и ветка `remontnik/<caseId>-<slug>-r<N>` |
 
 ### CheckResult
 

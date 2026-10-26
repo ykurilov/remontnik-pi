@@ -201,12 +201,12 @@ description: "Задачи реализации Ремонтника Pi"
 
 **Независимая проверка**: врач убит на каждой фазе и запущен снова — случай доведён, выкаток ≤ 1, приложение здорово.
 
-- [ ] T081 [P] [US5] Обвязка тестов падений `packages/doctor/test/crash/crash-harness.ts`: врач — дочерний процесс, `REMONTNIK_TEST_CRASH_AT=<фаза>`, перезапуск
-- [ ] T082 [US5] Тесты падений `packages/doctor/test/crash/phases.test.ts`: `triage`, `diagnosing`, `fixing`, `verifying`, `gated`, `deploying` до и после `promote`, `observing` — итог доведён, выкаток ≤ 1, `healthy`
-- [ ] T083 [US5] Эффекты «намерение → действие → итог» (`pendingEffect`) для метки, push, `promote`, `rollback` с проверкой через `current` в `packages/doctor/src/treatment/effects.ts`
-- [ ] T084 [US5] Перезапуск верстака незавершённого случая при старте (сироты), обработка `interrupted` у bash в `packages/doctor/src/workbench/`
-- [ ] T085 [US5] Сбой хранилища → выход и отчёт `doctor_problem`; тревога о припаркованной задаче; команда `case <id> retry` в `packages/doctor/src/service/` и `packages/doctor/src/cli/`
-- [ ] T086 [US5] Тест «основной поставщик упал посреди случая» `packages/doctor/test/integration/fallback.test.ts`
+- [X] T081 [P] [US5] Обвязка тестов падений `packages/doctor/test/crash/crash-harness.ts`: врач — дочерний процесс, `REMONTNIK_TEST_CRASH_AT=<фаза>`, перезапуск
+- [X] T082 [US5] Тесты падений `packages/doctor/test/crash/phases.test.ts`: `triage`, `diagnosing`, `fixing`, `verifying`, `gated`, `deploying` до и после `promote`, `observing` — итог доведён, выкаток ≤ 1, `healthy`
+- [X] T083 [US5] Эффекты «намерение → действие → итог» (`pendingEffect`) для метки, push, `promote`, `rollback` с проверкой через `current` в `packages/doctor/src/treatment/effects.ts` — отдельный модуль не понадобился: git-действия повторяемы, `promote`/`rollback` уже сверяются с `current` в `deployer/deploy-sequence.ts` (см. data-model, `pendingEffect`)
+- [X] T084 [US5] Перезапуск верстака незавершённого случая при старте (сироты), обработка `interrupted` у bash в `packages/doctor/src/workbench/`
+- [X] T085 [US5] Сбой хранилища → выход и отчёт `doctor_problem`; тревога о припаркованной задаче; команда `case <id> retry` в `packages/doctor/src/service/` и `packages/doctor/src/cli/`
+- [X] T086 [US5] Тест «основной поставщик упал посреди случая» `packages/doctor/test/integration/fallback.test.ts`
 
 ---
 

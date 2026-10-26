@@ -117,8 +117,12 @@ export interface Deployment {
   /** Хвост вывода команды или причина: для отчёта человеку. */
   detail?: string
   supersededBy?: string
+  /** Правку уже подтверждали (`confirm` начат), а приложение потом вернулось к прежней версии. */
+  revertedAfterConfirm?: boolean
   /** Какая выкатка сняла замок этой, когда её задача умерла. */
   abandonedBy?: number
+  /** `confirm` запускали (записано перед запуском): решение «правка держится» уже не пересматривается. */
+  confirmLaunched?: boolean
   confirmFailed?: string
   endedAt?: string
 }
@@ -670,22 +674,40 @@ export function createDeployer(deps: DeployerDeps): Deployer {
 
           case 'confirming': {
             if (!(await lock.holds(holder))) return lockLost()
-            const changed = await mainCopyChanged()
-            if (changed) {
-              await startRollback('main_copy_changed', changed)
-              break
+            if (deployment.confirmLaunched) {
+              // Врач упал посреди `confirm` или сразу после: правку уже подтверждали, и откатывать её поздно. `confirm`
+              // идёт ещё раз (повтор по договору безопасен), если работает всё ещё кандидат.
+              const current = await commands.current()
+              if (current.ok && current.version !== null && current.version === deployment.previousVersion) {
+                // Откатывать подтверждённую правку поздно, подтверждать прежнюю версию — не наше дело.
+                return finish((draft) => {
+                  draft.outcome = 'superseded_by_human'
+                  draft.supersededBy = current.version!
+                  draft.revertedAfterConfirm = true
+                })
+              }
+              if (current.ok && current.version !== null && current.version !== request.candidateVersion) return superseded(current.version)
+            } else {
+              const changed = await mainCopyChanged()
+              if (changed) {
+                await startRollback('main_copy_changed', changed)
+                break
+              }
+              const current = await commands.current()
+              if (!current.ok || current.version === null) {
+                await startRollback('current_unavailable', current.ok ? 'current: работающей версии нет' : current.reason)
+                break
+              }
+              if (current.version === deployment.previousVersion) {
+                await startRollback('reverted', 'приложение вернулось к прежней версии')
+                break
+              }
+              if (current.version !== request.candidateVersion) return superseded(current.version)
+              if (!(await lock.holds(holder))) return lockLost()
+              await save((draft) => {
+                draft.confirmLaunched = true
+              })
             }
-            const current = await commands.current()
-            if (!current.ok || current.version === null) {
-              await startRollback('current_unavailable', current.ok ? 'current: работающей версии нет' : current.reason)
-              break
-            }
-            if (current.version === deployment.previousVersion) {
-              await startRollback('reverted', 'приложение вернулось к прежней версии')
-              break
-            }
-            if (current.version !== request.candidateVersion) return superseded(current.version)
-            if (!(await lock.holds(holder))) return lockLost()
             const confirmed = await commands.confirm()
             return finish((draft) => {
               draft.outcome = draft.verdict ?? 'holding'
