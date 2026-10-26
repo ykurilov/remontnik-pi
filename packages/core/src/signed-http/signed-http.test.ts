@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  HEAD_SIGNATURE_HEADER,
   NONCE_HEADER,
   ReplayGuard,
   SIGNATURE_HEADER,
@@ -11,6 +12,7 @@ import {
   verifySignedBody,
   verifySignedRequest,
   verifySignedResponse,
+  verifyRequestHead,
 } from './index.js'
 
 const secret = 'shared-test-secret'
@@ -243,5 +245,29 @@ describe('precheckSignedRequest', () => {
   it('старая отметка и отметка раньше notBefore — stale', () => {
     expect(precheckSignedRequest({ headers: headers(), now: now + 10 * 60_000 })).toEqual({ ok: false, reason: 'stale' })
     expect(precheckSignedRequest({ headers: headers(), now, notBefore: now + 5_000 })).toEqual({ ok: false, reason: 'stale' })
+  })
+})
+
+describe('verifyRequestHead: подпись заголовков до тела', () => {
+  const secret = 'head-secret-for-signature-tests'
+  const now = Date.UTC(2026, 0, 1)
+  const request = { method: 'POST', target: '/v1/control/deploys', body: '{"action":"stop"}' }
+
+  it('верна для того же секрета, метода и пути — тело не нужно', () => {
+    const headers = signRequest({ ...request, secret, now })
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers, secret, now })).toEqual({ ok: true })
+  })
+
+  it('чужой секрет, другой путь или метод, подмена метки, старая отметка — отказ', () => {
+    const headers = signRequest({ ...request, secret, now })
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers, secret: `${secret}-other`, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(verifyRequestHead({ method: 'POST', target: '/v1/control/cases', headers, secret, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(verifyRequestHead({ method: 'PUT', target: request.target, headers, secret, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers: { ...headers, [NONCE_HEADER]: '0'.repeat(32) }, secret, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers, secret, now: now + 301_000 })).toEqual({ ok: false, reason: 'stale' })
+    // Полная подпись в месте подписи заголовков не годится: у них разные сообщения.
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers: { ...headers, [HEAD_SIGNATURE_HEADER]: headers[SIGNATURE_HEADER] }, secret, now })).toEqual({ ok: false, reason: 'bad_signature' })
+    const { [HEAD_SIGNATURE_HEADER]: _head, ...withoutHead } = headers
+    expect(verifyRequestHead({ method: 'POST', target: request.target, headers: withoutHead, secret, now })).toEqual({ ok: false, reason: 'missing' })
   })
 })

@@ -4,10 +4,13 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 // Сторож → врач: `signBody`, HMAC-SHA256 над `<секунды>.<тело>`.
 // Мост Paseo ↔ врач: `signRequest` покрывает ещё метод, путь с запросом и разовую метку,
 // а `signResponse` привязывает ответ к разовой метке запроса. Повтор отсекает `ReplayGuard`.
+// Подпись заголовков (`verifyRequestHead`) покрывает всё, кроме тела: по ней отправителя узнают ещё до чтения тела.
+// Она не заменяет полную подпись — только даёт понять, чьё тело стоит дождаться.
 
 export const SIGNATURE_HEADER = 'X-Remontnik-Signature'
 export const TIMESTAMP_HEADER = 'X-Remontnik-Timestamp'
 export const NONCE_HEADER = 'X-Remontnik-Nonce'
+export const HEAD_SIGNATURE_HEADER = 'X-Remontnik-Head-Signature'
 export const DEFAULT_MAX_SKEW_MS = 300_000
 
 export type SignatureHeaders = { [SIGNATURE_HEADER]: string; [TIMESTAMP_HEADER]: string }
@@ -69,10 +72,14 @@ export function verifySignedBody(input: VerifySignedBodyInput): SignatureCheck {
 
 const NONCE = /^[0-9a-f]{32}$/
 
-export type RequestSignatureHeaders = SignatureHeaders & { [NONCE_HEADER]: string }
+export type RequestSignatureHeaders = SignatureHeaders & { [NONCE_HEADER]: string; [HEAD_SIGNATURE_HEADER]: string }
 
 function requestMessage(timestamp: string, nonce: string, method: string, target: string, body: string): string {
   return `remontnik-request-v1\n${timestamp}\n${nonce}\n${method.toUpperCase()}\n${target}\n${body}`
+}
+
+function headMessage(timestamp: string, nonce: string, method: string, target: string): string {
+  return `remontnik-request-head-v1\n${timestamp}\n${nonce}\n${method.toUpperCase()}\n${target}`
 }
 
 function responseMessage(
@@ -93,15 +100,14 @@ function timestampOf(now: number): string {
 }
 
 function checkSignature(
-  headers: HeaderSource,
+  signature: string | undefined,
+  timestamp: string | undefined,
   secret: string,
   now: number,
   maxSkewMs: number,
   message: (timestamp: string) => string,
   notBefore?: number,
 ): SignatureCheck {
-  const signature = readHeader(headers, SIGNATURE_HEADER)
-  const timestamp = readHeader(headers, TIMESTAMP_HEADER)
   if (!signature || !timestamp) return { ok: false, reason: 'missing' }
   const format = SIGNATURE_FORMAT.exec(signature)
   if (secret === '' || !/^\d+$/.test(timestamp) || !format) return { ok: false, reason: 'bad_signature' }
@@ -132,6 +138,7 @@ export function signRequest(input: SignRequestInput): RequestSignatureHeaders {
     [SIGNATURE_HEADER]: `sha256=${hmac(requestMessage(timestamp, nonce, input.method, input.target, input.body), input.secret)}`,
     [TIMESTAMP_HEADER]: timestamp,
     [NONCE_HEADER]: nonce,
+    [HEAD_SIGNATURE_HEADER]: `sha256=${hmac(headMessage(timestamp, nonce, input.method, input.target), input.secret)}`,
   }
 }
 
@@ -152,9 +159,32 @@ export function verifySignedRequest(input: VerifySignedRequestInput): SignatureC
   const nonce = readHeader(input.headers, NONCE_HEADER)
   if (!nonce) return { ok: false, reason: 'missing' }
   if (!NONCE.test(nonce)) return { ok: false, reason: 'bad_signature' }
-  return checkSignature(input.headers, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (timestamp) =>
-    requestMessage(timestamp, nonce, input.method, input.target, input.body),
+  const signature = readHeader(input.headers, SIGNATURE_HEADER)
+  const timestamp = readHeader(input.headers, TIMESTAMP_HEADER)
+  return checkSignature(signature, timestamp, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (stamp) =>
+    requestMessage(stamp, nonce, input.method, input.target, input.body),
     input.notBefore,
+  )
+}
+
+export interface VerifyRequestHeadInput {
+  method: string
+  target: string
+  headers: HeaderSource
+  secret: string
+  now?: number
+  maxSkewMs?: number
+}
+
+/** Проверка подписи заголовков без тела: метод, путь, отметка времени и разовая метка подписаны этим секретом. */
+export function verifyRequestHead(input: VerifyRequestHeadInput): SignatureCheck {
+  const nonce = readHeader(input.headers, NONCE_HEADER)
+  const signature = readHeader(input.headers, HEAD_SIGNATURE_HEADER)
+  const timestamp = readHeader(input.headers, TIMESTAMP_HEADER)
+  if (!nonce || !signature || !timestamp) return { ok: false, reason: 'missing' }
+  if (!NONCE.test(nonce)) return { ok: false, reason: 'bad_signature' }
+  return checkSignature(signature, timestamp, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (stamp) =>
+    headMessage(stamp, nonce, input.method, input.target),
   )
 }
 
@@ -212,8 +242,10 @@ export function verifySignedResponse(input: {
   now?: number
   maxSkewMs?: number
 }): SignatureCheck {
-  return checkSignature(input.headers, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (timestamp) =>
-    responseMessage(timestamp, input.request, input.status, input.body),
+  const signature = readHeader(input.headers, SIGNATURE_HEADER)
+  const timestamp = readHeader(input.headers, TIMESTAMP_HEADER)
+  return checkSignature(signature, timestamp, input.secret, input.now ?? Date.now(), input.maxSkewMs ?? DEFAULT_MAX_SKEW_MS, (stamp) =>
+    responseMessage(stamp, input.request, input.status, input.body),
   )
 }
 

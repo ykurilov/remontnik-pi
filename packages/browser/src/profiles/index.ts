@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { type BrowserContext, type Page, chromium } from 'playwright-core'
 import { describeTarget, isAllowedTarget, startEgressProxy } from '../egress/index.js'
 import { type BlockedRequest, type NetworkGuard, installNetworkGuard } from '../guard/index.js'
+import { createBlockedJournal } from './blocked-journal.js'
 import type { BrowserPolicy, BrowserProfileConfig } from '../policy/index.js'
 import type { ServiceLog } from '../log.js'
 import { type SensitiveFields, createSensitiveFields } from '../snapshot/index.js'
@@ -44,25 +45,35 @@ export function createProfiles(options: {
   log: ServiceLog
   env?: NodeJS.ProcessEnv
   headless?: boolean
+  /** Только для тестов: внутренние `ip:port` (IPv6 — в скобках), куда прокси службы всё же пускает. */
+  reachableInternal?: readonly string[]
 }): Profiles {
   const { dataDir, policy, log, env = process.env, headless = true } = options
   const sessions = new Map<string, Promise<ProfileSession>>()
 
   async function launch(profile: BrowserProfileConfig): Promise<ProfileSession> {
     const proxy = proxyOf(profile, env)
-    let blocked: BlockedRequest[] = []
-    const record = (request: BlockedRequest) => {
-      blocked.push(request)
-      log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason })
-    }
+    const blocked = createBlockedJournal(
+      (request) => log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason }),
+      () => log({ event: 'blocked_overflow', profile: profile.name }),
+    )
+    const record = (request: BlockedRequest) => blocked.record(request)
     let guard: NetworkGuard | undefined
     // Пока замок закрыт, соединения — только с allowedOrigins, что бы ни открывал скрипт страницы: воркеры,
     // SharedWorker, WebTransport, TURN по TCP, предварительные соединения. Постоянный запрет на весь сеанс —
-    // это `isLocked` всегда истинно и свой список адресов.
+    // это `isLocked` всегда истинно и свой список адресов. Внутренние адреса (петля, частные сети, метаданные облака)
+    // закрыты всегда, кроме allowedOrigins.
     const egress = await startEgressProxy({
       allows: (target) => !guard?.isLocked() || isAllowedTarget(target, policy.allowedOrigins),
-      onRefused: (target) => record({ code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: на странице пароль, адрес вне allowedOrigins` }),
+      exempt: (target) => isAllowedTarget(target, policy.allowedOrigins),
+      onRefused: (target, reason) =>
+        record(
+          reason === 'internal'
+            ? { code: 'refused_internal', reason: `соединение с ${describeTarget(target)}: внутренний адрес вне allowedOrigins` }
+            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: на странице пароль, адрес вне allowedOrigins` },
+        ),
       ...(proxy ? { upstream: proxy } : {}),
+      ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
     })
     const context = await chromium.launchPersistentContext(join(dataDir, 'profiles', profile.name), {
       headless,
@@ -70,8 +81,9 @@ export function createProfiles(options: {
       locale: 'ru-RU',
       serviceWorkers: 'block',
       acceptDownloads: false,
-      // Петля (localhost) тоже идёт через прокси: Playwright сам добавляет `<-loopback>` к обходу.
-      proxy: { server: egress.url },
+      // Петля (localhost) тоже идёт через прокси: Playwright сам добавляет `<-loopback>` к обходу. Имя и пароль
+      // прокси — свои на каждый запуск: другие программы на машине через него не ходят.
+      proxy: { server: egress.url, username: egress.username, password: egress.password },
       args: [
         // Мимо прокси не уходит ничего: QUIC (WebTransport, HTTP/3) выключен, WebRTC — без UDP мимо прокси,
         // а имена Chromium сам не разрешает вовсе — их разрешает прокси, поэтому пароль в имени хоста дальше
@@ -99,11 +111,7 @@ export function createProfiles(options: {
       context,
       page,
       fields: createSensitiveFields(),
-      takeBlocked() {
-        const taken = blocked
-        blocked = []
-        return taken
-      },
+      takeBlocked: () => blocked.take(),
       passwordFilled: () => {
         guard!.passwordFilled(page)
         egress.dropRefused()

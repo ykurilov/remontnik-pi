@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { redactValue } from '@ykurilov/remontnik-core/redact'
-import { DEFAULT_MAX_SKEW_MS, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { DEFAULT_MAX_SKEW_MS, NONCE_HEADER, verifyRequestHead, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 import { createBodyReadSlots, DEFAULT_CONTROL_BODY_READS, type BodyReadSlotSettings } from './body-read-slots.js'
 import { createRateLimiter, DEFAULT_CONTROL_RATE_LIMIT, type RateLimitSettings } from './rate-limit.js'
@@ -30,8 +30,10 @@ export interface IntakeHandlerOptions {
   caseRetry?: IntakeHandler
   /** Предел чужих запросов с одного адреса на `/v1/control/*` (подпись владельца его не тратит); по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
   controlRateLimit?: RateLimitSettings
-  /** Одновременные чтения тел на `/v1/control/*`: сверх предела вытесняется самое медленное; по умолчанию `DEFAULT_CONTROL_BODY_READS`. */
+  /** Одновременные чужие чтения тел на `/v1/control/*`: сверх предела вытесняется самое старое; по умолчанию `DEFAULT_CONTROL_BODY_READS`. */
   controlBodyReads?: Partial<BodyReadSlotSettings>
+  /** Секрет владельца: запрос с его подписью заголовков читается мимо общих мест для тел. */
+  controlSecret?: string
 }
 
 export type { IntakeHandler }
@@ -67,9 +69,33 @@ function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
   return Date.parse(event.occurredAt) > receivedAt + DEFAULT_MAX_SKEW_MS ? { ...event, occurredAt: new Date(receivedAt).toISOString() } : event
 }
 
+/**
+ * Метка запроса владельца проходит мимо мест для тел один раз за срок подписи: перехваченные заголовки нельзя
+ * повторять, чтобы держать соединения без предела. Память мала — переполнена, и запрос идёт общим путём.
+ */
+function createOwnerHeadMemory(limit = 256, ttlMs = 2 * DEFAULT_MAX_SKEW_MS, now: () => number = Date.now): (nonce: string) => boolean {
+  const seen = new Map<string, number>()
+  return (nonce) => {
+    const at = now()
+    for (const [old, expiresAt] of seen) {
+      if (expiresAt > at) break
+      seen.delete(old)
+    }
+    if (nonce === '' || seen.has(nonce) || seen.size >= limit) return false
+    seen.set(nonce, at + ttlMs)
+    return true
+  }
+}
+
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
   const controlAllowed = createRateLimiter(options.controlRateLimit ?? DEFAULT_CONTROL_RATE_LIMIT)
   const enterBodyRead = createBodyReadSlots({ ...DEFAULT_CONTROL_BODY_READS, ...options.controlBodyReads })
+  const ownerHeadSeen = createOwnerHeadMemory()
+  /** Заголовки подписаны секретом владельца, и эта метка мимо мест ещё не шла: тело читается без общего места. */
+  const ownerHead = (request: IncomingMessage, path: string) =>
+    options.controlSecret !== undefined &&
+    verifyRequestHead({ method: request.method ?? '', target: request.url ?? path, headers: request.headers, secret: options.controlSecret }).ok &&
+    ownerHeadSeen(headerValue(request, NONCE_HEADER) ?? '')
   return async (request, response) => {
     const path = (request.url ?? '/').split('?')[0]!
     if (request.method === 'GET' && path === '/health') {
@@ -78,11 +104,10 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
     // Команды владельца и стоп-кран: чужие запросы (без подписи владельца) упираются в предел с одного адреса.
     const foreignAllowed = () => controlAllowed(request.socket.remoteAddress ?? '')
-    if (path.startsWith('/v1/control/')) {
+    if (path.startsWith('/v1/control/') && !ownerHead(request, path)) {
       // Место занято, пока тело не дочитано, ответ не ушёл или соединение не закрыто; вытесненное — обрываем.
       const socket = request.socket
       const release = enterBodyRead(socket.remoteAddress ?? '', {
-        bytesRead: () => socket.bytesRead,
         complete: () => request.complete,
         evict: () => request.destroy(),
       })

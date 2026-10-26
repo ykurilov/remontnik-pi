@@ -429,6 +429,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       handler: createIntakeHandler({
         secret: options.sharedSecret,
         receiveEvents,
+        ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
         health: async () => ({
           ok: harnessState === 'open',
           harness: harnessState,

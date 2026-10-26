@@ -1,9 +1,8 @@
-// Места для чтения тел на путях управления. Подпись проверяется только по телу, поэтому до конца чтения не видно,
-// чей это запрос. Медленные тела держат соединения: число одновременных чтений с одного адреса и всего ограничено.
-// Новый запрос сверх предела вытесняет самое медленное чтение: меньше всего байт в миллисекунду с начала. Не
-// вытесняется чтение, у которого тело уже пришло целиком, и молодое: команде владельца дают время дойти, даже если
-// за ней идёт поток новых медленных тел с того же адреса (за обратным прокси у всех один адрес). Вытеснять некого —
-// отказ получает новый запрос.
+// Места для чтения чужих тел на путях управления. Подпись тела видна только после чтения, поэтому медленные тела
+// держат соединения: число одновременных чтений с одного адреса и всего ограничено. Новый запрос сверх предела
+// вытесняет самое старое чтение, которое идёт дольше `graceMs` и ещё не дочитано; вытеснять некого — отказ получает
+// новый запрос. Скорость чтения не мерится: её подделывает пачка байт в начале. Команды владельца сюда не попадают —
+// их заголовки подписаны отдельно, и врач читает их тела мимо общих мест.
 
 export interface BodyReadSlotSettings {
   /** Сколько тел с одного адреса читается одновременно. */
@@ -16,9 +15,8 @@ export interface BodyReadSlotSettings {
 
 export const DEFAULT_CONTROL_BODY_READS: BodyReadSlotSettings = { perAddress: 8, total: 128, graceMs: 2_000 }
 
-/** Чтение тела, как его видит место: сколько байт пришло по соединению, пришло ли тело целиком, как его оборвать. */
+/** Чтение тела, как его видит место: пришло ли тело целиком и как его оборвать. */
 export interface BodyRead {
-  bytesRead(): number
   complete(): boolean
   evict(): void
 }
@@ -27,33 +25,29 @@ interface Slot {
   address: string
   read: BodyRead
   startedAt: number
-  startBytes: number
 }
 
 /** `enter` занимает место и возвращает освобождение; `null` — мест нет и вытеснить некого. */
 export function createBodyReadSlots(settings: BodyReadSlotSettings, now: () => number = Date.now): (address: string, read: BodyRead) => (() => void) | null {
   const slots = new Set<Slot>()
-  const speed = (slot: Slot, at: number) => (slot.read.bytesRead() - slot.startBytes) / Math.max(1, at - slot.startedAt)
-  /** Освобождает место самого медленного из вытесняемых; `false` — вытеснить некого. */
-  const evictSlowest = (matches: (slot: Slot) => boolean): boolean => {
+  /** Освобождает место самого старого из вытесняемых; `false` — вытеснить некого. Порядок Set — порядок начала чтения. */
+  const evictOldest = (matches: (slot: Slot) => boolean): boolean => {
     const at = now()
-    let slowest: Slot | undefined
     for (const slot of slots) {
-      if (!matches(slot) || slot.read.complete() || at - slot.startedAt < settings.graceMs) continue
-      // При равной скорости — более старое: порядок Set — порядок начала чтения.
-      if (!slowest || speed(slot, at) < speed(slowest, at)) slowest = slot
+      if (at - slot.startedAt < settings.graceMs) return false
+      if (!matches(slot) || slot.read.complete()) continue
+      slots.delete(slot)
+      slot.read.evict()
+      return true
     }
-    if (!slowest) return false
-    slots.delete(slowest)
-    slowest.read.evict()
-    return true
+    return false
   }
 
   return (address, read) => {
     const fromAddress = [...slots].filter((slot) => slot.address === address).length
-    if (fromAddress >= settings.perAddress && !evictSlowest((slot) => slot.address === address)) return null
-    if (slots.size >= settings.total && !evictSlowest(() => true)) return null
-    const slot: Slot = { address, read, startedAt: now(), startBytes: read.bytesRead() }
+    if (fromAddress >= settings.perAddress && !evictOldest((slot) => slot.address === address)) return null
+    if (slots.size >= settings.total && !evictOldest(() => true)) return null
+    const slot: Slot = { address, read, startedAt: now() }
     slots.add(slot)
     return () => slots.delete(slot)
   }

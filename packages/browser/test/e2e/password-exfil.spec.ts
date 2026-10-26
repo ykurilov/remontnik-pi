@@ -34,8 +34,15 @@ test('пароль на странице не уходит на чужой са�
     stolen.push(`ws:${request.url ?? ''}`)
     socket.destroy()
   })
-  // Чужой сайт — тот же адрес, но через `localhost`: другой origin.
+  // Чужой сайт — тот же адрес, но через `localhost`: другой origin. Он на петле, поэтому прокси службы пускает
+  // к нему только по списку теста; другой адрес петли (`inner`) закрыт всегда, пароля для этого не нужно.
   const foreignUrl = (await listen(foreign)).replace('127.0.0.1', 'localhost')
+  const innerHits: string[] = []
+  const inner = createServer((request, response) => {
+    innerHits.push(request.url ?? '')
+    response.writeHead(200, { 'content-type': 'image/gif' }).end()
+  })
+  const innerUrl = await listen(inner)
 
   const leakScript = `
     const steal = (value) => {
@@ -50,7 +57,7 @@ test('пароль на странице не уходит на чужой са�
     if (request.url === '/login') {
       response.end(`<!doctype html><title>Вход</title><label>Пароль <input type="password" name="password"></label><script>${leakScript}</script>`)
     } else {
-      response.end(`<!doctype html><title>Кабинет</title><img src="${foreignUrl}/after-login.gif">`)
+      response.end(`<!doctype html><title>Кабинет</title><img src="${foreignUrl}/after-login.gif"><img src="${innerUrl}/internal.gif">`)
     }
   })
   const siteUrl = await listen(site)
@@ -68,6 +75,7 @@ test('пароль на странице не уходит на чужой са�
     listen: { host: '127.0.0.1', port: 0 },
     live: null,
     log: (line) => logs.push(line),
+    reachableInternal: [new URL(foreignUrl.replace('localhost', '127.0.0.1')).host],
   })
   const call = async (command: string, body: Record<string, unknown> = {}): Promise<BrowserResult> => {
     const response = await fetch(`${service.url}/v1/${command}`, {
@@ -92,10 +100,14 @@ test('пароль на странице не уходит на чужой са�
     // Новая страница без пароля: подресурсы с других сайтов снова грузятся.
     expect(await call('url', { url: `${siteUrl}/cabinet` })).toMatchObject({ ok: true, title: 'Кабинет' })
     await expect.poll(() => stolen).toEqual(['/after-login.gif'])
+    // Внутренний адрес вне allowedOrigins закрыт и без пароля на странице.
+    await expect.poll(() => logs.filter((line) => line.includes('refused_internal')).length).toBeGreaterThanOrEqual(1)
+    expect(innerHits).toEqual([])
   } finally {
     await service.close()
     site.close()
     foreign.close()
+    inner.close()
   }
 })
 

@@ -116,7 +116,7 @@ export interface RequestFacts {
   passwordOnPage?: boolean
 }
 
-export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak'
+export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak' | 'refused_internal'
 export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string }
 
 export function describeRequest(method: string, url: string): string {

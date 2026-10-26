@@ -160,7 +160,7 @@ describe('медленные тела на путях управления', () 
 
   function serveControls(controlBodyReads: Parameters<typeof createIntakeHandler>[0]['controlBodyReads']) {
     const controls = createControls(createMemoryRecordStore(), () => new Date())
-    return serve({ deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }), controlBodyReads })
+    return serve({ deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }), controlSecret: CONTROL_SECRET, controlBodyReads })
   }
 
   it('с одного адреса одновременно читается не больше предела тел: лишнее вытесняет висящее, команда владельца проходит', async () => {
@@ -207,14 +207,53 @@ describe('медленные тела на путях управления', () 
     unsigned.socket.destroy()
   })
 
-  it('мест нет и вытеснить некого — новый запрос получает 503 body_reads_full', async () => {
+  it('мест нет и вытеснить некого — чужой запрос получает 503 body_reads_full', async () => {
     const url = await serveControls({ perAddress: 1, total: 10, graceMs: 60_000 })
     const target = '/v1/control/deploys'
     const hanging = await slowBody(url, target)
     await pause(30)
-    const refused = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
+    const refused = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'app' }), SECRET))
     expect(refused.status).toBe(503)
     expect(await refused.json()).toEqual({ error: 'body_reads_full' })
+    hanging.destroy()
+  })
+
+  it('атакующий держит все места адреса и переоткрывает их до срока вытеснения — стоп-кран владельца с того же адреса проходит', async () => {
+    const graceMs = 300
+    const url = await serveControls({ perAddress: 2, total: 10, graceMs })
+    const target = '/v1/control/deploys'
+    let held = await Promise.all([slowBody(url, target), slowBody(url, target)])
+    const all = [...held]
+    let flooding = true
+    // Каждое место переоткрывается раньше срока: старше `graceMs` чтений нет, вытеснять по сроку некого.
+    const flood = (async () => {
+      while (flooding) {
+        await pause(graceMs - 100)
+        const fresh = await Promise.all(held.map(() => slowBody(url, target)))
+        for (const socket of held) socket.destroy()
+        held = fresh
+        all.push(...fresh)
+      }
+    })()
+    await pause(graceMs * 2)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const owner = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: attempt % 2 ? 'resume' : 'stop', by: 'owner' }), CONTROL_SECRET))
+      expect(owner.status).toBe(200)
+      await pause(graceMs / 2)
+    }
+    flooding = false
+    await flood
+    for (const socket of all) socket.destroy()
+  })
+
+  it('подпись заголовков владельца без верной подписи тела не проходит: 401, а не исполнение', async () => {
+    const url = await serveControls({ perAddress: 1, total: 10, graceMs: 60_000 })
+    const target = '/v1/control/deploys'
+    const hanging = await slowBody(url, target)
+    await pause(30)
+    const request = signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET)
+    const forged = await fetch(`${url}${target}`, { ...request, body: JSON.stringify({ action: 'resume', by: 'owner' }) })
+    expect(forged.status).toBe(401)
     hanging.destroy()
   })
 })
