@@ -60,7 +60,7 @@ describe('createModelRoute', () => {
   })
 
   it('идентификаторы моделей — по одной константе на путь', () => {
-    expect(PRIMARY_MODEL).toBe('deepseek-4.1-flash')
+    expect(PRIMARY_MODEL).toBe('deepseek-flash')
     expect(FALLBACK_MODEL).toBe('deepseek/deepseek-v4.1-flash-1017')
   })
 
@@ -171,6 +171,112 @@ describe('createModelRoute', () => {
     expect((await route.completeJson(request)).route).toBe('fallback')
     vi.advanceTimersByTime(1)
     expect((await route.completeJson(request)).route).toBe('primary')
+  })
+})
+
+describe('createModelRoute: оплаченные ответы и сбои', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-26T10:00:00Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('bad_response после оплаченного ответа несёт расход из usage', async () => {
+    const { fetchImpl } = scriptedFetch({
+      primary: [
+        Response.json({
+          choices: [{ message: { content: 'не json' } }],
+          usage: { prompt_tokens: 900, completion_tokens: 40, prompt_cache_hit_tokens: 300, cost: 0.002 },
+        }),
+      ],
+      fallback: [],
+    })
+
+    const error = await createModelRoute(options(fetchImpl)).completeJson(request).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ModelRouteError)
+    expect((error as ModelRouteError).usage).toEqual({
+      promptTokens: 900,
+      completionTokens: 40,
+      cachedPromptTokens: 300,
+      costUsd: 0.002,
+    })
+    expect((error as ModelRouteError).unknownCostAttempts).toBe(0)
+  })
+
+  it('тайм-аут: расход неизвестен, но запрос мог быть оплачен — это видно в ошибке', async () => {
+    const { fetchImpl } = scriptedFetch({ primary: ['hang'], fallback: ['hang'] })
+
+    const pending = createModelRoute(options(fetchImpl, { timeoutMs: 1_000 }))
+      .completeJson(request)
+      .catch((caught: unknown) => caught)
+    await vi.advanceTimersByTimeAsync(3_000)
+    const error = await pending
+
+    expect(error).toMatchObject({ reason: 'unavailable', route: 'fallback', usage: null, unknownCostAttempts: 2 })
+  })
+
+  it('отказ по статусу 5xx или 429 не оплачивается и расходом не считается', async () => {
+    const { fetchImpl } = scriptedFetch({
+      primary: [new Response('', { status: 503 })],
+      fallback: [new Response('', { status: 429 })],
+    })
+
+    const error = await createModelRoute(options(fetchImpl)).completeJson(request).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({ usage: null, unknownCostAttempts: 0 })
+  })
+
+  it('ответ не JSON-документом: запрос мог быть оплачен, расход неизвестен', async () => {
+    const { fetchImpl } = scriptedFetch({ primary: [new Response('<html>', { status: 200 })], fallback: [] })
+
+    const error = await createModelRoute(options(fetchImpl)).completeJson(request).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({ reason: 'bad_response', usage: null, unknownCostAttempts: 1 })
+  })
+
+  it('тайм-аут основного и успех запасного: успех сообщает об одной попытке с неизвестным расходом', async () => {
+    const { fetchImpl } = scriptedFetch({ primary: ['hang'], fallback: [okResponse({ a: 1 })] })
+
+    const pending = createModelRoute(options(fetchImpl, { timeoutMs: 1_000 })).completeJson(request)
+    await vi.advanceTimersByTimeAsync(1_001)
+
+    await expect(pending).resolves.toMatchObject({ route: 'fallback', unknownCostAttempts: 1 })
+  })
+
+  it('чистый успех не сообщает о неучтённых попытках', async () => {
+    const { fetchImpl } = scriptedFetch({ primary: [okResponse({ a: 1 })], fallback: [] })
+
+    await expect(createModelRoute(options(fetchImpl)).completeJson(request)).resolves.toMatchObject({
+      unknownCostAttempts: 0,
+    })
+  })
+
+  it('уровень рассуждения уходит основному пути как reasoning_effort, запасному — как reasoning.effort', async () => {
+    const { fetchImpl, calls } = scriptedFetch({
+      primary: [new Response('', { status: 503 })],
+      fallback: [okResponse({ ok: true })],
+    })
+
+    await createModelRoute(options(fetchImpl)).completeJson({ ...request, reasoningEffort: 'low' })
+
+    const sent = calls.map((call) => JSON.parse(String(call.init.body)) as Record<string, unknown>)
+    expect(sent[0]).toMatchObject({ reasoning_effort: 'low' })
+    expect(sent[1]).toMatchObject({ reasoning: { effort: 'low' } })
+    expect(sent[1]).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('без уровня рассуждения поля в запросе нет', async () => {
+    const { fetchImpl, calls } = scriptedFetch({ primary: [okResponse({ ok: true })], fallback: [] })
+
+    await createModelRoute(options(fetchImpl)).completeJson(request)
+
+    const body = JSON.parse(String(calls[0]?.init.body)) as Record<string, unknown>
+    expect(body).not.toHaveProperty('reasoning_effort')
+    expect(body).not.toHaveProperty('reasoning')
   })
 })
 

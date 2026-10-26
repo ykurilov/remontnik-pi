@@ -1,0 +1,20 @@
+{
+  "id": "bad-unanswered-2",
+  "label": "bad",
+  "category": "unanswered_question",
+  "badMessageIndex": 2,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Где мой заказ 5120?"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(5120) → в пути"
+    },
+    {
+      "role": "assistant",
+      "content": "Тариф «Старт» стоит 990 ₽ в месяц, а тариф «Про» — 2990 ₽ в месяц."
+    }
+  ]
+}

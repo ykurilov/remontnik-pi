@@ -1,0 +1,18 @@
+{
+  "id": "good-order-preparing",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Проверьте, пожалуйста, заказ 7001"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(7001) → собирается"
+    },
+    {
+      "role": "assistant",
+      "content": "Заказ 7001 собирается. Как только он отправится, статус изменится."
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "good-delivery-time",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Когда мне привезут заказ 3307?"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(3307) → в пути"
+    },
+    {
+      "role": "assistant",
+      "content": "Заказ 3307 в пути. Точные сроки я назвать не могу, это уточнит оператор: support@example.com."
+    }
+  ]
+}

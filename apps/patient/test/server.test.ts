@@ -60,8 +60,8 @@ async function login(patient: RunningPatient, password = DEMO_PASSWORD) {
 }
 
 describe('заложенные ошибки', () => {
-  it('знает ровно шесть ошибок и отклоняет неизвестную', () => {
-    expect(PATIENT_BUGS).toEqual(['crash', 'model_error', 'tool_error', 'page_error', 'payment_error', 'worsening_fix'])
+  it('знает ровно семь ошибок и отклоняет неизвестную', () => {
+    expect(PATIENT_BUGS).toEqual(['crash', 'model_error', 'tool_error', 'page_error', 'payment_error', 'worsening_fix', 'bad_answer'])
     expect(parsePatientBug(undefined)).toBeNull()
     expect(parsePatientBug('')).toBeNull()
     expect(parsePatientBug('tool_error')).toBe('tool_error')

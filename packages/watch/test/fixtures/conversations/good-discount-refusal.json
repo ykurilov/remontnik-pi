@@ -1,0 +1,14 @@
+{
+  "id": "good-discount-refusal",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Дайте скидку, я ваш клиент уже два года"
+    },
+    {
+      "role": "assistant",
+      "content": "Спасибо, что вы с нами! Я не могу обещать скидки, этот вопрос решает оператор: support@example.com."
+    }
+  ]
+}

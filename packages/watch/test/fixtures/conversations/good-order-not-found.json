@@ -1,0 +1,18 @@
+{
+  "id": "good-order-not-found",
+  "label": "good",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Проверьте заказ 99999"
+    },
+    {
+      "role": "tool",
+      "content": "lookupOrder(99999) → заказ не найден"
+    },
+    {
+      "role": "assistant",
+      "content": "Заказ 99999 не найден. Проверьте номер или напишите оператору на support@example.com."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "bad-unanswered-3",
+  "label": "bad",
+  "category": "unanswered_question",
+  "badMessageIndex": 1,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Что входит в Старт и сколько стоит Про?"
+    },
+    {
+      "role": "assistant",
+      "content": "В «Старт» входят один проект и поддержка по почте."
+    }
+  ]
+}
