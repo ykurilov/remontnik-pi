@@ -1,3 +1,4 @@
+import { renameSync, writeFileSync } from 'node:fs'
 import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 
 // Общее для стенда падений и врача в дочернем процессе: точки падения, приложение-пациент и пути на диске.
@@ -22,6 +23,13 @@ export const CRASH_POINTS = [
   'after_merge_push',
 ] as const
 /** Правка делает хуже: врача убивают сразу после отката. */
+/** Состояние на диске читают родитель и дочерний врач одновременно: пишем целиком через переименование, чтобы читатель не увидел пустой файл. */
+export function writeJsonAtomically(path: string, value: unknown): void {
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(value))
+  renameSync(temporary, path)
+}
+
 export const ROLLBACK_CRASH_POINT = 'after_rollback'
 /** Браузер врача ждёт человека: отчёт `needs_human` уже записан, врача убивают на первом опросе службы браузера. */
 export const BROWSER_CRASH_POINT = 'browser_wait_human'

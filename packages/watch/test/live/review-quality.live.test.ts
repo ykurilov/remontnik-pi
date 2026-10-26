@@ -95,3 +95,22 @@ describe.skipIf(!deepseekKey)('качество чтения разговоро�
     expect(falseAlarms.length / good.length, report).toBeLessThanOrEqual(MAX_FALSE_SHARE)
   })
 })
+
+describe.skipIf(!openRouterKey)('запасной путь на настоящей модели', () => {
+  it('основной путь недоступен → ответ приходит через запасной, и сторож остаётся на нём', async () => {
+    const route = createModelRoute({
+      // Порт, на котором никто не слушает: основной путь отказывает так же, как при недоступном поставщике.
+      primary: { apiKey: 'нет-ключа', model: PRIMARY_MODEL, baseUrl: 'http://127.0.0.1:9' },
+      fallback: { apiKey: openRouterKey ?? '', model: FALLBACK_MODEL },
+    })
+
+    const answer = await route.completeJson<{ ok?: unknown }>({
+      messages: [{ role: 'user', content: 'Ответь JSON-объектом {"ok": true}.' }],
+      maxTokens: 2000,
+    })
+
+    expect(answer.route).toBe('fallback')
+    expect(answer.json).toMatchObject({ ok: true })
+    expect(route.state().onFallbackSince).not.toBeNull()
+  })
+})
