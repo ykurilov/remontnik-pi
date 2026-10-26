@@ -10,6 +10,8 @@ export type Diagnosis = {
   evidence: string[]
   confidence: 'low' | 'medium' | 'high'
   fixPlan?: string
+  /** Причина внутри установленного пакета: его имя. */
+  causeInPackage?: string
 }
 
 export type FixSummary = {

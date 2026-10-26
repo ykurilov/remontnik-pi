@@ -8,6 +8,8 @@ export type GateReasonCode =
   | 'tests_not_green'
   | 'eval_worse'
   | 'forbidden_zone'
+  /** Правка вне путей, которые можно править, или в том, чем врач её проверяет и собирает. */
+  | 'protected_path'
   | 'existing_test_changed'
   | 'suspicious_change'
   | 'diff_too_large'
@@ -37,6 +39,7 @@ export interface DeployFacts {
   /** `not_needed` — правка вне области сценариев; `not_run` — должен был идти, но не шёл. */
   eval: { status: 'not_needed' | 'not_worse' | 'worse' | 'stand_broken' | 'not_run'; worseScenarios: string[] }
   forbiddenZones: ForbiddenZoneHit[]
+  protectedChanges: Array<{ path: string; why: string }>
   diff: DiffInspection
   stopSwitch: boolean
   attempts: {
@@ -106,6 +109,7 @@ function invalidFactNames(facts: unknown): string[] {
   check('eval.worseScenarios', isListOf(evalFacts.worseScenarios))
 
   check('forbiddenZones', isListOf(facts.forbiddenZones))
+  check('protectedChanges', isListOf(facts.protectedChanges))
 
   const diff = section('diff')
   check('diff.existingTestChanges', isListOf(diff.existingTestChanges))
@@ -179,6 +183,14 @@ export function decideDeploy(facts: DeployFacts): GateDecision {
       code: 'forbidden_zone',
       message: `Выкатки нет: правка затрагивает запретные зоны (${zones.join(', ')}). Нужен человек.`,
       paths: unique(facts.forbiddenZones.map((hit) => hit.path)),
+    })
+  }
+
+  if (facts.protectedChanges.length > 0) {
+    reasons.push({
+      code: 'protected_path',
+      message: `Выкатки нет: правка задевает защищённые пути (${facts.protectedChanges.map((change) => `${change.path}: ${change.why}`).join('; ')}).`,
+      paths: unique(facts.protectedChanges.map((change) => change.path)),
     })
   }
 

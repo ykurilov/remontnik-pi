@@ -14,6 +14,7 @@ function greenFacts(): DeployFacts {
     tests: { status: 'green', failed: [] },
     eval: { status: 'not_worse', worseScenarios: [] },
     forbiddenZones: [],
+    protectedChanges: [],
     diff: structuredClone(cleanDiff),
     stopSwitch: false,
     attempts: {
@@ -63,6 +64,11 @@ describe('decideDeploy: каждая причина даёт report_only', () =>
     ['eval_worse', 'eval не запускался, хотя должен', (f) => void (f.eval = { status: 'not_run', worseScenarios: [] })],
     ['forbidden_zone', 'запретная зона', (f) => void (f.forbiddenZones = [moneyHit])],
     [
+      'protected_path',
+      'защищённый путь (вне путей правки, настройка тестов)',
+      (f) => void (f.protectedChanges = [{ path: 'vitest.config.ts', why: 'настройка запуска тестов или файл eval' }]),
+    ],
+    [
       'existing_test_changed',
       'изменён существующий тест',
       (f) => void (f.diff = { ...cleanDiff, existingTestChanges: [{ path: 'src/a.test.ts', status: 'modified' }] }),
@@ -109,6 +115,7 @@ describe('decideDeploy: каждая причина даёт report_only', () =>
         'tests_not_green',
         'eval_worse',
         'forbidden_zone',
+        'protected_path',
         'existing_test_changed',
         'suspicious_change',
         'diff_too_large',
@@ -149,6 +156,17 @@ describe('decideDeploy: подробности и несколько причи�
     expect(reasons.find((reason) => reason.code === 'diff_too_large')?.numbers).toEqual({ files: 20, lines: 450 })
   })
 
+  it('защищённые пути: пути и почему в подробностях', () => {
+    const facts = greenFacts()
+    facts.protectedChanges = [
+      { path: 'vitest.config.ts', why: 'настройка запуска тестов или файл eval' },
+      { path: 'scripts/fix.ts', why: 'вне путей, которые можно править (src/**)' },
+    ]
+    const [reason] = decideDeploy(facts).reasons
+    expect(reason?.paths).toEqual(['vitest.config.ts', 'scripts/fix.ts'])
+    expect(reason?.message).toContain('vitest.config.ts: настройка запуска тестов')
+  })
+
   it('подозрительные находки несут пути', () => {
     const facts = greenFacts()
     facts.diff = {
@@ -181,6 +199,7 @@ describe('decideDeploy: нет данных или данные невозмож
     ['eval.status — неизвестное слово', (f) => void ((f.eval as unknown as Record<string, unknown>).status = 'fine')],
     ['eval не задан', (f) => void ((f as unknown as Record<string, unknown>).eval = undefined)],
     ['forbiddenZones не список', (f) => void ((f as unknown as Record<string, unknown>).forbiddenZones = undefined)],
+    ['protectedChanges не список', (f) => void ((f as unknown as Record<string, unknown>).protectedChanges = undefined)],
     ['diff не задан', (f) => void ((f as unknown as Record<string, unknown>).diff = undefined)],
     ['diff.existingTestChanges не список', (f) => void ((f.diff as unknown as Record<string, unknown>).existingTestChanges = undefined)],
     ['diff.suspicious не список', (f) => void ((f.diff as unknown as Record<string, unknown>).suspicious = null)],

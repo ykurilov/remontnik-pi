@@ -118,7 +118,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### GateDecision
 
-`{ verdict: "deploy" | "report_only", reasons: GateReason[] }`; `GateReason` — код из списка R6 (`tests_not_green`, `eval_worse`, `forbidden_zone`, `existing_test_changed`, `suspicious_change`, `diff_too_large`, `stop_switch`, `attempts_exhausted`, `needs_human_after_rollback`, `budget_exhausted`, `rebase_conflict`, `facts_invalid` — факты неполные или невозможные: нет данных = нет выкатки) + подробности (пути, числа).
+`{ verdict: "deploy" | "report_only", reasons: GateReason[] }`; `GateReason` — код из списка R6 (`tests_not_green`, `eval_worse`, `forbidden_zone`, `protected_path` — правка вне `fixablePaths` или в том, чем врач её проверяет и собирает, `existing_test_changed`, `suspicious_change`, `diff_too_large`, `stop_switch`, `attempts_exhausted`, `needs_human_after_rollback`, `budget_exhausted`, `rebase_conflict`, `facts_invalid` — факты неполные или невозможные: нет данных = нет выкатки) + подробности (пути, числа).
 
 ### Deployment — выкатка (документ `remontnik.deployment/<id>`)
 

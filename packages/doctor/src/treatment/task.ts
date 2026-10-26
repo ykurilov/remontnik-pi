@@ -16,18 +16,19 @@ import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { Case, CaseState } from '../case-book/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
-import { inspectDiff } from '../diff-inspector/index.js'
+import { decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
 import { matchesAnyMask } from '../path-mask/index.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 import type { ReportType, Reports } from '../reports/index.js'
+import { agentChatSdkReport, agentChatSdkTask, gateReport } from '../reports/gate-texts.js'
 import { causeFoundReport, fixReadyReport, needsHumanReport, noCauseFoundReport, standBrokenReport, type ReportText } from '../reports/texts.js'
 import { durableTxOf, recordFamilyOf, recordTransactionOver } from '../service/harness.js'
 import { createWorkbench, SpoiledCopyError, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
-import { findProtectedChanges } from './protected-changes.js'
+import { agentChatSdkPackage, closingOf, deployFactsOf, fixCanBeChecked, inspectFix, noDeploysYet, type DeployControls, type FixInspection } from './gate.js'
 import {
   closeInterruptedEval,
   emptySpendDay,
@@ -46,11 +47,13 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // с последней сохранённой фазы, а фаза после перезапуска выполняется заново с начала, поэтому каждая
 // идемпотентна: копия переиспользуется, запрос модели находится по `requestId`, итог модели лежит в документе.
 //
-//   triage → diagnosing → fixing → verifying → (этап 5: gating и выкатка)
+//   triage → diagnosing → fixing → verifying → gated → (этап 6: выкатка)
 //
 // Основа — рабочая версия (`deploy.commands.current`); неизвестна — последний коммит основной ветки, и отчёт это говорит.
-// Правка, которая задевает защищённые пути (тесты, eval, зависимости, сборку, Ремонтника), не проверяется
-// и не отправляется. Подменённая копия (git-замок: `escape`) — попытка выхода из верстака: случай останавливается.
+// Выкатывать или нет, решает только фаза `gated` (`decideDeploy` по фактам из `gate.ts`). Правка, которая задевает
+// защищённые пути (тесты, eval, зависимости, сборку, Ремонтника) или похожа на подделку проверки, идёт в `gated`
+// без проверок и не отправляется. Причина в Agent Chat SDK — правки нет, отчёт с задачей для агента SDK.
+// Подменённая копия (git-замок: `escape`) — попытка выхода из верстака: случай останавливается.
 // Расход модели и eval пишется в дневной учёт (`spend.ts`) по ходу работы.
 //
 // Модель работает в отдельном разговоре, которым владеет задача: системный промпт и набор инструментов
@@ -73,15 +76,23 @@ export type TreatmentState =
   | { phase: 'triage' }
   | ({ phase: 'diagnosing' } & Treating)
   | ({ phase: 'fixing'; diagnosis: Diagnosis } & Treating)
-  | ({ phase: 'verifying'; diagnosis: Diagnosis; fix: FixSummary; fixCommit: string; changedPaths: string[] } & Treating)
+  | ({ phase: 'verifying' } & Fixed & Treating)
+  | ({ phase: 'gated'; checks?: ChecksResult; pushed: boolean } & Fixed & Treating)
+
+/** Закоммиченная правка и осмотр её диффа. */
+type Fixed = { diagnosis: Diagnosis; fix: FixSummary; fixCommit: string; changedPaths: string[]; inspection: FixInspection }
 
 export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken' | 'needs_human'
 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
   /** Почему нужен человек. */
-  why?: 'protected_paths' | 'suspicious' | 'escape' | 'spoiled' | 'eval_worse'
+  why?: 'escape' | 'spoiled' | 'agent_chat_sdk' | 'gate'
   reportId: number
+  /** Решение фазы `gated`. */
+  gate?: GateDecision
+  /** Пакет Agent Chat SDK, в котором причина. */
+  sdkPackage?: string
   branch?: string
   fixCommit?: string
   changedPaths?: string[]
@@ -108,6 +119,8 @@ export interface TreatmentDeps {
   /** Прокси модели для eval; без него eval с провайдерами не запускается. */
   evalProxy?: Pick<EvalProxy, 'openRun'>
   evalBaseCache: EvalBaseCache
+  /** Стоп-кран, учёт выкаток, перенос на свежий main. Нет — выкаток ещё не было (`noDeploysYet`). */
+  deployControls?: DeployControls
   appDescription?: string
   /** Как часто сверять расход модели с потолком. */
   budgetPollMs: number
@@ -424,6 +437,12 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           await finish(runtime, caseId, 'no_cause_found', 'no_cause_found', text, { outcome: 'no_cause_found' }, context, treating.baseRunning)
           return
         }
+        const sdkPackage = agentChatSdkPackage(diagnosis)
+        if (sdkPackage) {
+          const text = agentChatSdkReport({ case: doc.case, stack: doc.case.stack, diagnosis, packageName: sdkPackage })
+          await finish(runtime, caseId, 'report_only', 'needs_human', text, { outcome: 'needs_human', why: 'agent_chat_sdk', sdkPackage }, context, treating.baseRunning)
+          return
+        }
         await runtime.commit(async (tx) => {
           ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'fixing'
           return { status: 'running', checkpoint: { ...treating, phase: 'fixing', diagnosis } }
@@ -459,28 +478,13 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           }
           const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
           const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
-          const config = await deps.loadConfig()
-          const protectedChanges = findProtectedChanges(config, files)
-          if (protectedChanges.length > 0) {
-            const text = needsHumanReport({ case: doc.case, diagnosis, fix, reason: { kind: 'protected_paths', changes: protectedChanges, branch: treating.branch } })
-            const result = { outcome: 'needs_human', why: 'protected_paths', branch: treating.branch, fixCommit, changedPaths } as const
-            await finish(runtime, caseId, 'report_only', 'needs_human', text, result, context, treating.baseRunning)
-            return
-          }
-          // Запись в файлы, окружение, новые адреса, Ремонтник и итог eval: правка могла бы подделать проверку.
-          const suspicious = inspectDiff(files, config.limits, {
-            knownHosts: config.browser?.allowedOrigins ?? [],
-            ...(config.checks.eval ? { evalResultFile: config.checks.eval.resultFile } : {}),
-          }).suspicious
-          if (suspicious.length > 0) {
-            const text = needsHumanReport({ case: doc.case, diagnosis, fix, reason: { kind: 'suspicious', findings: suspicious, branch: treating.branch } })
-            const result = { outcome: 'needs_human', why: 'suspicious', branch: treating.branch, fixCommit, changedPaths } as const
-            await finish(runtime, caseId, 'report_only', 'needs_human', text, result, context, treating.baseRunning)
-            return
-          }
+          const inspection = inspectFix(await deps.loadConfig(), files, doc.case)
+          const fixed = { diagnosis, fix, fixCommit, changedPaths, inspection }
+          // Правке нельзя доверить собственную проверку: без проверок и без отправки — сразу к решению.
+          const next = fixCanBeChecked(inspection) ? ({ phase: 'verifying', ...fixed } as const) : ({ phase: 'gated', ...fixed, pushed: false } as const)
           await runtime.commit(async (tx) => {
-            ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'verifying'
-            return { status: 'running', checkpoint: { ...treating, phase: 'verifying', diagnosis, fix, fixCommit, changedPaths } }
+            ;(await caseIn(recordTransactionOver(tx), caseId)).state = next.phase
+            return { status: 'running', checkpoint: { ...treating, ...next } }
           }, context)
         })
       },
@@ -553,39 +557,53 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           runtime.report(error)
         }
 
-        const result = { branch: checkpoint.branch, fixCommit: checkpoint.fixCommit, changedPaths: checkpoint.changedPaths, checks }
-        if (checks.eval.status === 'stand_broken') {
-          const text = standBrokenReport({ case: doc.case, branch: checkpoint.branch, checks })
-          await finish(runtime, caseId, 'stand_broken', 'stand_broken', text, { outcome: 'stand_broken', ...result }, context, checkpoint.baseRunning)
-          return
+        await runtime.commit(async (tx) => {
+          ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'gated'
+          return { status: 'running', checkpoint: { ...checkpoint, phase: 'gated', checks, pushed } }
+        }, context)
+      },
+
+      gated: async (task, runtime, context) => {
+        const { caseId } = task.input
+        const checkpoint = task.state.checkpoint
+        const { checks, diagnosis, fix, inspection } = checkpoint
+        const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
+        const config = await deps.loadConfig()
+        const sick = await readCase(runtime, caseId, context)
+        const spendDay = (await runtime.snapshot(recordFamilyOf('spend'), spendDayKey(deps.now(), config.app.timeZone), context)) as unknown as SpendDay | undefined
+        const controls = deps.deployControls ? await deps.deployControls.read({ caseId, fingerprint: sick.fingerprint, config }) : noDeploysYet(config)
+        const gate = decideDeploy(deployFactsOf({ inspection, checks, controls, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
+        const closing = closingOf(gate, checks)
+        const sdkPackage = agentChatSdkPackage(diagnosis, inspection)
+        const result = {
+          branch: checkpoint.branch,
+          fixCommit: checkpoint.fixCommit,
+          changedPaths: checkpoint.changedPaths,
+          ...(checks ? { checks } : {}),
+          gate,
+          ...(sdkPackage ? { sdkPackage } : {}),
         }
-        const testsPassed = checks.tests.status === 'green' || checks.tests.status === 'flaky'
-        if (testsPassed && checks.eval.status === 'worse') {
-          const text = needsHumanReport({
-            case: doc.case,
-            diagnosis: checkpoint.diagnosis,
-            fix: checkpoint.fix,
-            reason: { kind: 'eval_worse', branch: checkpoint.branch, checks },
-          })
-          await finish(runtime, caseId, 'report_only', 'needs_human', text, { outcome: 'needs_human', why: 'eval_worse', ...result }, context, checkpoint.baseRunning)
-          return
+        const ready = { case: doc.case, diagnosis, fix, branch: checkpoint.branch, commit: checkpoint.fixCommit, pushed: checkpoint.pushed }
+        const sdkTask = sdkPackage ? agentChatSdkTask({ case: doc.case, stack: doc.case.stack, diagnosis, packageName: sdkPackage }) : undefined
+        const close = (text: ReportText, outcome: Omit<TreatmentResult, 'reportId'>) =>
+          finish(runtime, caseId, closing.caseState, closing.report, text, { ...result, ...outcome }, context, checkpoint.baseRunning)
+        switch (closing.kind) {
+          case 'deploy':
+            // Этап 6 подключает здесь выкатку; пока решение `deploy` закрывается отчётом «правка готова».
+            // Перед выкаткой решение надо зафиксировать в чекпойнте: при повторе фазы оно сейчас считается заново.
+            return close(fixReadyReport({ ...ready, checks: checks! }), { outcome: 'fix_ready' })
+          case 'not_deployed':
+            return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate }), { outcome: 'fix_ready' })
+          case 'checks_red':
+            return close(causeFoundReport({ case: doc.case, diagnosis, reason: 'checks_red', branch: checkpoint.branch, checks: checks! }), { outcome: 'cause_found' })
+          case 'stand_broken':
+            return close(standBrokenReport({ case: doc.case, branch: checkpoint.branch, checks: checks! }), { outcome: 'stand_broken' })
+          case 'needs_human':
+            return close(gateReport({ ...ready, ...(checks ? { checks } : {}), decision: gate, ...(sdkTask ? { sdkTask } : {}) }), {
+              outcome: 'needs_human',
+              why: sdkPackage ? 'agent_chat_sdk' : 'gate',
+            })
         }
-        if (testsPassed) {
-          const text = fixReadyReport({
-            case: doc.case,
-            diagnosis: checkpoint.diagnosis,
-            fix: checkpoint.fix,
-            branch: checkpoint.branch,
-            commit: checkpoint.fixCommit,
-            checks,
-            pushed,
-          })
-          // Этап 4 только сообщает: решение о выкатке (gated) добавит этап 5.
-          await finish(runtime, caseId, 'report_only', 'fix_ready', text, { outcome: 'fix_ready', ...result }, context, checkpoint.baseRunning)
-          return
-        }
-        const text = causeFoundReport({ case: doc.case, diagnosis: checkpoint.diagnosis, reason: 'checks_red', branch: checkpoint.branch, checks })
-        await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found', ...result }, context, checkpoint.baseRunning)
       },
     },
     abort: (_task, runtime, context) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),
