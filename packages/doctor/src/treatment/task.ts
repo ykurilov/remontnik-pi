@@ -300,23 +300,20 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     }, context)
   }
 
-  /** Расход eval по прокси — в бронь по ходу, по одной записи за раз; последняя запись важнее промежуточных. */
+  /**
+   * Расход eval по прокси — в бронь по ходу, записи по очереди. Прокси ждёт записи: бронь запроса попадает
+   * в журнал до отправки к поставщику, а не удалась запись — запрос не уходит.
+   */
   function evalSpendRecorder(runtime: Runtime, reservation: { day: string; id: string }, context: Context) {
     let latest: EvalSpend | undefined
-    let unwritten: EvalSpend | undefined
     let chain = Promise.resolve()
     return {
       latest: () => latest,
-      record(spend: EvalSpend) {
+      record(spend: EvalSpend): Promise<void> {
         latest = spend
-        unwritten = spend
-        chain = chain
-          .then(async () => {
-            const next = unwritten
-            unwritten = undefined
-            if (next) await updateReservation(runtime, reservation, context, (item) => recordEvalObserved(item, next))
-          })
-          .catch((error: unknown) => runtime.report(error))
+        const write = chain.then(() => updateReservation(runtime, reservation, context, (item) => recordEvalObserved(item, spend)))
+        chain = write.catch((error: unknown) => runtime.report(error))
+        return write
       },
       flush: () => chain,
     }
@@ -503,9 +500,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           // Копии проверок всегда заново: после сбоя в старых мог остаться мусор прошлого прогона.
           await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed, fresh: true })
           await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed, fresh: true })
-          // Бронь — прямо перед проверками: открытая бронь всегда закрывается в finally или после перезапуска.
-          const reservation = await reserveEval(runtime, caseId, config, context)
-          const evalSpend = evalSpendRecorder(runtime, reservation, context)
+          // Бронь — прямо перед запуском eval: открытая бронь всегда закрывается в finally или после перезапуска.
+          let reservation: { day: string; id: string; budgetUsd: number } | undefined
+          let evalSpend: ReturnType<typeof evalSpendRecorder> | undefined
           let settled = false
           try {
             const result = await createChecks({
@@ -521,18 +518,25 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               baseDir,
               baseCommit: checkpoint.baseCommit,
               changedPaths: checkpoint.changedPaths,
-              budgetUsd: reservation.budgetUsd,
-              onEvalSpend: evalSpend.record,
+              reserveEval: async () => {
+                reservation = await reserveEval(runtime, caseId, config, context)
+                evalSpend = evalSpendRecorder(runtime, reservation, context)
+                return reservation.budgetUsd
+              },
+              onEvalSpend: (spend) => evalSpend!.record(spend),
             })
-            await evalSpend.flush()
-            await updateReservation(runtime, reservation, context, (item) => (item.actualUsd = result.eval.costUsd))
+            if (reservation) {
+              await evalSpend!.flush()
+              await updateReservation(runtime, reservation, context, (item) => (item.actualUsd = result.eval.costUsd))
+            }
             settled = true
             checks = (await runtime.memo('checks', result as unknown as JsonValue, context)) as unknown as ChecksResult
           } finally {
             // Проверка упала: бронь закрывается тем, что досчитал прокси, а не сгорает целиком.
-            if (!settled) {
-              await evalSpend.flush()
-              await updateReservation(runtime, reservation, context, (item) => settleEvalWithProxyFact(item, evalSpend.latest())).catch((error: unknown) => runtime.report(error))
+            if (!settled && reservation) {
+              const open = reservation
+              await evalSpend!.flush()
+              await updateReservation(runtime, open, context, (item) => settleEvalWithProxyFact(item, evalSpend!.latest())).catch((error: unknown) => runtime.report(error))
             }
             await deps.guard.removeWorktree(candidateDir).catch(() => {})
             await deps.guard.removeWorktree(baseDir).catch(() => {})

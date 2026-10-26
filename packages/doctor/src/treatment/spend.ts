@@ -1,9 +1,10 @@
 // Дневной расход врача (data-model: SpendLedger) — в записях, поэтому переживает перезапуск.
 // Модель и eval считаются отдельно: у каждого свой дневной потолок (`modelUsdPerDay`, `evalUsdPerDay`).
 // Модель записывается по ходу разговора приращениями; eval — бронью до запуска и фактом после.
-// Бронь eval — доля случая (`evalUsdPerCase`), не больше остатка дня. Факт даёт прокси модели: пока eval идёт,
-// его расход пишется в бронь. Ошибка проверки или перезапуск врача закрывают бронь этим фактом;
-// целиком сгорает только то, чего прокси не досчитал (запрос ещё шёл, когда всё оборвалось).
+// Бронь eval — доля случая (`evalUsdPerCase`), не больше остатка дня; ставится прямо перед запуском eval.
+// Факт даёт прокси модели: до отправки каждого запроса к поставщику он ждёт записи его брони, после ответа —
+// записи факта. Ошибка проверки или перезапуск врача закрывают бронь eval записанным фактом плюс брони
+// запросов, которые ещё шли; ничего не записано — eval к модели не ходил, бронь закрывается нулём.
 
 import type { EvalSpend } from '../eval-proxy/index.js'
 
@@ -20,8 +21,8 @@ export interface EvalReservation {
   actualUsd?: number
   /** Расход по прокси, пока eval идёт. */
   observedUsd?: number
-  /** Запросы к модели, которые ещё шли при последней записи. */
-  pendingRequests?: number
+  /** Брони запросов к модели, которые ещё шли при последней записи. */
+  inFlightUsd?: number
 }
 
 /** Сколько модель уже записала по случаю: приращение к дню — это разница с новым итогом разговора. */
@@ -54,15 +55,15 @@ export function evalCaseBudgetUsd(day: SpendDay | undefined, limits: { evalUsdPe
 
 export function recordEvalObserved(item: EvalReservation, spend: EvalSpend): void {
   item.observedUsd = spend.spentUsd
-  item.pendingRequests = spend.pending
+  item.inFlightUsd = spend.inFlightUsd
 }
 
 /** Проверка упала, врач жив: все запросы шли через прокси. Нет его итога — eval к модели не ходил. */
 export function settleEvalWithProxyFact(item: EvalReservation, spend: EvalSpend | undefined): void {
-  item.actualUsd ??= spend && spend.pending > 0 ? item.reservedUsd : (spend?.spentUsd ?? 0)
+  item.actualUsd ??= spend ? spend.spentUsd + spend.inFlightUsd : 0
 }
 
-/** Бронь прогона, прерванного перезапуском: записанный факт прокси, если ни один запрос не висел; иначе — вся бронь. */
+/** Бронь прогона, прерванного перезапуском: записанный факт прокси плюс брони запросов в пути. */
 export function closeInterruptedEval(item: EvalReservation): void {
-  item.actualUsd ??= item.observedUsd !== undefined && !item.pendingRequests ? item.observedUsd : item.reservedUsd
+  item.actualUsd ??= (item.observedUsd ?? 0) + (item.inFlightUsd ?? 0)
 }

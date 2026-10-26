@@ -6,7 +6,7 @@ import { RemontnikConfigError } from '@ykurilov/remontnik-core/config'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ConfigSourceError, loadMainBranchConfig } from './config-source.js'
 
-function configObject(overrides: { timeoutMs?: number; moneyMask?: string; mainBranch?: string } = {}) {
+function configObject(overrides: { timeoutMs?: number; moneyMask?: string; mainBranch?: string; fixablePaths?: string[] } = {}) {
   return {
     app: { name: 'demo' },
     repo: { mainBranch: overrides.mainBranch ?? 'main' },
@@ -14,6 +14,7 @@ function configObject(overrides: { timeoutMs?: number; moneyMask?: string; mainB
     checks: { test: 'pnpm test' },
     evalScope: [],
     closedPaths: [],
+    ...(overrides.fixablePaths ? { fixablePaths: overrides.fixablePaths } : {}),
     forbidden: { schema: ['<нет>'], money: [overrides.moneyMask ?? 'src/payments/**'], access: ['src/auth/**'] },
     deploy: {
       commands: { build: 'b', promote: 'p', confirm: 'c', rollback: 'r', current: 'cur', health: 'h' },
@@ -262,5 +263,11 @@ describe('loadMainBranchConfig: ошибки', () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject({ moneyMask: '@(payments|billing)/**' })))
     commitAll(mainCheckout, 'config')
     await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'invalid_mask' })
+  })
+
+  it.each([['src/@(a|b)/**'], ['src/}/**']])('маска fixablePaths %s — понятная ошибка настройки при загрузке', async (mask) => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject({ fixablePaths: [mask] })))
+    commitAll(mainCheckout, 'config')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'invalid_mask', message: expect.stringContaining(mask) })
   })
 })

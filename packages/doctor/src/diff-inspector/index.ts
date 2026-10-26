@@ -76,12 +76,11 @@ const RUNNER_CONFIG_AND_EVAL_MASKS = [
   '**/*judge*',
 ]
 
+/** Файлы тестов по имени. Новый файл по этим маскам — новый тест; всё прочее в папках тестов — нет. */
+export const TEST_FILE_MASKS = ['**/*.test.*', '**/*.spec.*', '**/*_test.*', '**/*-test.*', '**/test_*.py']
+
 const TEST_AND_EVAL_MASKS = [
-  '**/*.test.*',
-  '**/*.spec.*',
-  '**/*_test.*',
-  '**/*-test.*',
-  '**/test_*.py',
+  ...TEST_FILE_MASKS,
   '**/test/**',
   '**/tests/**',
   '**/__tests__/**',
@@ -101,18 +100,22 @@ const SCHEME_RELATIVE_HOST = /(?<=['"`])\/\/([a-z0-9][^\s/'"`?#)]*\.[^\s/'"`?#)]
 const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g
 const LOCAL_HOSTS = new Set(['localhost', '[::1]'])
 
-const ENVIRONMENT_ACCESS = /\bprocess\s*(?:\.\s*env\b|\[\s*['"`]env['"`]\s*\])|\bimport\.meta\.env\b/
+const ENVIRONMENT_ACCESS =
+  /\bprocess\s*(?:\.\s*env\b|\[\s*['"`]env['"`]\s*\])|\bimport\.meta\.env\b|\{[^}]*\benv\b[^}]*\}\s*=\s*(?:globalThis\s*\.\s*)?process\b|\b(?:Deno|Bun)\s*\.\s*env\b/
 const PROCESS_SPAWN =
-  /\bchild_process\b|\bBun\.spawn\b|\bDeno\.Command\b|(?<![.\w])(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\.(?:execSync|execFileSync|execFile|spawn|spawnSync)\s*\(/
+  /\bchild_process\b|\bBun\.spawn\b|\bDeno\.(?:Command|run)\b|\bnew\s+Worker\s*\(|(?<![.\w])(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\.(?:execSync|execFileSync|execFile|spawn|spawnSync)\s*\(/
 const DYNAMIC_CODE =
-  /(?<![\w./-])eval(?![\w./-])(?!\s*:)|\b(?:globalThis|window|self|global)\.eval\b|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]/
+  /(?<![\w./-])eval(?![\w./-])(?!\s*:)|\b(?:globalThis|window|self|global)\.eval\b|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]|\b(?:globalThis|global|window|self)\s*\[|\b(?:require|import)\s*\(\s*(?!['"`][^'"`$+]*['"`]\s*[,)])|\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\b/
 const SYSTEM_PATH_LITERAL = /['"`](?:\/(?:etc|root|proc|usr|Users|Volumes|home|var|opt|mnt|sys)\/|~\/|[A-Za-z]:\\)/
 const HOME_DIRECTORY = /\bhomedir\s*\(/
 const FILE_CALL_WITH_PARENT_PATH =
   /\b(?:readFile|writeFile|appendFile|readdir|readFileSync|writeFileSync|appendFileSync|readdirSync|createReadStream|createWriteStream|unlink|unlinkSync|rm|rmSync|rmdir|copyFile|rename|mkdir|mkdirSync|open|openSync|stat|existsSync)\s*\(\s*['"`]\.\.[/\\]/
 const SUBMODULE_IN_PATCH = /^Subproject commit\b/
 const FILE_WRITE =
-  /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|rename|renameSync|copyFile|copyFileSync|cpSync|writeSync|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|symlink|symlinkSync|chmod|chmodSync)\s*\(|\bBun\.write\s*\(|\bfs\.write\s*\(|\bopen(?:Sync)?\s*\([^)]*,\s*['"`](?:[wa]|r\+)/
+  /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|rename|renameSync|copyFile|copyFileSync|cpSync|writeSync|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|symlink|symlinkSync|chmod|chmodSync|cp|link|linkSync|utimes|utimesSync|mkdir|mkdirSync|mkdtemp|mkdtempSync)\s*\(|\bBun\.write\s*\(|\bfs\.write\s*\(|\bDeno\.(?:write|remove|rename|create|truncate|symlink|link|chmod|chown|copyFile|mkdir|makeTemp|utime)\w*\s*\(|\.writer\s*\(|\bopen(?:Sync)?\s*\([^)]*,\s*['"`](?:[wa]|r\+)/
+// Импорт записи из `fs` под другим именем: `import { writeFile as w }` — дальше вызов `w(...)` уже не узнать.
+const FS_MODULE = /(?:\bfrom\s*|\brequire\s*\(\s*)['"`](?:node:)?fs(?:\/promises)?['"`]/
+const FS_WRITE_NAME = /\b(?:writeFile|appendFile|createWriteStream|rename|copyFile|cp|rm|rmdir|unlink|symlink|link|chmod|chown|truncate|mkdir|mkdtemp|utimes|write)\w*\b/
 const REMONTNIK_ACCESS = /\bREMONTNIK\w*|\boutDir\b|eval-result/
 
 const LINK_AND_SUBMODULE_MODES = new Set(['120000', '160000'])
@@ -201,7 +204,7 @@ function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: Read
       (host) => !isLocalHost(host) && !knownHosts.has(host) && !hostsInFile.has(host),
     )
     if (isNewExternal) report('new_external_address', line)
-    if (FILE_WRITE.test(line)) report('file_write', line)
+    if (FILE_WRITE.test(line) || (FS_MODULE.test(line) && FS_WRITE_NAME.test(line.replace(FS_MODULE, '')))) report('file_write', line)
     if (REMONTNIK_ACCESS.test(line) || (evalResultFile && line.includes(evalResultFile))) report('remontnik_access', line)
   }
   return findings

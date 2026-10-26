@@ -145,6 +145,38 @@ describe('inspectDiff: подозрительное в добавленных с
     }
   })
 
+  it.each([
+    ['const { env } = process', 'environment_access'],
+    ['const { argv, env: vars } = globalThis.process', 'environment_access'],
+    ['const port = Deno.env.get(name)', 'environment_access'],
+    ['const all = Bun.env', 'environment_access'],
+    ["const p = globalThis['pro' + 'cess']", 'dynamic_code'],
+    ["const fs = require('f' + 's')", 'dynamic_code'],
+    ["const fs = await import('f' + 's')", 'dynamic_code'],
+    ['const mod = await import(name)', 'dynamic_code'],
+    ['const mod = require(`./${name}`)', 'dynamic_code'],
+    ["const raw = process.binding('fs')", 'dynamic_code'],
+    ['const worker = new Worker(url)', 'process_spawn'],
+    ["Deno.run({ cmd: ['ls'] })", 'process_spawn'],
+    ["import { writeFile as w } from 'node:fs/promises'", 'file_write'],
+    ["const { appendFileSync: log } = require('fs')", 'file_write'],
+    ['await Deno.writeTextFile(path, text)', 'file_write'],
+    ['const writer = Bun.file(path).writer()', 'file_write'],
+    ['await fs.promises.cp(from, to, { recursive: true })', 'file_write'],
+    ['fs.linkSync(a, b)', 'file_write'],
+    ['fs.utimesSync(path, now, now)', 'file_write'],
+    ['fs.mkdirSync(dir)', 'file_write'],
+  ])('обходная форма: %s → %s', (line, signal) => {
+    expect(signalsOf(withAddedLines('src/a.ts', line))).toContain(signal)
+  })
+
+  it('обычные импорты и чтение — без тревоги', () => {
+    expect(signalsOf(withAddedLines('src/a.ts', "import { readFile } from 'node:fs/promises'"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', "const { join } = require('node:path')"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', "const page = await import('./page.js')"))).toEqual([])
+    expect(signalsOf(withAddedLines('src/a.ts', 'const { price } = plan'))).toEqual([])
+  })
+
   it('чтение файлов и запись в поток ответа — не запись в файлы', () => {
     expect(signalsOf(withAddedLines('src/a.ts', "const text = await readFile('data.json', 'utf8')"))).toEqual([])
     expect(signalsOf(withAddedLines('src/a.ts', 'response.write(chunk)'))).toEqual([])

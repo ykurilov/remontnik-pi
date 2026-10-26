@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PathMaskError, assertValidMask, matchesAnyMask, matchesMask, normalizeRepoPath } from './index.js'
+import { PathMaskError, assertValidMask, matchesAnyMask, matchesMask, normalizeRepoPath, matchesAllowMask } from './index.js'
 
 describe('matchesMask', () => {
   it('** охватывает любую глубину, в том числе нулевую', () => {
@@ -80,7 +80,7 @@ describe('matchesMask: папка без * охватывает всё внут�
 })
 
 describe('неподдерживаемый синтаксис масок — ошибка, а не тихое несовпадение', () => {
-  it.each(['@(a|b)/x.ts', '!(a)/x.ts', '+(a|b).ts', '?(a).ts', '*(a|b).ts', '!src/**', 'src/[abc', 'src/{a,b'])(
+  it.each(['@(a|b)/x.ts', '!(a)/x.ts', '+(a|b).ts', '?(a).ts', '*(a|b).ts', '!src/**', 'src/[abc', 'src/{a,b', 'src/}/**', 'src/a}b'])(
     '%s',
     (mask) => {
       expect(() => assertValidMask(mask)).toThrow(PathMaskError)
@@ -92,5 +92,23 @@ describe('неподдерживаемый синтаксис масок — о�
     for (const mask of ['**/.env*', 'src/payments/**', 'a?.ts', 'src/*.{ts,tsx}', 'file[12].txt', '<нет>']) {
       expect(() => assertValidMask(mask)).not.toThrow()
     }
+  })
+})
+
+describe('белый список: регистр важен, обратный слэш — отказ', () => {
+  it('регистр различается: на Linux SRC/ — другая папка', () => {
+    expect(matchesAllowMask(['src/**'], 'src/price.ts')).toBe(true)
+    expect(matchesAllowMask(['src/**'], 'SRC/price.ts')).toBe(false)
+    expect(matchesAllowMask(['src/**'], 'Src/x.ts')).toBe(false)
+    expect(matchesAllowMask(['**/*.test.*'], 'test/a.TEST.ts')).toBe(false)
+  })
+
+  it('путь с обратным слэшем не подходит: на Linux это имя файла, а не папка', () => {
+    expect(matchesAllowMask(['src/**'], 'src\\x.ts')).toBe(false)
+    expect(matchesAllowMask(['src/**'], 'src/a\\b.ts')).toBe(false)
+  })
+
+  it('.. внутри пути схлопывается до проверки', () => {
+    expect(matchesAllowMask(['src/**'], 'src/../lib/x.ts')).toBe(false)
   })
 })

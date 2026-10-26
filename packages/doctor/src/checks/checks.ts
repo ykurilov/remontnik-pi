@@ -94,10 +94,13 @@ export interface ChecksInput {
   baseDir: string
   baseCommit: string
   changedPaths: readonly string[]
-  /** Сколько денег можно потратить на eval в этом прогоне. */
-  budgetUsd: number
-  /** Расход eval по прокси за все прогоны этой проверки — по ходу, для дневного учёта. */
-  onEvalSpend?: (spend: EvalSpend) => void
+  /**
+   * Бронирует деньги на eval и возвращает долю. Зовётся прямо перед первым запуском eval;
+   * eval не дошёл до запуска — брони нет.
+   */
+  reserveEval: () => Promise<number>
+  /** Расход eval по прокси за все прогоны этой проверки — по ходу, для дневного учёта. Прокси ждёт записи. */
+  onEvalSpend?: (spend: EvalSpend) => Promise<void> | void
 }
 
 const FAILED_LINE = /^REMONTNIK_FAILED=(.*)$/m
@@ -150,7 +153,7 @@ function isScenarioResult(value: unknown): value is EvalScenarioResult {
 
 interface EvalRun {
   ok: boolean
-  /** Прерван: потратил свой бюджет. */
+  /** Прерван: запрос не влез в долю (402). */
   overBudget?: boolean
   scenarios: EvalScenarioResult[]
   costUsd: number
@@ -241,7 +244,7 @@ export function createChecks(options: ChecksOptions) {
     scenarios: readonly string[],
     maxCostUsd: number,
     providers: EvalProxyProvider[],
-    onSpend: (spentUsd: EvalSpend) => void,
+    onSpend: (spend: EvalSpend) => Promise<void>,
   ): Promise<EvalRun> {
     const evalConfig = config.checks.eval!
     mkdirSync(options.workDir, { recursive: true })
@@ -251,7 +254,7 @@ export function createChecks(options: ChecksOptions) {
       .replaceAll('{repeat}', String(evalConfig.repeat))
       .replaceAll('{maxCostUsd}', formatUsd(maxCostUsd))
       .replaceAll('{outDir}', shellWord(outDir))
-    const proxyRun = providers.length > 0 ? options.evalProxy!.openRun({ providers, tokenEnv: evalConfig.tokenEnv, budgetUsd: maxCostUsd, onSpend }) : undefined
+    const proxyRun = providers.length > 0 ? options.evalProxy!.openRun({ providers, tokenEnv: evalConfig.tokenEnv, budgetUsd: maxCostUsd, limits: evalConfig.proxy, onSpend }) : undefined
     let result: RunResult
     try {
       result = await run(command, dir, {
@@ -264,8 +267,9 @@ export function createChecks(options: ChecksOptions) {
       await proxyRun?.close()
     }
     const costUsd = proxyRun?.spentUsd() ?? 0
+    // Только отказ 402 рвёт eval; дошёл до доли без отказа — итог принимается.
     if (proxyRun?.overBudget.aborted) {
-      return { ok: false, overBudget: true, scenarios: [], costUsd, note: `eval (${label}) прерван: потратил свой бюджет $${formatUsd(maxCostUsd)}` }
+      return { ok: false, overBudget: true, scenarios: [], costUsd, note: `eval (${label}) прерван: запрос не влез в бюджет $${formatUsd(maxCostUsd)}` }
     }
     let parsed: unknown
     try {
@@ -290,17 +294,20 @@ export function createChecks(options: ChecksOptions) {
     if (selection.status === 'not_needed') return { status: 'not_needed', scenarios: [], costUsd: 0 }
     const truncated = selection.truncated ? { truncated: true } : {}
     if (tests.status !== 'green') return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'тесты не зелёные' }
-    if (input.budgetUsd <= 0) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'на eval не осталось денег' }
     const touched = input.changedPaths.filter((path) => isRunnerConfigOrEvalPath(path))
     if (touched.length > 0) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: `правка задела eval или настройку тестов: ${touched.join(', ')}` }
     const { providers, missing } = evalProviders()
     if (missing) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: `у врача нет ключа модели для eval (${missing})` }
     if (providers.length > 0 && !options.evalProxy) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'прокси модели для eval не включён' }
+    const budgetUsd = await input.reserveEval()
+    if (budgetUsd <= 0) return { status: 'not_run', scenarios: [], costUsd: 0, ...truncated, note: 'на eval не осталось денег' }
 
     // Расход прошлых прогонов этой проверки + текущего: дневной учёт видит итог по ходу.
     let settledUsd = 0
-    const onSpend = (spend: EvalSpend) => input.onEvalSpend?.({ spentUsd: settledUsd + spend.spentUsd, pending: spend.pending })
-    const candidate = await runEval(input.candidateDir, 'candidate', selection.scenarios, input.budgetUsd, providers, onSpend)
+    const onSpend = async (spend: EvalSpend) => {
+      await input.onEvalSpend?.({ spentUsd: settledUsd + spend.spentUsd, inFlightUsd: spend.inFlightUsd })
+    }
+    const candidate = await runEval(input.candidateDir, 'candidate', selection.scenarios, budgetUsd, providers, onSpend)
     settledUsd = candidate.costUsd
     let costUsd = candidate.costUsd
     if (candidate.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: candidate.note! }
@@ -318,7 +325,7 @@ export function createChecks(options: ChecksOptions) {
     }
     const missingScenarios = runAll ? [ALL_SCENARIOS] : ids.filter((id) => !base.has(id))
     if (missingScenarios.length > 0) {
-      const remaining = input.budgetUsd - costUsd
+      const remaining = budgetUsd - costUsd
       if (remaining <= 0) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: 'на eval основы не осталось денег' }
       const baseInstall = await run(config.workbench.install, input.baseDir)
       if (baseInstall.exitCode !== 0) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `установка зависимостей основы: код ${baseInstall.exitCode ?? '—'}` }

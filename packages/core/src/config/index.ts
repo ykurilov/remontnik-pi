@@ -68,8 +68,12 @@ const timeZone = z.string().refine((value) => {
 }, 'неизвестный часовой пояс')
 
 // Ключи провайдеров модели остаются у врача: eval ходит к модели через его прокси (адрес в `baseUrlEnv`,
-// токен прогона вместо ключа в `keyEnv`). Поэтому в `env` — только несекретные переменные.
-const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|PRIVATE/
+// токен прогона вместо ключа в `keyEnv`). Поэтому в `env` — только несекретные переменные. Фильтр по имени —
+// подсказка против ошибки, а не гарантия: секрет под невинным именем он не узнает.
+const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|COOKIE|SESSION/
+
+/** Цена модели в долларах за миллион токенов. */
+const modelPriceSchema = z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() })
 
 const evalProviderSchema = z.strictObject({
   name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'строчные латинские буквы, цифры и дефис: имя идёт в адрес прокси'),
@@ -77,8 +81,20 @@ const evalProviderSchema = z.strictObject({
   keyEnv: envName,
   upstream: z.url(),
   authHeader: z.enum(['authorization', 'x-api-key']).default('authorization'),
-  priceUsdPerMTok: z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() }),
+  /** Белый список моделей с ценами: модель выбирает код правки, поэтому цена — по модели, чужая модель — отказ. */
+  models: z.record(z.string().min(1), modelPriceSchema).refine((models) => Object.keys(models).length > 0, 'хотя бы одна модель с ценой'),
 })
+
+/** Пределы прокси eval на один прогон: память врача и бронь запросов в пути. */
+const evalProxyLimitsSchema = z
+  .strictObject({
+    maxRequestBytes: positiveInt.default(2 * 1024 * 1024),
+    maxResponseBytes: positiveInt.default(8 * 1024 * 1024),
+    maxConcurrentRequests: positiveInt.default(4),
+    /** Подставляется в запрос без предела ответа: без него наибольшую цену запроса не посчитать. */
+    maxOutputTokens: positiveInt.default(4096),
+  })
+  .prefault({})
 
 const evalSchema = z
   .strictObject({
@@ -89,6 +105,7 @@ const evalSchema = z
     env: z.array(envName),
     providers: z.array(evalProviderSchema).default([]),
     tokenEnv: envName.default('REMONTNIK_EVAL_TOKEN'),
+    proxy: evalProxyLimitsSchema,
   })
   .superRefine((evalConfig, context) => {
     const proxyNames = new Set([evalConfig.tokenEnv, ...evalConfig.providers.flatMap((provider) => [provider.keyEnv, provider.baseUrlEnv])])

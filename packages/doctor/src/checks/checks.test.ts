@@ -29,7 +29,7 @@ const config = testRemontnikConfig({
       repeat: 3,
       maxScenarios: 3,
       env: ['PATIENT_BUG'],
-      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'EVAL_API_KEY', upstream: 'https://api.example.com/v1', priceUsdPerMTok: { input: 1, output: 2 } }],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'EVAL_API_KEY', upstream: 'https://api.example.com/v1', models: { 'chat-small': { input: 1, output: 2 } } }],
     },
   },
   evalScope: [{ paths: ['src/bot/**'], scenarios: ['price-named-plan', 'greeting'] }],
@@ -47,7 +47,7 @@ interface FakeOptions {
   /** Итоги eval по папке (кандидат/основа) и сценарию. */
   evalOutcomes?: (cwd: string, scenario: string) => ScenarioOutcome
   evalCostUsd?: number
-  /** Eval пишет итог с этим расходом и не заканчивается, пока его не прервут. */
+  /** Eval тратит столько, получает 402 и не заканчивается, пока его не прервут. */
   evalHangsAtCostUsd?: number
   /** Вывод установки. */
   installOutput?: { exitCode: number; output: string }
@@ -84,11 +84,14 @@ function fakeProxy() {
       }
     },
     /** Eval потратил `usd` через прокси последнего прогона. */
-    spend(usd: number) {
+    async spend(usd: number) {
       const run = runs.at(-1)!
       run.spentUsd += usd
-      run.options.onSpend?.({ spentUsd: run.spentUsd, pending: 0 })
-      if (run.spentUsd >= run.options.budgetUsd) run.overBudget.abort()
+      await run.options.onSpend?.({ spentUsd: run.spentUsd, inFlightUsd: 0 })
+    },
+    /** Запрос не влез в долю: 402, прогон прерван. */
+    refuse() {
+      runs.at(-1)!.overBudget.abort()
     },
   }
 }
@@ -116,14 +119,15 @@ function fakeRunner(options: FakeOptions) {
         mkdirSync(outDir, { recursive: true })
         if (options.evalStillRunning) return { exitCode: null, timedOut: true, aborted: false, output: '', stillRunning: true }
         if (options.evalHangsAtCostUsd !== undefined) {
-          proxy.spend(options.evalHangsAtCostUsd)
+          await proxy.spend(options.evalHangsAtCostUsd)
+          proxy.refuse()
           await new Promise<void>((resolve) => {
             if (runOptions.signal?.aborted) resolve()
             runOptions.signal?.addEventListener('abort', () => resolve(), { once: true })
           })
           return { exitCode: null, timedOut: false, aborted: true, output: '' }
         }
-        proxy.spend(options.evalCostUsd ?? 0.1)
+        await proxy.spend(options.evalCostUsd ?? 0.1)
         writeFileSync(
           join(outDir, 'eval-result.json'),
           JSON.stringify({
@@ -173,7 +177,7 @@ function runInput(overrides: Partial<Parameters<ReturnType<typeof createChecks>[
     baseDir,
     baseCommit: 'a'.repeat(40),
     changedPaths: ['src/bot/bot.ts'],
-    budgetUsd: 1,
+    reserveEval: async () => 1,
     ...overrides,
   }
 }
@@ -285,14 +289,14 @@ describe('проверки', () => {
 
   it('потолок денег: бюджет уходит в {maxCostUsd}, остаток — основе; нет бюджета → not_run', async () => {
     const fake = fakeRunner({ evalCostUsd: 0.25 })
-    await checksWith(fake).run(runInput({ budgetUsd: 0.6 }))
+    await checksWith(fake).run(runInput({ reserveEval: async () => 0.6 }))
     const evalRuns = fake.calls.filter((call) => call.command.startsWith('node eval'))
     expect(evalRuns[0]?.command).toContain('--max-cost 0.6 ')
     expect(evalRuns[0]?.options.cwd).toBe(candidateDir)
     expect(evalRuns[1]?.command).toContain('--max-cost 0.35 ')
 
     const broke = fakeRunner({})
-    const result = await checksWith(broke).run(runInput({ budgetUsd: 0 }))
+    const result = await checksWith(broke).run(runInput({ reserveEval: async () => 0 }))
     expect(result.eval.status).toBe('not_run')
     expect(broke.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
   })
@@ -319,7 +323,47 @@ describe('проверки', () => {
     const result = await checksWith(fake).run(runInput({ onEvalSpend: (spend: EvalSpend) => spends.push(spend) }))
     expect(result.eval.costUsd).toBeCloseTo(0.4)
     expect(spends.at(-1)?.spentUsd).toBeCloseTo(0.4)
-    expect(spends.at(-1)?.pending).toBe(0)
+    expect(spends.at(-1)?.inFlightUsd).toBe(0)
+  })
+
+  it('бронь eval — прямо перед запуском eval: тесты красные или eval не запускается — брони нет', async () => {
+    let reserved = 0
+    const reserveEval = async () => {
+      reserved += 1
+      return 1
+    }
+    await checksWith(fakeRunner({ tests: [{ exitCode: 1 }] })).run(runInput({ reserveEval }))
+    await checksWith(fakeRunner({})).run(runInput({ reserveEval, changedPaths: ['src/bot/bot.ts', 'eval/run-eval.ts'] }))
+    await checksWith(fakeRunner({})).run(runInput({ reserveEval, changedPaths: ['docs/readme.md'] }))
+    expect(reserved).toBe(0)
+
+    const fake = fakeRunner({})
+    let callsAtReserve = -1
+    await checksWith(fake).run(
+      runInput({
+        reserveEval: async () => {
+          reserved += 1
+          callsAtReserve = fake.calls.length
+          return 1
+        },
+      }),
+    )
+    expect(reserved).toBe(1)
+    expect(fake.calls.slice(0, callsAtReserve).some((call) => call.command.startsWith('node eval'))).toBe(false)
+    expect(fake.calls.slice(0, callsAtReserve).some((call) => call.command === 'pnpm test')).toBe(true)
+  })
+
+  it('пределы прокси — из настройки', async () => {
+    const fake = fakeRunner({})
+    await checksWith(fake).run(runInput())
+    expect(fake.proxy.runs[0]?.options.limits).toEqual(config.checks.eval!.proxy)
+  })
+
+  it('расход дошёл до доли, но ни один запрос не получил 402 → итог eval принят', async () => {
+    const fake = fakeRunner({ evalCostUsd: 0.5 })
+    const result = await checksWith(fake).run(runInput())
+    expect(result.eval.status).toBe('not_worse')
+    expect(result.eval.costUsd).toBeCloseTo(1)
   })
 
   it('провайдеры есть, а прокси нет → eval не запускается', async () => {
@@ -387,12 +431,12 @@ describe('проверки', () => {
     expect(result.tests.outputTail).not.toContain(EVAL_KEY)
   })
 
-  it('eval потратил свою долю бюджета → прокси его прерывает, расход учтён', async () => {
-    const fake = fakeRunner({ evalHangsAtCostUsd: 0.7 })
-    const result = await checksWith(fake).run(runInput({ budgetUsd: 0.6 }))
+  it('запрос eval не влез в долю (402) → прокси прерывает eval, итог не принят, расход учтён', async () => {
+    const fake = fakeRunner({ evalHangsAtCostUsd: 0.5 })
+    const result = await checksWith(fake).run(runInput({ reserveEval: async () => 0.6 }))
     expect(result.eval.status).toBe('not_run')
     expect(result.eval.note).toContain('бюджет')
-    expect(result.eval.costUsd).toBeCloseTo(0.7)
+    expect(result.eval.costUsd).toBeCloseTo(0.5)
     expect(fake.proxy.runs[0]?.options.budgetUsd).toBeCloseTo(0.6)
     expect(fake.calls.find((call) => call.command.startsWith('node eval'))?.options.signal?.aborted).toBe(true)
   })

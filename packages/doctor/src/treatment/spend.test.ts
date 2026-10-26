@@ -37,33 +37,35 @@ describe('бронь eval', () => {
     expect(evalCaseBudgetUsd(day, limits)).toBe(0)
   })
 
-  it('расход прокси по ходу пишется в бронь', () => {
+  it('расход прокси по ходу пишется в бронь вместе с бронями запросов в пути', () => {
     const item: EvalReservation = { reservedUsd: 1 }
-    recordEvalObserved(item, { spentUsd: 0.3, pending: 1 })
-    expect(item).toEqual({ reservedUsd: 1, observedUsd: 0.3, pendingRequests: 1 })
+    recordEvalObserved(item, { spentUsd: 0.3, inFlightUsd: 0.2 })
+    expect(item).toEqual({ reservedUsd: 1, observedUsd: 0.3, inFlightUsd: 0.2 })
   })
 
-  it('ошибка проверки при живом враче → бронь закрывается фактом прокси', () => {
+  it('ошибка проверки при живом враче → бронь закрывается фактом прокси; прокси не открывался → нулём', () => {
     const item: EvalReservation = { reservedUsd: 1 }
-    settleEvalWithProxyFact(item, { spentUsd: 0.3, pending: 0 })
+    settleEvalWithProxyFact(item, { spentUsd: 0.3, inFlightUsd: 0 })
     expect(item.actualUsd).toBe(0.3)
     const untouched: EvalReservation = { reservedUsd: 1 }
     settleEvalWithProxyFact(untouched, undefined)
     expect(untouched.actualUsd).toBe(0)
   })
 
-  it('запрос ещё шёл, когда всё оборвалось → бронь сгорает целиком', () => {
+  it('запрос ещё шёл, когда всё оборвалось → засчитывается его бронь, а не вся бронь eval', () => {
     const item: EvalReservation = { reservedUsd: 1 }
-    settleEvalWithProxyFact(item, { spentUsd: 0.3, pending: 1 })
-    expect(item.actualUsd).toBe(1)
+    settleEvalWithProxyFact(item, { spentUsd: 0.3, inFlightUsd: 0.2 })
+    expect(item.actualUsd).toBeCloseTo(0.5)
   })
 
-  it('после перезапуска: записанный факт прокси без висящих запросов — он; иначе вся бронь', () => {
-    const seen: EvalReservation = { reservedUsd: 1, observedUsd: 0.3, pendingRequests: 0 }
-    const hanging: EvalReservation = { reservedUsd: 1, observedUsd: 0.3, pendingRequests: 2 }
+  it('после перезапуска: записанный факт плюс брони запросов в пути; ничего не записано — ноль', () => {
+    const seen: EvalReservation = { reservedUsd: 1, observedUsd: 0.3, inFlightUsd: 0 }
+    const hanging: EvalReservation = { reservedUsd: 1, observedUsd: 0.3, inFlightUsd: 0.2 }
     const unseen: EvalReservation = { reservedUsd: 1 }
-    const settled: EvalReservation = { reservedUsd: 1, actualUsd: 0.1, observedUsd: 0.3, pendingRequests: 0 }
+    const settled: EvalReservation = { reservedUsd: 1, actualUsd: 0.1, observedUsd: 0.3, inFlightUsd: 0 }
     for (const item of [seen, hanging, unseen, settled]) closeInterruptedEval(item)
-    expect([seen.actualUsd, hanging.actualUsd, unseen.actualUsd, settled.actualUsd]).toEqual([0.3, 1, 1, 0.1])
+    expect(seen.actualUsd).toBeCloseTo(0.3)
+    expect(hanging.actualUsd).toBeCloseTo(0.5)
+    expect([unseen.actualUsd, settled.actualUsd]).toEqual([0, 0.1])
   })
 })

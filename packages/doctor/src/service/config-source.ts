@@ -136,6 +136,7 @@ function assertMasksUnderstood(config: RemontnikConfig, file: string): void {
     ...config.forbidden.access,
     ...(config.forbidden.extra ?? []),
     ...config.closedPaths,
+    ...config.fixablePaths,
     ...config.evalScope.flatMap((scope) => scope.paths),
   ]
   for (const mask of masks) {

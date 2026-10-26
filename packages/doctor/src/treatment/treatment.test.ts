@@ -43,7 +43,7 @@ const key = process.env.CHAT_API_KEY ?? ''
 const response = await fetch(process.env.CHAT_BASE_URL + '/chat/completions', {
   method: 'POST',
   headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' },
-  body: JSON.stringify({ maxCost, key }),
+  body: JSON.stringify({ model: 'chat-small', maxCost, key }),
 })
 await response.text()
 const results = scenarios.split(',').map((id) => ({ id, repeats: 1, pass: 1, fail: 0, standBroken: 0, personaBroken: 0 }))
@@ -554,7 +554,7 @@ describe('лечение: задача remontnik.treatment', () => {
           run: 'node eval/run.mjs {scenarios} {maxCostUsd} {outDir}',
           resultFile: 'result.json',
           env: [],
-          providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: upstream.url, priceUsdPerMTok: { input: 1, output: 1 } }],
+          providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: upstream.url, models: { 'chat-small': { input: 1, output: 1 } } }],
         },
       },
       evalScope: [{ paths: ['src/**'], scenarios: ['price'] }],
