@@ -1,4 +1,5 @@
 import { UsageError, type DoctorCommandIo } from './command-io.js'
+import { deploysCommand, DEPLOYS_USAGE } from './deploys-commands.js'
 import { fingerprintCommand, FINGERPRINT_USAGE } from './fingerprint-commands.js'
 import { reportsCommand, REPORTS_USAGE } from './reports-commands.js'
 
@@ -11,9 +12,10 @@ type CommandGroup = (args: string[], io: DoctorCommandIo) => Promise<number>
 const COMMAND_GROUPS: Readonly<Record<string, CommandGroup>> = {
   reports: reportsCommand,
   fingerprint: fingerprintCommand,
+  deploys: deploysCommand,
 }
 
-const USAGE = `Использование:\n${REPORTS_USAGE}${FINGERPRINT_USAGE}`
+const USAGE = `Использование:\n${REPORTS_USAGE}${FINGERPRINT_USAGE}${DEPLOYS_USAGE}`
 
 export async function runDoctorCommand(argv: string[], io: DoctorCommandIo): Promise<number> {
   const [group, ...args] = argv

@@ -84,4 +84,4 @@ const hooks = agentChatWatchHooks(watch, { inner: appHooks, afterTurn: true }); 
 
 ## Отправка врачу
 
-`POST {doctor.url}/v1/events` — тело `{ events: IncidentEvent[] }` (до 50), заголовки `X-Remontnik-Signature: sha256=<HMAC от «отметка времени + тело»>`, `X-Remontnik-Timestamp` (секунды; допуск 5 минут). Ответ `200 { accepted: eventId[] }`. Повторная доставка того же `eventId` безопасна. Повторы: 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин.
+`POST {doctor.url}/v1/events` — тело `{ events: IncidentEvent[] }` (до 50), заголовки `X-Remontnik-Signature: sha256=<HMAC от «отметка времени + тело»>`, `X-Remontnik-Timestamp` (секунды; допуск 5 минут). Ответ `200 { accepted: eventId[] }`. Повторная доставка того же `eventId` безопасна. Событие с `occurredAt` позже часов врача больше чем на допуск подписи (5 минут) врач записывает временем приёма: часы сторожа сбились, а отказ всей пачке застопорил бы и верные события. Повторы: 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин.

@@ -77,6 +77,11 @@ export interface GitGuard {
   /** Коммит всех изменений копии; `undefined`, если менять нечего. */
   commitAll(cwd: string, message: string): Promise<string | undefined>
   push(branch: string): Promise<void>
+  /**
+   * Метка `remontnik/…` на коммите `commit` и в origin: по ней человек найдёт версию, что работала до выкатки.
+   * Повтор с тем же коммитом безопасен (перезапуск врача); та же метка на другом коммите — отказ.
+   */
+  tagPreDeploy(name: string, commit: string): Promise<void>
   /** Влить ветку врача в основную вперёд (`--ff-only`). Только при `mainline: "merge"`. */
   mergeIntoMain(branch: string): Promise<void>
 }
@@ -132,6 +137,12 @@ function isTreatmentRef(ref: string): boolean {
   return name.startsWith(TREATMENT_BRANCH_PREFIX) && !name.includes('..') && name.length > TREATMENT_BRANCH_PREFIX.length
 }
 
+function isTreatmentTag(ref: string): boolean {
+  return ref.startsWith('refs/tags/') && isTreatmentRef(ref.slice('refs/tags/'.length))
+}
+
+const COMMIT_ID = /^[0-9a-f]{40,64}$/
+
 function isMainRef(ref: string, policy: Policy): boolean {
   return ref.replace(/^refs\/heads\//, '') === policy.mainBranch
 }
@@ -165,7 +176,7 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
       const path = positional[0]
       if (!path || !inside(policy.worktreesDir, resolve(path))) return 'копия — только в папке врача'
       const target = positional[1]
-      if (target && branchIndex === -1 && !/^[0-9a-f]{40,64}$/.test(target) && !isTreatmentRef(target)) return 'копия — на коммите или своей ветке'
+      if (target && branchIndex === -1 && !COMMIT_ID.test(target) && !isTreatmentRef(target)) return 'копия — на коммите или своей ветке'
       return undefined
     }
     case 'sparse-checkout':
@@ -186,6 +197,10 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
         const parts = refspec.split(':')
         if (parts.length > 2 || parts[0] === '') return 'удаление веток запрещено'
         const destination = parts[1] ?? parts[0]!
+        if (destination.startsWith('refs/tags/')) {
+          if (isTreatmentTag(destination) && parts[0] === destination) continue
+          return `метка ${destination} чужая`
+        }
         if (isTreatmentRef(destination)) continue
         if (isMainRef(destination, policy) && policy.mainline === 'merge') continue
         return isMainRef(destination, policy) ? 'в основную ветку врач пишет только при mainline: "merge"' : `ветка ${destination} чужая`
@@ -198,7 +213,8 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
       return rest.length === 2 && rest[0] === '--ff-only' && isTreatmentRef(rest[1]!) ? undefined : 'merge только --ff-only своей ветки'
     }
     case 'tag':
-      return rest.length === 1 && isTreatmentRef(rest[0]!) ? undefined : 'метки только remontnik/…'
+      if (!isTreatmentRef(rest[0] ?? '')) return 'метки только remontnik/…'
+      return rest.length === 1 || (rest.length === 2 && COMMIT_ID.test(rest[1]!)) ? undefined : 'метка — на HEAD или на коммите по его полному id'
     default:
       return `git ${command} запрещён`
   }
@@ -507,6 +523,18 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
 
     async push(branch) {
       await run(['push', remote, `refs/heads/${branch}:refs/heads/${branch}`])
+    },
+
+    async tagPreDeploy(name, commit) {
+      if (!isTreatmentRef(name) || name.startsWith('refs/')) throw new GitGuardError('forbidden', 'git-замок: метки только remontnik/…')
+      if (!COMMIT_ID.test(commit)) throw new GitGuardError('forbidden', 'git-замок: метка — на коммите по его полному id')
+      if (await tagExists(name)) {
+        const tagged = (await run(['rev-parse', `refs/tags/${name}^{commit}`])).trim()
+        if (tagged !== commit) throw new GitGuardError('forbidden', `git-замок: метка ${name} уже стоит на другом коммите`)
+      } else {
+        await run(['tag', name, commit])
+      }
+      await run(['push', remote, `refs/tags/${name}:refs/tags/${name}`])
     },
 
     async mergeIntoMain(branch) {

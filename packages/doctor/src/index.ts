@@ -29,6 +29,18 @@ export {
   type FingerprintLedger,
 } from './ledgers/fingerprint-ledger.js'
 export { emptySpendDay, nextDayStartMs, spendDayKey, type SpendDay } from './ledgers/spend-ledger.js'
+export {
+  createServerDeployer,
+  readDeployment,
+  type Deployer,
+  type Deployment,
+  type DeployOutcome,
+  type DeployRequest,
+  type DeployStep,
+  type ServerDeployerOptions,
+} from './deployer/index.js'
+export { runDeploymentInTask } from './service/harness.js'
+export { createControls, readControls, type DeployControls } from './ledgers/controls.js'
 export { createDockerRunner, createLocalRunner, type CommandRunner } from './workbench/index.js'
 export { createEvalProxy, type EvalProxy, type EvalProxyOptions } from './eval-proxy/index.js'
 export { runDoctorCommand, type DoctorCommandIo } from './cli/run-doctor-command.js'

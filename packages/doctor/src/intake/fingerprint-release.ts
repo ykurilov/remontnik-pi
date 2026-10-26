@@ -1,7 +1,7 @@
 import { NONCE_HEADER, ReplayGuard, precheckSignedRequest, verifySignedRequest } from '@ykurilov/remontnik-core/signed-http'
 import { releaseFingerprint } from '../ledgers/fingerprint-ledger.js'
 import type { RecordStore } from '../records/index.js'
-import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
+import { assertOwnerSecrets, headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Снятие «нужен человек» по HTTP (contracts/doctor-api.md): `POST /v1/control/fingerprints`
 // `{ fingerprint, action: "release", by }` → `{ fingerprint, needsHuman }`. Снятие снова пускает автовыкатки по отпечатку,
@@ -38,10 +38,7 @@ function parseCommand(body: string): { fingerprint: string; by: string } | undef
 }
 
 export function createFingerprintReleaseHandler(options: FingerprintReleaseOptions): IntakeHandler {
-  if (options.secret === '') throw new Error('[remontnik] общий секрет пуст')
-  if (options.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
-  // Общий секрет есть у приложения: совпадение отдало бы ему право снимать «нужен человек».
-  if (options.controlSecret === options.secret) throw new Error('[remontnik] секрет владельца совпадает с общим секретом')
+  assertOwnerSecrets(options)
   const replayGuard = options.replayGuard ?? new ReplayGuard()
   const now = options.now ?? Date.now
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */

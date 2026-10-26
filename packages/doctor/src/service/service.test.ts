@@ -2,7 +2,7 @@ import { mkdtempSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
-import { signBody } from '@ykurilov/remontnik-core/signed-http'
+import { signBody, signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions } from './index.js'
@@ -55,11 +55,6 @@ afterEach(async () => {
 })
 
 describe('каркас врача', () => {
-  it('секрет владельца совпадает с общим → врач не запускается и не открывает хранилище', async () => {
-    await expect(start({ controlSecret: secret })).rejects.toThrow(/совпадает с общим/)
-    expect(existsSync(join(stateDir, 'doctor.sqlite'))).toBe(false)
-  })
-
   it('открывает хранилище SQLite в папке состояния и отвечает на /health', async () => {
     const service = await start()
 
@@ -67,6 +62,26 @@ describe('каркас врача', () => {
 
     expect(existsSync(join(stateDir, 'doctor.sqlite'))).toBe(true)
     expect(health).toMatchObject({ ok: true, harness: 'open', autoDeploy: 'on' })
+  })
+
+  it('секрет владельца, равный общему, — не секрет владельца: врач не запускается', async () => {
+    await expect(startDoctorService(options({ controlSecret: secret }))).rejects.toThrow(/совпадает с общим/)
+    expect(existsSync(join(stateDir, 'doctor.sqlite'))).toBe(false)
+  })
+
+  it('стоп-кран: подписанная команда останавливает автовыкатку, /health это показывает и после перезапуска', async () => {
+    const service = await start()
+    const body = JSON.stringify({ action: 'stop', by: 'telegram' })
+    const stop = await fetch(`${service.url}/v1/control/deploys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...signRequest({ method: 'POST', target: '/v1/control/deploys', body, secret }) },
+      body,
+    })
+    expect(await stop.json()).toEqual({ autoDeploy: 'stopped' })
+    await service.close()
+
+    const again = await start()
+    expect(await (await fetch(`${again.url}/health`)).json()).toMatchObject({ autoDeploy: 'stopped' })
   })
 
   it('принятое событие становится случаем с отчётом case_received без лишнего сообщения в Telegram', async () => {

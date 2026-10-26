@@ -60,7 +60,9 @@ describe('defineRemontnikConfig', () => {
       errorRateFactor: 3,
       minErrorsToRollback: 5,
       newFingerprintsToRollback: 3,
+      healthWindowTicks: 5,
     })
+    expect(config.deploy).toMatchObject({ buildEnv: [], lockWaitReportMinutes: 30 })
     // Модель: у сторожа и у врача по своему потолку, в сумме $5; общего счётчика нет.
     expect(config.limits).toMatchObject({
       watchModelUsdPerDay: 1,
@@ -78,6 +80,13 @@ describe('defineRemontnikConfig', () => {
     expect(() => defineRemontnikConfig({ ...minimalConfig(), limits: { modelUsdPerDay: 5 } } as never)).toThrow()
     expect(() => defineRemontnikConfig({ ...minimalConfig(), review: { botDescription: 'бот', usdPerDay: 1 } } as never)).toThrow()
     expect(defineRemontnikConfig({ ...minimalConfig(), limits: { watchModelUsdPerDay: 0.5, doctorModelUsdPerDay: 4.5 } }).limits).toMatchObject({ watchModelUsdPerDay: 0.5, doctorModelUsdPerDay: 4.5 })
+  })
+
+  it('deploy.buildEnv: только имена переменных; переменные врача REMONTNIK_ сборке не передаются', () => {
+    const withEnv = (buildEnv: string[]) => ({ ...minimalConfig(), deploy: { ...minimalConfig().deploy, buildEnv } })
+    expect(defineRemontnikConfig(withEnv(['NODE_ENV', 'APP_DIR'])).deploy.buildEnv).toEqual(['NODE_ENV', 'APP_DIR'])
+    expect(errorOf(() => defineRemontnikConfig(withEnv(['REMONTNIK_SHARED_SECRET']))).issues.some((issue) => issue.startsWith('deploy.buildEnv'))).toBe(true)
+    expect(errorOf(() => defineRemontnikConfig(withEnv(['A=B']))).issues.some((issue) => issue.startsWith('deploy.buildEnv'))).toBe(true)
   })
 
   it('fixablePaths: по умолчанию src/**, можно свои, пустой список — ошибка', () => {

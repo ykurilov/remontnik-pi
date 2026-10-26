@@ -88,6 +88,15 @@ describe('отчёты врача', () => {
     await expect(reports.pump()).resolves.toBeUndefined()
   })
 
+  it('снимки экрана хранятся в отчёте; без снимков поля нет', async () => {
+    const reports = createReports({ store: createMemoryRecordStore(), now: () => now })
+    const deployed = await reports.add({ type: 'deployed', caseId: 1, short: 'x', telegram: 'not_needed', screenshots: ['/state/shots/1-a.png'] })
+    const plain = await reports.add({ type: 'deployed', caseId: 1, short: 'y', telegram: 'not_needed' })
+
+    expect((await reports.get(deployed.reportId))?.screenshots).toEqual(['/state/shots/1-a.png'])
+    expect(await reports.get(plain.reportId)).not.toHaveProperty('screenshots')
+  })
+
   it('отчёт можно записать внутри чужой транзакции: откат убирает и его', async () => {
     const store = createMemoryRecordStore()
     const reports = reportsWithTelegram(store)

@@ -11,8 +11,12 @@ import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createModelBudget } from '../ledgers/model-budget.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { confirmAbandonedVersion } from '../deployer/index.js'
+import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createFingerprintReleaseHandler } from '../intake/fingerprint-release.js'
+import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
+import { createControls } from '../ledgers/controls.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
 import type { CommandRunner } from '../workbench/index.js'
@@ -25,7 +29,7 @@ import { openDoctorHarness } from './harness.js'
 export interface DoctorServiceOptions {
   stateDir: string
   sharedSecret: string
-  /** Секрет владельца: только им снимается «нужен человек» по отпечатку. Не задан — снять по HTTP нельзя. */
+  /** Секрет владельца: только им можно снова пустить выкатки после стоп-крана и снять «нужен человек» по отпечатку. Не задан — по HTTP нельзя. */
   controlSecret?: string
   listen: { host: string; port: number }
   telegram: { botToken: string; chatId: string; apiBaseUrl?: string; proxyToken?: string }
@@ -118,9 +122,8 @@ function describeError(error: unknown): string {
 export async function startDoctorService(options: DoctorServiceOptions): Promise<DoctorService> {
   // До открытия хранилища: настройка с публичным адресом для моста не должна даже начать работу.
   if (options.reportsFeed?.bridge) assertPrivateAddress(options.reportsFeed.bridge.listen.host, 'адрес приёма для моста Paseo')
-  if (options.controlSecret !== undefined && options.controlSecret === options.sharedSecret) {
-    throw new Error('[remontnik] секрет владельца совпадает с общим секретом: приложение получило бы права владельца')
-  }
+  // До открытия хранилища: равные секреты — приложение получило бы права владельца.
+  assertOwnerSecrets({ secret: options.sharedSecret, controlSecret: options.controlSecret })
   const log = options.log ?? ((line: string) => console.error(line))
   const exit = options.exit ?? ((code: number) => process.exit(code))
   const now = options.now ?? Date.now
@@ -175,7 +178,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     ...(modelBudget && runners ? { models: modelBudget.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
-  const caseBook = createCaseBook(opened.records)
+  const caseBook = createCaseBook(opened.records, { now })
   const reports = createReports({
     store: opened.records,
     telegram: { client: telegram, chatId: options.telegram.chatId },
@@ -253,13 +256,25 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   }
 
   const feed = options.reportsFeed
+  const controls = createControls(opened.records)
   let intake: IntakeServer
   try {
     intake = await startIntakeServer({
       handler: createIntakeHandler({
         secret: options.sharedSecret,
         receiveEvents,
-        health: () => ({ ok: harnessState === 'open', harness: harnessState, autoDeploy: 'on' }),
+        health: async () => ({
+          ok: harnessState === 'open',
+          harness: harnessState,
+          // Хранилище отказало — состояние стоп-крана неизвестно, но /health всё равно отвечает.
+          autoDeploy: await controls.read().then((read) => read.autoDeploy, () => 'unknown'),
+        }),
+        deployControls: createDeployControlsHandler({
+          controls,
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+          confirmVersion: (version) => confirmAbandonedVersion(opened.records, version),
+        }),
         fingerprintRelease: createFingerprintReleaseHandler({
           records: opened.records,
           secret: options.sharedSecret,
