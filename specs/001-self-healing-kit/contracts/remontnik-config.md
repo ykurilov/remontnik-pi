@@ -28,7 +28,16 @@ export default defineRemontnikConfig({
       resultFile: string,             // путь к итогу в {outDir}, формат — deploy-commands.md
       repeat: number,                 // по умолчанию 3
       maxScenarios: number,           // по умолчанию 3
-      env: string[],                  // имена переменных окружения для eval (отдельные ключи с лимитом)
+      env: string[],                  // имена обычных переменных для eval; имена с KEY, TOKEN, SECRET, PASSWORD, AUTH и т. п. — отказ
+      providers?: Array<{             // модели, к которым eval ходит через прокси врача; по умолчанию []
+        name: string,                 // латиница, цифры, дефис; без повторов
+        baseUrlEnv: string,           // переменная, в которой eval получит адрес прокси
+        keyEnv: string,               // переменная с настоящим ключом у врача; eval получает в ней разовый пропуск
+        upstream: string,             // настоящий адрес API модели
+        authHeader?: "authorization" | "x-api-key", // по умолчанию "authorization"
+        priceUsdPerMTok: { input: number, output: number }, // цена, если ответ не сообщает стоимость
+      }>,
+      tokenEnv?: string,              // переменная с разовым пропуском; по умолчанию REMONTNIK_EVAL_TOKEN
     },
   },
   evalScope: Array<{ paths: string[]; scenarios: string[] | "all" }>,
@@ -59,6 +68,7 @@ export default defineRemontnikConfig({
   limits?: {
     modelUsdPerDay?: number,          // 5 (сторож + врач)
     evalUsdPerDay?: number,           // 5
+    evalUsdPerCase?: number,          // 1; доля одного случая, больше прокси не пропустит
     autoDeploysPerFingerprintPerDay?: number, // 2
     autoDeploysPerDay?: number,       // 5
     maxDiffLines?: number,            // 300
