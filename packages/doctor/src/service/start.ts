@@ -1,18 +1,20 @@
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
+import { createCaseServices, type CaseServices } from '../case-services/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
-import { CASE_GATEWAY_HOST, createDockerRunner, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
+import { CASE_GATEWAY_HOST, createDockerRunner, removeOrphanWorkbenches, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
 import { loadMainBranchConfig } from './config-source.js'
 import { startDoctorService, type DoctorService, type DoctorServiceOptions, type DoctorTreatmentOptions } from './index.js'
 
 // Боевой запуск врача (`remontnik-doctor start`): всё берётся из окружения сервера и настройки основной ветки.
 // Команды модели и проверки идут только в контейнерах (`createDockerRunner`), у каждой копии случая — свои
 // закрытые сети (`case-networks`). Врач подключается к ним сам: в сети верстака слушает зеркало реестра пакетов,
-// в сети проверок — прокси eval. Приём событий сторожа слушает только адрес врача в сети приложения.
+// в сети проверок — прокси eval. Там же поднимаются службы для тестов приложения (`case-services`).
+// Приём событий сторожа слушает только адрес врача в сети приложения.
 
 export type DoctorEnv = Readonly<Record<string, string | undefined>>
 
@@ -49,8 +51,8 @@ function gitTokenEnv(token: string | undefined): Record<string, string> {
 }
 
 export interface DoctorStartPlan {
-  /** Служба без исполнителя и прокси eval: их создаёт `createCaseGateway`. */
-  service: Omit<DoctorServiceOptions, 'treatment' | 'listen'> & { treatment: Omit<DoctorTreatmentOptions, 'runner' | 'evalProxy'> }
+  /** Служба без исполнителя, прокси eval и служб для тестов: их создаёт `createCaseGateway`. */
+  service: Omit<DoctorServiceOptions, 'treatment' | 'listen'> & { treatment: Omit<DoctorTreatmentOptions, 'runner' | 'evalProxy' | 'services'> }
   /** Где слушать приём событий: явный адрес или адрес врача в сети приложения. */
   listen: { host: string; port: number } | { network: string; port: number }
   runner: Omit<DockerRunnerOptions, 'caseNetworks' | 'workbenchEnv'>
@@ -135,6 +137,7 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
 export interface CaseGateway {
   runner: CommandRunner
   caseNetworks: CaseNetworks
+  caseServices: CaseServices
   mirror: RegistryMirror
   evalProxy: EvalProxy
   close(): Promise<void>
@@ -156,9 +159,11 @@ export async function createCaseGateway(plan: DoctorStartPlan, options: { docker
     ...(options.log ? { log: options.log } : {}),
   })
   const runner = createDockerRunner({ ...plan.runner, ...(options.docker ? { docker: options.docker } : {}), caseNetworks, workbenchEnv: caseWorkbenchEnv() })
+  const caseServices = createCaseServices({ ...(options.docker ? { docker: options.docker } : {}), caseNetworks, ...(options.log ? { log: options.log } : {}) })
   return {
     runner,
     caseNetworks,
+    caseServices,
     mirror,
     evalProxy,
     async close() {
@@ -181,11 +186,14 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   const gateway = await createCaseGateway(plan, options)
   let service: DoctorService
   try {
+    // Сначала контейнеры верстака прошлого запуска (их копии испорчены) и службы для тестов, потом их сети.
+    await removeOrphanWorkbenches({ homesDir: plan.runner.homesDir, ...(options.docker ? { docker: options.docker } : {}), ...(options.log ? { log: options.log } : {}) })
+    await gateway.caseServices.removeStale()
     await gateway.caseNetworks.removeStale()
     service = await startDoctorService({
       ...plan.service,
       listen,
-      treatment: { ...plan.service.treatment, runner: gateway.runner, evalProxy: gateway.evalProxy },
+      treatment: { ...plan.service.treatment, runner: gateway.runner, evalProxy: gateway.evalProxy, services: gateway.caseServices },
       ...(options.log ? { log: options.log } : {}),
     })
   } catch (error) {

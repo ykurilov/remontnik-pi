@@ -104,6 +104,7 @@ describe('старт врача', () => {
         'case "$1 $2" in',
         `  "inspect --format") printf '%s\n' '${answer}';;`,
         "  \"network ls\") echo stale-network-id;;",
+        "  \"ps -a\") echo 'orphan-container running 0123456789abcdef';;",
         'esac',
         'exit 0',
         '',
@@ -121,6 +122,15 @@ describe('старт врача', () => {
     try {
       expect(doctor.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
       expect(fake.calls()).toEqual(expect.arrayContaining(['inspect --format {{json .NetworkSettings.Networks}} remontnik-doctor', 'network rm stale-network-id']))
+      // Контейнеры верстака прошлого запуска убиваются раньше, чем удаляются их сети; их копии испорчены.
+      const calls = fake.calls()
+      expect(calls.indexOf('rm -f orphan-container')).toBeGreaterThan(-1)
+      expect(calls.indexOf('rm -f orphan-container')).toBeLessThan(calls.findIndex((call) => call.startsWith('network ls')))
+      expect(existsSync(join(repoDir, '..', 'state', 'homes', '0123456789abcdef.spoiled'))).toBe(true)
+      // Службы для тестов прошлого запуска — тоже до удаления сетей: иначе сеть занята.
+      const staleServices = calls.indexOf('ps -aq --filter label=remontnik.case-services')
+      expect(staleServices).toBeGreaterThan(-1)
+      expect(staleServices).toBeLessThan(calls.findIndex((call) => call.startsWith('network ls')))
     } finally {
       await doctor.close()
     }

@@ -216,9 +216,16 @@ export function createCaseNetworks(options: CaseNetworksOptions): CaseNetworks {
       let network: CaseNetwork
       try {
         network = await current.ready
-        await verify(network)
       } catch (error) {
         current.active -= 1
+        throw error
+      }
+      try {
+        await verify(network)
+      } catch (error) {
+        // Сеть не та или уже не закрытая: врач уходит из неё сразу, следующая команда получит новую.
+        current.active -= 1
+        await release(key, current)
         throw error
       }
       let finished = false

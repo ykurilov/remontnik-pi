@@ -1,10 +1,16 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { once } from 'node:events'
+import { Readable } from 'node:stream'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from '../guarded-http/index.js'
 
 // Зеркало реестра пакетов для контейнеров верстака. Им нужен реестр (установка зависимостей), а больше ничего.
 // Туннеля нет: соединение с реестром по TLS ставит сам врач, адрес реестра задан здесь, а контейнер выбирает
 // только имя пакета. Пропускаются `GET` и `HEAD` метаданных пакета и его архива; путь проверяется до запроса,
 // `Host`, куки и прочие заголовки контейнера не уходят. Адреса архивов в метаданных переписываются на зеркало.
+//
+// Ответ идёт потоком: у реестра забирается не больше, чем прочёл контейнер, а метаданные переписываются по ходу,
+// без разбора JSON. Память врача держат пределы размера (после распаковки), срок записи и число одновременных ответов.
 
 export const NPM_REGISTRY = 'https://registry.npmjs.org'
 
@@ -16,6 +22,12 @@ export interface RegistryMirrorOptions {
   maxMetadataBytes?: number
   maxTarballBytes?: number
   upstreamTimeoutMs?: number
+  /** Клиент не забирает ответ дольше этого — соединение рвётся. */
+  writeTimeoutMs?: number
+  /** Одновременных ответов реестра во всём зеркале. */
+  maxConcurrentResponses?: number
+  /** Сколько запрос ждёт места среди одновременных ответов, потом — `503`. */
+  queueTimeoutMs?: number
   limits?: Partial<GuardedHttpLimits>
   log?: (line: string) => void
 }
@@ -31,6 +43,9 @@ export interface RegistryMirror {
 const MAX_METADATA_BYTES = 64 * 1024 * 1024
 const MAX_TARBALL_BYTES = 256 * 1024 * 1024
 const UPSTREAM_TIMEOUT_MS = 120_000
+const WRITE_TIMEOUT_MS = 60_000
+const MAX_CONCURRENT_RESPONSES = 32
+const QUEUE_TIMEOUT_MS = 30_000
 const NAME = '[A-Za-z0-9][A-Za-z0-9._~-]*'
 // `/name`, `/@scope/name`, `/@scope%2fname`; архив — `<пакет>/-/<файл>.tgz`.
 const PACKAGE_PATH = new RegExp(`^/(?:(@${NAME})(?:/|%2[fF]))?(${NAME})(?:/-/(${NAME}\\.tgz))?$`)
@@ -64,14 +79,71 @@ function checkedUrl(text: string, what: string, protocols: string[]): URL {
   return url
 }
 
-/** Метаданные с адресами архивов реестра, переписанными на зеркало. Чужие адреса остаются: контейнер до них не дотянется. */
-function rewriteTarballs(body: Buffer, upstream: string, publicUrl: string): Buffer {
-  const document = JSON.parse(body.toString('utf8')) as { versions?: Record<string, { dist?: { tarball?: unknown } }> }
-  for (const version of Object.values(document.versions ?? {})) {
-    const tarball = version?.dist?.tarball
-    if (typeof tarball === 'string' && tarball.startsWith(`${upstream}/`)) version.dist!.tarball = `${publicUrl}${tarball.slice(upstream.length)}`
+/**
+ * Замена `from` на `to` по кускам потока: совпадение, разрезанное между кусками, тоже находится. Так адреса архивов
+ * реестра в метаданных переписываются на зеркало без разбора JSON. Чужие адреса остаются: контейнер до них не дотянется.
+ */
+export function createReplacer(from: string, to: string): { push(chunk: Buffer): Buffer; end(): Buffer } {
+  const pattern = Buffer.from(from)
+  const replacement = Buffer.from(to)
+  let carry = Buffer.alloc(0)
+  return {
+    push(chunk) {
+      const data = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk
+      const parts: Buffer[] = []
+      let at = 0
+      for (let found = data.indexOf(pattern, at); found !== -1; found = data.indexOf(pattern, at)) {
+        parts.push(data.subarray(at, found), replacement)
+        at = found + pattern.length
+      }
+      // Хвост, где может начинаться совпадение, ждёт следующего куска.
+      const keep = Math.max(at, data.length - (pattern.length - 1))
+      parts.push(data.subarray(at, keep))
+      carry = Buffer.from(data.subarray(keep))
+      return Buffer.concat(parts)
+    },
+    end() {
+      return carry
+    },
   }
-  return Buffer.from(JSON.stringify(document))
+}
+
+/** Места для одновременных ответов: лишний запрос ждёт, не дождался — отказ. */
+function createSlots(max: number, waitMs: number): { acquire(): Promise<() => void> } {
+  let busy = 0
+  const waiting: (() => void)[] = []
+  const release = () => {
+    const next = waiting.shift()
+    if (next) next()
+    else busy -= 1
+  }
+  return {
+    acquire() {
+      const once = () => {
+        let done = false
+        return () => {
+          if (done) return
+          done = true
+          release()
+        }
+      }
+      if (busy < max) {
+        busy += 1
+        return Promise.resolve(once())
+      }
+      return new Promise((resolve, reject) => {
+        const grant = () => {
+          clearTimeout(timer)
+          resolve(once())
+        }
+        const timer = setTimeout(() => {
+          waiting.splice(waiting.indexOf(grant), 1)
+          reject(new Refusal(503, 'зеркало занято, повторите позже'))
+        }, waitMs)
+        waiting.push(grant)
+      })
+    },
+  }
 }
 
 export function createRegistryMirror(options: RegistryMirrorOptions): RegistryMirror {
@@ -80,6 +152,8 @@ export function createRegistryMirror(options: RegistryMirrorOptions): RegistryMi
   const maxMetadataBytes = options.maxMetadataBytes ?? MAX_METADATA_BYTES
   const maxTarballBytes = options.maxTarballBytes ?? MAX_TARBALL_BYTES
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS
+  const writeTimeoutMs = options.writeTimeoutMs ?? WRITE_TIMEOUT_MS
+  const slots = createSlots(options.maxConcurrentResponses ?? MAX_CONCURRENT_RESPONSES, options.queueTimeoutMs ?? QUEUE_TIMEOUT_MS)
 
   function reply(response: ServerResponse, status: number, text: string): void {
     if (response.headersSent) {
@@ -95,55 +169,71 @@ export function createRegistryMirror(options: RegistryMirrorOptions): RegistryMi
     const target = registryPath(request.url ?? '')
     const accept = request.headers.accept
     const headers: Record<string, string> = { 'user-agent': 'remontnik-registry-mirror', ...(accept && ACCEPT.test(accept) ? { accept } : {}) }
-    const signal = AbortSignal.timeout(upstreamTimeoutMs)
+    const release = await slots.acquire()
+    response.once('close', release)
+    // Клиент ушёл — запрос к реестру отменяется; реестр молчит дольше срока — тоже.
+    const gone = new AbortController()
+    response.once('close', () => gone.abort())
+    const signal = AbortSignal.any([AbortSignal.timeout(upstreamTimeoutMs), gone.signal])
     let upstreamResponse: Response
     try {
       upstreamResponse = await fetch(`${upstream}${target.path}`, { method: request.method, headers, redirect: 'manual', signal })
     } catch (error) {
       throw signal.aborted ? new Refusal(504, 'реестр не ответил в срок') : new Refusal(502, `реестр недоступен: ${(error as Error).message}`)
     }
-    if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) throw new Refusal(502, 'реестр ответил перенаправлением: зеркало по нему не идёт')
-    const limit = target.tarball ? maxTarballBytes : maxMetadataBytes
-    const declared = Number(upstreamResponse.headers.get('content-length') ?? '0')
-    if (declared > limit) throw new Refusal(502, 'ответ реестра больше предела')
+    const body = upstreamResponse.body
+    try {
+      if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) throw new Refusal(502, 'реестр ответил перенаправлением: зеркало по нему не идёт')
+      const limit = target.tarball ? maxTarballBytes : maxMetadataBytes
+      const declared = Number(upstreamResponse.headers.get('content-length') ?? '0')
+      if (declared > limit) throw new Refusal(502, 'ответ реестра больше предела')
+    } catch (error) {
+      await body?.cancel().catch(() => {})
+      throw error
+    }
     const contentType = upstreamResponse.headers.get('content-type') ?? 'application/octet-stream'
     const passed: Record<string, string> = { 'content-type': contentType }
     for (const name of ['etag', 'last-modified']) {
       const value = upstreamResponse.headers.get(name)
       if (value) passed[name] = value
     }
-
-    const chunks: Buffer[] = []
-    let size = 0
-    const streaming = target.tarball && upstreamResponse.ok
-    try {
-      for await (const chunk of upstreamResponse.body ?? []) {
-        size += chunk.length
-        if (size > limit) throw new Refusal(502, 'ответ реестра больше предела')
-        if (streaming) {
-          if (!response.headersSent) response.writeHead(upstreamResponse.status, passed)
-          response.write(chunk)
-        } else chunks.push(Buffer.from(chunk))
-      }
-    } catch (error) {
-      if (error instanceof Refusal) throw error
-      throw signal.aborted ? new Refusal(504, 'реестр не ответил в срок') : new Refusal(502, 'ответ реестра оборвался')
-    }
-    if (streaming) {
-      if (!response.headersSent) response.writeHead(upstreamResponse.status, passed)
+    if (request.method === 'HEAD' || !body) {
+      await body?.cancel().catch(() => {})
+      response.writeHead(upstreamResponse.status, passed)
       response.end()
       return
     }
-    let body: Buffer = Buffer.concat(chunks)
-    if (upstreamResponse.ok && request.method === 'GET' && /json/i.test(contentType)) {
+
+    // Длина после переписывания другая, поэтому ответ идёт частями (chunked). Заголовки уходят с первым куском:
+    // ответ больше предела уже в первом куске получает 502. Запись ждёт, пока клиент читает (drain); не читает
+    // дольше срока — соединение рвётся, запрос к реестру отменяется.
+    response.statusCode = upstreamResponse.status
+    for (const [name, value] of Object.entries(passed)) response.setHeader(name, value)
+    const limit = target.tarball ? maxTarballBytes : maxMetadataBytes
+    const replacer = !target.tarball && upstreamResponse.ok && /json/i.test(contentType) ? createReplacer(`"${upstream}/`, `"${publicUrl}/`) : undefined
+    const write = async (chunk: Buffer) => {
+      if (chunk.length === 0 || response.write(chunk)) return
       try {
-        body = rewriteTarballs(body, upstream, publicUrl)
+        await once(response, 'drain', { signal: AbortSignal.any([gone.signal, AbortSignal.timeout(writeTimeoutMs)]) })
       } catch {
-        throw new Refusal(502, 'метаданные реестра не разобрались')
+        response.destroy()
+        throw new Refusal(502, gone.signal.aborted ? 'клиент ушёл' : 'клиент не забирает ответ в срок')
       }
     }
-    response.writeHead(upstreamResponse.status, { ...passed, 'content-length': String(body.length) })
-    response.end(request.method === 'HEAD' ? undefined : body)
+    let size = 0
+    try {
+      for await (const chunk of Readable.fromWeb(body as WebReadableStream<Uint8Array>)) {
+        size += chunk.length
+        if (size > limit) throw new Refusal(502, 'ответ реестра больше предела')
+        await write(replacer ? replacer.push(chunk) : chunk)
+      }
+      if (replacer) await write(replacer.end())
+    } catch (error) {
+      gone.abort()
+      if (error instanceof Refusal) throw error
+      throw signal.aborted && !gone.signal.aborted ? new Refusal(504, 'реестр не ответил в срок') : new Refusal(502, 'ответ реестра оборвался')
+    }
+    response.end()
   }
 
   const http = createGuardedHttp((request, response) => {

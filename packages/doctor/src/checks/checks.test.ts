@@ -213,6 +213,14 @@ describe('проверки', () => {
     expect(fake.calls.map((call) => call.command).slice(0, 2)).toEqual(['pnpm install', 'pnpm typecheck'])
   })
 
+  it('зависимости ставятся строго по файлу-замку — у правки и у основы, независимо от CI=1 в образе', async () => {
+    const fake = fakeRunner({ tests: [{ exitCode: 0 }] })
+    await checksWith(fake).run(runInput())
+    const installs = fake.calls.filter((call) => call.command === 'pnpm install')
+    expect(installs.map((call) => call.options.cwd)).toEqual([candidateDir, baseDir])
+    for (const install of installs) expect(install.options.env).toMatchObject({ npm_config_frozen_lockfile: 'true' })
+  })
+
   it('упавшие тесты повторяются; разный итог → flaky', async () => {
     const fake = fakeRunner({ tests: [{ exitCode: 1, output: 'REMONTNIK_FAILED=prices' }, { exitCode: 0 }] })
     const result = await checksWith(fake).run(runInput())
@@ -419,7 +427,8 @@ describe('проверки', () => {
     }
     for (const call of fake.calls.filter((call) => !call.command.startsWith('node eval'))) {
       expect(call.options.writableDirs ?? []).toEqual([])
-      expect(call.options.env ?? {}).toEqual({})
+      // Переменных eval у остальных команд нет; установке — только строгий файл-замок.
+      expect(call.options.env ?? {}).toEqual(call.command === 'pnpm install' ? { npm_config_frozen_lockfile: 'true' } : {})
       expect(call.options.copyDir).toBe(call.options.cwd)
     }
   })
@@ -439,5 +448,74 @@ describe('проверки', () => {
     expect(result.eval.costUsd).toBeCloseTo(0.5)
     expect(fake.proxy.runs[0]?.options.budgetUsd).toBeCloseTo(0.6)
     expect(fake.calls.find((call) => call.command.startsWith('node eval'))?.options.signal?.aborted).toBe(true)
+  })
+})
+
+describe('службы для тестов (checks.services)', () => {
+  const servicesConfig = (services = 'test/services.yml') => testRemontnikConfig({ checks: { ...config.checks, services }, evalScope: config.evalScope })
+
+  /** Основа с файлом служб; подставные службы пишут подъёмы и уборки в общий журнал с командами. */
+  function setup(options: { upFails?: boolean; servicesPath?: string } = {}) {
+    const base = tempDir()
+    mkdirSync(join(base, 'test'))
+    writeFileSync(join(base, 'test/services.yml'), 'services:\n  db:\n    image: postgres:17\n')
+    const fake = fakeRunner({ tests: [{ exitCode: 0 }] })
+    const journal: string[] = []
+    const run = fake.runner.run.bind(fake.runner)
+    fake.runner.run = (command, runOptions) => {
+      journal.push(`${typeof command === 'string' ? command : command.join(' ')} @ ${runOptions.cwd}`)
+      return run(command, runOptions)
+    }
+    const services = {
+      async up(copyDir: string, text: string) {
+        journal.push(`up ${copyDir} ${text.includes('postgres:17') ? 'файл основы' : 'чужой файл'}`)
+        if (options.upFails) throw new Error('службы для тестов не поднялись: db unhealthy')
+        return { project: `p-${copyDir}`, down: async () => void journal.push(`down ${copyDir}`) }
+      },
+    }
+    const checks = createChecks({ runner: fake.runner, config: servicesConfig(options.servicesPath), evalEnv: { EVAL_API_KEY: EVAL_KEY }, evalProxy: fake.proxy, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60, services })
+    return { base, fake, journal, checks }
+  }
+
+  it('службы поднимаются из файла основы до проверок своей копии и убираются после всех проверок', async () => {
+    const { base, journal, checks } = setup()
+    // Файл в копии правки модель могла поменять — врач его не берёт.
+    const result = await checks.run(runInput({ baseDir: base }))
+    expect(result.tests.status).toBe('green')
+    expect(journal.filter((line) => line.startsWith('up') || line.startsWith('down'))).toEqual([
+      `up ${candidateDir} файл основы`,
+      `up ${base} файл основы`,
+      `down ${candidateDir}`,
+      `down ${base}`,
+    ])
+    const at = (line: string) => journal.indexOf(line)
+    expect(at(`up ${candidateDir} файл основы`)).toBeGreaterThan(at(`pnpm install @ ${candidateDir}`))
+    expect(at(`up ${candidateDir} файл основы`)).toBeLessThan(at(`pnpm typecheck @ ${candidateDir}`))
+    expect(at(`up ${base} файл основы`)).toBeLessThan(journal.findIndex((line) => line.startsWith('node eval') && line.endsWith(`@ ${base}`)))
+  })
+
+  it('службы не поднялись → тесты красные с шагом services, команды тестов не идут', async () => {
+    const { base, journal, checks } = setup({ upFails: true })
+    const result = await checks.run(runInput({ baseDir: base }))
+    expect(result.tests).toMatchObject({ status: 'red', failed: ['services'] })
+    expect(result.tests.outputTail).toMatch(/unhealthy/)
+    expect(journal.some((line) => line.startsWith('pnpm test'))).toBe(false)
+  })
+
+  it('службы заданы, а поднять их нечем → красные с объяснением, а не тесты без базы', async () => {
+    const base = tempDir()
+    const fake = fakeRunner({})
+    const checks = createChecks({ runner: fake.runner, config: servicesConfig(), evalEnv: {}, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60 })
+    const result = await checks.run(runInput({ baseDir: base }))
+    expect(result.tests).toMatchObject({ status: 'red', failed: ['services'] })
+    expect(result.tests.outputTail).toMatch(/checks\.services/)
+    expect(fake.calls.some((call) => call.command === 'pnpm test')).toBe(false)
+  })
+
+  it('файл служб вне копии основы — отказ', async () => {
+    const { base, checks } = setup({ servicesPath: '../services.yml' })
+    const result = await checks.run(runInput({ baseDir: base }))
+    expect(result.tests).toMatchObject({ status: 'red', failed: ['services'] })
+    expect(result.tests.outputTail).toMatch(/вне копии/)
   })
 })

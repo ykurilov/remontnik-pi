@@ -5,6 +5,7 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { Models } from '@earendil-works/pi-ai'
 import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
+import type { CaseServices } from '../case-services/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
@@ -63,6 +64,8 @@ export interface DoctorTreatmentOptions {
    * (`checks.eval.providers`) не запускается.
    */
   evalProxy?: { listen: { host: string; port: number }; publicUrl?: string } | EvalProxy
+  /** Службы для тестов (`checks.services`) в сети проверок случая; без них такие проверки не запускаются. */
+  services?: Pick<CaseServices, 'up'>
   appDescription?: string
   budgetPollMs?: number
 }
@@ -201,6 +204,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       checksDir: join(options.stateDir, 'checks'),
       evalEnv: treatmentOptions.evalEnv ?? process.env,
       ...(evalProxy ? { evalProxy } : {}),
+      ...(treatmentOptions.services ? { checksServices: treatmentOptions.services } : {}),
       evalBaseCache: createRecordEvalBaseCache(opened.records),
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,

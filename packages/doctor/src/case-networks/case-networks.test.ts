@@ -200,6 +200,23 @@ describe('сверка сети перед каждой командой', () =>
     await expect(created.use('/srv/worktrees/case-1', 'workbench')).rejects.toThrow(/не найдена|сменилась/)
     expect(fake.calls().filter((call) => call[1] === 'inspect').at(-1)!.at(-1)).toBe(old.id)
   })
+
+  it('сверка не прошла → сеть освобождается целиком; следующая команда — новая закрытая сеть', async () => {
+    const fake = fakeDocker()
+    const { created, detached } = networks(fake.docker)
+    const first = await created.use('/srv/worktrees/case-1', 'workbench')
+    first.done()
+    fake.tamper(first.network.id, { internal: false })
+    await expect(created.use('/srv/worktrees/case-1', 'workbench')).rejects.toThrow(/не закрыта/)
+    // Слушатель закрыт, врач отключён, сеть удалена — не ждёт простоя и перезапуска врача.
+    expect(detached).toEqual([`workbench ${first.network.gatewayIp}`])
+    expect(fake.calls()).toEqual(expect.arrayContaining([['network', 'disconnect', '--force', first.network.id, 'remontnik-doctor'], ['network', 'rm', first.network.id]]))
+    expect(fake.networks()).toEqual([])
+    const next = await created.use('/srv/worktrees/case-1', 'workbench')
+    expect(next.network.id).not.toBe(first.network.id)
+    expect(fake.networks()).toEqual([expect.objectContaining({ id: next.network.id, internal: true })])
+    next.done()
+  })
 })
 
 describe('жизнь сетей', () => {

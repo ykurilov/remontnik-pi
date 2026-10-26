@@ -111,9 +111,14 @@ function spawnWithTimeout(spec: SpawnSpec, options: RunOptions, killGraceMs = 0,
   })
 }
 
+/** Ключ копии: имя её HOME и метка её контейнеров. */
+function copyKey(copyDir: string): string {
+  return createHash('sha256').update(resolve(copyDir)).digest('hex').slice(0, 16)
+}
+
 /** HOME копии: папка по имени корня копии внутри `homesDir`. */
 function homeOf(homesDir: string, copyDir: string): string {
-  const home = join(homesDir, createHash('sha256').update(resolve(copyDir)).digest('hex').slice(0, 16))
+  const home = join(homesDir, copyKey(copyDir))
   mkdirSync(home, { recursive: true })
   return home
 }
@@ -168,9 +173,21 @@ export interface DockerRunSpec {
   memory: string
   cpus: string
   command: string
+  /** Срок жизни контейнера в секундах: по нему обёртка убивает всё внутри, даже если врача уже нет. */
+  lifetimeSeconds: number
 }
 
 const CONTAINER_HOME = '/home/remontnik'
+export const WORKBENCH_LABEL = 'remontnik.workbench'
+const COPY_LABEL = 'remontnik.copy'
+/** Запас срока жизни контейнера сверх тайм-аута команды: обычно её убивает врач, обёртка — когда врача нет. */
+export const CONTAINER_LIFETIME_MARGIN_SECONDS = 60
+/**
+ * Обёртка — первый процесс контейнера (`sh -c <обёртка> remontnik <срок> <команда>`). Команда идёт дочерним `sh`,
+ * обёртка раз в секунду сверяет часы и по сроку убивает все процессы контейнера, кроме себя, — контейнер кончается.
+ * Счёт ведёт сам первый процесс: сигналы от процессов контейнера ему не доходят, команда срок не отменит.
+ */
+const LIFETIME_WRAPPER = 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
 
 function bindMount(source: string, target: string): string[] {
   if (/[,\n]/.test(source) || /[,\n]/.test(target)) throw new Error(`путь с запятой нельзя смонтировать: ${source}`)
@@ -196,7 +213,8 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     'create',
     '--rm',
     '--name', spec.name,
-    '--label', 'remontnik.workbench=1',
+    '--label', `${WORKBENCH_LABEL}=1`,
+    '--label', `${COPY_LABEL}=${copyKey(spec.copyDir)}`,
     '--network', spec.network,
     ...Object.entries(spec.hosts ?? {}).flatMap(([host, ip]) => ['--add-host', `${host}:${ip}`]),
     ...(spec.user ? ['--user', spec.user] : []),
@@ -214,7 +232,7 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     '-w', spec.workdir,
     '--env-file', spec.envFile,
     spec.image,
-    'sh', '-c', spec.command,
+    'sh', '-c', LIFETIME_WRAPPER, 'remontnik', String(spec.lifetimeSeconds), spec.command,
   ]
 }
 
@@ -258,6 +276,35 @@ export function dockerClientEnv(): Record<string, string> {
 }
 const DOCKER_KILL_TIMEOUT_SECONDS = 30
 
+/** Отметка испорченной копии рядом с её HOME: переживает перезапуск врача. */
+function spoiledMarkOf(homesDir: string, key: string): string {
+  return `${join(homesDir, key)}.spoiled`
+}
+
+/**
+ * Контейнеры верстака прошлого запуска врача (врач упал, `--rm` их не убрал): убить и удалить. Если команда в
+ * контейнере уже шла, она оборвана на середине — копия помечается испорченной. Возвращает ID удалённых.
+ */
+export async function removeOrphanWorkbenches(options: { homesDir: string; docker?: string; log?: (line: string) => void }): Promise<string[]> {
+  const docker = options.docker ?? 'docker'
+  const step = (args: string[]) => spawnWithTimeout({ file: docker, args, cwd: tmpdir(), env: dockerClientEnv() }, { cwd: tmpdir(), timeoutSeconds: DOCKER_STEP_TIMEOUT_SECONDS })
+  const listed = await step(['ps', '-a', '--filter', `label=${WORKBENCH_LABEL}=1`, '--format', `{{.ID}} {{.State}} {{.Label "${COPY_LABEL}"}}`])
+  if (listed.exitCode !== 0) throw new Error(`контейнеры верстака не перечислились: ${(listed.spawnError ?? listed.output).trim().slice(-300)}`)
+  const removed: string[] = []
+  for (const line of listed.output.split('\n')) {
+    const [id, state, key] = line.trim().split(/\s+/)
+    if (!id) continue
+    if (state !== 'created' && key && /^[0-9a-f]{16}$/.test(key)) {
+      mkdirSync(options.homesDir, { recursive: true })
+      writeFileSync(spoiledMarkOf(options.homesDir, key), `${id}\n`)
+    }
+    const killed = await step(['rm', '-f', id])
+    if (killed.exitCode === 0) removed.push(id)
+    else options.log?.(`[врач] старый контейнер верстака ${id} не удалился: ${killed.output.trim().slice(-300)}`)
+  }
+  return removed
+}
+
 /**
  * Исполнитель в контейнере: на каждую команду — свой контейнер с одной копией. Основного репозитория,
  * его gitdir (указатель `.git` копии ведёт в никуда), окружения и файлов врача в контейнере нет.
@@ -269,7 +316,7 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
   const docker = options.docker ?? 'docker'
   const user = options.user ?? (process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined)
   const clientEnv = dockerClientEnv()
-  const spoiledMark = (copyDir: string) => `${homeOf(options.homesDir, copyDir)}.spoiled`
+  const spoiledMark = (copyDir: string) => spoiledMarkOf(options.homesDir, copyKey(copyDir))
   const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
   const dockerStep = (args: string[], cwd: string, timeoutSeconds: number, signal?: AbortSignal) =>
     spawnWithTimeout({ file: docker, args, cwd, env: clientEnv }, { cwd, timeoutSeconds, ...(signal ? { signal } : {}) })
@@ -306,6 +353,7 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
         memory: options.memory ?? '4g',
         cpus: options.cpus ?? '2',
         command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
+        lifetimeSeconds: Math.ceil(runOptions.timeoutSeconds) + CONTAINER_LIFETIME_MARGIN_SECONDS,
       })
       created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
     } catch (error) {

@@ -24,6 +24,7 @@ const CANARY = ['canary', 'secret', 'must', 'not', 'leak'].join('-')
 const INTERNET_V4 = [1, 1, 1, 1].join('.')
 const GATEWAY = 'remontnik-gateway'
 const MIRROR = `http://${GATEWAY}:7801`
+const POSTGRES_IMAGE = 'postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b'
 
 const dockerReady = spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0
 
@@ -291,6 +292,8 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     expect(docker(['network', 'inspect', '-f', '{{.Internal}}', 'remontnik-outside']).trim()).toBe('false')
     expect(docker(['network', 'ls', '--format', '{{.Name}}'])).not.toMatch(/remontnik-(workbench|checks)\b/)
     expect(docker(['inspect', '-f', '{{range .Mounts}}{{.Destination}} {{end}}', 'remontnik-doctor'])).toContain('/var/run/docker.sock')
+    // Память врача ограничена: по умолчанию 2 ГБ без подкачки сверху.
+    expect(docker(['inspect', '-f', '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}', 'remontnik-doctor']).trim()).toBe(`${2 * 1024 ** 3} ${2 * 1024 ** 3}`)
     // Из сети приложения порт 7800 открыт, из внешней сети врача — нет.
     expect(tcpFrom(APP_NETWORK, 'remontnik-doctor', 7800)).toBe('open')
     expect(tcpFrom('remontnik-outside', 'remontnik-doctor', 7800)).not.toBe('open')
@@ -391,6 +394,89 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     )
     expect(Object.values(out.fromSameCase)).toContain('open')
     expect(Object.values(out.fromNeighbor)).not.toContain('open')
+    expect(caseNetworks()).toEqual([])
+  })
+
+  it('службы для тестов: «Пациент» с Postgres в службе проходит проверку; из соседнего случая базы не видно', () => {
+    const [candidate, base, neighbor] = [copy('patient-candidate'), copy('patient-base'), copy('patient-neighbor')]
+    const services = [
+      'services:',
+      '  db:',
+      `    image: ${POSTGRES_IMAGE}`,
+      '    environment:',
+      '      POSTGRES_HOST_AUTH_METHOD: trust',
+      '    tmpfs: /var/lib/postgresql/data',
+      '    healthcheck:',
+      '      test: ["CMD", "pg_isready", "-U", "postgres"]',
+      '      interval: 1s',
+      '      retries: 120',
+      '',
+    ].join('\n')
+    // Тест приложения: запрос SSLRequest к базе по имени службы; Postgres без TLS отвечает «N».
+    const dbTest = String.raw`
+import { test } from 'node:test'
+import { connect } from 'node:net'
+import assert from 'node:assert/strict'
+test('база из службы отвечает', async () => {
+  const answer = await new Promise((resolve, reject) => {
+    const socket = connect(5432, 'db')
+    socket.setTimeout(5000, () => reject(new Error('timeout')))
+    socket.once('error', reject)
+    socket.once('connect', () => socket.write(Buffer.from([0, 0, 0, 8, 4, 210, 22, 47])))
+    socket.once('data', (data) => { socket.destroy(); resolve(data.toString()) })
+  })
+  assert.equal(answer, 'N')
+})
+`
+    for (const dir of [candidate, base]) {
+      writeFileSync(join(dir, 'services.yml'), services)
+      writeFileSync(join(dir, 'db.test.mjs'), dbTest)
+    }
+    const out = inDoctor(
+      String.raw`
+  const { createChecks, createMemoryEvalBaseCache } = await import('/app/dist/checks/index.js')
+  // Файл-замок — заранее, через зеркало: врач ставит зависимости только строго по нему.
+  for (const dir of [arg.candidate, arg.base]) out['lock ' + dir] = (await run(dir, 'pnpm install --lockfile-only')).exitCode
+  const checksConfig = { ...config, checks: { test: 'node --test', services: 'services.yml' } }
+  const checks = createChecks({ runner: gateway.runner, config: checksConfig, evalEnv: {}, baseCache: createMemoryEvalBaseCache(), workDir: '/tmp/checks', timeoutSeconds: 300, services: gateway.caseServices })
+  out.checks = (await checks.run({ candidateDir: arg.candidate, baseDir: arg.base, baseCommit: 'a'.repeat(40), changedPaths: [], reserveEval: async () => 0 })).tests
+  out.servicesAfterChecks = docker('ps', '-aq', '--filter', 'label=remontnik.case-services')
+
+  const running = await gateway.caseServices.up(arg.candidate, readFileSync(arg.base + '/services.yml', 'utf8'))
+  try {
+    const id = docker('ps', '-q', '--filter', 'label=remontnik.case-services=' + running.project)
+    const inspected = JSON.parse(docker('inspect', id))[0]
+    out.ports = Object.fromEntries(Object.entries(inspected.NetworkSettings.Ports ?? {}).filter(([, bound]) => bound))
+    out.mounts = inspected.Mounts.map((mount) => mount.Type)
+    out.canaryInEnv = inspected.Config.Env.some((line) => line.includes(arg.canary))
+    out.networks = Object.values(inspected.NetworkSettings.Networks).map((network) => network.NetworkID)
+    out.checksNetwork = (await gateway.caseNetworks.use(arg.candidate, 'checks'))
+    out.checksNetwork.done()
+    out.checksNetwork = out.checksNetwork.network.id
+    const ip = Object.values(inspected.NetworkSettings.Networks)[0].IPAddress
+    const targets = ['tcp=db:5432', 'tcp=' + ip + ':5432']
+    out.fromSameCase = (await probe(arg.candidate, targets, 'internal')).tcp
+    out.fromNeighbor = (await probe(arg.neighbor, targets, 'internal')).tcp
+    out.fromNeighborWorkbench = (await probe(arg.neighbor, targets)).tcp
+  } finally {
+    await running.down()
+  }
+  out.servicesAfterDown = docker('ps', '-aq', '--filter', 'label=remontnik.case-services')
+`,
+      { candidate, base, neighbor, canary: CANARY },
+    )
+    expect(out[`lock ${candidate}`]).toBe(0)
+    expect(out.checks).toMatchObject({ status: 'green' })
+    expect(out.servicesAfterChecks).toBe('')
+    // Портов наружу и томов хоста нет, секретов врача нет; сеть — только сеть проверок своего случая.
+    expect(out.ports).toEqual({})
+    expect(out.mounts.filter((type: string) => type === 'bind')).toEqual([])
+    expect(out.canaryInEnv).toBe(false)
+    expect(out.networks).toEqual([out.checksNetwork])
+    expect(Object.values(out.fromSameCase)).toEqual(['open', 'open'])
+    expect(Object.values(out.fromNeighbor)).not.toContain('open')
+    expect(Object.values(out.fromNeighborWorkbench)).not.toContain('open')
+    expect(out.servicesAfterDown).toBe('')
     expect(caseNetworks()).toEqual([])
   })
 

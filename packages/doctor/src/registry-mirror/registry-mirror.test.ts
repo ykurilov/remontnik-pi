@@ -1,5 +1,7 @@
 import { createServer, request as httpRequest, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { connect, type AddressInfo } from 'node:net'
+import { Readable } from 'node:stream'
+import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createRegistryMirror, type RegistryMirror, type RegistryMirrorOptions } from './index.js'
 
@@ -21,8 +23,9 @@ interface Seen {
 }
 
 /** Подставной реестр: метаданные пакетов, архив и ответы на особые пути. */
-async function fakeRegistry(): Promise<{ url: string; seen: Seen[] }> {
+async function fakeRegistry(): Promise<{ url: string; seen: Seen[]; streamed: { bytes: number; closed: boolean } }> {
   const seen: Seen[] = []
+  const streamed = { bytes: 0, closed: false }
   let url = ''
   const server: Server = createServer((request, response) => {
     seen.push({ path: request.url ?? '', host: request.headers.host, accept: request.headers.accept, cookie: request.headers.cookie })
@@ -63,6 +66,35 @@ async function fakeRegistry(): Promise<{ url: string; seen: Seen[] }> {
       return
     }
     if (path === '/slow') return
+    if (path === '/big/-/big-1.0.0.tgz') {
+      // 200 МБ кусками, с учётом drain: реестр шлёт ровно столько, сколько у него забирают.
+      response.writeHead(200, { 'content-type': 'application/octet-stream' })
+      const chunk = Buffer.alloc(64 * 1024, 3)
+      let left = 3200
+      response.once('close', () => (streamed.closed = true))
+      Readable.from(
+        (function* () {
+          while (left-- > 0) {
+            streamed.bytes += chunk.length
+            yield chunk
+          }
+        })(),
+      ).pipe(response)
+      return
+    }
+    if (path === '/bomb/-/bomb-1.0.0.tgz' || path === '/bomb') {
+      // Сжатая бомба: 64 КБ на проводе, 64 МБ после распаковки.
+      response.writeHead(200, { 'content-type': path === '/bomb' ? 'application/json' : 'application/octet-stream', 'content-encoding': 'gzip' })
+      response.end(gzipSync(Buffer.alloc(64 * 1024 * 1024, path === '/bomb' ? 32 : 0)))
+      return
+    }
+    if (path === '/split') {
+      // Метаданные мелкими кусками: адрес реестра разрезан между кусками.
+      response.writeHead(200, { 'content-type': 'application/json' })
+      const body = JSON.stringify({ name: 'split', versions: Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`1.0.${i}`, { dist: { tarball: `${url}/split/-/split-1.0.${i}.tgz` } }])) })
+      Readable.from(body.match(/[\s\S]{1,7}/g)!.map((part) => Buffer.from(part))).pipe(response)
+      return
+    }
     response.writeHead(404, { 'content-type': 'application/json' })
     response.end('{"error":"not found"}')
   })
@@ -75,7 +107,7 @@ async function fakeRegistry(): Promise<{ url: string; seen: Seen[] }> {
         server.closeAllConnections()
       }),
   )
-  return { url, seen }
+  return { url, seen, streamed }
 }
 
 async function mirror(upstream: string, options: Partial<RegistryMirrorOptions> = {}): Promise<{ mirror: RegistryMirror; url: string }> {
@@ -103,6 +135,50 @@ function raw(url: string, path: string, options: { method?: string; headers?: Re
     request.on('error', reject)
     request.end()
   })
+}
+
+/** Запрос без ожидания успеха: сколько байт пришло и дошёл ли ответ до конца. */
+function rawLoose(url: string, path: string): Promise<{ status: number; bytes: number; complete: boolean }> {
+  const { hostname, port } = new URL(url)
+  return new Promise((resolve) => {
+    let status = 0
+    let bytes = 0
+    const request = httpRequest({ host: hostname, port: Number(port), path, agent: false }, (response) => {
+      status = response.statusCode ?? 0
+      response.on('data', (chunk: Buffer) => (bytes += chunk.length))
+      response.on('end', () => resolve({ status, bytes, complete: response.complete }))
+      response.on('error', () => resolve({ status, bytes, complete: false }))
+    })
+    request.on('error', () => resolve({ status, bytes, complete: false }))
+    request.end()
+  })
+}
+
+/** Клиент, который отправил запрос и не читает ответ. */
+async function stalledClient(url: string, path: string): Promise<{ destroy(): void; resume(): void; readonly closed: boolean }> {
+  const { hostname, port } = new URL(url)
+  const socket = connect({ host: hostname, port: Number(port) })
+  let closed = false
+  socket.on('close', () => (closed = true))
+  socket.on('error', () => {})
+  await new Promise<void>((resolve) => socket.once('connect', () => resolve()))
+  socket.write(`GET ${path} HTTP/1.1\r\nHost: x\r\n\r\n`)
+  socket.pause()
+  return {
+    destroy: () => socket.destroy(),
+    resume: () => socket.resume(),
+    get closed() {
+      return closed
+    },
+  }
+}
+
+async function waitFor(condition: () => boolean, ms: number): Promise<void> {
+  const deadline = Date.now() + ms
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('условие не наступило')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
 }
 
 describe('зеркало реестра: что пропускает', () => {
@@ -214,6 +290,59 @@ describe('зеркало реестра: пределы', () => {
     const registry = await fakeRegistry()
     const { url } = await mirror(registry.url, { upstreamTimeoutMs: 300 })
     expect((await raw(url, '/slow')).status).toBe(504)
+  })
+
+  it('метаданные переписываются потоком: адрес, разрезанный между кусками, тоже', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url)
+    const answer = await raw(url, '/split')
+    expect(answer.status).toBe(200)
+    const versions = Object.values(JSON.parse(answer.body.toString('utf8')).versions) as { dist: { tarball: string } }[]
+    expect(versions).toHaveLength(50)
+    for (const version of versions) expect(version.dist.tarball).toMatch(new RegExp(`^${PUBLIC_URL}/split/-/split-1\\.0\\.\\d+\\.tgz$`))
+  })
+
+  it.each([
+    ['архив', '/bomb/-/bomb-1.0.0.tgz', { maxTarballBytes: 1024 * 1024 }],
+    ['метаданные', '/bomb', { maxMetadataBytes: 1024 * 1024 }],
+  ])('сжатая бомба (%s): после распаковки не больше предела, ответ оборван', async (_kind, path, limits) => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url, limits)
+    const answer = await rawLoose(url, path)
+    expect(answer.bytes).toBeLessThanOrEqual(1024 * 1024)
+    expect(answer.complete && answer.status === 200).toBe(false)
+  })
+
+  it('медленный клиент: зеркало не забирает у реестра больше, чем клиент прочёл', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url)
+    const client = await stalledClient(url, '/big/-/big-1.0.0.tgz')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    // Клиент не читает: в пути остаются только буферы сокетов, а не 200 МБ в памяти врача.
+    expect(registry.streamed.bytes).toBeLessThan(32 * 1024 * 1024)
+    client.destroy()
+  })
+
+  it('клиент не читает дольше срока записи → соединение рвётся, запрос к реестру отменяется', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url, { writeTimeoutMs: 300 })
+    const client = await stalledClient(url, '/big/-/big-1.0.0.tgz')
+    await waitFor(() => registry.streamed.closed, 5000)
+    // Клиент дочитывает то, что успело уйти, и видит обрыв: зеркало закрыло соединение.
+    client.resume()
+    await waitFor(() => client.closed, 5000)
+    expect(registry.streamed.bytes).toBeLessThan(32 * 1024 * 1024)
+  })
+
+  it('одновременных ответов не больше предела: лишний ждёт, не дождался места → 503', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url, { maxConcurrentResponses: 1, queueTimeoutMs: 300 })
+    const first = await stalledClient(url, '/big/-/big-1.0.0.tgz')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect((await raw(url, '/is-number')).status).toBe(503)
+    first.destroy()
+    await waitFor(() => registry.streamed.closed, 5000)
+    expect((await raw(url, '/is-number')).status).toBe(200)
   })
 
   it('реестр по умолчанию — registry.npmjs.org по HTTPS; иной адрес реестра — только явно', () => {
