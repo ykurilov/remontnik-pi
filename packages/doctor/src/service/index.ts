@@ -1,9 +1,15 @@
+import { join } from 'node:path'
 import { createTelegramClient } from '@ykurilov/remontnik-core/telegram'
 import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
+import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import type { Models } from '@earendil-works/pi-ai'
 import type { ReportInfo, Storage } from '@earendil-works/pi-durable'
 import { createCaseBook, type CaseBook } from '../case-book/index.js'
 import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../intake/index.js'
+import type { GitGuard } from '../git-guard/index.js'
 import { createReports, type Reports } from '../reports/index.js'
+import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
+import { createLocalRunner, type CommandRunner } from '../workbench/index.js'
 import { openDoctorHarness } from './harness.js'
 
 // Каркас врача: хранилище pi-durable, приём событий, книга случаев, отчёты и Telegram.
@@ -19,6 +25,25 @@ export interface DoctorServiceOptions {
   /** Для проверок: подменить хранилище. */
   wrapStorage?: (storage: Storage) => Storage
   now?: () => number
+  /** Лечение случаев; без него врач только принимает случаи и сообщает о них. */
+  treatment?: DoctorTreatmentOptions
+}
+
+export interface DoctorTreatmentOptions {
+  guard: GitGuard
+  /** Настройка приложения из основной ветки. */
+  loadConfig(): Promise<RemontnikConfig>
+  worktreesDir: string
+  models: Models
+  model: { provider: string; modelId: string }
+  /** Где идут команды модели; по умолчанию — локальный исполнитель. */
+  runner?: CommandRunner
+  /** Где идут проверки; по умолчанию — тот же, что у модели. */
+  checksRunner?: CommandRunner
+  /** Окружение, из которого eval берёт свои переменные; по умолчанию — окружение врача. */
+  evalEnv?: Readonly<Record<string, string | undefined>>
+  appDescription?: string
+  budgetPollMs?: number
 }
 
 export interface DoctorService {
@@ -27,10 +52,13 @@ export interface DoctorService {
   reports: Reports
   /** Отчёты pi-durable о сбоях, не роняющих вызов: припаркованная или упавшая задача и т. п. */
   handleHarnessReport(error: unknown, info: ReportInfo): void
+  /** То же, что приём по сети: события сторожа → случаи, отчёты и лечение. */
+  receiveEvents(events: IncidentEvent[]): Promise<{ accepted: string[] }>
   close(): Promise<void>
 }
 
 const REPORT_PUMP_INTERVAL_MS = 5_000
+const BUDGET_POLL_MS = 1_000
 const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
   task_parked: 'остановлена после повторных сбоев',
   task_faulted: 'упала',
@@ -89,13 +117,15 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       .then(pump, () => sendDirect(short))
   }
 
+  const treatmentOptions = options.treatment
+  const runner = treatmentOptions?.runner ?? createLocalRunner()
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
+    ...(treatmentOptions ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner }) } : {}),
   })
-  opened.harness.resume()
 
   const caseBook = createCaseBook(opened.records)
   const reports = createReports({
@@ -105,6 +135,27 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     onSendError: (error, report) => log(`[врач] отчёт ${report.reportId} не ушёл в Telegram: ${describeError(error)}`),
   })
   reportsRef = reports
+
+  let treatment: Treatment | undefined
+  if (treatmentOptions) {
+    treatment = createTreatment({
+      reports,
+      guard: treatmentOptions.guard,
+      loadConfig: treatmentOptions.loadConfig,
+      model: treatmentOptions.model,
+      checksRunner: treatmentOptions.checksRunner ?? runner,
+      worktreesDir: treatmentOptions.worktreesDir,
+      checksDir: join(options.stateDir, 'checks'),
+      evalEnv: treatmentOptions.evalEnv ?? process.env,
+      evalBaseCache: createRecordEvalBaseCache(opened.records),
+      ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
+      budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
+      onReport: pump,
+    })
+    // До resume(): прерванные перезапуском задачи лечения продолжаются со своих чекпойнтов.
+    opened.registry.install(treatment.extension)
+  }
+  opened.harness.resume()
 
   void opened.closed.then(async (end) => {
     if (end.reason !== 'failed') {
@@ -131,6 +182,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           telegram: 'not_needed',
         })
         opened.reportIds.push(report.reportId)
+        await treatment?.startIn(tx, opened)
       },
     })
     return { accepted }
@@ -162,6 +214,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     caseBook,
     reports,
     handleHarnessReport,
+    receiveEvents,
     async close() {
       closing = true
       clearInterval(pumpTimer)

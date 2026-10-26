@@ -1,0 +1,269 @@
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
+import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { CaseState } from '../case-book/index.js'
+import { createGitGuard } from '../git-guard/index.js'
+import { startDoctorService, type DoctorService } from '../service/index.js'
+import { testRemontnikConfig } from '../testing/config.js'
+import { callTool, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
+import { DOCTOR_TOOL_NAMES } from './index.js'
+
+// Лечение целиком на маленьком репозитории: модель по сценарию, локальный исполнитель, настоящий git.
+
+const BUGGY = `const PLANS = { start: 990, pro: 2990 }
+export const DEFAULT_PLAN = 'starter'
+export function price(plan = DEFAULT_PLAN) {
+  const value = PLANS[plan]
+  if (value === undefined) throw new Error('нет тарифа ' + plan)
+  return value
+}
+`
+const FIXED = BUGGY.replace("'starter'", "'start'")
+const NEW_TEST = `import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { price } from '../src/price.mjs'
+test('цена тарифа по умолчанию', () => assert.equal(price(), 990))
+`
+const SECRET_TEXT = 'closed-secret-value'
+const FINAL_STATES: CaseState[] = ['report_only', 'no_cause_found', 'stand_broken']
+
+const dirs: string[] = []
+const cleanups: (() => Promise<void>)[] = []
+let telegram: FakeTelegramServer
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } }).trim()
+}
+
+function writeFiles(root: string, files: Record<string, string>): void {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(root, path)), { recursive: true })
+    writeFileSync(join(root, path), content)
+  }
+}
+
+function repo() {
+  const root = mkdtempSync(join(tmpdir(), 'remontnik-treat-'))
+  dirs.push(root)
+  const origin = join(root, 'origin.git')
+  const repoDir = join(root, 'main')
+  git(root, 'init', '--bare', '--initial-branch=main', origin)
+  git(root, 'clone', origin, repoDir)
+  git(repoDir, 'config', 'user.email', 'owner@example.com')
+  git(repoDir, 'config', 'user.name', 'Owner')
+  writeFiles(repoDir, {
+    '.gitignore': 'node_modules\n',
+    'src/price.mjs': BUGGY,
+    'test/price.test.mjs': `import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { price } from '../src/price.mjs'\ntest('тариф pro', () => assert.equal(price('pro'), 2990))\n`,
+    'secret/keys.txt': `${SECRET_TEXT}\n`,
+  })
+  git(repoDir, 'add', '-A')
+  git(repoDir, 'commit', '-m', 'начало')
+  git(repoDir, 'push', 'origin', 'main')
+  return { root, origin, repoDir, stateDir: join(root, 'state'), worktreesDir: join(root, 'worktrees') }
+}
+
+type Repo = ReturnType<typeof repo>
+
+async function startDoctor(r: Repo, model: ScriptedModel, limits: { diagnoseUsdPerCase?: number } = {}): Promise<DoctorService> {
+  const config = testRemontnikConfig({
+    workbench: { image: 'node:22', install: 'true', bashTimeoutMs: 30_000 },
+    checks: { test: 'node --test test/*.test.mjs' },
+    closedPaths: ['secret/**'],
+    limits: { diagnoseUsdPerCase: 1, ...limits },
+  })
+  const service = await startDoctorService({
+    stateDir: r.stateDir,
+    sharedSecret: 'shared-test-secret',
+    listen: { host: '127.0.0.1', port: 0 },
+    telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: telegram.baseUrl },
+    exit: () => {},
+    log: () => {},
+    treatment: {
+      guard: createGitGuard({
+        repoDir: r.repoDir,
+        worktreesDir: r.worktreesDir,
+        mainBranch: 'main',
+        mainline: 'pull-request',
+        author: { name: 'Ремонтник', email: 'doctor@example.invalid' },
+      }),
+      loadConfig: async () => config,
+      worktreesDir: r.worktreesDir,
+      models: model.models,
+      model: model.model,
+      budgetPollMs: 10,
+    },
+  })
+  cleanups.push(() => service.close())
+  return service
+}
+
+function priceCrash() {
+  return createIncidentEvent({
+    appName: 'test-app',
+    kind: 'crash',
+    where: 'src/price.mjs:5:35',
+    message: 'нет тарифа starter',
+    stack: 'Error: нет тарифа starter\n    at price (src/price.mjs:5:35)',
+    context: { processName: 'web' },
+    occurredAt: new Date(),
+  })
+}
+
+async function settledCase(service: DoctorService, states: CaseState[] = FINAL_STATES, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const found = await service.caseBook.getCase(1)
+    if (found && states.includes(found.state)) return found
+    if (Date.now() > deadline) throw new Error(`случай 1 не дошёл до ${states.join('/')}: ${found?.state}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+const diagnosisSteps = (): ScriptStep[] => [
+  callTool('case_info', {}),
+  callTool('read', { path: 'secret/keys.txt' }),
+  callTool('bash', { command: 'git log --oneline' }),
+  callTool('read', { path: 'src/price.mjs' }),
+  callTool('finish_diagnosis', {
+    found: true,
+    cause: 'Тариф по умолчанию starter не существует',
+    evidence: ["src/price.mjs: DEFAULT_PLAN = 'starter'"],
+    confidence: 'high',
+  }),
+]
+
+const fixSteps = (): ScriptStep[] => [
+  callTool('write', { path: 'src/price.mjs', content: FIXED }),
+  callTool('write', { path: 'test/default-plan.test.mjs', content: NEW_TEST }),
+  callTool('bash', { command: 'node --test test/*.test.mjs' }),
+  callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: ['test/default-plan.test.mjs'] }),
+]
+
+function toolResults(model: ScriptedModel) {
+  return (model.requests.at(-1)?.messages ?? []).filter((message) => message.role === 'toolResult')
+}
+
+beforeEach(async () => {
+  telegram = await startFakeTelegram()
+})
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  await telegram.close()
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+describe('лечение: задача remontnik.treatment', () => {
+  it('сбой → ветка с правкой и тестом, проверки зелёные, отчёт; основная ветка не тронута', async () => {
+    const r = repo()
+    const mainBefore = git(r.origin, 'rev-parse', 'main')
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await settledCase(doctor)
+
+    expect(healed.state).toBe('report_only')
+    expect(healed.treatmentTaskId).toBeDefined()
+    const branches = git(r.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/gm, '').split('\n')
+    expect(branches).toHaveLength(1)
+    const branch = branches[0]!
+    expect(branch).toMatch(/^remontnik\/1-/)
+    expect(git(r.origin, 'diff', '--name-only', 'main', branch).split('\n').sort()).toEqual(['src/price.mjs', 'test/default-plan.test.mjs'])
+    expect(git(r.origin, 'rev-parse', 'main')).toBe(mainBefore)
+    expect(git(r.repoDir, 'rev-parse', 'HEAD')).toBe(mainBefore)
+    expect(readFileSync(join(r.repoDir, 'src/price.mjs'), 'utf8')).toBe(BUGGY)
+
+    const reports = await doctor.reports.list({ after: 0, limit: 20 })
+    const ready = reports.find((report) => report.type === 'fix_ready')
+    expect(ready?.short).toContain(branch)
+    expect(ready?.short).toContain('тесты зелёные')
+    expect(reports.map((report) => report.type)).toEqual(['case_received', 'fix_ready'])
+
+    // Промпт и набор инструментов одни и те же во всех запросах; сведения о сбое — только в сообщениях.
+    // pi-durable передаёт промпт ведущим сообщением `system`; других сообщений `system` быть не должно.
+    const prompts = new Set(model.requests.map((request) => JSON.stringify(request.messages.filter((message) => message.role === 'system'))))
+    expect(prompts.size).toBe(1)
+    for (const request of model.requests) expect(request.messages[0]?.role).toBe('system')
+    const prompt = [...prompts][0]!
+    expect(prompt).toContain('src/price.mjs')
+    expect(prompt).not.toContain('secret/keys.txt')
+    expect(prompt).not.toContain('нет тарифа starter')
+    const leading = model.requests[0]!.messages[0]
+    expect(leading?.role === 'system' && leading.toolsAdded?.map((tool) => tool.name)).toEqual([...DOCTOR_TOOL_NAMES])
+    expect(model.requests.every((request) => request.messages.filter((message) => message.role === 'system').length === 1)).toBe(true)
+
+    // Закрытый файл не прочитан, git не запущен.
+    const results = toolResults(model)
+    expect(JSON.stringify(model.requests)).not.toContain(SECRET_TEXT)
+    expect(results.find((result) => result.role === 'toolResult' && result.toolName === 'read')?.isError).toBe(true)
+    expect(results.find((result) => result.role === 'toolResult' && result.toolName === 'bash')?.isError).toBe(true)
+  }, 60_000)
+
+  it('причина не найдена → отчёт no_cause_found, ветки нет', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(
+      callTool('read', { path: 'src/price.mjs' }),
+      callTool('finish_diagnosis', { found: false, cause: 'не понял, откуда starter', evidence: ['src/price.mjs прочитан'], confidence: 'low' }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('no_cause_found')
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*')).toBe('')
+    const reports = await doctor.reports.list({ after: 0, limit: 20 })
+    expect(reports.at(-1)).toMatchObject({ type: 'no_cause_found', caseId: 1 })
+    expect(reports.at(-1)?.full).toContain('src/price.mjs прочитан')
+  }, 60_000)
+
+  it('потолок diagnoseUsdPerCase → работа модели остановлена, отчёт no_cause_found', async () => {
+    const r = repo()
+    const model = createScriptedModel({ costPerResponseUsd: 0.3 })
+    model.script(...Array.from({ length: 40 }, () => callTool('bash', { command: 'true' })))
+    const doctor = await startDoctor(r, model, { diagnoseUsdPerCase: 0.5 })
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('no_cause_found')
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('no_cause_found')
+    expect(report?.short).toContain('бюджет')
+    expect(model.pending()).toBeGreaterThan(30)
+  }, 60_000)
+
+  it('перезапуск врача посреди правки: задача продолжает с чекпойнта, диагноз не повторяется', async () => {
+    const r = repo()
+    const first = createScriptedModel()
+    first.script(...diagnosisSteps(), hang)
+    const firstDoctor = await startDoctor(r, first)
+    await firstDoctor.receiveEvents([priceCrash()])
+    await settledCase(firstDoctor, ['fixing'])
+    const deadline = Date.now() + 10_000
+    while (first.pending() > 0) {
+      if (Date.now() > deadline) throw new Error('модель не дошла до правки')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    await cleanups.pop()!()
+
+    const second = createScriptedModel()
+    second.script(...fixSteps())
+    const doctor = await startDoctor(r, second)
+    const healed = await settledCase(doctor)
+
+    expect(healed.state).toBe('report_only')
+    expect(second.requests).toHaveLength(fixSteps().length)
+    const userMessages = second.requests[0]!.messages.filter((message) => message.role === 'user')
+    expect(userMessages).toHaveLength(2)
+    expect((await doctor.reports.list({ after: 0, limit: 20 })).map((report) => report.type)).toEqual(['case_received', 'fix_ready'])
+  }, 60_000)
+})
