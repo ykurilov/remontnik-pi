@@ -247,6 +247,34 @@ describe('createDoctorModels', () => {
     expect(openrouter?.body.max_completion_tokens).toBe(DOCTOR_MAX_OUTPUT_TOKENS)
   })
 
+  it('переход на запасной путь и возврат на основной видны в журнале врача, без ключей', async () => {
+    const lines: string[] = []
+    let clock = 1_000_000
+    const built = createDoctorModels(
+      { DEEPSEEK_API_KEY: 'test-deepseek-key', OPENROUTER_API_KEY: 'test-openrouter-key', DEEPSEEK_BASE_URL: 'https://deepseek.example.com', OPENROUTER_BASE_URL: 'https://openrouter.example.com/api/v1', PROXY_TOKEN: 'test-proxy-token' },
+      { log: (line) => lines.push(line), now: () => clock },
+    )
+    let deepseekDown = true
+    const fetch = async (input: string | URL | Request) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (url.includes('deepseek') && deepseekDown) {
+        return new Response(JSON.stringify({ error: { message: 'перегружен, ключ test-deepseek-key' } }), { status: 503, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ id: 'x', object: 'chat.completion', created: 0, model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'ок' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const model = built.models.getModel(DOCTOR_PROVIDER_ID, DOCTOR_MODEL_ID)!
+    await built.models.completeSimple(model, context(), { fetch, maxRetries: 0 })
+    deepseekDown = false
+    clock += TEN_MINUTES
+    await built.models.completeSimple(model, context(), { fetch, maxRetries: 0 })
+
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toMatch(/запасной путь \(OpenRouter\)/)
+    expect(lines[0]).toContain('503')
+    expect(lines[1]).toMatch(/основной путь \(DeepSeek\)/)
+    expect(lines.join('\n')).not.toMatch(/test-deepseek-key|test-openrouter-key|test-proxy-token/)
+  })
+
   it('без ключа DeepSeek не собирается', () => {
     expect(() => createDoctorModels({ OPENROUTER_API_KEY: 'test-openrouter' })).toThrow(/DEEPSEEK_API_KEY/)
   })

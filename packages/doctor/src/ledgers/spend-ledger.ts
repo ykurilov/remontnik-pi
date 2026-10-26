@@ -55,6 +55,8 @@ export interface OpenHoldDays {
 /** Расход модели по случаю за всё лечение. */
 export interface CaseSpend {
   modelUsd: number
+  /** Тот же расход по поставщикам, которые ответили (`deepseek`, `openrouter`): видно, уходил ли случай на запасной путь. */
+  byProvider?: Record<string, number>
   /** Последнюю бронь случая не пустили: почему. Снимается следующей удачной бронью. */
   refused?: ModelBlock
 }
@@ -205,18 +207,23 @@ async function sweepModelHoldsIn(tx: RecordTransaction, day: SpendDay, input: { 
 }
 
 /** Ответ пришёл (или запрос оборвался): бронь заменяется настоящей ценой. */
-export async function settleModelHoldIn(tx: RecordTransaction, input: { dayKey: string; holdId: string; actualUsd: number }): Promise<void> {
+/** `provider` — поставщик, который ответил; оборванный запрос его не знает. */
+export async function settleModelHoldIn(tx: RecordTransaction, input: { dayKey: string; holdId: string; actualUsd: number; provider?: string }): Promise<void> {
   const day = await tx.doc<SpendDay>('spend', input.dayKey, emptySpendDay())
   const hold = day.modelHolds?.[input.holdId]
   if (!hold) return
   delete day.modelHolds![input.holdId]
-  await chargeModelIn(tx, day, hold.caseKey, input.actualUsd)
+  await chargeModelIn(tx, day, hold.caseKey, input.actualUsd, input.provider)
 }
 
-async function chargeModelIn(tx: RecordTransaction, day: SpendDay, caseKey: string, usd: number): Promise<void> {
+async function chargeModelIn(tx: RecordTransaction, day: SpendDay, caseKey: string, usd: number, provider?: string): Promise<void> {
   const key = caseKey === '' ? NO_CASE : caseKey
   day.model[key] = (day.model[key] ?? 0) + usd
-  if (caseKey !== '') (await caseSpendIn(tx, caseKey)).modelUsd += usd
+  if (caseKey === '') return
+  const spend = await caseSpendIn(tx, caseKey)
+  spend.modelUsd += usd
+  // Черновик pi-durable: вложенный объект присваивается целиком, а не правится по ссылке.
+  if (provider) spend.byProvider = { ...spend.byProvider, [provider]: (spend.byProvider?.[provider] ?? 0) + usd }
 }
 
 /** Сколько других случаев сейчас ждут eval. Свой и давно забытые не считаются. */

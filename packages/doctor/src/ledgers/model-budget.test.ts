@@ -54,13 +54,14 @@ describe('бронь перед запросом к модели', () => {
   it('после ответа бронь заменяется настоящей ценой', async () => {
     const { scripted, records, ask } = setup({ costPerResponseUsd: 0.05, maxResponseUsd: 0.4, limits: { doctorModelUsdPerDay: 1 } })
     scripted.script(say('один'), say('два'), say('три'))
-    await ask(1)
+    const answered = await ask(1)
     await ask(1)
     await ask(2)
     const day = await records.read<SpendDay>('spend', DAY)
     expect(day?.modelHolds).toEqual({})
     expect(day?.model).toEqual({ '1': 0.1, '2': 0.05 })
     expect((await records.read<CaseSpend>('spend-case', '1'))?.modelUsd).toBeCloseTo(0.1)
+    expect((await records.read<CaseSpend>('spend-case', '1'))?.byProvider).toEqual({ [answered.provider]: expect.closeTo(0.1) })
   })
 
   it('параллельные запросы разных случаев вместе не выходят за дневной потолок', async () => {
