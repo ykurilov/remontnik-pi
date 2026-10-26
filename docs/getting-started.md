@@ -279,7 +279,7 @@ docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor depl
 
 4. Секрет моста — через `secret-handoff` в окружение врача и в файл моста. Адрес моста и адрес врача в частной сети — тоже в окружение врача.
 
-Агент приложения отчитывается командами `remontnik-paseo accept | done | cannot`.
+Агент приложения отчитывается командами `remontnik-paseo accept | done | cannot`. Частная сеть, правила доступа, порт врача в Docker и секрет моста по шагам — [operations.md](./operations.md#режим-сначала-paseo).
 
 ## Готово, когда
 

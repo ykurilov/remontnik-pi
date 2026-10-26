@@ -18,10 +18,12 @@
 | `POST /v1/control/cases` | `{ caseId, action: "retry", by }` → `{ caseId, retried: "parked" \| "restarted", attempt }`; незнакомый случай — `404 unknown_case`; нельзя повторить — `409` с `error`: `case_finished` (лечение дошло до итога), `already_running` (задача жива), `deploy_unfinished` (упала посреди выкатки или наблюдения: сначала владелец смотрит приложение), `treatment_off`; подпись общим секретом — `403 control_secret_required` | снова поставить случай в работу, когда его задача остановлена после повторных падений врача (`parked` — продолжает со своего чекпойнта) или упала насовсем (`restarted` — новая попытка со своей копией и веткой). Только секретом владельца |
 | `GET /v1/reports?after=<reportId>&limit=50` | `{ reports: Report[], last, acked }`: `reports` — по возрастанию номера, `limit` до 100, страница не больше ~200 КиБ (минимум один отчёт); `last` — номер последнего отчёта в ответе или `after`, если новых нет; `acked` — подтверждённый номер | забор отчётов для Paseo |
 | `POST /v1/reports/ack` | `{ upTo: reportId }` → `{ ok, acked }` | подтверждение доставки в Paseo; растёт, но не убывает; номер дальше последнего отчёта — `400 bad_request` |
-| `POST /v1/handoffs/:caseId/accepted` | `{ taskId, agent }` | агент взял случай (через мост) |
-| `POST /v1/handoffs/:caseId/result` | `{ taskId, kind: "done", commit?, deployed, version? }` \| `{ taskId, kind: "cannot", reason }` | итог агента (через мост) |
+| `POST /v1/handoffs/:caseId/accepted` | `{ taskId, agent, app? }` → `{ ok: true }`; повтор — тот же ответ; нет передачи — `404 unknown_case`, чужой `taskId` — `404 unknown_task`; врач уже забрал случай — `409 reclaimed` | агент взял случай (через мост) |
+| `POST /v1/handoffs/:caseId/result` | `{ taskId, kind: "done", commit?, deployed, version? }` \| `{ taskId, kind: "cannot", reason ≤ 1000 }` → `{ ok: true }`; `deployed` ⇔ есть `version`; повтор того же итога — тот же ответ, другой — `409 result_already_sent`; после `reclaimed` — `{ ok: true, late: true }`: итог пишется только в `lateResult`, поздняя выкатка идёт под наблюдение этого случая | итог агента (через мост) |
 | `GET /v1/cases/:id` | `Case` + `Treatment` + отчёты | подробности для агентов |
 | `GET /health` | `{ ok, harness, queue, autoDeploy, lastError? }` | здоровье врача |
+
+Адреса `/v1/handoffs/*` подписаны секретом моста (`signRequest`, разовая метка, отметка времени), ответы — `signResponse` с той же меткой. Подпись, сделанная до запуска врача, не принимается. `app` в теле, если есть, должен совпадать с именем приложения, иначе — `401 bad_signature`. Тело больше 16 КиБ — `413`.
 
 ## Консольные команды `remontnik-doctor`
 

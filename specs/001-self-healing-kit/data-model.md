@@ -77,6 +77,8 @@ handoff_check → handed_off → paseo_working
 paseo_working → observing                         (агент выкатил)
 paseo_working → healed_by_paseo                   (агент сделал без выкатки; итог — у агента)
 handed_off | paseo_working → reclaimed → triage    (срок вышел, «не смог», мост пропал)
+после reclaimed → observing                         (поздняя выкатка агента: врач бросает своё лечение
+                                                    или начинает новую попытку того же случая и наблюдает её)
 ```
 
 Закрыты `healed`, `healed_by_paseo` и `rolled_back`: после них тот же отпечаток открывает новый случай. После отката новое лечение готовит правку, но автовыкатки по отпечатку нет до решения человека (FingerprintLedger). Повторы после `report_only`, `needs_human` и других итогов без лечения склеиваются в открытый случай — владелец уже знает о сбое, второй случай был бы шумом.
@@ -94,7 +96,10 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `acceptDeadline`, `workDeadline` | время | из `handoff.paseo.acceptTimeoutMs` / `workTimeoutMs` |
 | `result?` | `{ kind: "done", commit?, deployed: boolean, version? }` \| `{ kind: "cannot", reason ≤ 1000 }` | |
 | `reclaimReason?` | `bridge_unreachable` \| `accept_timeout` \| `work_timeout` \| `cannot` | |
-| `lateResult?` | как `result` | итог, пришедший после `reclaimed`; только в отчёт |
+| `lateResult?` | как `result` + `receivedAt` | итог, пришедший после `reclaimed`: врач его не применяет; поздняя выкатка (`deployed: true`) — только под наблюдение этого же случая |
+| `taskOffered?` | boolean | задачу мосту отправляли, но приём не подтвердился: при отмене её всё равно отменяют |
+| `cancelSent?` | boolean | мост принял отмену задачи (или её у него нет) |
+| `adoptedAt?` | время | врач взял выкатку агента под наблюдение: второй раз ту же не берёт |
 
 ### Treatment — лечение (чекпойнт задачи `remontnik.treatment`)
 
