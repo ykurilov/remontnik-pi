@@ -25,7 +25,22 @@ export const CRASH_POINTS = [
 export const ROLLBACK_CRASH_POINT = 'after_rollback'
 /** Браузер врача ждёт человека: отчёт `needs_human` уже записан, врача убивают на первом опросе службы браузера. */
 export const BROWSER_CRASH_POINT = 'browser_wait_human'
-export type CrashPoint = (typeof CRASH_POINTS)[number] | typeof ROLLBACK_CRASH_POINT | typeof BROWSER_CRASH_POINT
+/**
+ * Режим «сначала Paseo»: мост принял задачу, а передача ещё не записана; агент работает; врач наблюдает выкатку агента;
+ * врач забрал случай, а отменить задачу у моста не успел; мост молчит, а начало молчания уже записано.
+ */
+export const PASEO_CRASH_POINTS = ['handoff_sent', 'paseo_working', 'paseo_observing', 'before_cancel', 'bridge_silent'] as const
+export type CrashPoint =
+  | (typeof CRASH_POINTS)[number]
+  | typeof ROLLBACK_CRASH_POINT
+  | typeof BROWSER_CRASH_POINT
+  | (typeof PASEO_CRASH_POINTS)[number]
+
+/** Сколько мост может молчать на стенде: минута по часам врача, а не 5 — опросов меньше. */
+export const STAND_BRIDGE_SILENCE_MS = 60_000
+
+/** Секрет моста Paseo на стенде. */
+export const BRIDGE_SECRET = 'bridge-test-secret'
 
 /** Секрет владельца врача на стенде: им подписывается `case <id> retry`. */
 export const CONTROL_SECRET = 'owner-test-secret'
@@ -44,6 +59,8 @@ export interface ChildWorld {
   browserStatePath: string
   /** Правка делает хуже: здоровье приложения плохое, пока она работает. */
   sickFix: boolean
+  /** Подставной мост Paseo (режим «сначала Paseo»): он в процессе стенда и переживает перезапуск врача. */
+  paseoBridgeUrl?: string
 }
 
 /** Подставное приложение на диске: какая версия работает и сколько раз её переключали. */

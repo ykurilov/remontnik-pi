@@ -10,10 +10,12 @@ import {
   UsageDoc,
   type ConversationId,
   type Extension,
+  type TaskId,
   type TaskRuntime,
   type UsageState,
 } from '@earendil-works/pi-durable'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { newEventId } from '@ykurilov/remontnik-core/incident'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
@@ -22,6 +24,25 @@ import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
 import { ATTEMPT_REFUSALS, decideDeploy, type GateDecision } from '../deploy-gate/index.js'
 import { deploymentIdIn, type Deployer, type DeployRequest, type Deployment, type DeployStep } from '../deployer/deploy-sequence.js'
 import { GIT_GUARD_REASONS, GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
+import {
+  agentDeadlineOf,
+  agentDeployWindow,
+  agentStep,
+  BRIDGE_SILENCE_MS,
+  CANCEL_REASONS,
+  cancelPending,
+  HANDOFF_COLLECTION,
+  HANDOFF_POLL_MS,
+  handoffKey,
+  handoffTaskBody,
+  reclaimHandoff,
+  unadoptedDeploy,
+  type AgentWaitPhase,
+  type Handoff,
+  type HandoffResult,
+  type PaseoBridgeClient,
+  type ReclaimReason,
+} from '../handoff/index.js'
 import { CONTROLS, type DeployControls as DeployControlsState } from '../ledgers/controls.js'
 import { diagnoseMessage, fixMessage, resumeMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
@@ -35,7 +56,12 @@ import {
   deploymentReport,
   fixReadyReport,
   needsHumanReport,
+  handedOffReport,
   noCauseFoundReport,
+  paseoDeploymentReport,
+  paseoDoneReport,
+  PASEO_UNAVAILABLE_NOTE,
+  reclaimedReport,
   standBrokenReport,
   type MainlineResult,
   type ReportText,
@@ -101,12 +127,28 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 //
 // Модель работает в отдельном разговоре, которым владеет задача: системный промпт и набор инструментов
 // постоянны для основы, сведения о случае — в сообщениях.
+//
+// Режим «сначала Paseo» (`handoff.mode: paseo-first`, R18): до своего лечения врач отдаёт случай агенту Paseo.
+//
+//   handoff_check → handed_off → paseo_working → healed_by_paseo | paseo_observing → …
+//
+// Мост не ответил — врач лечит сам, отчёты говорят «Paseo недоступен». Агент не взял случай, не уложился, не смог или
+// мост пропал — врач забирает случай (`reclaimed`), отменяет задачу агента и лечит сам с `triage`. Выкатку агента
+// врач наблюдает своим выкатчиком (`adopt`) и откатывает, если стало хуже. Поздняя выкатка агента — после `reclaimed` —
+// тоже не остаётся без присмотра: врач бросает своё лечение (правит случай только один) или, если лечение уже
+// кончилось, начинает новую попытку только для наблюдения.
 
 /** Вид задачи лечения в pi-durable: по нему отчёт о её сбое находит случай. */
 export const TREATMENT_TASK_NAME = 'remontnik.treatment'
 
-/** `attempt` — номер попытки лечения случая: новая после `case <id> retry` упавшей задачи, со своей копией и веткой. */
-export type TreatmentInput = { caseId: number; attempt?: number }
+/**
+ * `attempt` — номер попытки лечения случая: новая после `case <id> retry` упавшей задачи, со своей копией и веткой.
+ * `adopt` — попытка только наблюдает позднюю выкатку агента Paseo: версия и когда агент о ней сообщил.
+ */
+export type TreatmentInput = { caseId: number; attempt?: number; adopt?: PaseoDeploy }
+
+/** `caseSince` нет у наблюдений, начатых до него: тогда сбой случая — тоже с `since`. */
+type PaseoDeploy = { version: string; since: number; caseSince?: number }
 
 type Treating = {
   conversationId: ConversationId
@@ -125,6 +167,10 @@ type Treating = {
 
 export type TreatmentState =
   | { phase: 'triage' }
+  | { phase: 'handoff_check' }
+  /** С какой проверки мост молчит, пока агент работает. */
+  | { phase: AgentWaitPhase; bridgeDownSince?: number }
+  | ({ phase: 'paseo_observing' } & PaseoDeploy)
   | ({ phase: 'diagnosing' } & Treating)
   | ({ phase: 'fixing'; diagnosis: Diagnosis } & Treating)
   | ({ phase: 'verifying' } & Fixed & Treating)
@@ -137,7 +183,16 @@ type Fixed = { diagnosis: Diagnosis; fix: FixSummary; fixCommit: string; changed
 /** Правка проверена (или проверять её нельзя) и, может быть, отправлена в origin. */
 type Gated = { checks?: ChecksResult; pushed: boolean } & Fixed & Treating
 
-export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken' | 'needs_human' | 'healed' | 'rolled_back' | 'not_helped'
+export type TreatmentOutcome =
+  | 'fix_ready'
+  | 'cause_found'
+  | 'no_cause_found'
+  | 'stand_broken'
+  | 'needs_human'
+  | 'healed'
+  | 'healed_by_paseo'
+  | 'rolled_back'
+  | 'not_helped'
 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
@@ -192,6 +247,8 @@ export interface TreatmentDeps {
   onReport(): void
   /** Служба браузера врача (`REMONTNIK_BROWSER_*`) и окружение для ссылки на живой экран. Нет — браузера нет. */
   browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>>; pollMs?: number }
+  /** Мост Paseo для режима «сначала Paseo». Нет клиента — мост недоступен, врач лечит сам. */
+  handoff?: { client?: PaseoBridgeClient; pollMs?: number }
   now(): number
 }
 
@@ -201,6 +258,11 @@ export interface Treatment {
   startIn(tx: RecordTransaction, opened: Case): Promise<void>
   /** Внутри транзакции: новая попытка лечения открытого случая, чья задача упала. Возвращает номер попытки. */
   restartIn(tx: RecordTransaction, opened: Case): Promise<number>
+  /**
+   * Внутри транзакции позднего итога агента: его выкатку, ещё не взятую под наблюдение, наблюдает новая попытка,
+   * если лечение случая уже кончилось. Идущее лечение заметит её само на ближайшей фазе.
+   */
+  adoptLateDeployIn(tx: RecordTransaction, caseId: number): Promise<void>
 }
 
 type Runtime = TaskRuntime<TreatmentInput, TreatmentState, TreatmentResult, object>
@@ -209,6 +271,7 @@ type Stage = 'diagnose' | 'fix'
 type Base = { commit: string; running: boolean }
 type DeployPhase = Extract<TreatmentState, { phase: 'deploying' | 'observing' }>
 type DeploySleep = Extract<DeployStep, { kind: 'sleep' }>
+type AgentWait = Extract<TreatmentState, { phase: AgentWaitPhase }>
 
 const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
@@ -279,7 +342,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       type,
       caseId,
       short: text.short,
-      full: text.full,
+      full: opened.paseoUnavailable ? `${text.full}\n${PASEO_UNAVAILABLE_NOTE}` : text.full,
       telegram: 'pending',
       ...(text.stopSwitch ? { stopSwitch: true } : {}),
       ...(screenshots.length > 0 ? { screenshots } : {}),
@@ -301,13 +364,174 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     alsoIn?: (records: RecordTransaction) => Promise<void>,
   ): Promise<void> {
     const redacted = await redactedReport(text, baseRunning)
+    const handedOff = (await readHandoff(runtime, caseId, context)) !== undefined
     await runtime.commit(async (tx) => {
       const records = recordTransactionOver(tx)
       if (alsoIn) await alsoIn(records)
       const reportId = await reportIn(records, caseId, state, type, redacted)
+      // Агент выкатил после `reclaimed`, пока врач лечил: наблюдение этой выкатки — следующей попыткой.
+      if (handedOff) await adoptIn(records, caseId)
       return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId } } }
     }, context)
     deps.onReport()
+  }
+
+  async function readHandoff(runtime: Runtime, caseId: number, context: Context): Promise<Handoff | undefined> {
+    return (await runtime.snapshot(recordFamilyOf(HANDOFF_COLLECTION), handoffKey(caseId), context)) as unknown as Handoff | undefined
+  }
+
+  /** Документ передачи внутри фиксации; вызывать, только когда он точно есть — иначе создастся пустой. */
+  async function handoffIn(records: RecordTransaction, caseId: number): Promise<Handoff> {
+    return records.doc<Handoff>(HANDOFF_COLLECTION, handoffKey(caseId), {} as Handoff)
+  }
+
+  /** Новая попытка наблюдает позднюю выкатку агента. Случай `observing`, документ передачи помнит, что выкатка взята. */
+  async function adoptIn(records: RecordTransaction, caseId: number): Promise<void> {
+    if (!deps.deployer) return
+    const handoff = await handoffIn(records, caseId)
+    const late = unadoptedDeploy(handoff)
+    if (!late) return
+    handoff.adoptedAt = new Date(deps.now()).toISOString()
+    const opened = await caseIn(records, caseId)
+    const attempt = (opened.treatmentAttempt ?? 1) + 1
+    await startTreatmentIn(records, opened, { caseId, attempt, adopt: late })
+    opened.treatmentAttempt = attempt
+    opened.state = 'observing'
+  }
+
+  /**
+   * Агент выкатил после `reclaimed`, а врач ещё лечит: своё лечение бросается — правит случай только один, —
+   * задача переходит к наблюдению выкатки агента. `true` — перешла.
+   */
+  async function switchToLateDeploy(runtime: Runtime, caseId: number, context: Context): Promise<boolean> {
+    if (!deps.deployer || !unadoptedDeploy(await readHandoff(runtime, caseId, context))) return false
+    let switched = false
+    await runtime.commit(async (tx) => {
+      const records = recordTransactionOver(tx)
+      const handoff = await handoffIn(records, caseId)
+      const late = unadoptedDeploy(handoff)
+      if (!late) return undefined
+      handoff.adoptedAt = new Date(deps.now()).toISOString()
+      await setCaseStateIn(records, caseId, 'observing')
+      switched = true
+      return { status: 'running', checkpoint: { phase: 'paseo_observing', ...late } }
+    }, context)
+    return switched
+  }
+
+  /** Врач забрал случай: задача агента отменяется у моста. Не вышло (мост пропал) — повтор в начале следующей фазы. */
+  async function cancelReclaimed(runtime: Runtime, handoff: Handoff, context: Context): Promise<void> {
+    if (!cancelPending(handoff)) return
+    if (!(await deps.handoff?.client?.cancel(handoff.taskId, CANCEL_REASONS[handoff.reclaimReason!]))) return
+    await runtime.commit(async (tx) => {
+      ;(await handoffIn(recordTransactionOver(tx), handoff.caseId)).cancelSent = true
+      return undefined
+    }, context)
+  }
+
+  /**
+   * Начало фазы лечения врачом после `reclaimed`: повторить отмену задачи агента, если мост её ещё не подтвердил,
+   * и перейти к поздней выкатке агента, если она есть. `true` — перешла.
+   */
+  async function followUpReclaim(runtime: Runtime, caseId: number, context: Context): Promise<boolean> {
+    const handoff = await readHandoff(runtime, caseId, context)
+    if (!handoff) return false
+    await cancelReclaimed(runtime, handoff, context)
+    return switchToLateDeploy(runtime, caseId, context)
+  }
+
+  /**
+   * Правит случай один: свою правку врач не выкатывает, пока агент, может быть, ещё работает — мост не подтвердил
+   * отмену его задачи, а срок работы агента не прошёл. Возвращает, до какого времени ждать; `undefined` — можно.
+   */
+  async function ownDeployHold(runtime: Runtime, caseId: number, config: RemontnikConfig, context: Context): Promise<number | undefined> {
+    const paseo = config.handoff.paseo
+    const handoff = await readHandoff(runtime, caseId, context)
+    if (!paseo || !handoff || !cancelPending(handoff)) return undefined
+    const deadline = agentDeadlineOf(handoff, paseo)
+    const now = deps.now()
+    if (!(now < deadline)) return undefined
+    return Math.min(now + (deps.handoff?.pollMs ?? HANDOFF_POLL_MS), deadline)
+  }
+
+  /** Врач забирает случай: `reclaimed`, отчёт и снова `triage` — одной фиксацией. Итог агента, пришедший раньше, важнее. */
+  async function reclaim(runtime: Runtime, caseId: number, phase: AgentWaitPhase, reason: ReclaimReason, context: Context): Promise<void> {
+    const config = await deps.loadConfig()
+    const paseo = config.handoff.paseo
+    const sick = await readCase(runtime, caseId, context)
+    const seen = await readHandoff(runtime, caseId, context)
+    const minutes = paseo ? Math.round((reason === 'accept_timeout' ? paseo.acceptTimeoutMs : paseo.workTimeoutMs) / 60_000) : undefined
+    const agentSaid = seen?.result?.kind === 'cannot' ? seen.result.reason : undefined
+    const text = await redactedReport(reclaimedReport({ case: sick, reason, ...(minutes === undefined ? {} : { minutes }), ...(agentSaid ? { agentSaid } : {}) }), true)
+    let reported = false
+    await runtime.commit(async (tx) => {
+      const records = recordTransactionOver(tx)
+      const handoff = await handoffIn(records, caseId)
+      // Пока врач решал, агент прислал «сделано»: фаза перечитает документ и закроет случай по итогу агента.
+      if (handoff.owner !== 'paseo' || (handoff.result?.kind === 'done' && reason !== 'cannot')) return { status: 'running', checkpoint: { phase } }
+      reclaimHandoff(handoff, reason, deps.now())
+      if (reason === 'bridge_unreachable') (await caseIn(records, caseId)).paseoUnavailable = true
+      await reportIn(records, caseId, 'reclaimed', 'reclaimed', text)
+      reported = true
+      return { status: 'running', checkpoint: { phase: 'triage' } }
+    }, context)
+    if (reported) deps.onReport()
+  }
+
+  /** Агент сделал: без выкатки случай закрыт агентом; с выкаткой врач берёт её под наблюдение. */
+  async function agentDone(runtime: Runtime, caseId: number, result: Extract<HandoffResult, { kind: 'done' }>, context: Context): Promise<void> {
+    const sick = await readCase(runtime, caseId, context)
+    const deployed = result.deployed && result.version ? result.version : undefined
+    if (!deployed || !deps.deployer) {
+      const text = paseoDoneReport({ case: sick, result: deployed ? { ...result, deployed: false } : result })
+      await finish(runtime, caseId, 'healed_by_paseo', 'paseo_done', text, { outcome: 'healed_by_paseo' }, context)
+      return
+    }
+    const text = await redactedReport(paseoDoneReport({ case: sick, result }), true)
+    await runtime.commit(async (tx) => {
+      const records = recordTransactionOver(tx)
+      const handoff = await handoffIn(records, caseId)
+      handoff.adoptedAt = new Date(deps.now()).toISOString()
+      await reportIn(records, caseId, 'observing', 'paseo_done', text)
+      return { status: 'running', checkpoint: { phase: 'paseo_observing', ...agentDeployWindow(handoff, deployed, handoff.finishedAt ?? handoff.adoptedAt) } }
+    }, context)
+    deps.onReport()
+  }
+
+  /**
+   * Фазы `handed_off` и `paseo_working`: раз в `pollMs` — документ передачи (итог, «взял», сроки) и жив ли мост.
+   * Мост молчит дольше `bridgeSilenceMs` — ждать итога агента незачем. Короче — перезагрузка моста или сон Mac: ждём.
+   */
+  async function waitForAgent(runtime: Runtime, caseId: number, checkpoint: AgentWait, context: Context): Promise<void> {
+    const handoff = await readHandoff(runtime, caseId, context)
+    if (!handoff) throw new Error(`передачи случая ${caseId} нет`)
+    const pollMs = deps.handoff?.pollMs ?? HANDOFF_POLL_MS
+    const step = agentStep(handoff, checkpoint.phase, deps.now(), pollMs)
+    switch (step.kind) {
+      case 'done':
+        return agentDone(runtime, caseId, step.result, context)
+      case 'reclaim':
+        return reclaim(runtime, caseId, checkpoint.phase, step.reason, context)
+      case 'accepted': {
+        const paseo = (await deps.loadConfig()).handoff.paseo
+        await runtime.commit(async (tx) => {
+          const records = recordTransactionOver(tx)
+          const fresh = await handoffIn(records, caseId)
+          fresh.workDeadline = new Date(Date.parse(fresh.acceptedAt!) + (paseo?.workTimeoutMs ?? 0)).toISOString()
+          await setCaseStateIn(records, caseId, 'paseo_working')
+          return { status: 'running', checkpoint: { phase: 'paseo_working' } }
+        }, context)
+        return
+      }
+      case 'wait': {
+        if ((await deps.handoff?.client?.health()) ?? false) return runtime.sleepUntil(step.until, { phase: checkpoint.phase }, context)
+        const now = deps.now()
+        const bridgeDownSince = checkpoint.bridgeDownSince ?? now
+        const silenceMs = (await deps.loadConfig()).handoff.paseo?.bridgeSilenceMs ?? BRIDGE_SILENCE_MS
+        if (now - bridgeDownSince >= silenceMs) return reclaim(runtime, caseId, checkpoint.phase, 'bridge_unreachable', context)
+        return runtime.sleepUntil(step.until, { phase: checkpoint.phase, bridgeDownSince }, context)
+      }
+    }
   }
 
   /**
@@ -594,12 +818,32 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   const task = defineTask<TreatmentInput, TreatmentState, TreatmentResult>({
     name: TREATMENT_TASK_NAME,
     version: 1,
-    initial: () => ({ phase: 'triage' }),
+    initial: (input) => (input.adopt ? { phase: 'paseo_observing', ...input.adopt } : { phase: 'triage' }),
     phases: {
       triage: async (task, runtime, context) => {
         const { caseId } = task.input
         const sick = await readCase(runtime, caseId, context)
         const config = await deps.loadConfig()
+        if (config.handoff.mode === 'paseo-first') {
+          const handoff = await readHandoff(runtime, caseId, context)
+          if (!handoff) {
+            await runtime.commit(async (tx) => {
+              ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'handoff_check'
+              return { status: 'running', checkpoint: { phase: 'handoff_check' } }
+            }, context)
+            return
+          }
+          // Попытка после сбоя задачи, пока случай у агента: врач снова ждёт его, а не лечит поверх.
+          if (handoff.owner === 'paseo') {
+            const phase = handoff.acceptedAt ? 'paseo_working' : 'handed_off'
+            await runtime.commit(async (tx) => {
+              ;(await caseIn(recordTransactionOver(tx), caseId)).state = phase
+              return { status: 'running', checkpoint: { phase } }
+            }, context)
+            return
+          }
+          if (await followUpReclaim(runtime, caseId, context)) return
+        }
         await deps.guard.fetch()
         const base = (await runtime.memo<Base>('base', context)) ?? (await runtime.memo<Base>('base', await chooseBase(config), context))
         const baseCommit = base.commit
@@ -656,9 +900,93 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         }, context)
       },
 
+      handoff_check: async (task, runtime, context) => {
+        const { caseId } = task.input
+        const config = await deps.loadConfig()
+        const paseo = config.handoff.paseo
+        const sick = await readCase(runtime, caseId, context)
+        const client = deps.handoff?.client
+        // Номер задачи — один на случай: повтор фазы после перезапуска мост узнаёт и второго письма агенту не шлёт.
+        const taskId = (await runtime.memo<string>('handoffTaskId', context)) ?? (await runtime.memo('handoffTaskId', newEventId(deps.now()), context))
+        let offered = false
+        let sent = false
+        if (client && paseo && (await client.health())) {
+          offered = true
+          sent = await client.sendTask(handoffTaskBody({ taskId, appName: config.app.name, case: sick, knownSecrets: knownSecretsOf(config) }))
+        }
+        const now = deps.now()
+        const at = new Date(now).toISOString()
+        if (!sent || !paseo) {
+          await runtime.commit(async (tx) => {
+            const records = recordTransactionOver(tx)
+            const handoff = await records.doc<Handoff>(HANDOFF_COLLECTION, handoffKey(caseId), { caseId, taskId, owner: 'doctor' })
+            Object.assign(handoff, { owner: 'doctor', reclaimedAt: at, reclaimReason: 'bridge_unreachable' }, offered ? { taskOffered: true } : {})
+            const opened = await caseIn(records, caseId)
+            opened.paseoUnavailable = true
+            opened.state = 'triage'
+            return { status: 'running', checkpoint: { phase: 'triage' } }
+          }, context)
+          return
+        }
+        const acceptDeadline = now + paseo.acceptTimeoutMs
+        const text = await redactedReport(handedOffReport({ case: sick, acceptMinutes: Math.round(paseo.acceptTimeoutMs / 60_000) }), true)
+        await runtime.commit(async (tx) => {
+          const records = recordTransactionOver(tx)
+          const handoff = await records.doc<Handoff>(HANDOFF_COLLECTION, handoffKey(caseId), { caseId, taskId, owner: 'paseo' })
+          Object.assign(handoff, { owner: 'paseo', sentAt: at, acceptDeadline: new Date(acceptDeadline).toISOString() })
+          await reportIn(records, caseId, 'handed_off', 'handed_off', text)
+          return { status: 'sleeping', until: Math.min(now + (deps.handoff?.pollMs ?? HANDOFF_POLL_MS), acceptDeadline), checkpoint: { phase: 'handed_off' } }
+        }, context)
+        deps.onReport()
+      },
+
+      handed_off: async (task, runtime, context) => waitForAgent(runtime, task.input.caseId, task.state.checkpoint, context),
+
+      paseo_working: async (task, runtime, context) => waitForAgent(runtime, task.input.caseId, task.state.checkpoint, context),
+
+      paseo_observing: async (task, runtime, context) => {
+        if (!deps.deployer) throw new Error('выкатку агента наблюдать нечем: выкатчика у врача нет')
+        const { caseId } = task.input
+        const checkpoint = task.state.checkpoint
+        const sick = await readCase(runtime, caseId, context)
+        const request: DeployRequest = {
+          caseId,
+          appName: sick.appName,
+          fingerprint: sick.fingerprint,
+          candidateVersion: checkpoint.version,
+          candidateDir: '',
+          adopt: { since: checkpoint.since, ...(checkpoint.caseSince === undefined ? {} : { caseSince: checkpoint.caseSince }) },
+        }
+        let step: DeployStep
+        try {
+          step = await runDeploymentInTask(runtime, deps.deployer, request, checkpoint, context)
+        } finally {
+          deps.onReport()
+        }
+        if (step.kind === 'sleep') return
+        const { deployment } = step
+        const text = paseoDeploymentReport({ case: sick, deployment })
+        // Отказ выкатчика (работает не та версия, замок не взять) — не «правка готова»: правку делал агент, нужен человек.
+        const closing =
+          text.type === 'paseo_done'
+            ? ({ state: 'healed_by_paseo', outcome: 'healed_by_paseo' } as const)
+            : deployment.outcome === 'refused'
+              ? ({ state: 'needs_human', outcome: 'needs_human', why: 'deploy' } as const)
+              : deployClosing(deployment, text.type)
+        const type: ReportType = deployment.outcome === 'refused' ? 'needs_human' : text.type
+        const ledgerIn = async (records: RecordTransaction) => {
+          if (deployment.outcome === 'rolled_back' || deployment.outcome === 'rollback_failed') {
+            await recordRollbackIn(records, { fingerprint: sick.fingerprint, deploymentId: deployment.deploymentId, at: deps.now() })
+          }
+        }
+        const result = { outcome: closing.outcome, ...('why' in closing && closing.why ? { why: closing.why } : {}), deploymentId: deployment.deploymentId }
+        await finish(runtime, caseId, closing.state, type, text, result, context, true, ledgerIn)
+      },
+
       diagnosing: async (task, runtime, context) => {
         const { caseId } = task.input
         const treating = task.state.checkpoint
+        if (await followUpReclaim(runtime, caseId, context)) return
         await backFromDeferral(runtime, caseId, 'diagnosing', context)
         let doc = await treatmentDoc(runtime, treating.conversationId, context)
         let run: { status: ConverseStatus; spentUsd: number } | undefined
@@ -690,6 +1018,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       fixing: async (task, runtime, context) => {
         const { caseId } = task.input
         const { diagnosis, phase: _phase, ...treating } = task.state.checkpoint
+        if (await followUpReclaim(runtime, caseId, context)) return
         await backFromDeferral(runtime, caseId, 'fixing', context)
         await stopOnBrokenWorkbench(runtime, caseId, treating, context, async () => {
           // Копия, испорченная ещё при диагнозе, — не работаем в ней дальше; испорченная правкой — не коммитим.
@@ -732,6 +1061,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       verifying: async (task, runtime, context) => {
         const { caseId } = task.input
         const checkpoint = task.state.checkpoint
+        if (await followUpReclaim(runtime, caseId, context)) return
         await backFromDeferral(runtime, caseId, 'verifying', context)
         const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
         const config = await deps.loadConfig()
@@ -836,6 +1166,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const { caseId } = task.input
         const checkpoint = task.state.checkpoint
         const { checks, diagnosis, fix, inspection } = checkpoint
+        if (await followUpReclaim(runtime, caseId, context)) return
         const doc = await treatmentDoc(runtime, checkpoint.conversationId, context)
         const config = await deps.loadConfig()
         const sick = await readCase(runtime, caseId, context)
@@ -852,6 +1183,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const ready = { case: doc.case, diagnosis, fix, branch: checkpoint.branch, commit: checkpoint.fixCommit, pushed: checkpoint.pushed }
         const sdkTask = sdkPackage ? agentChatSdkTask({ case: doc.case, stack: doc.case.stack, diagnosis, packageName: sdkPackage }) : undefined
         const knownSecrets = knownSecretsOf(config)
+        const holdUntil = await ownDeployHold(runtime, caseId, config, context)
         const closeWith = (kind: GateClosing['kind'], gate: GateDecision): { text: ReportText; outcome: Pick<TreatmentResult, 'outcome' | 'why'> } => {
           switch (kind) {
             case 'deploy':
@@ -881,6 +1213,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           const attempts = deployAttemptsOf(ledger, { fingerprint: sick.fingerprint, now, timeZone: config.app.timeZone, limits: config.limits })
           let gate = decideDeploy(deployFactsOf({ inspection, checks, controls, attempts, spendDay: spendDay ?? emptySpendDay(), limits: config.limits }))
           let closing = closingOf(gate, checks)
+          // Агент, может быть, ещё правит: решение примем заново, когда мост подтвердит отмену или срок агента пройдёт.
+          if (closing.kind === 'deploy' && deps.deployer && holdUntil !== undefined) return { status: 'sleeping', until: holdUntil, checkpoint }
           if (closing.kind === 'deploy' && deps.deployer) {
             const deployment = await deploymentIdIn(records, { caseId, candidateVersion: checkpoint.fixCommit })
             const admission = await admitAutoDeployIn(records, {
@@ -980,6 +1314,14 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       await startTreatmentIn(records, opened, { caseId: opened.caseId, attempt })
       opened.treatmentAttempt = attempt
       return attempt
+    },
+    async adoptLateDeployIn(records, caseId) {
+      const tx = durableTxOf(records)
+      const opened = await caseIn(records, caseId)
+      const current = opened.treatmentTaskId && tx ? await tx.task(Number(opened.treatmentTaskId) as TaskId) : undefined
+      // Лечение ещё идёт — оно само заметит выкатку на ближайшей фазе или в своей последней фиксации.
+      if (current && current.state.status !== 'terminal' && current.state.status !== 'completing') return
+      await adoptIn(records, caseId)
     },
   }
 }

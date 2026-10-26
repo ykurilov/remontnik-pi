@@ -1,0 +1,32 @@
+# Добавка к compose.remontnik.yml для режима «сначала Paseo»: врач слушает мост только на адресе сервера в tailnet.
+# Запуск из корня репозитория Ремонтника:
+#   docker compose -f deploy/compose.remontnik.yml -f deploy/compose.paseo.yml up -d --build
+#
+# Переменные (в том же .env рядом с compose.remontnik.yml; секретов среди них нет):
+#   REMONTNIK_TAILNET_IP        адрес сервера в tailnet — порт для моста открыт только на нём
+#   REMONTNIK_PASEO_DOCTOR_IP   адрес врача в сети remontnik-paseo (по умолчанию 172.30.250.2);
+#                               его же врач слушает: REMONTNIK_BRIDGE_LISTEN=<этот адрес>:7810
+#   REMONTNIK_PASEO_SUBNET      подсеть remontnik-paseo (по умолчанию 172.30.250.0/29); не должна пересекаться
+#                               с другими сетями сервера
+#
+# Нужны Docker Engine 28 и Compose 2.33 или новее (gw_priority). После запуска: docker inspect remontnik-doctor —
+# у сети remontnik-paseo стоит GwPriority: 1.
+
+services:
+  doctor:
+    ports:
+      # Только адрес сервера в tailnet: на других адресах сервера порта нет.
+      - "${REMONTNIK_TAILNET_IP:?адрес сервера в tailnet}:7810:7810"
+    networks:
+      paseo:
+        ipv4_address: ${REMONTNIK_PASEO_DOCTOR_IP:-172.30.250.2}
+        # Проброшенный порт Docker ведёт только на адрес в сети-шлюзе контейнера. Без этой строки
+        # шлюзом станет сеть приложения, и до врача на адресе выше никто не достучится.
+        gw_priority: 1
+
+networks:
+  paseo:
+    name: remontnik-paseo
+    ipam:
+      config:
+        - subnet: ${REMONTNIK_PASEO_SUBNET:-172.30.250.0/29}

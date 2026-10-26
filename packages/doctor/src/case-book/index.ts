@@ -57,6 +57,8 @@ export interface Case {
   treatmentTaskId?: string
   /** Номер попытки лечения: больше 1 после `case <id> retry` упавшей задачи. */
   treatmentAttempt?: number
+  /** Режим «сначала Paseo»: мост не ответил, врач лечит сам — отчёты случая это говорят. */
+  paseoUnavailable?: boolean
   /** Кто и когда последним снова поставил случай в работу (`case <id> retry`). */
   retriedBy?: string
   retriedAt?: string

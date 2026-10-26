@@ -139,13 +139,18 @@ export async function readErrorBaseline(store: RecordStore, appName: string, at:
   return { errorsPerHour: Math.max(lastHour, lastDay / 24), knownFingerprints7d: [...known] }
 }
 
-/** Что случилось с начала выкатки `from` до `to`. Время делится не меньше чем на минуту: одна ошибка в первые секунды — не всплеск. */
+/**
+ * Что случилось с начала выкатки `from` до `to`. Время делится не меньше чем на минуту: одна ошибка в первые секунды —
+ * не всплеск. Новые отпечатки и повтор сбоя случая — с `caseFrom`, если он позже `from`: до него мог работать прежний
+ * код, и его побочный сбой — не сбой новой версии.
+ */
 export async function readErrorsSince(
   store: RecordStore,
   appName: string,
-  window: { from: Date; to: Date; knownFingerprints: readonly string[]; caseFingerprint: string },
+  window: { from: Date; to: Date; knownFingerprints: readonly string[]; caseFingerprint: string; caseFrom?: Date },
 ): Promise<ErrorsSince> {
   const from = floorTo(window.from.getTime(), MINUTE_MS)
+  const caseFrom = Math.max(window.from.getTime(), window.caseFrom?.getTime() ?? 0)
   const to = window.to.getTime()
   const hours = await readHours(store, appName, from, to)
   const errors = errorsBetween(hours, from)
@@ -154,9 +159,9 @@ export async function readErrorsSince(
   let caseFingerprintSeen = false
   for (const { hour } of hours) {
     for (const [fingerprint, seen] of Object.entries(hour.fingerprints)) {
-      if (Date.parse(seen.lastAt) < window.from.getTime()) continue
-      if (fingerprint === window.caseFingerprint) caseFingerprintSeen = true
-      else if (!known.has(fingerprint)) fresh.add(fingerprint)
+      const lastAt = Date.parse(seen.lastAt)
+      if (fingerprint === window.caseFingerprint) caseFingerprintSeen ||= lastAt >= caseFrom
+      else if (lastAt >= caseFrom && !known.has(fingerprint)) fresh.add(fingerprint)
     }
   }
   const elapsedHours = Math.max(to - from, MINUTE_MS) / HOUR_MS
