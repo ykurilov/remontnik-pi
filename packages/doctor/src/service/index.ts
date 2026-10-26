@@ -24,6 +24,8 @@ import { openDoctorHarness } from './harness.js'
 export interface DoctorServiceOptions {
   stateDir: string
   sharedSecret: string
+  /** Секрет владельца: только им можно снова пустить выкатки после стоп-крана. */
+  controlSecret?: string
   listen: { host: string; port: number }
   telegram: { botToken: string; chatId: string; apiBaseUrl?: string; proxyToken?: string }
   /** Лента отчётов (R13). Не задана — адресов `/v1/reports*` нет. */
@@ -255,7 +257,11 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           // Хранилище отказало — состояние стоп-крана неизвестно, но /health всё равно отвечает.
           autoDeploy: await controls.read().then((read) => read.autoDeploy, () => 'unknown'),
         }),
-        deployControls: createDeployControlsHandler({ controls, secret: options.sharedSecret }),
+        deployControls: createDeployControlsHandler({
+          controls,
+          secret: options.sharedSecret,
+          ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+        }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),
       host: options.listen.host,

@@ -23,6 +23,7 @@ function deployTask(app: FakeDeployApp, lockPath: string) {
   const deployer = createDeployer({
     loadConfig: async () => testRemontnikConfig(),
     commandsFor: () => app.commands,
+    mainCopyFor: () => app.mainCopy,
     lockFor: () => createDeployLock(lockPath),
     tagPreDeploy: async () => ({ ok: true }),
   })
@@ -93,7 +94,7 @@ describe('выкатка в задаче pi-durable', () => {
     expect(app.running).toBe(CAND)
     expect(clock.sleeps()).toBeGreaterThan(10)
     const result = (settled.state.outcome as { result: { deploymentId: number } }).result
-    expect(await readDeployment(opened.records, result.deploymentId)).toMatchObject({ stage: 'done', outcome: 'holding' })
+    expect(await readDeployment(opened.records, result.deploymentId)).toMatchObject({ stage: 'done', outcome: 'holding', taskId })
     await opened.close()
   })
 

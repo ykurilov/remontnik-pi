@@ -10,6 +10,7 @@ import { createControls, type Controls } from './controls.js'
 // Что стоп-кран останавливает выкатку, проверяет deployer/deploy-sequence.test.ts.
 
 const SECRET = 'shared-secret-for-tests'
+const CONTROL_SECRET = 'owner-control-secret-for-tests'
 const at = new Date('2026-10-26T12:00:00Z')
 let store: RecordStore
 let controls: Controls
@@ -25,7 +26,7 @@ beforeEach(async () => {
       secret: SECRET,
       receiveEvents: async () => ({ accepted: [] }),
       health: async () => ({ ok: true, autoDeploy: (await controls.read()).autoDeploy }),
-      deployControls: createDeployControlsHandler({ controls, secret: SECRET }),
+      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
     }),
     host: '127.0.0.1',
     port: 0,
@@ -60,8 +61,32 @@ describe('POST /v1/control/deploys', () => {
     expect(await response.json()).toEqual({ autoDeploy: 'stopped' })
     expect(await (await fetch(`${server.url}/health`)).json()).toMatchObject({ autoDeploy: 'stopped' })
 
-    const resumed = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'resume', by: 'telegram:admin' })))
+    const resumed = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'resume', by: 'owner' }), CONTROL_SECRET))
     expect(await resumed.json()).toEqual({ autoDeploy: 'on' })
+  })
+
+  it('пуск — только секретом владельца: общий секрет кнопки Telegram выкатки только останавливает', async () => {
+    const byOwner = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
+    expect(await byOwner.json()).toEqual({ autoDeploy: 'stopped' })
+
+    const byButton = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'resume', by: 'telegram:admin' })))
+    expect(byButton.status).toBe(403)
+    expect(await byButton.json()).toEqual({ error: 'control_secret_required' })
+    expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
+
+    const handler = createDeployControlsHandler({ controls, secret: SECRET })
+    const bare = await startIntakeServer({
+      handler: createIntakeHandler({ secret: SECRET, receiveEvents: async () => ({ accepted: [] }), health: async () => ({ ok: true }), deployControls: handler }),
+      host: '127.0.0.1',
+      port: 0,
+    })
+    try {
+      const noOwnerSecret = await fetch(`${bare.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'resume', by: 'x' })))
+      expect(noOwnerSecret.status).toBe(403)
+    } finally {
+      await bare.close()
+    }
+    expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
   })
 
   it('без подписи, чужим секретом, повтором или подписью до запуска врача — 401, стоп-кран не тронут', async () => {
@@ -70,7 +95,7 @@ describe('POST /v1/control/deploys', () => {
     expect(unsigned.status).toBe(401)
     expect((await fetch(`${server.url}/v1/control/deploys`, signedPost(body, 'other-secret'))).status).toBe(401)
 
-    const once = signedPost(JSON.stringify({ action: 'resume', by: 'x' }))
+    const once = signedPost(JSON.stringify({ action: 'resume', by: 'x' }), CONTROL_SECRET)
     expect((await fetch(`${server.url}/v1/control/deploys`, once)).status).toBe(200)
     const replay = await fetch(`${server.url}/v1/control/deploys`, once)
     expect(replay.status).toBe(401)
@@ -92,7 +117,7 @@ describe('POST /v1/control/deploys', () => {
 })
 
 describe('remontnik-doctor deploys stop|resume', () => {
-  async function run(argv: string[], env: Record<string, string | undefined> = { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET }) {
+  async function run(argv: string[], env: Record<string, string | undefined> = { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET, REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }) {
     let out = ''
     let err = ''
     const code = await runDoctorCommand(argv, { env, stdout: (text) => (out += text), stderr: (text) => (err += text) })
@@ -108,10 +133,19 @@ describe('remontnik-doctor deploys stop|resume', () => {
     expect(JSON.parse((await run(['deploys', 'resume'])).out)).toEqual({ autoDeploy: 'on' })
   })
 
+  it('стоп подписывается общим секретом, если секрета владельца нет; пуск без секрета владельца — ошибка', async () => {
+    const stopped = await run(['deploys', 'stop'], { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET })
+    expect(stopped.code).toBe(0)
+    const resume = await run(['deploys', 'resume'], { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET })
+    expect(resume.code).toBe(1)
+    expect(resume.err).toContain('REMONTNIK_CONTROL_SECRET')
+    expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
+  })
+
   it('без секрета — ошибка, секрет в вывод не попадает; неизвестное действие — код 2', async () => {
     const noSecret = await run(['deploys', 'stop'], { REMONTNIK_DOCTOR_URL: server.url })
     expect(noSecret.code).toBe(1)
-    expect(noSecret.err).toContain('REMONTNIK_SHARED_SECRET')
+    expect(noSecret.err).toContain('REMONTNIK_CONTROL_SECRET')
 
     const wrong = await run(['deploys', 'stop'], { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: 'other-secret' })
     expect(wrong.code).toBe(1)

@@ -65,10 +65,13 @@ export default defineRemontnikConfig({
       rollback: string, current: string, health: string,
     },
     lockFile: string,                 // общий с ручной выкаткой
+    buildEnv?: string[],              // []; имена переменных окружения, которые видит build (не REMONTNIK_*)
+    lockWaitReportMinutes?: number,   // 30; ждёт замок дольше — зовёт человека и ждёт дальше
   },
   observe?: {
     windowMinutes?: number,           // 30
-    healthFailuresToRollback?: number,// 3
+    healthFailuresToRollback?: number,// 3; подряд или среди последних healthWindowTicks проверок
+    healthWindowTicks?: number,       // 5; окно не закрывается раньше этого числа проверок
     errorRateFactor?: number,         // 3
     minErrorsToRollback?: number,     // 5
     newFingerprintsToRollback?: number, // 3

@@ -199,6 +199,8 @@ const ROLLBACK_CAUSES: Record<RollbackCause, string> = {
   new_fingerprints: 'появились новые сбои',
   promote_failed: 'команда promote не довела выкатку',
   current_unavailable: 'приложение не говорит, какая версия работает',
+  reverted: 'приложение вернулось к прежней версии',
+  main_copy_changed: 'рабочую копию основной ветки на сервере кто-то изменил',
 }
 
 const REFUSALS: Record<DeployRefusal, string> = {
@@ -209,6 +211,7 @@ const REFUSALS: Record<DeployRefusal, string> = {
   tag_failed: 'не смог поставить метку прежней версии в git',
   build_failed: 'сборка не прошла',
   promote_failed: 'команда promote не прошла, работает прежняя версия',
+  main_copy_changed: 'рабочую копию основной ветки на сервере кто-то изменил',
 }
 
 function deploymentLines(deployment: Deployment): string[] {
@@ -224,6 +227,7 @@ function deploymentLines(deployment: Deployment): string[] {
     ...(deployment.healthyAfterRollback === undefined
       ? []
       : [deployment.healthyAfterRollback ? 'После отката приложение здорово.' : `После отката приложение нездорово: ${deployment.healthAfterRollback ?? 'причина неизвестна'}`]),
+    ...(deployment.mainCopyChange ? [`Во время отката: ${deployment.mainCopyChange}`] : []),
     ...(deployment.confirmFailed ? [`confirm не прошёл: ${deployment.confirmFailed}`] : []),
     ...(deployment.detail ? [`Подробности: ${deployment.detail}`] : []),
   ]
@@ -247,7 +251,13 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
         return ['not_helped', `${head(input.case)}: правка (версия ${candidate}) не помогла — сбой случая повторяется, хотя хуже не стало. Версию оставил.`]
       case 'rolled_back': {
         const why = deployment.rollbackReason ?? (deployment.rollbackCause ? ROLLBACK_CAUSES[deployment.rollbackCause] : 'стало хуже')
-        const after = deployment.healthyAfterRollback === false ? ` Но и после отката приложение нездорово. Нужен человек.` : ''
+        const copyChanged = deployment.rollbackCause === 'main_copy_changed' || deployment.mainCopyChange !== undefined
+        const after =
+          deployment.healthyAfterRollback === false
+            ? ` Но и после отката приложение нездорово. Нужен человек.`
+            : copyChanged
+              ? ' Рабочую копию основной ветки на сервере изменили: нужен человек.'
+              : ''
         return ['rolled_back', `${head(input.case)}: откатил правку на прежнюю версию ${previous} — ${why}.${after}`]
       }
       case 'rollback_failed':
@@ -266,4 +276,18 @@ export function deploymentReport(input: { case: ReportCase; deployment: Deployme
   })()
   const full = [short, '', ...caseLines(input.case), ...deploymentLines(deployment)].join('\n')
   return { type, short, full, ...(input.screenshots && input.screenshots.length > 0 ? { screenshots: [...input.screenshots] } : {}) }
+}
+
+/** Замок выкатки занят дольше `minutes`: врач ждёт дальше, но зовёт человека. `holder` — содержимое файла замка. */
+export function lockWaitReport(input: { deployment: Deployment; lockFile: string; minutes: number; holder: string }): ReportText {
+  const { deployment } = input
+  const short = `Случай ${deployment.caseId} (${deployment.appName}): правка (версия ${version(deployment.candidateVersion)}) ждёт выкатки, а замок выкатки занят дольше ${input.minutes} минут. Жду дальше. Если ручная выкатка закончилась, а замок остался, уберите файл ${input.lockFile}.`
+  const holder = input.holder.trim().slice(0, 300)
+  const full = [
+    short,
+    '',
+    `Выкатка ${deployment.deploymentId}, ждёт замок с ${clock(deployment.waitingLockSince)}`,
+    `В файле замка: ${holder === '' ? '(пусто)' : holder}`,
+  ].join('\n')
+  return { short, full }
 }

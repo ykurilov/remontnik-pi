@@ -2,9 +2,12 @@ import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 
 // Почасовой учёт ошибок приложения: уровень до выкатки и что появилось после неё (наблюдение, research R9).
-// Час — один документ: поминутные счётчики и отпечатки с последним появлением.
+// Час — один документ: поминутные счётчики и отпечатки с последним появлением. Нужна только последняя неделя,
+// поэтому часы старше 8 дней от самого нового удаляются, когда начинается новый час.
 
 export const ERROR_HOUR_COLLECTION = 'error-hour'
+export const ERROR_HOUR_INDEX_COLLECTION = 'error-hour-index'
+const KEEP_HOURS_DAYS = 8
 /** Больше отпечатков за час не помним: остальные идут в общий счёт. Столько новых и так даёт откат. */
 const FINGERPRINTS_PER_HOUR_LIMIT = 200
 const HOUR_MS = 3_600_000
@@ -33,14 +36,32 @@ export interface ErrorsSince {
   caseFingerprintSeen: boolean
 }
 
+/** Записанные часы приложения: `YYYY-MM-DDTHH`. */
+interface ErrorHourIndex {
+  hours: string[]
+}
+
 const emptyHour = (): ErrorHour => ({ minutes: {}, fingerprints: {}, overflow: 0 })
-const hourKey = (appName: string, hourStart: number) => `${appName}/${new Date(hourStart).toISOString().slice(0, 13)}`
+const hourStamp = (hourStart: number) => new Date(hourStart).toISOString().slice(0, 13)
+const hourStartOf = (stamp: string) => Date.parse(`${stamp}:00:00Z`)
+const hourKey = (appName: string, hourStart: number) => `${appName}/${hourStamp(hourStart)}`
 const floorTo = (time: number, step: number) => Math.floor(time / step) * step
 
 /** Внутри транзакции книги случаев: одно новое событие (`occurrences` — с учётом склеенных повторов). */
 export async function countErrorIn(tx: RecordTransaction, event: IncidentEvent, occurrences: number): Promise<void> {
   const at = Date.parse(event.occurredAt)
-  const hour = await tx.doc<ErrorHour>(ERROR_HOUR_COLLECTION, hourKey(event.appName, floorTo(at, HOUR_MS)), emptyHour())
+  const start = floorTo(at, HOUR_MS)
+  const index = await tx.doc<ErrorHourIndex>(ERROR_HOUR_INDEX_COLLECTION, event.appName, { hours: [] })
+  if (!index.hours.includes(hourStamp(start))) {
+    const newest = Math.max(start, ...index.hours.map(hourStartOf))
+    const keepFrom = newest - KEEP_HOURS_DAYS * 24 * HOUR_MS
+    // Событие старше срока хранения (запоздало) — уже не нужно ни уровню, ни наблюдению.
+    if (start < keepFrom) return
+    const old = index.hours.filter((stamp) => hourStartOf(stamp) < keepFrom)
+    for (const stamp of old) await tx.retire(ERROR_HOUR_COLLECTION, `${event.appName}/${stamp}`)
+    index.hours = [...index.hours.filter((stamp) => !old.includes(stamp)), hourStamp(start)]
+  }
+  const hour = await tx.doc<ErrorHour>(ERROR_HOUR_COLLECTION, hourKey(event.appName, start), emptyHour())
   const minute = String(new Date(at).getUTCMinutes())
   hour.minutes[minute] = (hour.minutes[minute] ?? 0) + occurrences
   const seen = hour.fingerprints[event.fingerprint]

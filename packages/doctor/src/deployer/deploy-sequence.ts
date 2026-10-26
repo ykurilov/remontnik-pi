@@ -1,20 +1,27 @@
+import { randomBytes } from 'node:crypto'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { readErrorBaseline, type ErrorBaseline } from '../case-book/error-hours.js'
 import { readControls } from '../ledgers/controls.js'
-import { copyRecord, type RecordStore } from '../records/index.js'
+import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
+import { createReports } from '../reports/index.js'
+import { lockWaitReport } from '../reports/texts.js'
 import type { AppCommands } from './app-commands.js'
-import type { DeployLock } from './lock.js'
+import type { DeployLock, LockHolder } from './lock.js'
+import { mainCopyChange, type MainCopy, type MainCopySnapshot } from './main-copy.js'
 import { OBSERVE_TICK_MS, observe, readObservationTick, startObservation, type ObservationState, type RollbackReason } from './observer.js'
 
-// Выкатка правки (contracts/deploy-commands.md): замок → `current` → метка git на прежней версии → `build` →
-// `promote` → `current` = кандидат → наблюдение (первый тик с `health` — сразу) → `confirm` → замок снят.
-// Сбой после `promote` или ухудшение в окне → `rollback` → `current` = прежняя.
+// Выкатка правки (contracts/deploy-commands.md): замок → снимок рабочей копии → `current` → метка git на прежней
+// версии → `build` → стоп-кран → `promote` → `current` = кандидат → наблюдение (первый тик с `health` — сразу) →
+// `confirm` → замок снят. Сбой после `promote` или ухудшение в окне → `rollback` → `current` = прежняя.
+// Перед `promote`, `rollback`, `current` и `health` рабочая копия сверяется со снимком: изменилась до `promote` —
+// отказ, после — откат.
 //
 // Врач может упасть на любом шаге, и шаг тогда идёт заново. Поэтому каждый шаг: записать намерение → сделать →
 // проверить настоящее состояние сервера (`current`), а не память. `promote` идёт, только пока работает прежняя
-// версия; `rollback` — только пока работает кандидат, и попытки считаются до запуска. Выкатка — документ
-// `deployment/<id>`; ждать (замок, тик наблюдения) она не умеет сама: `step()` возвращает `sleep`, и задача
-// pi-durable спит через `runtime.sleepUntil` (см. `runDeploymentInTask` в service/harness.ts).
+// версия; `rollback` — только пока работает не прежняя, и попытка считается, когда `rollback` закончился: лучше
+// лишний повтор, чем потерянный откат. Выкатка — документ `deployment/<id>`; ждать (замок, тик наблюдения, пауза
+// между откатами) она не умеет сама: `step()` возвращает `sleep`, и задача pi-durable спит через
+// `runtime.sleepUntil` (см. `runDeploymentInTask` в service/harness.ts).
 
 export const DEPLOYMENT_COLLECTION = 'deployment'
 export const DEPLOYMENT_INDEX_COLLECTION = 'deployment-index'
@@ -22,13 +29,23 @@ const INDEX_KEY = 'main'
 /** Как часто проверять, свободен ли замок. */
 export const LOCK_RETRY_MS = 30_000
 const MAX_ROLLBACK_ATTEMPTS = 3
+/** Пауза после неудачной попытки отката: 10 с, 30 с, 90 с. */
+const ROLLBACK_PAUSE_MS = 10_000
 const DETAIL_LIMIT = 4000
 
 export type DeployStage = 'starting' | 'locked' | 'tagging' | 'building' | 'promoting' | 'observing' | 'rolling_back' | 'confirming' | 'done'
 export type DeployOutcome = 'in_progress' | 'holding' | 'not_helped' | 'rolled_back' | 'superseded_by_human' | 'rollback_failed' | 'refused'
 /** Почему выкатка не началась; работающую версию при этом не трогали. */
-export type DeployRefusal = 'stop_switch' | 'current_unavailable' | 'no_previous_build' | 'already_running' | 'tag_failed' | 'build_failed' | 'promote_failed'
-export type RollbackCause = RollbackReason | 'promote_failed' | 'current_unavailable'
+export type DeployRefusal =
+  | 'stop_switch'
+  | 'current_unavailable'
+  | 'no_previous_build'
+  | 'already_running'
+  | 'tag_failed'
+  | 'build_failed'
+  | 'promote_failed'
+  | 'main_copy_changed'
+export type RollbackCause = RollbackReason | 'promote_failed' | 'main_copy_changed'
 
 export interface Deployment {
   deploymentId: number
@@ -40,8 +57,18 @@ export interface Deployment {
   stage: DeployStage
   outcome: DeployOutcome
   startedAt: string
+  /** Знак выкатки в файле замка: по нему врач узнаёт свой замок. */
+  lockToken: string
+  /** Задача pi-durable, которая ведёт выкатку: умерла — замок выкатки брошен. */
+  taskId?: number
   /** С какого времени ждёт замок (ручная или другая выкатка). */
   waitingLockSince?: string
+  /** Когда позвал человека из-за долгого ожидания замка. */
+  lockWaitReportedAt?: string
+  /** Рабочая копия основной ветки в начале выкатки. */
+  mainCopy?: MainCopySnapshot
+  /** Рабочую копию изменили во время отката: откат всё равно шёл, но нужен человек. */
+  mainCopyChange?: string
   previousVersion?: string
   preDeployTag?: string
   baseline?: ErrorBaseline
@@ -56,7 +83,9 @@ export interface Deployment {
   verdict?: 'holding' | 'not_helped'
   rollbackCause?: RollbackCause
   rollbackReason?: string
+  /** Законченные запуски `rollback`. */
   rollbackAttempts?: number
+  nextRollbackAt?: string
   healthyAfterRollback?: boolean
   healthAfterRollback?: string
   refusal?: DeployRefusal
@@ -83,10 +112,14 @@ export interface DeployIo {
   store: RecordStore
   /** Часы Harness (`runtime.now`). */
   now(): number
+  /** Задача pi-durable, которая ведёт выкатку. */
+  taskId?: number
+  /** Жива ли задача (не закончилась): по нему врач снимает замок выкатки, чья задача умерла. */
+  isTaskAlive?(taskId: number): Promise<boolean>
 }
 
 export type DeployStep =
-  | { kind: 'sleep'; until: number; stage: 'waiting_lock' | 'observing'; deployment: Deployment }
+  | { kind: 'sleep'; until: number; stage: 'waiting_lock' | 'observing' | 'rolling_back'; deployment: Deployment }
   | { kind: 'done'; deployment: Deployment }
 
 export type TagResult = { ok: true } | { ok: false; reason: string }
@@ -95,6 +128,8 @@ export interface DeployerDeps {
   /** Настройка приложения из основной ветки. */
   loadConfig(): Promise<RemontnikConfig>
   commandsFor(config: RemontnikConfig): AppCommands
+  /** Рабочая копия основной ветки, из которой идут команды выкатки. */
+  mainCopyFor(config: RemontnikConfig): MainCopy
   lockFor(config: RemontnikConfig): DeployLock
   /** Метка прежней версии в git и origin; повтор безопасен. Отказ git — `ok: false`, остальное — исключение. */
   tagPreDeploy(name: string, version: string): Promise<TagResult>
@@ -146,6 +181,7 @@ async function openDeployment(store: RecordStore, request: DeployRequest, now: D
       stage: 'starting',
       outcome: 'in_progress',
       startedAt: now.toISOString(),
+      lockToken: randomBytes(8).toString('hex'),
     })
     return copyRecord(deployment)
   })
@@ -159,18 +195,22 @@ export function createDeployer(deps: DeployerDeps): Deployer {
     async step(request, io) {
       const config = await deps.loadConfig()
       const commands = deps.commandsFor(config)
+      const mainCopy = deps.mainCopyFor(config)
       const lock = deps.lockFor(config)
       const { store } = io
       const now = () => new Date(io.now())
+      const windowMs = config.observe.windowMinutes * 60_000
       let deployment = await openDeployment(store, request, now())
       const id = deployment.deploymentId
+      const holder: LockHolder = { deploymentId: id, token: deployment.lockToken }
       /** `promote` уже запускали в этом вызове: второй раз подряд — не выкатка, а сломанная команда. */
       let promotedHere = false
 
-      async function save(change: (draft: Deployment) => void): Promise<void> {
+      async function save(change: (draft: Deployment) => void, alsoIn?: (tx: RecordTransaction) => Promise<unknown>): Promise<void> {
         deployment = await store.transaction(async (tx) => {
           const draft = await tx.doc<Deployment>(DEPLOYMENT_COLLECTION, String(id), {} as Deployment)
           change(draft)
+          await alsoIn?.(tx)
           return copyRecord(draft)
         })
       }
@@ -182,7 +222,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           draft.stage = 'done'
           draft.endedAt = now().toISOString()
         })
-        await lock.release(id)
+        await lock.release(holder)
         return { kind: 'done', deployment }
       }
 
@@ -203,29 +243,59 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           draft.rollbackCause = cause
           draft.rollbackReason = clip(reason)
         })
-      const isFinished = async (other: number) => ((await readDeployment(store, other))?.outcome ?? 'refused') !== 'in_progress'
+      /** Замок другой выкатки брошен: она из своих записей и закончилась или её задача умерла. Чужое не трогаем. */
+      async function isStale(other: LockHolder): Promise<boolean> {
+        const found = await readDeployment(store, other.deploymentId)
+        if (!found || found.lockToken !== other.token) return false
+        if (found.outcome !== 'in_progress') return true
+        if (!found.taskId || found.taskId === io.taskId || !io.isTaskAlive) return false
+        return !(await io.isTaskAlive(found.taskId))
+      }
       /** До `promote` замок должен быть этой выкатки; потерян (сняли руками) — заново в очередь за ним. */
       async function holdsLock(): Promise<boolean> {
-        if ((await lock.acquire(id, now(), isFinished)).acquired) return true
+        if ((await lock.acquire(holder, now(), isStale)).acquired) return true
         await save((draft) => {
           draft.stage = 'starting'
         })
         return false
       }
+      /** Чем рабочая копия отличается от снимка начала выкатки; `undefined` — ничем. */
+      async function mainCopyChanged(): Promise<string | undefined> {
+        return deployment.mainCopy ? mainCopyChange(deployment.mainCopy, await mainCopy.snapshot()) : undefined
+      }
+
+      if (io.taskId && deployment.taskId !== io.taskId && deployment.stage !== 'done') {
+        const taskId = io.taskId
+        await save((draft) => {
+          draft.taskId = taskId
+        })
+      }
 
       for (;;) {
         switch (deployment.stage) {
           case 'done':
-            await lock.release(id)
+            await lock.release(holder)
             return { kind: 'done', deployment }
 
           case 'starting': {
             if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
-            if (!(await lock.acquire(id, now(), isFinished)).acquired) {
-              if (!deployment.waitingLockSince) {
-                await save((draft) => {
-                  draft.waitingLockSince = now().toISOString()
-                })
+            const attempt = await lock.acquire(holder, now(), isStale)
+            if (!attempt.acquired) {
+              const since = deployment.waitingLockSince ?? now().toISOString()
+              const reportDue = !deployment.lockWaitReportedAt && io.now() - Date.parse(since) >= config.deploy.lockWaitReportMinutes * 60_000
+              if (!deployment.waitingLockSince || reportDue) {
+                await save(
+                  (draft) => {
+                    draft.waitingLockSince = since
+                    if (reportDue) draft.lockWaitReportedAt = now().toISOString()
+                  },
+                  reportDue
+                    ? (tx) => {
+                        const text = lockWaitReport({ deployment, lockFile: config.deploy.lockFile, minutes: config.deploy.lockWaitReportMinutes, holder: attempt.content })
+                        return createReports({ store, now: () => io.now() }).addIn(tx, { type: 'needs_human', caseId: request.caseId, ...text, telegram: 'pending' })
+                      }
+                    : undefined,
+                )
               }
               return { kind: 'sleep', until: io.now() + lockRetryMs, stage: 'waiting_lock', deployment }
             }
@@ -237,12 +307,17 @@ export function createDeployer(deps: DeployerDeps): Deployer {
 
           case 'locked': {
             if (!(await holdsLock())) break
+            const snapshot = await mainCopy.snapshot()
+            // Снимок со сравнением с собой — только чистота копии.
+            const dirty = mainCopyChange(snapshot, snapshot)
+            if (dirty) return refuse('main_copy_changed', dirty)
             const current = await commands.current()
             if (!current.ok) return refuse('current_unavailable', current.reason)
             if (current.version === null) return refuse('no_previous_build')
             if (current.version === request.candidateVersion) return refuse('already_running')
             const previousVersion = current.version
             await save((draft) => {
+              draft.mainCopy = snapshot
               draft.previousVersion = previousVersion
               draft.preDeployTag = preDeployTagName(request.caseId, id, now())
               draft.stage = 'tagging'
@@ -264,7 +339,6 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             if (!(await holdsLock())) break
             const built = await commands.build(request.candidateDir, request.candidateVersion)
             if (!built.ok) return refuse('build_failed', built.output)
-            if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
             const baseline = await readErrorBaseline(store, request.appName, now())
             await save((draft) => {
               draft.baseline = baseline
@@ -277,14 +351,22 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             const previousVersion = deployment.previousVersion!
             if (!deployment.promoteRequested) {
               if (!(await holdsLock())) break
+              const changed = await mainCopyChanged()
+              if (changed) return refuse('main_copy_changed', changed)
               const before = await commands.current()
               if (!before.ok) return refuse('current_unavailable', before.reason)
               if (before.version === null) return refuse('no_previous_build')
               if (before.version !== previousVersion) return superseded(before.version)
+              // Стоп-кран — последним, прямо перед намерением: после него `promote` уже не остановить.
+              if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
               await save((draft) => {
                 draft.promoteRequested = true
-                draft.promotedAt = now().toISOString()
               })
+            }
+            const changed = await mainCopyChanged()
+            if (changed) {
+              await startRollback('main_copy_changed', changed)
+              break
             }
             let current = await commands.current()
             if (current.ok && current.version === previousVersion) {
@@ -308,9 +390,11 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               await startRollback('promote_failed', `после promote прежняя сборка — ${current.previous ?? 'нет'}, а не ${previousVersion}`)
               break
             }
+            // Время выкатки — когда `current` подтвердил кандидата: от него окно наблюдения и счёт ошибок.
             await save((draft) => {
               draft.stage = 'observing'
-              draft.observeUntil = new Date(Date.parse(draft.promotedAt!) + config.observe.windowMinutes * 60_000).toISOString()
+              draft.promotedAt = now().toISOString()
+              draft.observeUntil = new Date(io.now() + windowMs).toISOString()
               draft.observation = startObservation()
               draft.nextTickAt = now().toISOString()
             })
@@ -320,6 +404,19 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           case 'observing': {
             const nextTickAt = Date.parse(deployment.nextTickAt!)
             if (io.now() < nextTickAt) return { kind: 'sleep', until: nextTickAt, stage: 'observing', deployment }
+            // Врач спал дольше окна: прошлые проверки устарели, окно начинается заново.
+            const lastLook = Date.parse(deployment.lastTick?.at ?? deployment.promotedAt!)
+            if (io.now() - lastLook > windowMs) {
+              await save((draft) => {
+                draft.observeUntil = new Date(io.now() + windowMs).toISOString()
+                draft.observation = startObservation()
+              })
+            }
+            const changed = await mainCopyChanged()
+            if (changed) {
+              await startRollback('main_copy_changed', changed)
+              break
+            }
             const observeUntil = new Date(deployment.observeUntil!)
             const tick = await readObservationTick({
               commands,
@@ -334,6 +431,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               settings: config.observe,
               baseline: deployment.baseline!,
               candidateVersion: request.candidateVersion,
+              previousVersion: deployment.previousVersion!,
               observeUntil,
             })
             const lastTick = {
@@ -348,7 +446,8 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               draft.observation = state
               draft.lastTick = lastTick
               if (verdict.kind === 'continue') {
-                draft.nextTickAt = new Date(Math.min(io.now() + tickMs, Math.max(observeUntil.getTime(), io.now() + 1))).toISOString()
+                const untilWindowEnd = observeUntil.getTime() > io.now() ? observeUntil.getTime() : io.now() + tickMs
+                draft.nextTickAt = new Date(Math.min(io.now() + tickMs, untilWindowEnd)).toISOString()
               } else if (verdict.kind === 'rollback') {
                 draft.stage = 'rolling_back'
                 draft.rollbackCause = verdict.reason
@@ -362,6 +461,13 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           }
 
           case 'rolling_back': {
+            // Изменённая копия отката не останавливает: откатиться важнее, но позвать человека надо.
+            const changed = await mainCopyChanged()
+            if (changed && changed !== deployment.mainCopyChange) {
+              await save((draft) => {
+                draft.mainCopyChange = clip(changed)
+              })
+            }
             const current = await commands.current()
             if (current.ok && current.version === deployment.previousVersion) {
               const health = await commands.health()
@@ -372,27 +478,36 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               })
             }
             if (current.ok && current.version !== null && current.version !== request.candidateVersion) return superseded(current.version)
-            if ((deployment.rollbackAttempts ?? 0) >= MAX_ROLLBACK_ATTEMPTS) {
+            const attempts = deployment.rollbackAttempts ?? 0
+            if (attempts >= MAX_ROLLBACK_ATTEMPTS) {
               return finish((draft) => {
                 draft.outcome = 'rollback_failed'
               })
             }
-            await save((draft) => {
-              draft.rollbackAttempts = (draft.rollbackAttempts ?? 0) + 1
-            })
+            const pauseUntil = deployment.nextRollbackAt ? Date.parse(deployment.nextRollbackAt) : 0
+            if (io.now() < pauseUntil) return { kind: 'sleep', until: pauseUntil, stage: 'rolling_back', deployment }
             const rolled = await commands.rollback()
-            if (!rolled.ok) {
-              await save((draft) => {
-                draft.detail = clip(rolled.output)
-              })
-            }
+            await save((draft) => {
+              draft.rollbackAttempts = attempts + 1
+              draft.nextRollbackAt = new Date(io.now() + ROLLBACK_PAUSE_MS * 3 ** attempts).toISOString()
+              if (!rolled.ok) draft.detail = clip(rolled.output)
+            })
             break
           }
 
           case 'confirming': {
+            const changed = await mainCopyChanged()
+            if (changed) {
+              await startRollback('main_copy_changed', changed)
+              break
+            }
             const current = await commands.current()
             if (!current.ok || current.version === null) {
               await startRollback('current_unavailable', current.ok ? 'current: работающей версии нет' : current.reason)
+              break
+            }
+            if (current.version === deployment.previousVersion) {
+              await startRollback('reverted', 'приложение вернулось к прежней версии')
               break
             }
             if (current.version !== request.candidateVersion) return superseded(current.version)

@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_GIT_TOKEN`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`, `REMONTNIK_DOCTOR_URL` (для консольных команд: адрес врача в контейнере), переменные из `handoff.paseo.*Env` (адрес моста, секрет моста, адрес частной сети для приёма).
+`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_CONTROL_SECRET` (секрет владельца: только им снова пускают выкатки), `REMONTNIK_GIT_TOKEN`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`, `REMONTNIK_DOCTOR_URL` (для консольных команд: адрес врача в контейнере), переменные из `handoff.paseo.*Env` (адрес моста, секрет моста, адрес частной сети для приёма).
 
 ## HTTP
 
@@ -13,7 +13,7 @@
 | Метод и путь | Тело / ответ | Назначение |
 |---|---|---|
 | `POST /v1/events` | см. watch-api | приём событий от сторожа |
-| `POST /v1/control/deploys` | `{ action: "stop" \| "resume", by }` → `{ autoDeploy }` | стоп-кран (кнопка Telegram через приложение) |
+| `POST /v1/control/deploys` | `{ action: "stop" \| "resume", by }` → `{ autoDeploy }` | стоп-кран (кнопка Telegram через приложение). Подпись `signRequest`: `stop` — общим секретом или секретом владельца, `resume` — только секретом владельца, иначе `403 control_secret_required` |
 | `GET /v1/reports?after=<reportId>&limit=50` | `{ reports: Report[], last, acked }`: `reports` — по возрастанию номера, `limit` до 100, страница не больше ~200 КиБ (минимум один отчёт); `last` — номер последнего отчёта в ответе или `after`, если новых нет; `acked` — подтверждённый номер | забор отчётов для Paseo |
 | `POST /v1/reports/ack` | `{ upTo: reportId }` → `{ ok, acked }` | подтверждение доставки в Paseo; растёт, но не убывает; номер дальше последнего отчёта — `400 bad_request` |
 | `POST /v1/handoffs/:caseId/accepted` | `{ taskId, agent }` | агент взял случай (через мост) |
@@ -27,7 +27,7 @@
 |---|---|
 | `start` | запустить службу (точка входа контейнера) |
 | `status` | открытые случаи, идущая выкатка, расходы за сутки, стоп-кран |
-| `deploys stop` / `deploys resume` | стоп-кран |
+| `deploys stop` / `deploys resume` | стоп-кран; `resume` подписывается `REMONTNIK_CONTROL_SECRET`, `stop` — им же, а без него `REMONTNIK_SHARED_SECRET` |
 | `case <id>` | полный отчёт по случаю |
 | `case <id> retry` | снова поставить случай в работу (в том числе припаркованную задачу) |
 | `fingerprint <fp> release` | снять «нужен человек» после отката |

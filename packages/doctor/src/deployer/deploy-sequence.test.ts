@@ -6,10 +6,11 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { createCaseBook } from '../case-book/index.js'
 import { createControls } from '../ledgers/controls.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
+import { createReports } from '../reports/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
 import type { AppCommands } from './app-commands.js'
-import { createDeployer, type DeployRequest, type Deployment } from './deploy-sequence.js'
+import { createDeployer, LOCK_RETRY_MS, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
 import { createDeployLock } from './lock.js'
 
 // Порядок выкатки (contracts/deploy-commands.md) и её доведение до конца после падения врача на любом шаге.
@@ -31,6 +32,8 @@ interface RigOptions {
   afterCommand?: (name: keyof AppCommands, rig: Rig) => void | Promise<void>
   /** Перед каждым шагом выкатки (после сна). */
   beforeStep?: (rig: Rig) => void | Promise<void>
+  /** Врач падает, не успев запустить команду (или посреди неё, не дождавшись конца). */
+  crashBefore?: (name: keyof AppCommands) => boolean
 }
 
 interface Rig {
@@ -39,6 +42,8 @@ interface Rig {
   lockPath: string
   tags: Array<[string, string]>
   now(): number
+  /** Перевести часы вперёд: команда шла долго или врач спал. */
+  advance(ms: number): void
   /** Падение врача сразу после N-го внешнего действия или записи. */
   crashAfter(effect: number): void
   effects(): number
@@ -79,6 +84,9 @@ function rig(options: RigOptions = {}): Rig {
     lockPath,
     tags,
     now: () => clock,
+    advance: (ms) => {
+      clock += ms
+    },
     crashAfter: (effect) => {
       crashAt = effect
     },
@@ -88,18 +96,24 @@ function rig(options: RigOptions = {}): Rig {
       const commands = Object.fromEntries(
         Object.entries(app.commands).map(([name, command]) => [
           name,
-          async (...args: unknown[]) =>
-            effect(async () => {
+          async (...args: unknown[]) => {
+            if (options.crashBefore?.(name as keyof AppCommands)) {
+              crashes += 1
+              throw new Crash()
+            }
+            return effect(async () => {
               const result = await (command as (...args: unknown[]) => Promise<unknown>)(...args)
               await options.afterCommand?.(name as keyof AppCommands, self)
               return result
-            }),
+            })
+          },
         ]),
       ) as unknown as AppCommands
       const deployer = () =>
         createDeployer({
           loadConfig: async () => config,
           commandsFor: () => commands,
+          mainCopyFor: () => app.mainCopy,
           lockFor: () => {
             const lock = createDeployLock(lockPath)
             return {
@@ -224,6 +238,42 @@ describe('порядок выкатки', () => {
     expect(count(midway.app.calls, 'promote')).toBe(0)
     expect(existsSync(midway.lockPath)).toBe(false)
   })
+
+  it('стоп-кран нажат после сборки, перед самым promote, — promote нет', async () => {
+    let built = false
+    const r = rig({
+      afterCommand: async (name, self) => {
+        if (name === 'build') built = true
+        else if (name === 'current' && built) await createControls(self.records).set('stop', 'telegram:admin')
+      },
+    })
+    expect(await r.drive()).toMatchObject({ outcome: 'refused', refusal: 'stop_switch' })
+    expect(count(r.app.calls, 'promote')).toBe(0)
+    expect(r.app.running).toBe(PREV)
+  })
+
+  it('время выкатки — когда current подтвердил кандидата, а не когда записано намерение', async () => {
+    const r = rig({ afterCommand: (name, self) => void (name === 'promote' && self.advance(10 * MINUTE)) })
+    const deployment = await r.drive()
+    const promotedAt = Date.parse(deployment.promotedAt!)
+    expect(promotedAt).toBeGreaterThanOrEqual(START + 10 * MINUTE)
+    expect(Date.parse(deployment.observeUntil!)).toBe(promotedAt + 30 * MINUTE)
+  })
+
+  it('врач спал дольше окна наблюдения — окно начинается заново, итог не по одной проверке', async () => {
+    let slept = false
+    const r = rig({
+      beforeStep: (self) => {
+        if (slept || self.app.running !== CAND || !self.app.calls.includes('health')) return
+        slept = true
+        self.advance(45 * MINUTE)
+      },
+    })
+    const deployment = await r.drive()
+    expect(deployment.outcome).toBe('holding')
+    expect(Date.parse(deployment.observeUntil!)).toBeGreaterThanOrEqual(START + 75 * MINUTE)
+    expect(count(r.app.calls, 'health')).toBeGreaterThan(5)
+  })
 })
 
 describe('откат', () => {
@@ -278,6 +328,35 @@ describe('откат', () => {
     expect(count(app.calls, 'rollback')).toBe(3)
     expect(existsSync(r.lockPath)).toBe(false)
   })
+
+  it('откат, прерванный падением врача, не считается попыткой; между неудачными попытками пауза растёт', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    sickAfterPromote(app)
+    app.failNext('rollback', 2)
+    const rolledAt: number[] = []
+    let interrupted = 0
+    const r = rig({
+      app,
+      crashBefore: (name) => name === 'rollback' && interrupted++ < 3,
+      afterCommand: (name, self) => void (name === 'rollback' && rolledAt.push(self.now())),
+    })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackAttempts: 3 })
+    expect(app.running).toBe(PREV)
+    expect(rolledAt).toHaveLength(3)
+    const [first, second, third] = rolledAt as [number, number, number]
+    expect(second - first).toBeGreaterThan(0)
+    expect(third - second).toBeGreaterThan(second - first)
+  })
+
+  it('после promote приложение вернулось к прежней версии — откат с этой причиной, а не «человек выкатил своё»', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({ app, beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.humanDeploys(PREV)) })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'reverted', rollbackReason: 'приложение вернулось к прежней версии' })
+    expect(count(app.calls, 'rollback')).toBe(0)
+    expect(existsSync(r.lockPath)).toBe(false)
+  })
 })
 
 describe('итоги наблюдения', () => {
@@ -309,6 +388,34 @@ describe('итоги наблюдения', () => {
   })
 })
 
+describe('рабочая копия основной ветки', () => {
+  it('изменена ещё до выкатки — отказ, сборки нет', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    app.changeMainCopy('dirty')
+    const r = rig({ app })
+    expect(await r.drive()).toMatchObject({ outcome: 'refused', refusal: 'main_copy_changed', detail: expect.stringContaining('src/app.ts') })
+    expect(app.calls.filter((call) => call.startsWith('build'))).toHaveLength(0)
+    expect(existsSync(r.lockPath)).toBe(false)
+  })
+
+  it('сборка правки испортила рабочую копию — promote нет, нужен человек', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({ app, afterCommand: (name) => void (name === 'build' && app.changeMainCopy('file')) })
+    expect(await r.drive()).toMatchObject({ outcome: 'refused', refusal: 'main_copy_changed', detail: expect.stringContaining('remontnik.config.ts') })
+    expect(count(app.calls, 'promote')).toBe(0)
+    expect(app.running).toBe(PREV)
+  })
+
+  it('рабочую копию сменили после promote — откат', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({ app, beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.changeMainCopy('commit')) })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'main_copy_changed' })
+    expect(app.running).toBe(PREV)
+    expect(count(app.calls, 'rollback')).toBe(1)
+  })
+})
+
 describe('общий замок', () => {
   it('ручная выкатка держит замок: врач спит и ждёт, потом выкатывает', async () => {
     let steps = 0
@@ -335,6 +442,69 @@ describe('общий замок', () => {
     const r = rig({ afterCommand: (name, self) => void (name === 'promote' && seen.push(readFileSync(self.lockPath, 'utf8'))) })
     const deployment = await r.drive()
     expect(seen[0]).toMatch(new RegExp(`^remontnik deployment ${deployment.deploymentId} `))
+  })
+
+  it('замок занят дольше 30 минут — один отчёт человеку, врач ждёт дальше', async () => {
+    const r = rig({
+      beforeStep: (self) => {
+        if (self.now() - START >= 50 * MINUTE && existsSync(self.lockPath) && readFileSync(self.lockPath, 'utf8') === 'manual deploy\n') rmSync(self.lockPath)
+      },
+    })
+    mkdirSync(dirname(r.lockPath), { recursive: true })
+    writeFileSync(r.lockPath, 'manual deploy\n', { flag: 'wx' })
+
+    const deployment = await r.drive()
+    expect(deployment.outcome).toBe('holding')
+    const reports = await createReports({ store: r.records }).list({ after: 0, limit: 10 })
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({ type: 'needs_human', caseId: 7, telegram: { state: 'pending' } })
+    expect(reports[0]!.full).toContain('manual deploy')
+    expect(Date.parse(deployment.lockWaitReportedAt!) - START).toBeGreaterThanOrEqual(30 * MINUTE)
+  })
+
+  function plainDeployer(app: FakeDeployApp, lockPath: string) {
+    return createDeployer({
+      loadConfig: async () => testRemontnikConfig(),
+      commandsFor: () => app.commands,
+      mainCopyFor: () => app.mainCopy,
+      lockFor: () => createDeployLock(lockPath),
+      tagPreDeploy: async () => ({ ok: true }),
+    })
+  }
+
+  it('замок выкатки, чья задача умерла, снимается: следующая выкатка не ждёт вечно', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const records = createMemoryRecordStore()
+    const lockPath = join(mkdtempSync(join(tmpdir(), 'remontnik-deploy-')), 'deploy.lock')
+    const deployer = plainDeployer(app, lockPath)
+    let clock = START
+    const dead = new Set<number>()
+    const io = (taskId: number): DeployIo => ({ store: records, now: () => clock, taskId, isTaskAlive: async (id) => !dead.has(id) })
+
+    expect(await deployer.step(request, io(1))).toMatchObject({ kind: 'sleep', stage: 'observing' })
+    const other: DeployRequest = { ...request, caseId: 8, candidateVersion: 'e'.repeat(40) }
+    expect(await deployer.step(other, io(2))).toMatchObject({ kind: 'sleep', stage: 'waiting_lock' })
+
+    dead.add(1)
+    clock += LOCK_RETRY_MS
+    const next = await deployer.step(other, io(2))
+    expect(next).toMatchObject({ kind: 'sleep', stage: 'observing', deployment: { caseId: 8, previousVersion: CAND } })
+    expect(readFileSync(lockPath, 'utf8')).toMatch(new RegExp(`^remontnik deployment ${next.deployment.deploymentId} `))
+  })
+
+  it('замок врача, которого нет в своих записях (чужой врач), не снимается никогда', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const lockPath = join(mkdtempSync(join(tmpdir(), 'remontnik-deploy-')), 'deploy.lock')
+    const foreign = 'remontnik deployment 99 0123456789abcdef 2026-10-25T00:00:00.000Z\n'
+    writeFileSync(lockPath, foreign)
+    const deployer = plainDeployer(app, lockPath)
+    const records = createMemoryRecordStore()
+    for (let hour = 0; hour < 3; hour += 1) {
+      const step = await deployer.step(request, { store: records, now: () => START + hour * 60 * MINUTE, taskId: 1, isTaskAlive: async () => false })
+      expect(step).toMatchObject({ kind: 'sleep', stage: 'waiting_lock' })
+    }
+    expect(readFileSync(lockPath, 'utf8')).toBe(foreign)
+    expect(app.calls).toEqual([])
   })
 })
 
@@ -372,6 +542,7 @@ describe('падение врача посреди выкатки', () => {
         expect(r.tags.length, where).toBe(1)
         expect(existsSync(r.lockPath), where).toBe(false)
       }
-    })
+      // Полная выкатка заново после каждого из десятков шагов: на занятой машине дольше обычных 5 с.
+    }, 60_000)
   }
 })

@@ -58,10 +58,12 @@ function setup() {
         health: 'true',
       },
       lockFile: '.remontnik/deploy.lock',
+      buildEnv: ['APP_DIR', 'MAIN_DIR'],
+      lockWaitReportMinutes: 30,
     },
     observe: { ...base.observe, windowMinutes: 2 },
   }
-  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', APP_DIR: appDir }
+  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', APP_DIR: appDir, MAIN_DIR: repoDir }
   return { root, origin, repoDir, appDir, running, guard, config, env }
 }
 
@@ -91,14 +93,25 @@ describe('серверная выкатка', () => {
     expect(existsSync(join(s.repoDir, '.remontnik', 'deploy.lock'))).toBe(false)
   })
 
-  it('версия из `current`, похожая на ключ git, — отказ с меткой, а не команда git', async () => {
+  it('версия из `current`, похожая на ключ git, — неизвестная версия: отказ до метки и сборки', async () => {
     const s = setup()
     writeFileSync(join(s.appDir, 'running'), '--upload-pack=touch')
     const deployer = createServerDeployer({ guard: s.guard, loadConfig: async () => s.config, env: s.env })
 
     const deployment = await drive(deployer, { caseId: 6, appName: 'patient', fingerprint: 'fp', candidateVersion: 'c'.repeat(40), candidateDir: s.root })
 
-    expect(deployment).toMatchObject({ outcome: 'refused', refusal: 'tag_failed' })
+    expect(deployment).toMatchObject({ outcome: 'refused', refusal: 'current_unavailable' })
     expect(existsSync(join(s.appDir, 'candidate'))).toBe(false)
+  })
+
+  it('сборка правки дописала файл в рабочую копию основной ветки — promote нет', async () => {
+    const s = setup()
+    const config: RemontnikConfig = { ...s.config, deploy: { ...s.config.deploy, commands: { ...s.config.deploy.commands, build: `${s.config.deploy.commands.build} && echo hack >> "$MAIN_DIR/app.ts"` } } }
+    const deployer = createServerDeployer({ guard: s.guard, loadConfig: async () => config, env: s.env })
+
+    const deployment = await drive(deployer, { caseId: 7, appName: 'patient', fingerprint: 'fp', candidateVersion: 'c'.repeat(40), candidateDir: s.root })
+
+    expect(deployment).toMatchObject({ outcome: 'refused', refusal: 'main_copy_changed', detail: expect.stringContaining('app.ts') })
+    expect(execFileSync('cat', [join(s.appDir, 'running')], { encoding: 'utf8' }).trim()).toBe(s.running)
   })
 })

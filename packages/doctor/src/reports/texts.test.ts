@@ -97,6 +97,7 @@ describe('тексты отчётов выкатки', () => {
     fingerprint: 'fp',
     candidateVersion: CAND,
     candidateDir: '/srv/copies/7',
+    lockToken: '0123456789abcdef',
     stage: 'done',
     outcome: 'holding',
     startedAt: '2026-10-26T12:00:00.000Z',
@@ -136,6 +137,14 @@ describe('тексты отчётов выкатки', () => {
     const sick2 = report({ outcome: 'rolled_back', rollbackCause: 'health', rollbackReason: '3 сбоя здоровья подряд', healthyAfterRollback: false, healthAfterRollback: 'база недоступна' })
     expect(sick2.short).toContain('Нужен человек')
     expect(sick2.full).toContain('база недоступна')
+  })
+
+  it('откат из-за правки рабочей копии или возврата приложения: причина и зов человека', () => {
+    const changed = report({ outcome: 'rolled_back', rollbackCause: 'main_copy_changed', rollbackReason: 'рабочая копия основной ветки изменена: изменены файлы: app.ts', healthyAfterRollback: true })
+    expect(changed.short).toContain('app.ts')
+    expect(changed.full).toContain('нужен человек')
+    const reverted = report({ outcome: 'rolled_back', rollbackCause: 'reverted', rollbackReason: 'приложение вернулось к прежней версии', healthyAfterRollback: true })
+    expect(reverted.short).toContain('приложение вернулось к прежней версии')
   })
 
   it('не помогло: сбой случая повторился без ухудшения', () => {

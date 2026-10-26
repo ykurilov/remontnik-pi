@@ -1,63 +1,94 @@
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { createDeployLock } from './lock.js'
+import { createDeployLock, type LockHolder } from './lock.js'
 
 const lockPath = () => join(mkdtempSync(join(tmpdir(), 'remontnik-lock-')), '.remontnik', 'deploy.lock')
 const at = new Date('2026-10-26T12:00:00Z')
 const stillRunning = async () => false
-const finished = async () => true
+const holder = (deploymentId: number): LockHolder => ({ deploymentId, token: `token-${deploymentId}` })
+
+function humanLock(path: string, content: string) {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, content, { flag: 'wx' })
+}
 
 describe('общий замок выкатки', () => {
   it('одна выкатка на приложение: вторая ждёт, пока первая не отпустит замок', async () => {
     const path = lockPath()
     const lock = createDeployLock(path)
-    expect(await lock.acquire(1, at, stillRunning)).toEqual({ acquired: true })
-    expect(readFileSync(path, 'utf8')).toContain('remontnik deployment 1 ')
+    expect(await lock.acquire(holder(1), at, stillRunning)).toEqual({ acquired: true })
+    expect(readFileSync(path, 'utf8')).toBe(`remontnik deployment 1 token-1 ${at.toISOString()}\n`)
 
-    expect(await lock.acquire(2, at, stillRunning)).toEqual({ acquired: false, holder: 'doctor' })
-    await lock.release(1)
+    expect(await lock.acquire(holder(2), at, stillRunning)).toEqual({ acquired: false, holder: 'doctor', content: expect.stringContaining('deployment 1') })
+    await lock.release(holder(1))
     expect(existsSync(path)).toBe(false)
-    expect(await lock.acquire(2, at, stillRunning)).toEqual({ acquired: true })
+    expect(await lock.acquire(holder(2), at, stillRunning)).toEqual({ acquired: true })
   })
 
-  it('после перезапуска врач узнаёт свой замок и не ждёт сам себя', async () => {
+  it('замок появляется целиком: рядом не остаётся временных файлов', async () => {
     const path = lockPath()
-    await createDeployLock(path).acquire(7, at, stillRunning)
-    expect(await createDeployLock(path).acquire(7, at, stillRunning)).toEqual({ acquired: true })
+    await createDeployLock(path).acquire(holder(1), at, stillRunning)
+    expect(readdirSync(dirname(path))).toEqual(['deploy.lock'])
   })
 
-  it('ручная выкатка держит замок: врач ждёт и сам замок человека не снимает', async () => {
+  it('после перезапуска врач узнаёт свой замок и не ждёт сам себя; та же выкатка с другим знаком — не своя', async () => {
     const path = lockPath()
-    const lock = createDeployLock(path)
-    await lock.acquire(1, at, stillRunning)
-    await lock.release(1)
-    writeFileSync(path, 'manual deploy by admin\n', { flag: 'wx' })
+    await createDeployLock(path).acquire(holder(7), at, stillRunning)
+    expect(await createDeployLock(path).acquire(holder(7), at, stillRunning)).toEqual({ acquired: true })
+    expect(await createDeployLock(path).acquire({ deploymentId: 7, token: 'other' }, at, stillRunning)).toMatchObject({ acquired: false, holder: 'doctor' })
+  })
 
-    expect(await lock.acquire(2, at, finished)).toEqual({ acquired: false, holder: 'human' })
-    await lock.release(2)
-    expect(readFileSync(path, 'utf8')).toBe('manual deploy by admin\n')
+  it('ручная выкатка держит замок: врач ждёт и сам замок человека не снимает, даже пустой', async () => {
+    for (const content of ['manual deploy by admin\n', '']) {
+      const path = lockPath()
+      humanLock(path, content)
+      expect(await createDeployLock(path).acquire(holder(2), at, async () => true)).toEqual({ acquired: false, holder: 'human', content })
+      await createDeployLock(path).release(holder(2))
+      expect(readFileSync(path, 'utf8')).toBe(content)
+    }
+  })
+
+  it('недописанная строка своей выкатки — свой замок, а не чужой', async () => {
+    const path = lockPath()
+    humanLock(path, 'remontnik deployment 4 tok')
+    expect(await createDeployLock(path).acquire(holder(4), at, stillRunning)).toEqual({ acquired: true })
+    expect(readFileSync(path, 'utf8')).toBe(`remontnik deployment 4 token-4 ${at.toISOString()}\n`)
   })
 
   it('замок закончившейся выкатки (врач упал до снятия) снимается', async () => {
     const path = lockPath()
-    await createDeployLock(path).acquire(3, at, stillRunning)
-    const asked: number[] = []
-    const result = await createDeployLock(path).acquire(4, at, async (id) => {
-      asked.push(id)
+    await createDeployLock(path).acquire(holder(3), at, stillRunning)
+    const asked: LockHolder[] = []
+    const result = await createDeployLock(path).acquire(holder(4), at, async (other) => {
+      asked.push(other)
       return true
     })
     expect(result).toEqual({ acquired: true })
-    expect(asked).toEqual([3])
+    expect(asked).toEqual([holder(3)])
     expect(readFileSync(path, 'utf8')).toContain('remontnik deployment 4 ')
+    expect(readdirSync(dirname(path))).toEqual(['deploy.lock'])
+  })
+
+  it('пока врач решал, что замок брошен, его занял человек — замок человека остаётся', async () => {
+    const path = lockPath()
+    await createDeployLock(path).acquire(holder(3), at, stillRunning)
+    const result = await createDeployLock(path).acquire(holder(4), at, async () => {
+      writeFileSync(path, 'manual deploy\n')
+      return true
+    })
+    expect(result).toMatchObject({ acquired: false, holder: 'human' })
+    expect(readFileSync(path, 'utf8')).toBe('manual deploy\n')
+    expect(readdirSync(dirname(path))).toEqual(['deploy.lock'])
   })
 
   it('чужой замок врач не отпускает', async () => {
     const path = lockPath()
     const lock = createDeployLock(path)
-    await lock.acquire(5, at, stillRunning)
-    await lock.release(6)
+    await lock.acquire(holder(5), at, stillRunning)
+    await lock.release(holder(6))
+    await lock.release({ deploymentId: 5, token: 'other' })
     expect(readFileSync(path, 'utf8')).toContain('remontnik deployment 5 ')
   })
 })

@@ -3,7 +3,8 @@ import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 
 // `remontnik-doctor deploys stop|resume`: стоп-кран из консоли. Тот же подписанный `POST /v1/control/deploys`,
-// что и у кнопки Telegram: общий секрет `REMONTNIK_SHARED_SECRET`, адрес `REMONTNIK_DOCTOR_URL`.
+// что и у кнопки Telegram, адрес `REMONTNIK_DOCTOR_URL`. Пуск подписывается только секретом владельца
+// `REMONTNIK_CONTROL_SECRET`; стоп — им же, а без него общим секретом `REMONTNIK_SHARED_SECRET`.
 
 export const DEPLOYS_USAGE = `  remontnik-doctor deploys stop [--by <кто>]
   remontnik-doctor deploys resume [--by <кто>]
@@ -25,7 +26,11 @@ export async function deploysCommand(args: string[], io: DoctorCommandIo): Promi
     values: { by = 'console' },
   } = parseArgs({ args: rest, options: { by: { type: 'string' } } })
   const base = requiredEnv(io, 'REMONTNIK_DOCTOR_URL').replace(/\/+$/, '')
-  const secret = requiredEnv(io, 'REMONTNIK_SHARED_SECRET')
+  const secret =
+    action === 'resume'
+      ? requiredEnv(io, 'REMONTNIK_CONTROL_SECRET')
+      : io.env.REMONTNIK_CONTROL_SECRET || io.env.REMONTNIK_SHARED_SECRET
+  if (!secret) throw new Error('не задана переменная REMONTNIK_CONTROL_SECRET или REMONTNIK_SHARED_SECRET')
   const body = JSON.stringify({ action, by })
   let response: Response
   try {

@@ -3,8 +3,10 @@ import type { Controls } from '../ledgers/controls.js'
 import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Стоп-кран по HTTP (contracts/doctor-api.md): `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`.
-// Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан общим секретом `signRequest`
-// с разовой меткой. Повтор метки и подпись раньше запуска врача отвергаются, как у моста.
+// Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан `signRequest` с разовой меткой.
+// Остановить можно общим секретом: он есть у приложения. Снова пустить выкатки — только секретом владельца
+// `REMONTNIK_CONTROL_SECRET`: утечка общего секрета не должна снимать стоп-кран. Повтор метки и подпись раньше
+// запуска врача отвергаются, как у моста.
 
 const BODY_LIMIT_BYTES = 4 * 1024
 const BODY_TIMEOUT_MS = 10_000
@@ -13,6 +15,8 @@ const BY_MAX_LENGTH = 100
 export interface DeployControlsOptions {
   controls: Pick<Controls, 'set'>
   secret: string
+  /** Секрет владельца: им подписывают пуск. Не задан — пустить выкатки по HTTP нельзя. */
+  controlSecret?: string
   replayGuard?: ReplayGuard
   bodyTimeoutMs?: number
   now?: () => number
@@ -32,6 +36,7 @@ function parseCommand(body: string): { action: 'stop' | 'resume'; by: string } |
 
 export function createDeployControlsHandler(options: DeployControlsOptions): IntakeHandler {
   if (options.secret === '') throw new Error('[remontnik] общий секрет пуст')
+  if (options.controlSecret === '') throw new Error('[remontnik] секрет владельца пуст')
   const replayGuard = options.replayGuard ?? new ReplayGuard()
   const now = options.now ?? Date.now
   /** Подписи до запуска врача не принимаются: память повторов после перезапуска пуста. */
@@ -59,15 +64,10 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
       else request.destroy()
       return
     }
-    const check = verifySignedRequest({
-      method: 'POST',
-      target: request.url ?? '/',
-      body: read.body,
-      headers: request.headers,
-      secret: options.secret,
-      now: now(),
-      notBefore: startedAt,
-    })
+    const verify = (secret: string) =>
+      verifySignedRequest({ method: 'POST', target: request.url ?? '/', body: read.body, headers: request.headers, secret, now: now(), notBefore: startedAt })
+    const byOwner = options.controlSecret !== undefined && verify(options.controlSecret).ok
+    const check = byOwner ? { ok: true as const } : verify(options.secret)
     if (!check.ok) {
       sendJson(response, 401, { error: check.reason })
       return
@@ -82,6 +82,10 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
       return
     }
     const { action, by } = command
+    if (action === 'resume' && !byOwner) {
+      sendJson(response, 403, { error: 'control_secret_required' })
+      return
+    }
     const controls = await options.controls.set(action, by)
     sendJson(response, 200, { autoDeploy: controls.autoDeploy })
   }

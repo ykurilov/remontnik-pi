@@ -1,9 +1,13 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { spawnWithTimeout } from '../workbench/runner.js'
 
 // Команды выкатки приложения (contracts/deploy-commands.md). Это команды приложения, не модели: они идут на сервере,
-// в рабочей копии основной ветки (`build` — в копии правки). Окружение — врача, но без его секретов: `build`
-// запускает код правки, а ключи моделей, Telegram и общий секрет ему не нужны. Свои секреты приложение берёт само.
+// в рабочей копии основной ветки (`build` — в копии правки). `build` запускает код правки, поэтому видит только
+// PATH, свой пустой HOME, REMONTNIK_VERSION и перечисленное в `deploy.buildEnv`. Остальным командам — окружение
+// врача без его секретов. Свои секреты приложение берёт само.
 
 export type DeployCommands = RemontnikConfig['deploy']['commands']
 type CommandName = keyof DeployCommands
@@ -19,6 +23,9 @@ const DEFAULT_TIMEOUTS_SECONDS: Record<CommandName, number> = {
   current: 30,
   health: 30,
 }
+
+/** Версия в `current` — полный коммит: всё остальное — неизвестная версия. */
+const FULL_SHA = /^[0-9a-f]{40}$/
 
 /** `version: null` — работающей версии нет (приложение ещё ни разу не выкатывали этими командами). */
 export type CurrentAnswer = { ok: true; version: string | null; previous: string | null } | { ok: false; reason: string }
@@ -44,6 +51,8 @@ export interface AppCommandsOptions {
   commands: DeployCommands
   /** Окружение врача; по умолчанию — `process.env`. Секреты из него убираются. */
   env?: Record<string, string | undefined>
+  /** Какие переменные из `env` видит `build` (`deploy.buildEnv`); REMONTNIK_ — никогда. */
+  buildEnv?: readonly string[]
   timeoutsSeconds?: Partial<Record<CommandName, number>>
 }
 
@@ -57,14 +66,27 @@ export function deployEnv(env: Record<string, string | undefined>): Record<strin
   return clean
 }
 
+/** Окружение `build`: только белый список, без секретов врача. */
+export function buildEnvOf(env: Record<string, string | undefined>, names: readonly string[], home: string, version: string): Record<string, string> {
+  const clean: Record<string, string> = {}
+  for (const name of names) {
+    const value = env[name]
+    if (value !== undefined && !name.toUpperCase().startsWith('REMONTNIK_')) clean[name] = value
+  }
+  return { ...clean, PATH: env.PATH ?? '/usr/bin:/bin', HOME: home, REMONTNIK_VERSION: version }
+}
+
+const version = (value: unknown): string | null | undefined => (value === null ? null : typeof value === 'string' && FULL_SHA.test(value) ? value : undefined)
+
 export function createAppCommands(options: AppCommandsOptions): AppCommands {
-  const env = deployEnv(options.env ?? process.env)
+  const doctorEnv = options.env ?? process.env
+  const env = deployEnv(doctorEnv)
   const timeouts = { ...DEFAULT_TIMEOUTS_SECONDS, ...options.timeoutsSeconds }
 
-  async function run(name: CommandName, cwd = options.repoDir, extraEnv: Record<string, string> = {}) {
+  async function run(name: CommandName, cwd = options.repoDir, commandEnv: Record<string, string> = env) {
     let stdout = ''
     const result = await spawnWithTimeout(
-      { file: '/bin/sh', args: ['-c', options.commands[name]], cwd, env: { ...env, ...extraEnv } },
+      { file: '/bin/sh', args: ['-c', options.commands[name]], cwd, env: commandEnv },
       {
         cwd,
         timeoutSeconds: timeouts[name],
@@ -78,8 +100,8 @@ export function createAppCommands(options: AppCommandsOptions): AppCommands {
     return { ok, stdout, output: result.output.slice(-OUTPUT_FOR_REPORT), why }
   }
 
-  const outcome = async (name: CommandName, cwd?: string, extraEnv?: Record<string, string>): Promise<CommandOutcome> => {
-    const result = await run(name, cwd, extraEnv)
+  const outcome = async (name: CommandName, cwd?: string, commandEnv?: Record<string, string>): Promise<CommandOutcome> => {
+    const result = await run(name, cwd, commandEnv)
     return { ok: result.ok, output: result.ok ? result.output : `${result.why}\n${result.output}`.trim() }
   }
 
@@ -89,10 +111,11 @@ export function createAppCommands(options: AppCommandsOptions): AppCommands {
       if (!result.ok) return { ok: false, reason: `current: ${result.why}` }
       try {
         const parsed = JSON.parse(result.stdout.trim()) as { version?: unknown; previous?: unknown }
-        const version = parsed.version === null ? null : typeof parsed.version === 'string' && parsed.version !== '' ? parsed.version : undefined
-        if (version === undefined) return { ok: false, reason: 'current: нет version' }
-        const previous = typeof parsed.previous === 'string' && parsed.previous !== '' ? parsed.previous : null
-        return { ok: true, version, previous }
+        const running = version(parsed.version)
+        if (running === undefined) return { ok: false, reason: 'current: version — не полный коммит из 40 знаков' }
+        const previous = parsed.previous === undefined ? null : version(parsed.previous)
+        if (previous === undefined) return { ok: false, reason: 'current: previous — не полный коммит из 40 знаков' }
+        return { ok: true, version: running, previous }
       } catch {
         return { ok: false, reason: 'current: ответ не JSON' }
       }
@@ -105,7 +128,14 @@ export function createAppCommands(options: AppCommandsOptions): AppCommands {
       return { ok: false, reason: reason || `health: ${result.why}` }
     },
 
-    build: (copyDir, version) => outcome('build', copyDir, { REMONTNIK_VERSION: version }),
+    async build(copyDir, candidate) {
+      const home = await mkdtemp(join(tmpdir(), 'remontnik-build-home-'))
+      try {
+        return await outcome('build', copyDir, buildEnvOf(doctorEnv, options.buildEnv ?? [], home, candidate))
+      } finally {
+        await rm(home, { recursive: true, force: true })
+      }
+    },
     promote: () => outcome('promote'),
     confirm: () => outcome('confirm'),
     rollback: () => outcome('rollback'),

@@ -83,4 +83,15 @@ describe('почасовой учёт ошибок', () => {
     expect(seen.errors).toBe(1)
     expect(seen.errorsPerHour).toBe(60)
   })
+
+  it('часы старше 8 дней удаляются, когда приходит новый час', async () => {
+    const store = createMemoryRecordStore()
+    const book = createCaseBook(store)
+    await book.recordEvents([event('old', '2026-10-15T10:00:00Z'), event('week', '2026-10-19T10:00:00Z')])
+    await book.recordEvents([event('now', '2026-10-26T12:00:00Z')])
+
+    expect(await store.read('error-hour', 'patient/2026-10-15T10')).toBeUndefined()
+    expect(await store.read('error-hour', 'patient/2026-10-19T10')).toBeDefined()
+    expect(await store.read('error-hour', 'patient/2026-10-26T12')).toBeDefined()
+  })
 })

@@ -15,6 +15,7 @@ import {
   type SessionDocFamilyToken,
   type SessionEnd,
   type Storage,
+  type TaskId,
   type TaskRuntime,
   type Tx,
 } from '@earendil-works/pi-durable'
@@ -52,6 +53,8 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   'spend-case': recordFamily('remontnik.spend-case'),
   /** Ошибки приложения по часам: уровень до выкатки и рост после неё. */
   'error-hour': recordFamily('remontnik.error-hour'),
+  /** Какие часы ошибок приложения записаны: по нему удаляются старые. */
+  'error-hour-index': recordFamily('remontnik.error-hour-index'),
   deployment: recordFamily('remontnik.deployment'),
   'deployment-index': recordFamily('remontnik.deployment-index'),
   /** Стоп-кран автовыкатки. */
@@ -100,6 +103,9 @@ export function recordTransactionOver(tx: Tx): RecordTransaction {
   const records: RecordTransaction = {
     async doc(collection, key, initial) {
       return (await tx.doc(recordFamilyOf(collection), key, initial as unknown as JsonObject)) as unknown as typeof initial
+    },
+    async retire(collection, key) {
+      await tx.retireDoc(recordFamilyOf(collection), key)
     },
   }
   durableTransactions.set(records, tx)
@@ -156,7 +162,15 @@ export async function runDeploymentInTask<I, S, R, H extends object>(
   checkpoint: S,
   context: Context,
 ): Promise<DeployStep> {
-  const step = await deployer.step(request, { store: taskRecordStore(runtime, context), now: () => runtime.now() })
+  const step = await deployer.step(request, {
+    store: taskRecordStore(runtime, context),
+    now: () => runtime.now(),
+    taskId: runtime.taskId,
+    async isTaskAlive(taskId) {
+      const task = await runtime.getTask(taskId as TaskId, context)
+      return task !== undefined && task.state.status !== 'completing' && task.state.status !== 'terminal'
+    },
+  })
   if (step.kind === 'sleep') await runtime.sleepUntil(step.until, checkpoint, context)
   return step
 }

@@ -126,19 +126,23 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 |---|---|
 | `deploymentId` | число |
 | `caseId`, `appName`, `fingerprint` | случай и его отпечаток |
-| `previousVersion` | строка из `current` до выкатки |
+| `previousVersion` | полный sha из `current` до выкатки |
+| `lockToken` | случайный знак выкатки в строке замка: по нему врач узнаёт свой замок |
+| `taskId?` | задача pi-durable, которая ведёт выкатку: умерла — замок выкатки брошен |
+| `mainCopy?` | снимок рабочей копии основной ветки в начале: `{ commit, dirty[], files: { путь: sha256 } }` |
 | `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>-<deploymentId>` |
 | `candidateVersion` | sha правки |
 | `candidateDir` | рабочая копия правки, где идёт `build` |
 | `stage` | `starting` \| `locked` \| `tagging` \| `building` \| `promoting` \| `observing` \| `rolling_back` \| `confirming` \| `done` — шаг, с которого выкатка продолжится после перезапуска |
-| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?` | время |
+| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?`, `lockWaitReportedAt?` | время; `promotedAt` — когда `current` подтвердил кандидата; `lockWaitReportedAt` — когда позвал человека из-за долгого замка |
 | `baseline` | `{ errorsPerHour, knownFingerprints7d[] }` |
 | `observeUntil`, `nextTickAt` | конец окна и следующий тик наблюдения |
-| `observation`, `lastTick` | счёт сбоев здоровья подряд и последний замер ошибок |
+| `observation`, `lastTick` | сбои здоровья подряд, итоги последних проверок, число проверок окна и последний замер ошибок |
 | `promoteRequested` | намерение `promote` записано: дальше по `current` видно, прошёл ли он |
 | `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` |
-| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` |
-| `rollbackCause`, `rollbackReason`, `rollbackAttempts` | почему и сколько раз откатывал (не больше 3) |
+| `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` \| `main_copy_changed` |
+| `rollbackCause`, `rollbackReason`, `rollbackAttempts`, `nextRollbackAt?` | почему откатывал (в том числе `current_unavailable`, `reverted`, `main_copy_changed`), сколько законченных попыток (не больше 3) и когда следующая |
+| `mainCopyChange?` | чем рабочая копия основной ветки разошлась со снимком во время отката |
 | `healthyAfterRollback`, `healthAfterRollback` | здоровье после отката |
 | `supersededBy`, `confirmFailed`, `detail` | версия человека, сбой `confirm`, хвост вывода для отчёта |
 
@@ -147,6 +151,8 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 ### ErrorHour — ошибки приложения по часам (документ `remontnik.error-hour/<app>/<YYYY-MM-DDTHH>`)
 
 `{ minutes: { [минута]: число }, fingerprints: { [fp]: { count, lastAt } }, overflow }` — не больше 200 отпечатков в часе. Пишется книгой случаев вместе с приёмом события. Из него — уровень ошибок до выкатки (больший из «последний час» и «сутки / 24») и известные за 7 дней отпечатки.
+
+Список записанных часов приложения — `remontnik.error-hour-index/<app>`: `{ hours: ["YYYY-MM-DDTHH"] }`. Когда начинается новый час, часы старше 8 дней от самого нового удаляются в той же записи; запоздавшее событие старше этого срока не считается.
 
 ### FingerprintLedger — защита от циклов (документ `remontnik.ledger`)
 
