@@ -11,8 +11,8 @@ import type { GitGuard } from '../git-guard/index.js'
 
 export interface MainCopySnapshot {
   commit: string
-  /** Изменённые и новые файлы по `git status`, кроме файла замка. */
-  dirty: string[]
+  /** Изменённые и новые файлы по `git status`, кроме файла замка: путь → sha256 (удалённый — `deleted`). */
+  dirty: Record<string, string>
   /** Отпечатки `remontnik.config.*` и скриптов из команд выкатки, в том числе не попавших в git: путь → sha256. */
   files: Record<string, string>
 }
@@ -22,16 +22,21 @@ export interface MainCopy {
 }
 
 const CONFIG_FILE = /^remontnik\.config\./
+const DELETED = 'deleted'
 const LISTED_LIMIT = 10
 
 const listed = (paths: readonly string[]) => `${paths.slice(0, LISTED_LIMIT).join(', ')}${paths.length > LISTED_LIMIT ? ` и ещё ${paths.length - LISTED_LIMIT}` : ''}`
 
-/** Чем `actual` отличается от `expected`: коммит, новые изменённые файлы, настройка и скрипты; `undefined` — ничем. */
+/**
+ * Чем `actual` отличается от `expected`: коммит, изменённые файлы (новые или с другим отпечатком), настройка и
+ * скрипты; `undefined` — ничем.
+ */
 export function mainCopyChange(expected: MainCopySnapshot, actual: MainCopySnapshot): string | undefined {
   const changes: string[] = []
   if (actual.commit !== expected.commit) changes.push(`коммит ${expected.commit.slice(0, 12)} сменился на ${actual.commit.slice(0, 12)}`)
-  const known = new Set(expected.dirty)
-  const dirty = actual.dirty.filter((path) => !known.has(path))
+  const dirty = Object.keys(actual.dirty)
+    .sort()
+    .filter((path) => expected.dirty[path] !== actual.dirty[path])
   if (dirty.length > 0) changes.push(`изменены файлы: ${listed(dirty)}`)
   const paths = [...new Set([...Object.keys(expected.files), ...Object.keys(actual.files)])].sort()
   const touched = paths.filter((path) => expected.files[path] !== actual.files[path])
@@ -73,14 +78,14 @@ export function createMainCopy(options: { guard: GitGuard; deploy: RemontnikConf
     async snapshot() {
       const commit = (await guard.run(['rev-parse', '--verify', 'HEAD^{commit}'])).trim()
       const entries = (await guard.run(['status', '--porcelain=v1', '-z', '--untracked-files=all'])).split('\0')
-      const dirty: string[] = []
+      const dirty: Record<string, string> = {}
       for (let index = 0; index < entries.length; index += 1) {
         const entry = entries[index]!
         if (entry.length < 4) continue
         const path = entry.slice(3)
         // Переименование: следом идёт прежнее имя.
         if (entry[0] === 'R' || entry[0] === 'C') index += 1
-        if (!isLock(path)) dirty.push(path)
+        if (!isLock(path)) dirty[path] = (await fingerprint(resolve(repoDir, path))) ?? DELETED
       }
       const files: Record<string, string> = {}
       const configs = (await readdir(repoDir)).filter((name) => CONFIG_FILE.test(name))
@@ -88,7 +93,7 @@ export function createMainCopy(options: { guard: GitGuard; deploy: RemontnikConf
         const hash = await fingerprint(resolve(repoDir, path))
         if (hash !== undefined) files[path] = hash
       }
-      return { commit, dirty: dirty.sort(), files }
+      return { commit, dirty, files }
     },
   }
 }

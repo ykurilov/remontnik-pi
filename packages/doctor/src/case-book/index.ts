@@ -88,7 +88,13 @@ function occurrences(event: IncidentEvent): number {
   return 1 + (typeof repeats === 'number' && Number.isInteger(repeats) && repeats > 0 ? repeats : 0)
 }
 
-export function createCaseBook(store: RecordStore): CaseBook {
+export interface CaseBookOptions {
+  /** Часы врача: время записи событий. */
+  now?: () => number
+}
+
+export function createCaseBook(store: RecordStore, options: CaseBookOptions = {}): CaseBook {
+  const now = options.now ?? Date.now
   const caseKey = (caseId: number) => String(caseId)
   /** Приложения, чьи старые часы ошибок уже внесены в список (`seedErrorHourIndex`). */
   const seededApps = new Set<string>()
@@ -109,10 +115,11 @@ export function createCaseBook(store: RecordStore): CaseBook {
       for (const event of events) {
         if (Number.isNaN(Date.parse(event.occurredAt))) throw new Error(`событие ${event.eventId}: неверное время ${event.occurredAt}`)
       }
+      // Опорное время учёта часов — время записи, а не время событий: его пишет сторож, и часы у него бывают неверные.
+      const recordedAt = new Date(now())
       for (const event of events) {
         if (seededApps.has(event.appName)) continue
-        const latest = Math.max(...events.filter((other) => other.appName === event.appName).map((other) => Date.parse(other.occurredAt)))
-        await seedErrorHourIndex(store, event.appName, new Date(latest))
+        await seedErrorHourIndex(store, event.appName, recordedAt)
         seededApps.add(event.appName)
       }
       return store.transaction(async (tx) => {
@@ -125,7 +132,7 @@ export function createCaseBook(store: RecordStore): CaseBook {
           if (recent.has(event.eventId)) continue
           recent.add(event.eventId)
           index.recentEventIds.push(event.eventId)
-          await countErrorIn(tx, event, occurrences(event))
+          await countErrorIn(tx, event, occurrences(event), recordedAt)
 
           const key = openKey(event.appName, event.fingerprint)
           const openId = index.open[key]

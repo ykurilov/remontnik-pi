@@ -10,7 +10,7 @@ import { createReports } from '../reports/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { createFakeDeployApp, type FakeDeployApp } from '../testing/fake-deploy-app.js'
 import type { AppCommands } from './app-commands.js'
-import { createDeployer, LOCK_RETRY_MS, readDeployment, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
+import { confirmAbandonedVersion, createDeployer, LOCK_RETRY_MS, readDeployment, type DeployIo, type DeployRequest, type Deployment } from './deploy-sequence.js'
 import { createDeployLock, type DeployLock } from './lock.js'
 
 // Порядок выкатки (contracts/deploy-commands.md) и её доведение до конца после падения врача на любом шаге.
@@ -513,6 +513,34 @@ describe('рабочая копия основной ветки', () => {
     expect(deployment.rollbackReason).not.toContain('.deploy-state')
   })
 
+  it('принятый файл состояния потом изменили — изменённая копия, откат', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const r = rig({
+      app,
+      afterCommand: (name) => void (name === 'promote' && app.changeMainCopy('dirty', '.deploy-state')),
+      beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.changeMainCopy('dirty', '.deploy-state')),
+    })
+    const deployment = await r.drive()
+    expect(deployment).toMatchObject({ outcome: 'rolled_back', rollbackCause: 'main_copy_changed', rollbackReason: expect.stringContaining('.deploy-state') })
+  })
+
+  it('врач упал после намерения promote, но до запуска; за это время копию изменили — правка не принимается за свою', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    let crashed = false
+    let changed = false
+    const r = rig({
+      app,
+      // Третий `current` — сразу после записи намерения: врач падает, не дойдя до promote.
+      crashBefore: (name) => name === 'current' && count(app.calls, 'current') === 2 && !crashed && (crashed = true),
+      beforeStep: () => void (crashed && !changed && ((changed = true), app.changeMainCopy('dirty', 'src/app.ts'))),
+    })
+    const deployment = await r.drive()
+    expect(r.crashes()).toBe(1)
+    expect(count(app.calls, 'promote')).toBe(0)
+    expect(deployment.rollbackReason ?? deployment.detail).toContain('src/app.ts')
+    expect(app.running).toBe(PREV)
+  })
+
   it('рабочую копию сменили после promote — откат', async () => {
     const app = createFakeDeployApp({ running: PREV, previous: OLDER })
     const r = rig({ app, beforeStep: (self) => void (self.now() - START >= 10 * MINUTE && app.running === CAND && app.changeMainCopy('commit')) })
@@ -588,6 +616,39 @@ describe('общий замок', () => {
     const confirming = rig({ afterCommand: (name, self) => void (name === 'health' && self.now() - START >= 30 * MINUTE && replace(self)) })
     expect(await confirming.drive()).toMatchObject({ outcome: 'abandoned', verdict: 'holding' })
     expect(count(confirming.app.calls, 'confirm')).toBe(0)
+  })
+
+  it('замок потерян после promote — кандидат брошенной выкатки не считается прежней версией, пока владелец не подтвердит', async () => {
+    let replaced = false
+    const r = rig({ beforeStep: (self) => void (!replaced && self.app.calls.includes('health') && ((replaced = true), writeFileSync(self.lockPath, 'manual deploy\n'))) })
+    expect(await r.drive()).toMatchObject({ outcome: 'abandoned' })
+    const { app, lockPath, records } = r
+    rmSync(lockPath)
+
+    const other: DeployRequest = { ...request, caseId: 8, candidateVersion: 'e'.repeat(40) }
+    const next = await plainDeployer(app, lockPath).step(other, { store: records, now: () => START + 60 * MINUTE })
+    expect(next).toMatchObject({ kind: 'done', deployment: { outcome: 'refused', refusal: 'unconfirmed_version' } })
+
+    // Владелец подтвердил версию — блок снят, следующая выкатка идёт.
+    expect(await confirmAbandonedVersion(records, CAND)).toEqual({ wasBlocked: true })
+    expect(await confirmAbandonedVersion(records, CAND)).toEqual({ wasBlocked: false })
+    const third: DeployRequest = { ...request, caseId: 9, candidateVersion: 'e'.repeat(40) }
+    expect(await plainDeployer(app, lockPath).step(third, { store: records, now: () => START + 61 * MINUTE })).toMatchObject({ kind: 'sleep', stage: 'observing' })
+  })
+
+  it('рядом с замком остался .stale-* (врач упал, снимая замок) — человеку, выкатка не начинается', async () => {
+    const app = createFakeDeployApp({ running: PREV, previous: OLDER })
+    const records = createMemoryRecordStore()
+    const lockPath = join(mkdtempSync(join(tmpdir(), 'remontnik-deploy-')), 'deploy.lock')
+    writeFileSync(`${lockPath}.stale-0a1b2c`, 'manual deploy\n')
+    const deployer = plainDeployer(app, lockPath)
+    for (let hour = 0; hour < 3; hour += 1) {
+      expect(await deployer.step(request, { store: records, now: () => START + hour * 60 * MINUTE })).toMatchObject({ kind: 'sleep', stage: 'waiting_lock' })
+    }
+    expect(app.calls).toEqual([])
+    expect(existsSync(lockPath)).toBe(false)
+    const reports = await createReports({ store: records }).list({ after: 0, limit: 10 })
+    expect(reports).toEqual([expect.objectContaining({ type: 'needs_human', caseId: 7, short: expect.stringContaining('deploy.lock.stale-0a1b2c') })])
   })
 
   function plainDeployer(app: FakeDeployApp, lockPath: string, lockFor: () => DeployLock = () => createDeployLock(lockPath)) {

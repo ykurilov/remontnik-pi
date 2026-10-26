@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import * as nodeFs from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 // Общий замок выкатки (contracts/deploy-commands.md): файл в репозитории приложения, общий для врача и человека.
 // Врач пишет свою строку во временный файл и ставит его на место замка через `link`: замок появляется сразу целиком
@@ -10,6 +10,8 @@ import { dirname } from 'node:path'
 // Снять файл «только если в нём всё ещё X» файловая система одним действием не умеет. Врач уводит замок под своё
 // имя, сверяет и при расхождении возвращает. Если в этот миг место уже занял кто-то третий, увезённый замок не
 // удаляется, а остаётся рядом как `<замок>.lost-*`, и врач зовёт человека: чужой замок не пропадает никогда.
+// Если врач упал, пока замок был уведён в `<замок>.stale-*`, замок человека мог остаться только там: при таком
+// файле рядом врач замок не берёт и не снимает, а ждёт, пока человек разберётся.
 
 const OWN_LINE = /^remontnik deployment (\d+) (\S+) /
 
@@ -19,10 +21,13 @@ export interface LockHolder {
   token: string
 }
 
-export type LockAttempt = { acquired: true } | { acquired: false; holder: 'doctor' | 'human'; content: string; lost?: string }
+export type LockAttempt =
+  | { acquired: true }
+  /** `lost` — чужой замок, отложенный при гонке; `leftover` — `.stale-*` после падения врача, `content` — его. */
+  | { acquired: false; holder: 'doctor' | 'human'; content: string; lost?: string; leftover?: string }
 
 /** Что замку нужно от файловой системы; в проверках — подмена с гонкой. */
-export type LockFs = Pick<typeof nodeFs, 'link' | 'mkdir' | 'readFile' | 'rename' | 'unlink' | 'writeFile'>
+export type LockFs = Pick<typeof nodeFs, 'link' | 'mkdir' | 'readdir' | 'readFile' | 'rename' | 'unlink' | 'writeFile'>
 
 export interface DeployLock {
   /**
@@ -52,6 +57,20 @@ export function createDeployLock(path: string, fs: LockFs = nodeFs): DeployLock 
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error
     }
+  }
+
+  /** Уведённый для сверки замок, оставшийся после падения врача: `<замок>.stale-*`. */
+  async function findLeftover(): Promise<string | undefined> {
+    const prefix = `${basename(path)}.stale-`
+    let names: string[]
+    try {
+      names = await fs.readdir(dirname(path))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+    const name = names.filter((other) => other.startsWith(prefix)).sort()[0]
+    return name === undefined ? undefined : join(dirname(path), name)
   }
 
   /** Поставить замок целиком, если его нет. */
@@ -107,6 +126,8 @@ export function createDeployLock(path: string, fs: LockFs = nodeFs): DeployLock 
 
   return {
     async acquire(holder, now, isStale) {
+      const leftover = await findLeftover()
+      if (leftover) return { acquired: false, holder: 'human', content: (await readLock(leftover)) ?? '', leftover }
       const line = lineOf(holder, now)
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (await create(line)) return { acquired: true }

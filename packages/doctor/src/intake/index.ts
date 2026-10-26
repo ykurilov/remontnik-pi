@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { INCIDENT_KINDS, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { redactValue } from '@ykurilov/remontnik-core/redact'
-import { verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
+import { DEFAULT_MAX_SKEW_MS, verifySignedBody } from '@ykurilov/remontnik-core/signed-http'
 import { headerValue, precheckSignature, readLimitedBody, refuse, sendJson, type IntakeHandler } from './http-kit.js'
 
 // Приём событий от сторожей: подписанный POST /v1/events и открытый GET /health; рядом — лента отчётов и стоп-кран.
@@ -47,6 +47,14 @@ function isIncidentEvent(value: unknown): value is IncidentEvent {
     isString(event.occurredAt) &&
     !Number.isNaN(Date.parse(event.occurredAt))
   )
+}
+
+/**
+ * Событие позже часов врача дальше допуска подписи — у сторожа сбились часы: время события — время приёма.
+ * Отказ всей пачке тут не годится: сторож слал бы её снова, и с ней застряли бы и верные события.
+ */
+function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
+  return Date.parse(event.occurredAt) > receivedAt + DEFAULT_MAX_SKEW_MS ? { ...event, occurredAt: new Date(receivedAt).toISOString() } : event
 }
 
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
@@ -107,7 +115,8 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     }
 
     // Сторож уже вычистил секреты; врач чистит ещё раз — вдруг сторож старый или чужой.
-    const result = await options.receiveEvents(events.map((event) => redactValue(event)))
+    const receivedAt = Date.now()
+    const result = await options.receiveEvents(events.map((event) => clampFuture(redactValue(event), receivedAt)))
     sendJson(response, 200, { accepted: result.accepted })
   }
 }

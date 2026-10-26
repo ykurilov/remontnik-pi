@@ -108,6 +108,20 @@ describe('общий замок выкатки', () => {
     expect(readFileSync(join(dirname(path), lost[0]!), 'utf8')).toBe(fresh)
   })
 
+  it('рядом остался .stale-* (врач упал, снимая замок) — замок не берётся и не снимается, в ответе путь этого файла', async () => {
+    for (const lockNow of [undefined, 'remontnik deployment 3 token-3 2026-10-26T11:00:00.000Z\n']) {
+      const path = lockPath()
+      mkdirSync(dirname(path), { recursive: true })
+      const leftover = `${path}.stale-0a1b2c`
+      writeFileSync(leftover, 'manual deploy\n')
+      if (lockNow) writeFileSync(path, lockNow)
+      const result = await createDeployLock(path).acquire(holder(4), at, async () => true)
+      expect(result).toEqual({ acquired: false, holder: 'human', content: 'manual deploy\n', leftover })
+      expect(readFileSync(leftover, 'utf8')).toBe('manual deploy\n')
+      expect(existsSync(path)).toBe(lockNow !== undefined)
+    }
+  })
+
   it('держит ли выкатка замок — только чтение: пустое место не своё', async () => {
     const path = lockPath()
     const lock = createDeployLock(path)

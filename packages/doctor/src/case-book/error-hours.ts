@@ -3,7 +3,8 @@ import type { RecordStore, RecordTransaction } from '../records/index.js'
 
 // Почасовой учёт ошибок приложения: уровень до выкатки и что появилось после неё (наблюдение, research R9).
 // Час — один документ: поминутные счётчики и отпечатки с последним появлением. Нужна только последняя неделя,
-// поэтому часы старше 8 дней от самого нового удаляются, когда начинается новый час.
+// поэтому часы старше 8 дней от самого нового удаляются, когда начинается новый час. Самый новый час — не позже
+// часа записи: событие с неверными часами «из будущего» не должно удалить настоящие часы.
 
 export const ERROR_HOUR_COLLECTION = 'error-hour'
 export const ERROR_HOUR_INDEX_COLLECTION = 'error-hour-index'
@@ -52,13 +53,16 @@ const hourStartOf = (stamp: string) => Date.parse(`${stamp}:00:00Z`)
 const hourKey = (appName: string, hourStart: number) => `${appName}/${hourStamp(hourStart)}`
 const floorTo = (time: number, step: number) => Math.floor(time / step) * step
 
-/** Внутри транзакции книги случаев: одно новое событие (`occurrences` — с учётом склеенных повторов). */
-export async function countErrorIn(tx: RecordTransaction, event: IncidentEvent, occurrences: number): Promise<void> {
+/**
+ * Внутри транзакции книги случаев: одно новое событие (`occurrences` — с учётом склеенных повторов), `recordedAt` —
+ * время записи.
+ */
+export async function countErrorIn(tx: RecordTransaction, event: IncidentEvent, occurrences: number, recordedAt: Date): Promise<void> {
   const at = Date.parse(event.occurredAt)
   const start = floorTo(at, HOUR_MS)
   const index = await tx.doc<ErrorHourIndex>(ERROR_HOUR_INDEX_COLLECTION, event.appName, { hours: [] })
   if (!index.hours.includes(hourStamp(start))) {
-    const newest = Math.max(start, ...index.hours.map(hourStartOf))
+    const newest = Math.min(Math.max(start, ...index.hours.map(hourStartOf)), floorTo(recordedAt.getTime(), HOUR_MS))
     const keepFrom = newest - KEEP_HOURS_DAYS * 24 * HOUR_MS
     // Событие старше срока хранения (запоздало) — уже не нужно ни уровню, ни наблюдению.
     if (start < keepFrom) return
@@ -83,7 +87,7 @@ export async function countErrorIn(tx: RecordTransaction, event: IncidentEvent, 
 /**
  * Один раз на приложение: часы, записанные до появления списка, внести в него, а старше срока хранения — удалить.
  * Иначе их не удалит никто: удаление идёт только по списку. Искать приходится перебором часов (списка документов
- * у хранилища нет), поэтому проход однократный: после него в списке пометка `seeded`.
+ * у хранилища нет), поэтому проход однократный: после него в списке пометка `seeded`. `at` — время записи.
  */
 export async function seedErrorHourIndex(store: RecordStore, appName: string, at: Date): Promise<void> {
   if ((await store.read<ErrorHourIndex>(ERROR_HOUR_INDEX_COLLECTION, appName))?.seeded) return

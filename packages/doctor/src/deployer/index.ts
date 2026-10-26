@@ -11,6 +11,7 @@ import { createMainCopy } from './main-copy.js'
 
 export { createAppCommands, type AppCommands, type CurrentAnswer, type DeployCommands, type HealthAnswer } from './app-commands.js'
 export {
+  confirmAbandonedVersion,
   createDeployer,
   preDeployTagName,
   readDeployment,

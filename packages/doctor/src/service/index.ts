@@ -9,6 +9,7 @@ import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../in
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import type { GitGuard } from '../git-guard/index.js'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
+import { confirmAbandonedVersion } from '../deployer/index.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createReportsFeedHandler } from '../intake/reports-feed.js'
 import { createControls } from '../ledgers/controls.js'
@@ -171,7 +172,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
     ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
-  const caseBook = createCaseBook(opened.records)
+  const caseBook = createCaseBook(opened.records, { now })
   const reports = createReports({
     store: opened.records,
     telegram: { client: telegram, chatId: options.telegram.chatId },
@@ -264,6 +265,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
           controls,
           secret: options.sharedSecret,
           ...(options.controlSecret ? { controlSecret: options.controlSecret } : {}),
+          confirmVersion: (version) => confirmAbandonedVersion(opened.records, version),
         }),
         ...(feed?.token ? { reportsFeed: createReportsFeedHandler({ reports, access: { kind: 'token', token: feed.token } }) } : {}),
       }),

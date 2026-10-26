@@ -5,30 +5,40 @@ import { headerValue, readLimitedBody, refuse, sendJson, type IntakeHandler } fr
 // Стоп-кран по HTTP (contracts/doctor-api.md): `POST /v1/control/deploys` `{ action: "stop" | "resume", by }`.
 // Жмёт кнопку Telegram приложение (или консольная команда): запрос подписан `signRequest` с разовой меткой.
 // Остановить можно общим секретом: он есть у приложения. Снова пустить выкатки — только секретом владельца
-// `REMONTNIK_CONTROL_SECRET`: утечка общего секрета не должна снимать стоп-кран. Повтор метки и подпись раньше
-// запуска врача отвергаются, как у моста.
+// `REMONTNIK_CONTROL_SECRET`: утечка общего секрета не должна снимать стоп-кран. Им же — `{ action:
+// "confirm_version", version, by }`: владелец подтверждает работающую версию брошенной выкатки, и от неё снова
+// можно выкатываться. Повтор метки и подпись раньше запуска врача отвергаются, как у моста.
 
 const BODY_LIMIT_BYTES = 4 * 1024
 const BODY_TIMEOUT_MS = 10_000
 const BY_MAX_LENGTH = 100
+/** Версия — полный хеш коммита (sha1 или sha256). */
+const VERSION = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/
 
 export interface DeployControlsOptions {
   controls: Pick<Controls, 'set'>
   secret: string
-  /** Секрет владельца: им подписывают пуск. Не задан — пустить выкатки по HTTP нельзя. */
+  /** Секрет владельца: им подписывают пуск и подтверждение версии. Не задан — по HTTP этого не сделать. */
   controlSecret?: string
+  /** Снять блок `unconfirmed_version` с версии; `wasBlocked` — была ли она в неподтверждённых. */
+  confirmVersion?(version: string): Promise<{ wasBlocked: boolean }>
   replayGuard?: ReplayGuard
   bodyTimeoutMs?: number
   now?: () => number
 }
 
-function parseCommand(body: string): { action: 'stop' | 'resume'; by: string } | undefined {
+type ControlCommand = { action: 'stop' | 'resume'; by: string } | { action: 'confirm_version'; version: string; by: string }
+
+function parseCommand(body: string): ControlCommand | undefined {
   try {
-    const parsed = JSON.parse(body) as { action?: unknown; by?: unknown } | null
+    const parsed = JSON.parse(body) as { action?: unknown; by?: unknown; version?: unknown } | null
     const action = parsed?.action
     const by = parsed?.by
-    if ((action !== 'stop' && action !== 'resume') || typeof by !== 'string' || by.trim() === '' || by.length > BY_MAX_LENGTH) return undefined
-    return { action, by: by.trim() }
+    if (typeof by !== 'string' || by.trim() === '' || by.length > BY_MAX_LENGTH) return undefined
+    if (action === 'stop' || action === 'resume') return { action, by: by.trim() }
+    const version = parsed?.version
+    if (action === 'confirm_version' && typeof version === 'string' && VERSION.test(version)) return { action, version, by: by.trim() }
+    return undefined
   } catch {
     return undefined
   }
@@ -79,15 +89,20 @@ export function createDeployControlsHandler(options: DeployControlsOptions): Int
       return
     }
     const command = parseCommand(read.body)
-    if (!command) {
+    if (!command || (command.action === 'confirm_version' && !options.confirmVersion)) {
       sendJson(response, 400, { error: 'bad_request' })
       return
     }
-    const { action, by } = command
-    if (action === 'resume' && !byOwner) {
+    if (command.action !== 'stop' && !byOwner) {
       sendJson(response, 403, { error: 'control_secret_required' })
       return
     }
+    if (command.action === 'confirm_version') {
+      const { wasBlocked } = await options.confirmVersion!(command.version)
+      sendJson(response, 200, { version: command.version, wasBlocked })
+      return
+    }
+    const { action, by } = command
     const controls = await options.controls.set(action, by)
     sendJson(response, 200, { autoDeploy: controls.autoDeploy })
   }

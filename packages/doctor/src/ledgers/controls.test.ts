@@ -4,6 +4,7 @@ import { runDoctorCommand } from '../cli/run-doctor-command.js'
 import { createDeployControlsHandler } from '../intake/deploy-controls.js'
 import { createIntakeHandler, startIntakeServer, type IntakeServer } from '../intake/index.js'
 import { createMemoryRecordStore, type RecordStore } from '../records/index.js'
+import { confirmAbandonedVersion } from '../deployer/deploy-sequence.js'
 import { createControls, type Controls } from './controls.js'
 
 // Стоп-кран выкаток: документ `remontnik.controls`, подписанный `POST /v1/control/deploys` и `deploys stop|resume`.
@@ -16,17 +17,27 @@ let store: RecordStore
 let controls: Controls
 let server: IntakeServer
 let startedAt: number
+let confirmed: string[]
 
 beforeEach(async () => {
   store = createMemoryRecordStore()
   controls = createControls(store, () => at)
   startedAt = Date.now()
+  confirmed = []
   server = await startIntakeServer({
     handler: createIntakeHandler({
       secret: SECRET,
       receiveEvents: async () => ({ accepted: [] }),
       health: async () => ({ ok: true, autoDeploy: (await controls.read()).autoDeploy }),
-      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
+      deployControls: createDeployControlsHandler({
+        controls,
+        secret: SECRET,
+        controlSecret: CONTROL_SECRET,
+        confirmVersion: async (version) => {
+          confirmed.push(version)
+          return confirmAbandonedVersion(store, version)
+        },
+      }),
     }),
     host: '127.0.0.1',
     port: 0,
@@ -91,6 +102,24 @@ describe('POST /v1/control/deploys', () => {
     expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
   })
 
+  it('подтвердить версию брошенной выкатки — только секретом владельца; версия — полный хеш коммита', async () => {
+    const version = 'c'.repeat(40)
+    const byButton = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'confirm_version', version, by: 'telegram:admin' })))
+    expect(byButton.status).toBe(403)
+    expect(await byButton.json()).toEqual({ error: 'control_secret_required' })
+    expect(confirmed).toEqual([])
+
+    for (const bad of [undefined, 'c'.repeat(12), 'C'.repeat(40), `${'c'.repeat(39)}g`]) {
+      const response = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'confirm_version', version: bad, by: 'owner' }), CONTROL_SECRET))
+      expect(response.status).toBe(400)
+    }
+
+    const byOwner = await fetch(`${server.url}/v1/control/deploys`, signedPost(JSON.stringify({ action: 'confirm_version', version, by: 'owner' }), CONTROL_SECRET))
+    expect(byOwner.status).toBe(200)
+    expect(await byOwner.json()).toEqual({ version, wasBlocked: false })
+    expect(confirmed).toEqual([version])
+  })
+
   it('без подписи, чужим секретом, повтором или подписью до запуска врача — 401, стоп-кран не тронут', async () => {
     const body = JSON.stringify({ action: 'stop', by: 'x' })
     const unsigned = await fetch(`${server.url}/v1/control/deploys`, { method: 'POST', body })
@@ -118,7 +147,7 @@ describe('POST /v1/control/deploys', () => {
   })
 })
 
-describe('remontnik-doctor deploys stop|resume', () => {
+describe('remontnik-doctor deploys stop|resume|confirm', () => {
   async function run(argv: string[], env: Record<string, string | undefined> = { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET, REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }) {
     let out = ''
     let err = ''
@@ -142,6 +171,20 @@ describe('remontnik-doctor deploys stop|resume', () => {
     expect(resume.code).toBe(1)
     expect(resume.err).toContain('REMONTNIK_CONTROL_SECRET')
     expect(await controls.read()).toMatchObject({ autoDeploy: 'stopped' })
+  })
+
+  it('deploys confirm <версия> — подтверждение владельца: только с его секретом, без версии — код 2', async () => {
+    const version = 'c'.repeat(40)
+    const done = await run(['deploys', 'confirm', version, '--by', 'admin'])
+    expect(done.code).toBe(0)
+    expect(JSON.parse(done.out)).toEqual({ version, wasBlocked: false })
+    expect(confirmed).toEqual([version])
+
+    const noOwner = await run(['deploys', 'confirm', version], { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SECRET })
+    expect(noOwner.code).toBe(1)
+    expect(noOwner.err).toContain('REMONTNIK_CONTROL_SECRET')
+    expect((await run(['deploys', 'confirm'])).code).toBe(2)
+    expect(confirmed).toEqual([version])
   })
 
   it('без секрета — ошибка, секрет в вывод не попадает; неизвестное действие — код 2', async () => {

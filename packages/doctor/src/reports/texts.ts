@@ -302,6 +302,14 @@ export function lostLockReport(input: { deployment: Deployment; lockFile: string
   return { short, full: short }
 }
 
+/** Рядом с замком остался `.stale-*`: врач упал, снимая замок, и замок человека мог остаться только в нём. */
+export function leftoverLockReport(input: { deployment: Deployment; lockFile: string; leftover: string; content: string }): ReportText {
+  const { deployment } = input
+  const short = `Случай ${deployment.caseId} (${deployment.appName}): рядом с замком выкатки ${input.lockFile} остался файл ${input.leftover} — врач упал, снимая замок. В нём мог остаться замок ручной выкатки. Выкатку не начинаю. Если ручной выкатки нет, удалите этот файл; если есть — верните его на место замка. Нужен человек.`
+  const content = input.content.trim().slice(0, 300)
+  return { short, full: [short, '', `В файле: ${content === '' ? '(пусто)' : content}`].join('\n') }
+}
+
 /** Замок выкатки занят дольше `minutes`: врач ждёт дальше, но зовёт человека. `holder` — содержимое файла замка. */
 export function lockWaitReport(input: { deployment: Deployment; lockFile: string; minutes: number; holder: string }): ReportText {
   const { deployment } = input

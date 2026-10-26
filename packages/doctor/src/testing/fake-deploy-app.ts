@@ -22,7 +22,7 @@ export interface FakeDeployApp {
   humanDeploys(version: string): void
   /** Рабочая копия основной ветки на сервере: снимок для проверки, что её никто не трогал. */
   mainCopy: MainCopy
-  /** Кто-то изменил рабочую копию: правка файла (`path`, по умолчанию `src/app.ts`), другой коммит или настройка выкатки. */
+  /** Кто-то изменил рабочую копию: правка файла (`path`, по умолчанию `src/app.ts`; повтор — новая правка), другой коммит или настройка выкатки. */
   changeMainCopy(part: 'dirty' | 'commit' | 'file', path?: string): void
 }
 
@@ -36,7 +36,8 @@ export function createFakeDeployApp(initial: { running: string | null; previous?
   let health: (version: string | null) => HealthAnswer = () => ({ ok: true })
   const failing = new Map<string, number>()
   const calls: string[] = []
-  const mainCopy: MainCopySnapshot = { commit: 'f'.repeat(40), dirty: [], files: { 'remontnik.config.ts': 'sha-1' } }
+  const mainCopy: MainCopySnapshot = { commit: 'f'.repeat(40), dirty: {}, files: { 'remontnik.config.ts': 'sha-1' } }
+  let edits = 0
   const done = (output: string): CommandOutcome => ({ ok: true, output })
   const fails = (name: string) => {
     const left = failing.get(name) ?? 0
@@ -114,7 +115,8 @@ export function createFakeDeployApp(initial: { running: string | null; previous?
     },
     mainCopy: { snapshot: async () => structuredClone(mainCopy) },
     changeMainCopy: (part, path = 'src/app.ts') => {
-      if (part === 'dirty') mainCopy.dirty = [...new Set([...mainCopy.dirty, path])].sort()
+      // Каждая правка файла — новый отпечаток.
+      if (part === 'dirty') mainCopy.dirty[path] = `sha-edit-${(edits += 1)}`
       else if (part === 'commit') mainCopy.commit = 'e'.repeat(40)
       else mainCopy.files['remontnik.config.ts'] = 'sha-2'
     },

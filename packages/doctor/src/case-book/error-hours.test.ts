@@ -102,11 +102,21 @@ describe('почасовой учёт ошибок', () => {
         await tx.doc('error-hour', `patient/${stamp}`, { minutes: { '0': 1 }, fingerprints: {}, overflow: 0 })
       }
     })
-    await createCaseBook(store).recordEvents([event('now', '2026-10-26T12:00:00Z')])
+    await createCaseBook(store, { now: () => Date.parse('2026-10-26T12:00:30Z') }).recordEvents([event('now', '2026-10-26T12:00:00Z')])
 
     expect(await store.read('error-hour', 'patient/2026-10-01T10')).toBeUndefined()
     expect(await store.read('error-hour', 'patient/2026-10-15T10')).toBeUndefined()
     expect(await store.read('error-hour', 'patient/2026-10-19T10')).toBeDefined()
     expect(await store.read('error-hour', 'patient/2026-10-26T12')).toBeDefined()
+  })
+
+  it('опорное время прохода — время записи, а не время события: событие «из будущего» не удаляет настоящие часы', async () => {
+    const store = createMemoryRecordStore()
+    await store.transaction(async (tx) => {
+      await tx.doc('error-hour', 'patient/2026-10-25T10', { minutes: { '0': 1 }, fingerprints: {}, overflow: 0 })
+    })
+    await createCaseBook(store, { now: () => Date.parse('2026-10-26T12:00:00Z') }).recordEvents([event('late', '2026-10-26T11:00:00Z'), event('future', '2026-12-01T00:00:00Z')])
+    expect(await store.read('error-hour', 'patient/2026-10-25T10')).toBeDefined()
+    expect(await store.read('error-hour', 'patient/2026-10-26T11')).toBeDefined()
   })
 })

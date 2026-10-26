@@ -129,16 +129,17 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `previousVersion` | полный sha из `current` до выкатки |
 | `lockToken` | случайный знак выкатки в строке замка: по нему врач узнаёт свой замок |
 | `taskId?` | задача pi-durable, которая ведёт выкатку: умерла — замок выкатки брошен |
-| `mainCopy?` | снимок рабочей копии основной ветки в начале: `{ commit, dirty[], files: { путь: sha256 } }` |
+| `mainCopy?` | снимок рабочей копии основной ветки в начале: `{ commit, dirty: { путь: sha256 }, files: { путь: sha256 } }`; в `dirty` дописываются файлы своих `promote` и `rollback` |
 | `preDeployTag` | `remontnik/pre-deploy/<дата>-<caseId>-<deploymentId>` |
 | `candidateVersion` | sha правки |
 | `candidateDir` | рабочая копия правки, где идёт `build` |
 | `stage` | `starting` \| `locked` \| `tagging` \| `building` \| `promoting` \| `observing` \| `rolling_back` \| `confirming` \| `done` — шаг, с которого выкатка продолжится после перезапуска |
-| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?`, `lockWaitReportedAt?` | время; `promotedAt` — когда `current` подтвердил кандидата; `lockWaitReportedAt` — когда позвал человека из-за долгого замка |
+| `startedAt`, `promotedAt`, `endedAt`, `waitingLockSince?`, `lockWaitReportedAt?`, `leftoverLockReportedAt?` | время; `promotedAt` — когда `current` подтвердил кандидата; `lockWaitReportedAt` — когда позвал человека из-за долгого замка; `leftoverLockReportedAt?` — из-за `<замок>.stale-*` |
 | `baseline` | `{ errorsPerHour, knownFingerprints7d[] }` |
 | `observeUntil`, `nextTickAt` | конец окна и следующий тик наблюдения |
 | `observation`, `lastTick` | сбои здоровья подряд, итоги последних проверок, число проверок окна и последний замер ошибок |
 | `promoteRequested` | намерение `promote` записано: дальше по `current` видно, прошёл ли он |
+| `promoteLaunched?` | `promote` запускали (записано прямо перед запуском): только после него новые файлы копии могут быть его |
 | `promoteReturnedAt?` | когда `promote` вернулся: с этой минуты считаются ошибки кандидата |
 | `outcome` | `in_progress` \| `holding` \| `not_helped` \| `rolled_back` \| `superseded_by_human` \| `rollback_failed` \| `refused` \| `abandoned` (замок потерян посреди выкатки или её задача умерла) |
 | `refusal` | при `refused`: `stop_switch` \| `current_unavailable` \| `no_previous_build` \| `already_running` \| `tag_failed` \| `build_failed` \| `promote_failed` \| `main_copy_changed` \| `lock_lost` \| `unconfirmed_version` |
@@ -149,7 +150,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 | `supersededBy`, `confirmFailed`, `detail` | версия человека, сбой `confirm`, хвост вывода для отчёта |
 | `abandonedBy?` | какая выкатка сняла замок этой, когда её задача умерла |
 
-Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую. В том же индексе `abandonedVersions` — кандидаты брошенных выкаток, успевших записать намерение `promote`: такая версия не считается прежней.
+Повтор той же правки по тому же случаю находит прежнюю выкатку (индекс `remontnik.deployment-index`), а не начинает вторую. В том же индексе `abandonedVersions` — кандидаты брошенных выкаток (задача умерла или замок потерян), успевших записать намерение `promote`: такая версия не считается прежней, пока владелец её не подтвердит (`deploys confirm`).
 
 ### ErrorHour — ошибки приложения по часам (документ `remontnik.error-hour/<app>/<YYYY-MM-DDTHH>`)
 

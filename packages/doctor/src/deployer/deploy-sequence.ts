@@ -4,7 +4,7 @@ import { readErrorBaseline, type ErrorBaseline } from '../case-book/error-hours.
 import { readControls } from '../ledgers/controls.js'
 import { copyRecord, type RecordStore, type RecordTransaction } from '../records/index.js'
 import { createReports } from '../reports/index.js'
-import { abandonedDeploymentReport, lockWaitReport, lostLockReport } from '../reports/texts.js'
+import { abandonedDeploymentReport, leftoverLockReport, lockWaitReport, lostLockReport } from '../reports/texts.js'
 import type { AppCommands } from './app-commands.js'
 import type { DeployLock, LockHolder } from './lock.js'
 import { mainCopyChange, type MainCopy, type MainCopySnapshot } from './main-copy.js'
@@ -81,6 +81,8 @@ export interface Deployment {
   waitingLockSince?: string
   /** Когда позвал человека из-за долгого ожидания замка. */
   lockWaitReportedAt?: string
+  /** Когда позвал человека из-за `.stale-*` рядом с замком. */
+  leftoverLockReportedAt?: string
   /** Рабочая копия основной ветки в начале выкатки. */
   mainCopy?: MainCopySnapshot
   /** Рабочую копию изменили во время отката: откат всё равно шёл, но нужен человек. */
@@ -90,6 +92,8 @@ export interface Deployment {
   baseline?: ErrorBaseline
   /** Намерение `promote` записано: дальше по `current` видно, прошёл ли он. */
   promoteRequested?: boolean
+  /** `promote` запускали (записано перед запуском): только после него новые файлы копии могут быть его. */
+  promoteLaunched?: boolean
   /** Когда `promote` вернулся: с этой минуты считаются ошибки кандидата. */
   promoteReturnedAt?: string
   /** Когда `current` подтвердил кандидата: от него окно наблюдения. */
@@ -184,6 +188,23 @@ export async function readDeployment(store: RecordStore, deploymentId: number): 
   return store.read<Deployment>(DEPLOYMENT_COLLECTION, String(deploymentId))
 }
 
+/** Кандидата брошенной выкатки внести в неподтверждённые: такая версия не считается прежней. */
+async function blockVersion(tx: RecordTransaction, version: string): Promise<void> {
+  const index = await tx.doc<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY, { nextId: 1, byRequest: {} })
+  index.abandonedVersions = [...new Set([...(index.abandonedVersions ?? []), version])]
+}
+
+/** Владелец подтвердил работающую версию брошенной выкатки: от неё снова можно выкатываться. */
+export async function confirmAbandonedVersion(store: RecordStore, version: string): Promise<{ wasBlocked: boolean }> {
+  return store.transaction(async (tx) => {
+    const index = await tx.doc<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY, { nextId: 1, byRequest: {} })
+    const blocked = index.abandonedVersions ?? []
+    if (!blocked.includes(version)) return { wasBlocked: false }
+    index.abandonedVersions = blocked.filter((other) => other !== version)
+    return { wasBlocked: true }
+  })
+}
+
 async function openDeployment(store: RecordStore, request: DeployRequest, now: Date): Promise<Deployment> {
   const index = await store.read<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY)
   const known = index?.byRequest[requestKey(request)]
@@ -252,12 +273,12 @@ export function createDeployer(deps: DeployerDeps): Deployer {
       }
 
       // Сначала итог в записи, потом замок: упадёт между ними — следующий вызов снимет замок на `done`.
-      async function finish(change: (draft: Deployment) => void): Promise<DeployStep> {
+      async function finish(change: (draft: Deployment) => void, alsoIn?: (tx: RecordTransaction) => Promise<unknown>): Promise<DeployStep> {
         await save((draft) => {
           change(draft)
           draft.stage = 'done'
           draft.endedAt = now().toISOString()
-        })
+        }, alsoIn)
         await releaseLock()
         return { kind: 'done', deployment }
       }
@@ -273,12 +294,18 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           draft.outcome = 'superseded_by_human'
           draft.supersededBy = version
         })
-      /** Замок потерян посреди выкатки: приложение больше не трогаем, разбираться человеку. */
+      /**
+       * Замок потерян посреди выкатки: приложение больше не трогаем, разбираться человеку. После намерения `promote`
+       * кандидат мог остаться работать неподтверждённым — как у брошенной выкатки.
+       */
       const lockLost = () =>
-        finish((draft) => {
-          draft.outcome = 'abandoned'
-          draft.detail = 'замок выкатки потерян: его сняли или заняли посреди выкатки; после этого приложение не трогал'
-        })
+        finish(
+          (draft) => {
+            draft.outcome = 'abandoned'
+            draft.detail = 'замок выкатки потерян: его сняли или заняли посреди выкатки; после этого приложение не трогал'
+          },
+          deployment.promoteRequested ? (tx) => blockVersion(tx, request.candidateVersion) : undefined,
+        )
       const startRollback = (cause: RollbackCause, reason: string) =>
         save((draft) => {
           draft.stage = 'rolling_back'
@@ -298,10 +325,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           other.endedAt = now().toISOString()
           other.abandonedBy = id
           other.detail = 'задача врача, которая вела выкатку, умерла; замок снят'
-          if (other.promoteRequested) {
-            const index = await tx.doc<DeploymentIndex>(DEPLOYMENT_INDEX_COLLECTION, INDEX_KEY, { nextId: 1, byRequest: {} })
-            index.abandonedVersions = [...new Set([...(index.abandonedVersions ?? []), other.candidateVersion])]
-          }
+          if (other.promoteRequested) await blockVersion(tx, other.candidateVersion)
           const text = abandonedDeploymentReport({ deployment: copyRecord(other) })
           await reports.addIn(tx, { type: 'needs_human', caseId: other.caseId, ...text, telegram: 'pending' })
         })
@@ -334,16 +358,17 @@ export function createDeployer(deps: DeployerDeps): Deployer {
         return deployment.mainCopy ? mainCopyChange(deployment.mainCopy, await mainCopy.snapshot()) : undefined
       }
       /**
-       * Файлы, появившиеся в копии за свой `promote` или `rollback` (файлы состояния выкатки), — часть снимка, а не
-       * чужая правка. Только список изменённых файлов: коммит и отпечатки настройки и скриптов не принимаются никогда.
+       * Файлы, которые изменил свой `promote` или `rollback` (файлы состояния выкатки), — часть снимка, а не чужая
+       * правка: их отпечатки запоминаются, и следующая их правка уже видна. Только изменённые файлы: коммит и
+       * отпечатки настройки и скриптов не принимаются никогда.
        */
       async function acceptOwnFiles(): Promise<void> {
         if (!deployment.mainCopy) return
-        const known = new Set(deployment.mainCopy.dirty)
-        const fresh = (await mainCopy.snapshot()).dirty.filter((path) => !known.has(path))
-        if (fresh.length === 0) return
+        const known = deployment.mainCopy.dirty
+        const actual = (await mainCopy.snapshot()).dirty
+        if (Object.keys(actual).every((path) => known[path] === actual[path])) return
         await save((draft) => {
-          draft.mainCopy!.dirty = [...known, ...fresh].sort()
+          draft.mainCopy!.dirty = { ...known, ...actual }
         })
       }
 
@@ -363,6 +388,21 @@ export function createDeployer(deps: DeployerDeps): Deployer {
           case 'starting': {
             if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
             const attempt = await acquireLock()
+            if (!attempt.acquired && attempt.leftover) {
+              const { leftover, content } = attempt
+              if (!deployment.leftoverLockReportedAt) {
+                await save(
+                  (draft) => {
+                    draft.leftoverLockReportedAt = now().toISOString()
+                  },
+                  (tx) => {
+                    const text = leftoverLockReport({ deployment, lockFile: config.deploy.lockFile, leftover, content })
+                    return reports.addIn(tx, { type: 'needs_human', caseId: request.caseId, ...text, telegram: 'pending' })
+                  },
+                )
+              }
+              return { kind: 'sleep', until: io.now() + lockRetryMs, stage: 'waiting_lock', deployment }
+            }
             if (!attempt.acquired) {
               const since = deployment.waitingLockSince ?? now().toISOString()
               const reportDue = !deployment.lockWaitReportedAt && io.now() - Date.parse(since) >= config.deploy.lockWaitReportMinutes * 60_000
@@ -392,7 +432,7 @@ export function createDeployer(deps: DeployerDeps): Deployer {
             if (!(await holdsLock())) break
             const snapshot = await mainCopy.snapshot()
             // В начале копия чистая: дальше новые изменённые файлы видны по сравнению с этим снимком.
-            if (snapshot.dirty.length > 0) return refuse('main_copy_changed', mainCopyChange({ ...snapshot, dirty: [] }, snapshot))
+            if (Object.keys(snapshot.dirty).length > 0) return refuse('main_copy_changed', mainCopyChange({ ...snapshot, dirty: {} }, snapshot))
             const current = await commands.current()
             if (!current.ok) return refuse('current_unavailable', current.reason)
             if (current.version === null) return refuse('no_previous_build')
@@ -447,8 +487,8 @@ export function createDeployer(deps: DeployerDeps): Deployer {
                 draft.promoteRequested = true
               })
             }
-            // Повтор после падения врача: `promote` мог пройти, и его файлы состояния — не чужая правка.
-            if (!promotedHere) await acceptOwnFiles()
+            // Повтор после падения врача посреди `promote`: он мог пройти, и его файлы состояния — не чужая правка.
+            if (!promotedHere && deployment.promoteLaunched) await acceptOwnFiles()
             const changed = await mainCopyChanged()
             if (changed) {
               await startRollback('main_copy_changed', changed)
@@ -460,6 +500,11 @@ export function createDeployer(deps: DeployerDeps): Deployer {
               // Пока врач лежал, замок могли снять или занять, а стоп-кран — нажать.
               if (!(await lock.holds(holder))) return refuse('lock_lost', 'замок выкатки перед promote оказался не этой выкатки')
               if ((await readControls(store)).autoDeploy === 'stopped') return refuse('stop_switch')
+              if (!deployment.promoteLaunched) {
+                await save((draft) => {
+                  draft.promoteLaunched = true
+                })
+              }
               const promoted = await commands.promote()
               promotedHere = true
               await save((draft) => {

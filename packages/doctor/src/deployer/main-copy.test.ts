@@ -45,7 +45,7 @@ describe('рабочая копия основной ветки', () => {
 
     const snapshot = await mainCopy.snapshot()
     expect(snapshot.commit).toBe(git(repoDir, 'rev-parse', 'HEAD'))
-    expect(snapshot.dirty).toEqual([])
+    expect(snapshot.dirty).toEqual({})
     expect(Object.keys(snapshot.files).sort()).toEqual(['remontnik.config.local.ts', 'remontnik.config.ts', 'scripts/deploy.sh'])
     expect(mainCopyChange(snapshot, await mainCopy.snapshot())).toBeUndefined()
   })
@@ -64,11 +64,22 @@ describe('рабочая копия основной ветки', () => {
     expect(mainCopyChange(before, await mainCopy.snapshot())).toContain(before.commit.slice(0, 12))
   })
 
-  it('изменённые файлы сравниваются со снимком: уже известные — не изменение, новые — изменение', () => {
-    const known = { commit: 'a'.repeat(40), dirty: ['.deploy-state'], files: {} }
+  it('изменённые файлы сравниваются со снимком по отпечатку: тот же — не изменение, новый или другой — изменение', () => {
+    const known = { commit: 'a'.repeat(40), dirty: { '.deploy-state': 'sha-1' }, files: {} }
     expect(mainCopyChange(known, known)).toBeUndefined()
-    const changed = mainCopyChange(known, { ...known, dirty: ['.deploy-state', 'src/app.ts'] })
-    expect(changed).toContain('src/app.ts')
-    expect(changed).not.toContain('.deploy-state')
+    const added = mainCopyChange(known, { ...known, dirty: { '.deploy-state': 'sha-1', 'src/app.ts': 'sha-2' } })
+    expect(added).toContain('src/app.ts')
+    expect(added).not.toContain('.deploy-state')
+    expect(mainCopyChange(known, { ...known, dirty: { '.deploy-state': 'sha-3' } })).toContain('.deploy-state')
+  })
+
+  it('в снимке у каждого изменённого файла свой отпечаток: правка уже изменённого файла видна', async () => {
+    const { repoDir, mainCopy } = setup()
+    writeFileSync(join(repoDir, '.deploy-state'), 'v1\n')
+    const before = await mainCopy.snapshot()
+    expect(Object.keys(before.dirty)).toEqual(['.deploy-state'])
+    expect(mainCopyChange(before, await mainCopy.snapshot())).toBeUndefined()
+    writeFileSync(join(repoDir, '.deploy-state'), 'v2\n')
+    expect(mainCopyChange(before, await mainCopy.snapshot())).toContain('.deploy-state')
   })
 })
