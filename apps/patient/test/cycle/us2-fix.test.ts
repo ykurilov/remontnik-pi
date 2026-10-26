@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
-import { createGitGuard, startDoctorService, type DoctorService } from '@ykurilov/remontnik-doctor'
+import { createGitGuard, createLocalRunner, startDoctorService, type DoctorService } from '@ykurilov/remontnik-doctor'
 import { callTool, createScriptedModel, testRemontnikConfig, type ScriptedModel, type ScriptStep } from '@ykurilov/remontnik-doctor/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import patientConfig from '../../remontnik.config.ts'
@@ -88,7 +88,8 @@ async function startDoctor(r: SickRepo, model: ScriptedModel, limits: { diagnose
         promote: deploy('promote'),
         confirm: deploy('confirm'),
         rollback: deploy('rollback'),
-        current: deploy('current'),
+        // Рабочая версия — коммит, с которого начат репозиторий.
+        current: `${deploy('current')} && printf '{"version":"%s","previous":null}' ${git(r.repoDir, 'rev-parse', 'HEAD')}`,
         health: deploy('health'),
       },
       lockFile: '.remontnik/deploy.lock',
@@ -115,6 +116,8 @@ async function startDoctor(r: SickRepo, model: ScriptedModel, limits: { diagnose
       model: model.model,
       evalEnv: {},
       budgetPollMs: 10,
+      runner: createLocalRunner(),
+      allowUnisolatedRunner: true,
     },
   })
   cleanups.push(() => doctor.close())
@@ -201,7 +204,8 @@ describe('история 2 на «Пациенте»: лечение в ветк
     expect(git(r.origin, 'rev-parse', 'main')).toBe(mainBefore)
     expect(git(r.repoDir, 'rev-parse', 'HEAD')).toBe(mainBefore)
     expect(readFileSync(join(r.repoDir, PLANS), 'utf8')).toBe(plansBefore)
-    expect(readdirSync(r.deployMarks)).toEqual([])
+    // Врач только спросил рабочую версию: ни сборки, ни выкатки.
+    expect(readdirSync(r.deployMarks)).toEqual(['current'])
 
     expect(await reportTypes(doctor)).toEqual(['case_received', 'fix_ready'])
     const ready = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)!
@@ -214,7 +218,7 @@ describe('история 2 на «Пациенте»: лечение в ветк
     expect(ready.telegram.state).not.toBe('not_needed')
   }, 90_000)
 
-  it('соблазнительная правка ломает сценарий с названным тарифом → отчёт называет eval хуже', async () => {
+  it('соблазнительная правка ломает сценарий с названным тарифом → не готова, нужен человек, отчёт называет eval хуже', async () => {
     const r = sickPatientRepo()
     const bot = readFileSync(join(r.repoDir, BOT), 'utf8')
     const pricesRemoved = bot.replace(
@@ -230,7 +234,7 @@ describe('история 2 на «Пациенте»: лечение в ветк
     await settledCase(doctor)
 
     const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)!
-    expect(report.type).toBe('fix_ready')
+    expect(report.type).toBe('needs_human')
     expect(report.short).toContain('eval хуже: price-named-plan')
     expect(report.short).not.toContain('price-default-plan')
     expect(report.full).toContain('price-named-plan: 2/2 → 0/2')

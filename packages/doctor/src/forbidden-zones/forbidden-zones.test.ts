@@ -306,7 +306,7 @@ describe('findForbiddenZones: пути из самой настройки', () =
     'eval/run-eval.ts',
     '.remontnik/deploy.lock',
   ])('файл %s из команд и замка настройки защищён, даже если сборка и выкатка разрешены', (path) => {
-    expect(zonesOf(config, file(path))).toEqual(['build_and_deploy'])
+    expect(zonesOf(config, file(path))).toContain('build_and_deploy')
   })
 
   it('хит говорит, откуда путь', () => {

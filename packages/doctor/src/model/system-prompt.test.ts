@@ -9,6 +9,7 @@ function input(overrides: Partial<SystemPromptInput> = {}): SystemPromptInput {
     repoMap: buildRepoMap(files, { closedPaths: ['secrets/**'] }),
     closedPaths: ['secrets/**'],
     bashTimeoutSeconds: 600,
+    base: 'running',
     ...overrides,
   }
 }
@@ -47,5 +48,12 @@ describe('системный промпт врача', () => {
     const map = buildRepoMap(many, { closedPaths: [], maxEntries: 10 })
     expect(map.split('\n')).toHaveLength(11)
     expect(map).toContain('ещё 40')
+  })
+
+  it('про основу не врёт: рабочая версия — только когда она и есть основа', () => {
+    expect(buildSystemPrompt(input({ base: 'running' }))).toContain('на коммите рабочей версии')
+    const fallback = buildSystemPrompt(input({ base: 'main' }))
+    expect(fallback).not.toContain('рабочей версии,')
+    expect(fallback).toContain('основной ветки')
   })
 })

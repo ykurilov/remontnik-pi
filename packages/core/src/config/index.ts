@@ -21,8 +21,8 @@ export const BUILT_IN_FORBIDDEN = deepFreeze({
     'patches/@ykurilov__agent-chat-*',
     'patches/@ykurilov+agent-chat-*',
   ],
-  /** Сам Ремонтник: его настройку правит только человек. */
-  remontnikMasks: ['remontnik.config.*', '**/remontnik.config.*'],
+  /** Сам Ремонтник: его настройку и служебные файлы правит только человек. */
+  remontnikMasks: ['remontnik.config.*', '**/remontnik.config.*', '.remontnik*', '**/.remontnik*', '.remontnik*/**', '**/.remontnik*/**'],
   /** Пакеты, чьи версии и патчи (`pnpm.patchedDependencies`) менять нельзя даже при `allowDependencyChanges`. */
   protectedPackages: ['@ykurilov/agent-chat-*', '@ykurilov/remontnik-*'],
   /** Признаки изменения схемы базы в диффе файлов `schemaSignalFiles`. */

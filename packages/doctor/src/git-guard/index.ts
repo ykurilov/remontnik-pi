@@ -1,18 +1,24 @@
 import { spawn } from 'node:child_process'
-import { existsSync, realpathSync } from 'node:fs'
-import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
+import type { ChangedFile } from '../changed-files/index.js'
 
 // Git-замок: единственный путь врача к git. Модель git не получает вовсе; врач зовёт git только отсюда.
 // Разрешено немногое: забрать изменения, сделать копию в своей ветке `remontnik/…`, закоммитить, отправить
 // свою ветку без перезаписи. В основную ветку — только при `mainline: "merge"` и только вперёд, без `--force`.
 // Хуки репозитория выключены: их код написан приложением и не должен выполняться с правами врача.
+//
+// В копиях git врача не доверяет ничему, что лежит в самой копии: `.git` там — файл-указатель, который модель
+// может подменить своей папкой с `core.fsmonitor` или фильтром. Поэтому перед каждой командой в копии указатель
+// сверяется с ожидаемым gitdir, команда идёт с явными `--git-dir`/`--work-tree`, без глобального и системного
+// конфига, а вложенные репозитории не принимаются. Подмена — это попытка выхода: ошибка `escape`.
 
 export const TREATMENT_BRANCH_PREFIX = 'remontnik/'
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
-export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout'
+export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape'
 
 export class GitGuardError extends Error {
   readonly code: GitGuardErrorCode
@@ -47,20 +53,27 @@ export interface AddWorktreeOptions {
   base: string
   /** Файлы основы, которых в копии быть не должно (sparse checkout). */
   exclude?: readonly string[]
+  /** Пересоздать копию начисто, если она уже есть (проверочные копии после перезапуска). */
+  fresh?: boolean
 }
 
 export interface GitGuard {
+  /** Рабочая копия основной ветки: здесь врач запускает свои команды выкатки. */
+  readonly repoDir: string
   /** Любая разрешённая команда git. Возвращает stdout. */
   run(args: readonly string[], options?: { cwd?: string }): Promise<string>
   fetch(): Promise<void>
   resolve(ref: string, options?: { cwd?: string }): Promise<string>
-  /** Копия от `base`. Если она уже есть (перезапуск врача), остаётся как есть. */
+  /** Копия от `base`. Если она уже есть (перезапуск врача), остаётся как есть, если не просили `fresh`. */
   addWorktree(options: AddWorktreeOptions): Promise<void>
+  /** Удаляет копию вместе с мусором проверок. */
   removeWorktree(path: string): Promise<void>
   /** Все файлы коммита. */
   listFiles(commit: string): Promise<string[]>
   /** Пути, изменённые в `cwd` относительно `base` (по коммитам). */
   changedPaths(cwd: string, base: string): Promise<string[]>
+  /** Изменённые файлы в `cwd` относительно `base`: статус, строки, дифф, режимы, полный текст `package.json`. */
+  changedFiles(cwd: string, base: string): Promise<ChangedFile[]>
   /** Коммит всех изменений копии; `undefined`, если менять нечего. */
   commitAll(cwd: string, message: string): Promise<string | undefined>
   push(branch: string): Promise<void>
@@ -140,7 +153,7 @@ export function checkGitCommand(args: readonly string[], cwd: string, policy: Po
   if (READ_ONLY.has(command)) return undefined
   switch (command) {
     case 'fetch':
-      return rest.every((arg) => arg === policy.remote || arg === '--prune' || arg === '--quiet') ? undefined : 'fetch только своего origin'
+      return rest.every((arg) => arg === policy.remote || arg === '--quiet') ? undefined : 'fetch только своего origin, без --prune'
     case 'worktree': {
       const [action, ...options] = rest
       if (action === 'list' || action === 'prune') return undefined
@@ -216,12 +229,58 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     return real === canonical(repoDir) || inside(canonical(worktreesDir), real)
   }
 
-  function exec(args: readonly string[], cwd: string, input?: string): Promise<string> {
+  const commonGitDir = (() => {
+    try {
+      return realpathSync(join(repoDir, '.git'))
+    } catch {
+      return resolve(repoDir, '.git')
+    }
+  })()
+
+  function escape(path: string, why: string): GitGuardError {
+    return new GitGuardError('escape', `git-замок: копия ${path} подменена (${why}) — похоже на попытку выхода из верстака`)
+  }
+
+  /**
+   * Gitdir копии, если её `.git` — нетронутый файл-указатель врача: обычный файл (не папка, не ссылка),
+   * ведёт в `<repo>/.git/worktrees/<имя>`, и тот gitdir ведёт обратно в эту копию.
+   */
+  function verifiedGitDir(copy: string): string {
+    const pointer = join(copy, '.git')
+    let stat
+    try {
+      stat = lstatSync(pointer)
+    } catch {
+      throw escape(copy, 'нет .git')
+    }
+    if (!stat.isFile()) throw escape(copy, stat.isDirectory() ? '.git — папка' : '.git — не обычный файл')
+    const match = /^gitdir: (.+)\n?$/.exec(readFileSync(pointer, 'utf8'))
+    if (!match) throw escape(copy, 'в .git не указатель')
+    let gitDir: string
+    try {
+      gitDir = realpathSync(resolve(copy, match[1]!))
+    } catch {
+      throw escape(copy, '.git ведёт в несуществующую папку')
+    }
+    if (dirname(gitDir) !== join(commonGitDir, 'worktrees')) throw escape(copy, '.git ведёт в чужой gitdir')
+    let back: string
+    try {
+      back = realpathSync(dirname(readFileSync(join(gitDir, 'gitdir'), 'utf8').trim()))
+    } catch {
+      throw escape(copy, 'gitdir копии не ведёт обратно')
+    }
+    if (back !== canonical(copy)) throw escape(copy, 'gitdir принадлежит другой копии')
+    return gitDir
+  }
+
+  function exec(args: readonly string[], cwd: string, input?: string, copy?: { gitDir: string; workTree: string }): Promise<string> {
     return new Promise((resolvePromise, reject) => {
       const child = spawn(
         options.gitBinary ?? 'git',
         [
+          ...(copy ? [`--git-dir=${copy.gitDir}`, `--work-tree=${copy.workTree}`] : []),
           '-c', 'core.hooksPath=/dev/null',
+          '-c', 'core.fsmonitor=false',
           '-c', `user.name=${options.author.name}`,
           '-c', `user.email=${options.author.email}`,
           '-c', 'commit.gpgSign=false',
@@ -237,6 +296,9 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
             ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
             GIT_TERMINAL_PROMPT: '0',
             LC_ALL: 'C',
+            // Конфиг git — только репозитория и врача (`-c`): глобальный и системный могли бы подсунуть фильтры.
+            GIT_CONFIG_NOSYSTEM: '1',
+            GIT_CONFIG_GLOBAL: '/dev/null',
             ...options.env,
           },
         },
@@ -272,12 +334,72 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     })
   }
 
+  /** Корень копии, в которой лежит `cwd`, или `undefined` для рабочей копии основной ветки. */
+  function copyRootOf(cwd: string): string | undefined {
+    const real = canonical(cwd)
+    if (real === canonical(repoDir)) return undefined
+    const [first] = relative(canonical(worktreesDir), real).split(/[\\/]/)
+    return join(canonical(worktreesDir), first!)
+  }
+
   async function run(args: readonly string[], runOptions: { cwd?: string } = {}, input?: string): Promise<string> {
     const cwd = runOptions.cwd ?? repoDir
     if (!allowedCwd(cwd)) throw new GitGuardError('forbidden', `git вне своих папок: ${cwd}`)
     const reason = checkGitCommand(args, canonical(cwd) === canonical(repoDir) ? repoDir : cwd, policy)
     if (reason) throw new GitGuardError('forbidden', `git-замок: ${reason}`)
-    return exec(args, cwd, input)
+    const copyRoot = copyRootOf(cwd)
+    const copy = copyRoot === undefined ? undefined : { gitDir: verifiedGitDir(copyRoot), workTree: copyRoot }
+    return exec(args, cwd, input, copy)
+  }
+
+  async function tagExists(name: string): Promise<boolean> {
+    try {
+      await run(['rev-parse', '--verify', '--quiet', `refs/tags/${name}`])
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Подмодули (`160000`) в индексе копии, которых не было в последнем коммите: вложенный репозиторий модели. */
+  async function newGitlinks(cwd: string): Promise<string[]> {
+    const gitlinks = (out: string) =>
+      out
+        .split('\0')
+        .filter((entry) => entry.startsWith('160000 '))
+        .map((entry) => entry.slice(entry.indexOf('\t') + 1))
+    const staged = gitlinks(await run(['ls-files', '--stage', '-z'], { cwd }))
+    const committed = new Set(gitlinks(await run(['ls-tree', '-r', '-z', 'HEAD'], { cwd })))
+    return staged.filter((path) => !committed.has(path))
+  }
+
+  /** Удаляет копию целиком (с мусором проверок) и забывает её в git. Только внутри папки копий. */
+  async function removeCopy(path: string): Promise<void> {
+    const real = canonical(path)
+    if (real === canonical(worktreesDir) || !inside(canonical(worktreesDir), real)) throw new GitGuardError('forbidden', 'git-замок: удалять можно только свои копии')
+    rmSync(path, { recursive: true, force: true })
+    await run(['worktree', 'prune'])
+  }
+
+  /** Есть ли в рабочем дереве `.git` кроме указателя копии: вложенный репозиторий со своим конфигом. */
+  function nestedGitDirs(copyRoot: string): string[] {
+    const found: string[] = []
+    const walk = (dir: string, depth: number) => {
+      if (depth > 64) return
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const path = join(dir, entry.name)
+        if (entry.name === '.git' && dir !== copyRoot) found.push(relative(copyRoot, path))
+        else if (entry.isDirectory() && entry.name !== '.git' && entry.name !== 'node_modules') walk(path, depth + 1)
+      }
+    }
+    walk(copyRoot, 0)
+    return found
   }
 
   async function branchExists(branch: string): Promise<boolean> {
@@ -290,7 +412,13 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
   }
 
   return {
-    run: (args, runOptions) => run(args, runOptions),
+    repoDir,
+
+    run: async (args, runOptions) => {
+      // Метка не перезаписывается: git сам откажет, но отказ замка понятнее и не зависит от версии git.
+      if (args[0] === 'tag' && args.length === 2 && (await tagExists(args[1]!))) throw new GitGuardError('forbidden', `git-замок: метка ${args[1]} уже есть`)
+      return run(args, runOptions)
+    },
 
     async fetch() {
       await run(['fetch', remote])
@@ -302,7 +430,11 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
 
     async addWorktree(add) {
       const path = resolve(add.path)
-      if (existsSync(resolve(path, '.git'))) return
+      if (add.fresh) await removeCopy(path)
+      else if (existsSync(path)) {
+        verifiedGitDir(path)
+        return
+      }
       const target =
         add.branch === undefined
           ? ['--detach', path, add.base]
@@ -315,9 +447,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       await run(['checkout'], { cwd: path })
     },
 
-    async removeWorktree(path) {
-      await run(['worktree', 'remove', resolve(path)])
-    },
+    removeWorktree: (path) => removeCopy(resolve(path)),
 
     async listFiles(commit) {
       const out = await run(['ls-tree', '-r', '--name-only', '-z', commit])
@@ -329,10 +459,23 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       return out.split('\0').filter(Boolean)
     },
 
+    async changedFiles(cwd, base) {
+      return readChangedFiles((args) => run(args, { cwd }), base)
+    },
+
     async commitAll(cwd, message) {
+      const copyRoot = copyRootOf(cwd)
+      if (copyRoot !== undefined) {
+        verifiedGitDir(copyRoot)
+        const nested = nestedGitDirs(copyRoot)
+        if (nested.length > 0) throw escape(copyRoot, `вложенный репозиторий: ${nested.slice(0, 3).join(', ')}`)
+      }
       await run(['add', '-A'], { cwd })
-      const status = await run(['status', '--porcelain'], { cwd })
-      if (status.trim() === '') return undefined
+      const gitlinks = await newGitlinks(cwd)
+      if (gitlinks.length > 0) throw escape(copyRoot ?? cwd, `вложенный репозиторий: ${gitlinks.slice(0, 3).join(', ')}`)
+      // Не `status`: он заходит во вложенные репозитории и читает их конфиг. Сравнение индекса с коммитом — нет.
+      const staged = await run(['diff', '--cached', '--name-only', '-z', '--ignore-submodules=all', '--no-ext-diff'], { cwd })
+      if (staged === '') return undefined
       await run(['commit', '-m', message], { cwd })
       return (await run(['rev-parse', 'HEAD'], { cwd })).trim()
     },
@@ -346,6 +489,54 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
       await run(['merge', '--ff-only', branch])
     },
   }
+}
+
+const STATUS: Record<string, ChangedFile['status']> = { A: 'added', M: 'modified', D: 'deleted', R: 'renamed', C: 'added', T: 'modified' }
+const MANIFEST = /(^|\/)package\.json$/
+
+/** Изменённые файлы от `base` до `HEAD`: `--raw` даёт режимы и статус, `--numstat` — строки, дифф — по файлу. */
+async function readChangedFiles(git: (args: readonly string[]) => Promise<string>, base: string): Promise<ChangedFile[]> {
+  const common = ['-M', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', base, 'HEAD']
+  const raw = (await git(['diff', '--raw', '-z', ...common])).split('\0')
+  const files: ChangedFile[] = []
+  for (let index = 0; index < raw.length - 1; ) {
+    const header = raw[index++]!
+    const [oldMode, newMode, , , statusField] = header.slice(1).split(' ')
+    const letter = statusField!.charAt(0)
+    const status = STATUS[letter] ?? 'modified'
+    const first = raw[index++]!
+    const second = letter === 'R' || letter === 'C' ? raw[index++]! : undefined
+    const path = second ?? first
+    files.push({
+      path,
+      ...(letter === 'R' ? { previousPath: first } : {}),
+      status,
+      added: 0,
+      removed: 0,
+      ...(newMode !== '000000' ? { mode: newMode! } : {}),
+      ...(oldMode !== '000000' ? { previousMode: oldMode! } : {}),
+    })
+  }
+  const numstat = (await git(['diff', '--numstat', '-z', ...common])).split('\0')
+  for (let index = 0; index < numstat.length - 1; ) {
+    const [added, removed, inlinePath] = numstat[index++]!.split('\t')
+    const path = inlinePath === '' ? (index++, numstat[index++]!) : inlinePath!
+    const file = files.find((candidate) => candidate.path === path)
+    if (!file) continue
+    // Двоичный файл: `-` вместо чисел. Размер неизвестен — `NaN`, осмотр диффа это поймает.
+    file.added = added === '-' ? Number.NaN : Number(added)
+    file.removed = removed === '-' ? Number.NaN : Number(removed)
+  }
+  for (const file of files) {
+    const paths = file.previousPath ? [file.previousPath, file.path] : [file.path]
+    const patch = await git(['diff', '-M', '--no-ext-diff', '--no-textconv', base, 'HEAD', '--', ...paths])
+    if (patch !== '' && !/^Binary files /m.test(patch)) file.patch = patch
+    if (MANIFEST.test(file.path)) {
+      if (file.status !== 'added') file.contentBefore = await git(['show', `${base}:${file.previousPath ?? file.path}`])
+      if (file.status !== 'deleted') file.contentAfter = await git(['show', `HEAD:${file.path}`])
+    }
+  }
+  return files
 }
 
 /** Путь файла как шаблон sparse checkout: служебные знаки шаблонов экранируются. */

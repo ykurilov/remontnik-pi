@@ -27,7 +27,7 @@ const config = testRemontnikConfig({
       resultFile: 'eval-result.json',
       repeat: 3,
       maxScenarios: 3,
-      env: ['PATIENT_BUG'],
+      env: ['PATIENT_BUG', 'EVAL_API_KEY'],
     },
   },
   evalScope: [{ paths: ['src/bot/**'], scenarios: ['price-named-plan', 'greeting'] }],
@@ -45,12 +45,17 @@ interface FakeOptions {
   /** Итоги eval по папке (кандидат/основа) и сценарию. */
   evalOutcomes?: (cwd: string, scenario: string) => ScenarioOutcome
   evalCostUsd?: number
+  /** Eval пишет итог с этим расходом и не заканчивается, пока его не прервут. */
+  evalHangsAtCostUsd?: number
+  /** Вывод установки. */
+  installOutput?: { exitCode: number; output: string }
 }
 
 function fakeRunner(options: FakeOptions) {
   const calls: { command: string; options: RunOptions }[] = []
   const tests = [...(options.tests ?? [{ exitCode: 0 }])]
   const runner: CommandRunner = {
+    isolation: 'none',
     async run(command, runOptions): Promise<RunResult> {
       const text = typeof command === 'string' ? command : command.join(' ')
       calls.push({ command: text, options: runOptions })
@@ -64,6 +69,11 @@ function fakeRunner(options: FakeOptions) {
         const outDir = args[args.indexOf('--out') + 1]!
         const repeats = Number(args[args.indexOf('--repeat') + 1])
         mkdirSync(outDir, { recursive: true })
+        if (options.evalHangsAtCostUsd !== undefined) {
+          writeFileSync(join(outDir, 'eval-result.json'), JSON.stringify({ scenarios: [], costUsd: options.evalHangsAtCostUsd }))
+          await new Promise<void>((resolve) => runOptions.signal?.addEventListener('abort', () => resolve(), { once: true }))
+          return { exitCode: null, timedOut: false, aborted: true, output: '' }
+        }
         writeFileSync(
           join(outDir, 'eval-result.json'),
           JSON.stringify({
@@ -83,20 +93,24 @@ function fakeRunner(options: FakeOptions) {
         )
         return { exitCode: 0, timedOut: false, aborted: false, output: '' }
       }
+      if (text === 'pnpm install' && options.installOutput) return { ...options.installOutput, timedOut: false, aborted: false }
       return { exitCode: 0, timedOut: false, aborted: false, output: '' }
     },
   }
   return { runner, calls }
 }
 
-function checksWith(fake: ReturnType<typeof fakeRunner>, baseCache: EvalBaseCache = createMemoryEvalBaseCache()) {
+const EVAL_KEY = 'eval-key-example-0000'
+
+function checksWith(fake: ReturnType<typeof fakeRunner>, baseCache: EvalBaseCache = createMemoryEvalBaseCache(), workDir = tempDir()) {
   return createChecks({
     runner: fake.runner,
     config,
-    evalEnv: { PATIENT_BUG: 'worsening_fix', DEEPSEEK_API_KEY: 'test-not-passed' },
+    evalEnv: { PATIENT_BUG: 'worsening_fix', EVAL_API_KEY: EVAL_KEY, DEEPSEEK_API_KEY: 'test-not-passed' },
     baseCache,
-    workDir: tempDir(),
+    workDir,
     timeoutSeconds: 60,
+    costPollMs: 5,
   })
 }
 
@@ -230,12 +244,47 @@ describe('проверки', () => {
     const fake = fakeRunner({})
     await checksWith(fake).run(runInput())
     const evalRun = fake.calls.find((call) => call.command.startsWith('node eval'))
-    expect(evalRun?.options.env).toEqual({ PATIENT_BUG: 'worsening_fix' })
+    expect(evalRun?.options.env).toEqual({ PATIENT_BUG: 'worsening_fix', EVAL_API_KEY: EVAL_KEY })
   })
 
   it('стоимость eval складывается', async () => {
     const fake = fakeRunner({ evalCostUsd: 0.2 })
     const result = await checksWith(fake).run(runInput())
     expect(result.eval.costUsd).toBeCloseTo(0.4)
+  })
+
+  it('итог eval пишется в папку вне копии, и писать туда может только eval', async () => {
+    const workDir = tempDir()
+    const fake = fakeRunner({})
+    await checksWith(fake, createMemoryEvalBaseCache(), workDir).run(runInput())
+    const evalRuns = fake.calls.filter((call) => call.command.startsWith('node eval'))
+    expect(evalRuns).toHaveLength(2)
+    for (const call of evalRuns) {
+      const outDir = call.command.split(' ')[call.command.split(' ').indexOf('--out') + 1]!
+      expect(outDir.startsWith(workDir)).toBe(true)
+      expect(call.options.writableDirs).toEqual([outDir])
+      expect(call.options.copyDir).toBe(call.options.cwd)
+    }
+    for (const call of fake.calls.filter((call) => !call.command.startsWith('node eval'))) {
+      expect(call.options.writableDirs ?? []).toEqual([])
+      expect(call.options.env ?? {}).toEqual({})
+      expect(call.options.copyDir).toBe(call.options.cwd)
+    }
+  })
+
+  it('ключи eval вырезаны из хвоста вывода и заметок', async () => {
+    const fake = fakeRunner({ installOutput: { exitCode: 1, output: `ошибка: ключ ${EVAL_KEY} не подошёл` } })
+    const result = await checksWith(fake).run(runInput())
+    expect(result.tests.outputTail).toContain('ключ')
+    expect(result.tests.outputTail).not.toContain(EVAL_KEY)
+  })
+
+  it('eval потратил свою долю бюджета → врач его прерывает, расход учтён', async () => {
+    const fake = fakeRunner({ evalHangsAtCostUsd: 0.7 })
+    const result = await checksWith(fake).run(runInput({ budgetUsd: 0.6 }))
+    expect(result.eval.status).toBe('not_run')
+    expect(result.eval.note).toContain('бюджет')
+    expect(result.eval.costUsd).toBeCloseTo(0.7)
+    expect(fake.calls.find((call) => call.command.startsWith('node eval'))?.options.signal?.aborted).toBe(true)
   })
 })

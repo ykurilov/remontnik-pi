@@ -6,10 +6,11 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { CaseState } from '../case-book/index.js'
-import { createGitGuard } from '../git-guard/index.js'
-import { startDoctorService, type DoctorService } from '../service/index.js'
+import { createGitGuard, type GitGuard } from '../git-guard/index.js'
+import { startDoctorService, type DoctorService, type DoctorTreatmentOptions } from '../service/index.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { callTool, createScriptedModel, hang, type ScriptedModel, type ScriptStep } from '../testing/scripted-model.js'
+import { createLocalRunner } from '../workbench/index.js'
 import { DOCTOR_TOOL_NAMES } from './index.js'
 
 // Лечение целиком на маленьком репозитории: модель по сценарию, локальный исполнитель, настоящий git.
@@ -29,7 +30,9 @@ import { price } from '../src/price.mjs'
 test('цена тарифа по умолчанию', () => assert.equal(price(), 990))
 `
 const SECRET_TEXT = 'closed-secret-value'
-const FINAL_STATES: CaseState[] = ['report_only', 'no_cause_found', 'stand_broken']
+// Похоже на ключ модели; собрано по частям, чтобы проверка публичности не приняла тест за утечку.
+const LEAKED_KEY = ['sk', 'example0000000000000000'].join('-')
+const FINAL_STATES: CaseState[] = ['report_only', 'no_cause_found', 'stand_broken', 'needs_human']
 
 const dirs: string[] = []
 const cleanups: (() => Promise<void>)[] = []
@@ -69,14 +72,36 @@ function repo() {
 
 type Repo = ReturnType<typeof repo>
 
-async function startDoctor(r: Repo, model: ScriptedModel, limits: { diagnoseUsdPerCase?: number } = {}): Promise<DoctorService> {
+interface DoctorOptions {
+  limits?: { diagnoseUsdPerCase?: number; modelUsdPerDay?: number }
+  /** Команда `deploy.commands.current`; по умолчанию её скрипта нет, и рабочая версия неизвестна. */
+  current?: string
+  wrapGuard?: (guard: GitGuard) => GitGuard
+  /** Подменить настройки лечения (исполнитель и т. п.). */
+  treatment?: Partial<DoctorTreatmentOptions>
+}
+
+function doctorGuard(r: Repo): GitGuard {
+  return createGitGuard({
+    repoDir: r.repoDir,
+    worktreesDir: r.worktreesDir,
+    mainBranch: 'main',
+    mainline: 'pull-request',
+    author: { name: 'Ремонтник', email: 'doctor@example.invalid' },
+  })
+}
+
+function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOptions = {}) {
+  const base = testRemontnikConfig()
   const config = testRemontnikConfig({
     workbench: { image: 'node:22', install: 'true', bashTimeoutMs: 30_000 },
     checks: { test: 'node --test test/*.test.mjs' },
     closedPaths: ['secret/**'],
-    limits: { diagnoseUsdPerCase: 1, ...limits },
+    limits: { diagnoseUsdPerCase: 1, ...options.limits },
+    deploy: { ...base.deploy, commands: { ...base.deploy.commands, ...(options.current ? { current: options.current } : {}) } },
   })
-  const service = await startDoctorService({
+  const guard = doctorGuard(r)
+  return {
     stateDir: r.stateDir,
     sharedSecret: 'shared-test-secret',
     listen: { host: '127.0.0.1', port: 0 },
@@ -84,42 +109,43 @@ async function startDoctor(r: Repo, model: ScriptedModel, limits: { diagnoseUsdP
     exit: () => {},
     log: () => {},
     treatment: {
-      guard: createGitGuard({
-        repoDir: r.repoDir,
-        worktreesDir: r.worktreesDir,
-        mainBranch: 'main',
-        mainline: 'pull-request',
-        author: { name: 'Ремонтник', email: 'doctor@example.invalid' },
-      }),
+      guard: options.wrapGuard ? options.wrapGuard(guard) : guard,
       loadConfig: async () => config,
       worktreesDir: r.worktreesDir,
       models: model.models,
       model: model.model,
       budgetPollMs: 10,
-    },
-  })
+      runner: createLocalRunner(),
+      allowUnisolatedRunner: true,
+      ...options.treatment,
+    } as DoctorTreatmentOptions,
+  }
+}
+
+async function startDoctor(r: Repo, model: ScriptedModel, options: DoctorOptions = {}): Promise<DoctorService> {
+  const service = await startDoctorService(doctorServiceOptions(r, model, options))
   cleanups.push(() => service.close())
   return service
 }
 
-function priceCrash() {
+function priceCrash(message = 'нет тарифа starter') {
   return createIncidentEvent({
     appName: 'test-app',
     kind: 'crash',
     where: 'src/price.mjs:5:35',
-    message: 'нет тарифа starter',
+    message,
     stack: 'Error: нет тарифа starter\n    at price (src/price.mjs:5:35)',
     context: { processName: 'web' },
     occurredAt: new Date(),
   })
 }
 
-async function settledCase(service: DoctorService, states: CaseState[] = FINAL_STATES, timeoutMs = 30_000) {
+async function settledCase(service: DoctorService, states: CaseState[] = FINAL_STATES, timeoutMs = 30_000, caseId = 1) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const found = await service.caseBook.getCase(1)
+    const found = await service.caseBook.getCase(caseId)
     if (found && states.includes(found.state)) return found
-    if (Date.now() > deadline) throw new Error(`случай 1 не дошёл до ${states.join('/')}: ${found?.state}`)
+    if (Date.now() > deadline) throw new Error(`случай ${caseId} не дошёл до ${states.join('/')}: ${found?.state}`)
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
 }
@@ -211,7 +237,7 @@ describe('лечение: задача remontnik.treatment', () => {
     const model = createScriptedModel()
     model.script(
       callTool('read', { path: 'src/price.mjs' }),
-      callTool('finish_diagnosis', { found: false, cause: 'не понял, откуда starter', evidence: ['src/price.mjs прочитан'], confidence: 'low' }),
+      callTool('finish_diagnosis', { found: false, cause: 'не понял, откуда starter', evidence: ['src/price.mjs прочитан', `в логе ключ ${LEAKED_KEY}`], confidence: 'low' }),
     )
     const doctor = await startDoctor(r, model)
 
@@ -223,13 +249,14 @@ describe('лечение: задача remontnik.treatment', () => {
     const reports = await doctor.reports.list({ after: 0, limit: 20 })
     expect(reports.at(-1)).toMatchObject({ type: 'no_cause_found', caseId: 1 })
     expect(reports.at(-1)?.full).toContain('src/price.mjs прочитан')
+    expect(reports.at(-1)?.full).not.toContain(LEAKED_KEY)
   }, 60_000)
 
   it('потолок diagnoseUsdPerCase → работа модели остановлена, отчёт no_cause_found', async () => {
     const r = repo()
     const model = createScriptedModel({ costPerResponseUsd: 0.3 })
     model.script(...Array.from({ length: 40 }, () => callTool('bash', { command: 'true' })))
-    const doctor = await startDoctor(r, model, { diagnoseUsdPerCase: 0.5 })
+    const doctor = await startDoctor(r, model, { limits: { diagnoseUsdPerCase: 0.5 } })
 
     await doctor.receiveEvents([priceCrash()])
     const sick = await settledCase(doctor)
@@ -265,5 +292,131 @@ describe('лечение: задача remontnik.treatment', () => {
     const userMessages = second.requests[0]!.messages.filter((message) => message.role === 'user')
     expect(userMessages).toHaveLength(2)
     expect((await doctor.reports.list({ after: 0, limit: 20 })).map((report) => report.type)).toEqual(['case_received', 'fix_ready'])
+  }, 60_000)
+
+  it('без исполнителя-контейнера врач не лечит: локальный — только явно, для тестов', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    const noRunner = doctorServiceOptions(r, model)
+    delete (noRunner.treatment as Partial<DoctorTreatmentOptions>).runner
+    await expect(startDoctorService(noRunner)).rejects.toThrow(/контейнер/)
+    const unisolated = doctorServiceOptions(r, model, { treatment: { allowUnisolatedRunner: false } })
+    await expect(startDoctorService(unisolated)).rejects.toThrow(/контейнер/)
+  })
+
+  it('основа — рабочая версия из deploy current, а не свежий main; промпт говорит так же', async () => {
+    const r = repo()
+    const running = git(r.repoDir, 'rev-parse', 'HEAD')
+    writeFiles(r.repoDir, { 'README.md': 'новее рабочей версии\n' })
+    git(r.repoDir, 'add', '-A')
+    git(r.repoDir, 'commit', '-m', 'после выкатки')
+    git(r.repoDir, 'push', 'origin', 'main')
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model, { current: `printf '{"version":"${running}","previous":null}'` })
+
+    await doctor.receiveEvents([priceCrash()])
+    expect((await settledCase(doctor)).state).toBe('report_only')
+
+    const branch = git(r.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/gm, '')
+    expect(git(r.origin, 'rev-parse', `${branch}~1`)).toBe(running)
+    expect(JSON.stringify(model.requests[0]!.messages[0])).toContain('на коммите рабочей версии')
+    expect((await doctor.reports.list({ after: 0, limit: 20 })).at(-1)?.full).not.toContain('рабочая версия неизвестна')
+  }, 60_000)
+
+  it('рабочая версия неизвестна → основа main, отчёт и промпт об этом говорят', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model, { current: 'exit 3' })
+
+    await doctor.receiveEvents([priceCrash()])
+    await settledCase(doctor)
+
+    expect(JSON.stringify(model.requests[0]!.messages[0])).toContain('какая версия работает, неизвестно')
+    expect((await doctor.reports.list({ after: 0, limit: 20 })).at(-1)?.full).toContain('основа — main, рабочая версия неизвестна')
+  }, 60_000)
+
+  it('правка меняет существующий тест → не проверяется и не отправляется, нужен человек', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(
+      ...diagnosisSteps(),
+      callTool('write', { path: 'src/price.mjs', content: FIXED }),
+      callTool('write', { path: 'test/price.test.mjs', content: NEW_TEST }),
+      callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: [] }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('report_only')
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*')).toBe('')
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('needs_human')
+    expect(report?.full).toContain('test/price.test.mjs')
+  }, 60_000)
+
+  it('модель подменила .git в копии → случай остановлен, отчёт о попытке выхода', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    const dotGit = "'.'+'g'+'it'"
+    model.script(
+      ...diagnosisSteps(),
+      callTool('write', { path: 'src/price.mjs', content: FIXED }),
+      callTool('bash', { command: `node -e "const fs=require('fs'); fs.rmSync(${dotGit}); fs.writeFileSync(${dotGit}, 'gitdir: /nonexistent.invalid/x\\n')"` }),
+      callTool('finish_fix', { summary: 'Тариф по умолчанию — start', testsAdded: [] }),
+    )
+    const doctor = await startDoctor(r, model)
+
+    await doctor.receiveEvents([priceCrash()])
+    const sick = await settledCase(doctor)
+
+    expect(sick.state).toBe('needs_human')
+    expect(git(r.origin, 'branch', '--list', 'remontnik/*')).toBe('')
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.type).toBe('needs_human')
+    expect(report?.short).toContain('верстак')
+  }, 60_000)
+
+  it('коммит правки есть, а commitAll вернул пусто (сбой между коммитом и памятью) → правка не теряется', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model, {
+      wrapGuard: (guard) => ({
+        ...guard,
+        commitAll: async (cwd, message) => {
+          await guard.commitAll(cwd, message)
+          return undefined
+        },
+      }),
+    })
+
+    await doctor.receiveEvents([priceCrash()])
+    await settledCase(doctor)
+
+    expect((await doctor.reports.list({ after: 0, limit: 20 })).at(-1)?.type).toBe('fix_ready')
+  }, 60_000)
+
+  it('дневной бюджет модели общий для случаев и переживает перезапуск', async () => {
+    const r = repo()
+    const first = createScriptedModel({ costPerResponseUsd: 0.3 })
+    first.script(...Array.from({ length: 40 }, () => callTool('bash', { command: 'true' })))
+    const firstDoctor = await startDoctor(r, first, { limits: { diagnoseUsdPerCase: 5, modelUsdPerDay: 0.5 } })
+    await firstDoctor.receiveEvents([priceCrash()])
+    expect((await settledCase(firstDoctor)).state).toBe('no_cause_found')
+    await cleanups.pop()!()
+
+    const second = createScriptedModel({ costPerResponseUsd: 0.3 })
+    second.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, second, { limits: { diagnoseUsdPerCase: 5, modelUsdPerDay: 0.5 } })
+    await doctor.receiveEvents([priceCrash('нет тарифа basic')])
+    expect((await settledCase(doctor, FINAL_STATES, 30_000, 2)).state).toBe('no_cause_found')
+
+    expect(second.requests).toHaveLength(0)
+    const report = (await doctor.reports.list({ after: 0, limit: 20 })).at(-1)
+    expect(report?.short).toContain('дневной бюджет')
   }, 60_000)
 })

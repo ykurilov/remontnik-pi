@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Context } from '@earendil-works/chord/context'
 import {
@@ -106,7 +106,7 @@ export class ContainerExecutionEnv implements ExecutionEnv {
     this.files = new NodeExecutionEnv({ cwd: this.cwd, shellEnv: {} })
   }
 
-  /** Путь внутри копии, не в `.git` и не закрытый; иначе — отказ. */
+  /** Путь внутри копии, не в `.git` и не закрытый; иначе — отказ. Ссылки разворачиваются до проверки. */
   private check(path: string): Result<string, FileError> {
     const absolute = resolve(this.cwd, path)
     const real = realpathOfExisting(absolute)
@@ -119,8 +119,42 @@ export class ContainerExecutionEnv implements ExecutionEnv {
     return ok(absolute)
   }
 
+  /**
+   * Для записи: ни одна часть пути внутри копии не символьная ссылка. Иначе висячая ссылка (цель не существует,
+   * проверка по настоящему пути её не видит) увела бы запись за пределы копии. `last: false` — сама ссылка
+   * в конце пути допустима (удаление и переименование трогают ссылку, а не цель).
+   */
+  private checkWrite(path: string, last = true): Result<string, FileError> {
+    const checked = this.check(path)
+    if (!checked.ok) return checked
+    const absolute = checked.value
+    const real = realpathOfExisting(dirname(absolute))
+    if (this.tempRoots.some((root) => real === root || real.startsWith(root + sep))) return checked
+    const lexical = relative(this.cwd, absolute)
+    const [start, inside] = lexical.startsWith('..') || isAbsolute(lexical) ? [this.realRoot, relative(this.realRoot, absolute)] : [this.cwd, lexical]
+    const parts = inside.split(sep).filter((part) => part !== '' && part !== '.')
+    let current = start
+    for (const [index, part] of parts.entries()) {
+      current = join(current, part)
+      if (!last && index === parts.length - 1) break
+      let isLink: boolean
+      try {
+        isLink = lstatSync(current).isSymbolicLink()
+      } catch {
+        break
+      }
+      if (isLink) return err(denied(path, 'запись через символьную ссылку запрещена'))
+    }
+    return checked
+  }
+
   private async guarded<T>(path: string, action: (absolute: string) => Promise<Result<T, FileError>>): Promise<Result<T, FileError>> {
     const checked = this.check(path)
+    return checked.ok ? action(checked.value) : err(checked.error)
+  }
+
+  private async guardedWrite<T>(path: string, action: (absolute: string) => Promise<Result<T, FileError>>, last = true): Promise<Result<T, FileError>> {
+    const checked = this.checkWrite(path, last)
     return checked.ok ? action(checked.value) : err(checked.error)
   }
 
@@ -146,19 +180,19 @@ export class ContainerExecutionEnv implements ExecutionEnv {
     return this.guarded(path, (p) => this.files.openBinaryReader(p, options, context))
   }
   writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(path, (p) => this.files.writeFile(p, content, context))
+    return this.guardedWrite(path, (p) => this.files.writeFile(p, content, context))
   }
   appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(path, (p) => this.files.appendFile(p, content, context))
+    return this.guardedWrite(path, (p) => this.files.appendFile(p, content, context))
   }
   truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(path, (p) => this.files.truncateFile(p, size, context))
+    return this.guardedWrite(path, (p) => this.files.truncateFile(p, size, context))
   }
   flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
     return this.guarded(path, (p) => this.files.flushFile(p, context))
   }
   renameFile(sourcePath: string, destinationPath: string, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(sourcePath, (source) => this.guarded(destinationPath, (destination) => this.files.renameFile(source, destination, context)))
+    return this.guardedWrite(sourcePath, (source) => this.guardedWrite(destinationPath, (destination) => this.files.renameFile(source, destination, context)), false)
   }
   fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
     return this.guarded(path, (p) => this.files.fileInfo(p, context))
@@ -191,10 +225,10 @@ export class ContainerExecutionEnv implements ExecutionEnv {
     return this.guarded(path, (p) => this.files.exists(p, context))
   }
   createDir(path: string, options: { recursive?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(path, (p) => this.files.createDir(p, options, context))
+    return this.guardedWrite(path, (p) => this.files.createDir(p, options, context))
   }
   remove(path: string, options: { recursive?: boolean; force?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
-    return this.guarded(path, (p) => this.files.remove(p, options, context))
+    return this.guardedWrite(path, (p) => this.files.remove(p, options, context), false)
   }
   async createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
     const created = await this.files.createTempDir(prefix, context)
@@ -218,6 +252,7 @@ export class ContainerExecutionEnv implements ExecutionEnv {
     const timeoutSeconds = Math.min(options?.timeout ?? this.options.defaultTimeoutSeconds, this.options.maxTimeoutSeconds)
     const result = await this.options.runner.run(command, {
       cwd: cwd.value,
+      copyDir: this.cwd,
       env: { ...this.options.env, ...options?.env },
       timeoutSeconds,
       ...(context.abortSignal ? { signal: context.abortSignal } : {}),

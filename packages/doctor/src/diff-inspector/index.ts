@@ -48,16 +48,8 @@ export interface InspectDiffOptions {
   knownHosts?: readonly string[]
 }
 
-const TEST_AND_EVAL_MASKS = [
-  '**/*.test.*',
-  '**/*.spec.*',
-  '**/test/**',
-  '**/tests/**',
-  '**/__tests__/**',
-  '**/__snapshots__/**',
-  '**/__mocks__/**',
-  '**/fixtures/**',
-  '**/e2e/**',
+// Настройки запуска тестов и eval: их нельзя ни менять, ни добавлять заново.
+const RUNNER_CONFIG_AND_EVAL_MASKS = [
   '**/vite.config.*',
   '**/vitest.config.*',
   '**/vitest.workspace.*',
@@ -70,6 +62,19 @@ const TEST_AND_EVAL_MASKS = [
   '**/scenarios/**',
   '**/*rubric*',
   '**/*judge*',
+]
+
+const TEST_AND_EVAL_MASKS = [
+  '**/*.test.*',
+  '**/*.spec.*',
+  '**/test/**',
+  '**/tests/**',
+  '**/__tests__/**',
+  '**/__snapshots__/**',
+  '**/__mocks__/**',
+  '**/fixtures/**',
+  '**/e2e/**',
+  ...RUNNER_CONFIG_AND_EVAL_MASKS,
 ]
 
 const BLOCK_COMMENT = /\/\*.*?\*\//g
@@ -96,6 +101,11 @@ const EXECUTABLE_MODE = '100755'
 
 export function isTestOrEvalPath(path: string): boolean {
   return matchesAnyMask(TEST_AND_EVAL_MASKS, path)
+}
+
+/** Настройка запуска тестов, сценарий, рубрика или судья eval. */
+export function isRunnerConfigOrEvalPath(path: string): boolean {
+  return matchesAnyMask(RUNNER_CONFIG_AND_EVAL_MASKS, path)
 }
 
 function isOutsideProject(path: string): boolean {

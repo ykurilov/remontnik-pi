@@ -9,7 +9,8 @@ import { startIntakeServer, createIntakeHandler, type IntakeServer } from '../in
 import type { GitGuard } from '../git-guard/index.js'
 import { createReports, type Reports } from '../reports/index.js'
 import { createRecordEvalBaseCache, createTreatment, createWorkbenchEnvFactory, type Treatment } from '../treatment/index.js'
-import { createLocalRunner, type CommandRunner } from '../workbench/index.js'
+import type { CommandRunner } from '../workbench/index.js'
+import { createCurrentVersionReader } from './current-version.js'
 import { openDoctorHarness } from './harness.js'
 
 // Каркас врача: хранилище pi-durable, приём событий, книга случаев, отчёты и Telegram.
@@ -36,10 +37,14 @@ export interface DoctorTreatmentOptions {
   worktreesDir: string
   models: Models
   model: { provider: string; modelId: string }
-  /** Где идут команды модели; по умолчанию — локальный исполнитель. */
+  /** Где идут команды модели: контейнер (`createDockerRunner`). Без него врач не лечит. */
   runner?: CommandRunner
   /** Где идут проверки; по умолчанию — тот же, что у модели. */
   checksRunner?: CommandRunner
+  /** Только для тестов: разрешить исполнитель без изоляции (`createLocalRunner`). */
+  allowUnisolatedRunner?: boolean
+  /** Коммит рабочей версии; по умолчанию — команда `deploy.commands.current` в основной копии репозитория. */
+  currentVersion?: (config: RemontnikConfig) => Promise<string | undefined>
   /** Окружение, из которого eval берёт свои переменные; по умолчанию — окружение врача. */
   evalEnv?: Readonly<Record<string, string | undefined>>
   appDescription?: string
@@ -64,6 +69,19 @@ const TASK_REPORTS: Partial<Record<ReportInfo['type'], string>> = {
   task_faulted: 'упала',
   migration_failed: 'не перенесена на новую версию',
   task_outdated: 'не может продолжиться: её код сменился',
+}
+
+/** Модель и проверки идут только в контейнере; локальный исполнитель — лишь по явному разрешению тестов. */
+function isolatedRunners(options: DoctorTreatmentOptions): { runner: CommandRunner; checksRunner: CommandRunner } {
+  const { runner } = options
+  const checksRunner = options.checksRunner ?? runner
+  if (!runner || !checksRunner) throw new Error('врач лечит только в контейнере: задайте treatment.runner (createDockerRunner)')
+  for (const candidate of [runner, checksRunner]) {
+    if (candidate.isolation !== 'container' && options.allowUnisolatedRunner !== true) {
+      throw new Error('исполнитель без изоляции: врач лечит только в контейнере (createDockerRunner); локальный — только для тестов')
+    }
+  }
+  return { runner, checksRunner }
 }
 
 function describeError(error: unknown): string {
@@ -118,13 +136,13 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   }
 
   const treatmentOptions = options.treatment
-  const runner = treatmentOptions?.runner ?? createLocalRunner()
+  const runners = treatmentOptions ? isolatedRunners(treatmentOptions) : undefined
   const opened = await openDoctorHarness({
     stateDir: options.stateDir,
     onReport: (error, info) => handleHarnessReport(error, info),
     ...(options.wrapStorage ? { wrapStorage: options.wrapStorage } : {}),
     ...(options.now ? { now: options.now } : {}),
-    ...(treatmentOptions ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner }) } : {}),
+    ...(treatmentOptions && runners ? { models: treatmentOptions.models, env: createWorkbenchEnvFactory({ runner: runners.runner }) } : {}),
   })
 
   const caseBook = createCaseBook(opened.records)
@@ -137,13 +155,14 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   reportsRef = reports
 
   let treatment: Treatment | undefined
-  if (treatmentOptions) {
+  if (treatmentOptions && runners) {
     treatment = createTreatment({
       reports,
       guard: treatmentOptions.guard,
       loadConfig: treatmentOptions.loadConfig,
+      currentVersion: treatmentOptions.currentVersion ?? createCurrentVersionReader(treatmentOptions.guard.repoDir),
       model: treatmentOptions.model,
-      checksRunner: treatmentOptions.checksRunner ?? runner,
+      checksRunner: runners.checksRunner,
       worktreesDir: treatmentOptions.worktreesDir,
       checksDir: join(options.stateDir, 'checks'),
       evalEnv: treatmentOptions.evalEnv ?? process.env,
@@ -151,6 +170,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       ...(treatmentOptions.appDescription ? { appDescription: treatmentOptions.appDescription } : {}),
       budgetPollMs: treatmentOptions.budgetPollMs ?? BUDGET_POLL_MS,
       onReport: pump,
+      now,
     })
     // До resume(): прерванные перезапуском задачи лечения продолжаются со своих чекпойнтов.
     opened.registry.install(treatment.extension)

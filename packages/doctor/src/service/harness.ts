@@ -43,6 +43,10 @@ const RECORD_FAMILIES: Readonly<Record<string, RecordFamily>> = {
   'report-index': recordFamily('remontnik.report-index'),
   /** Итоги eval основы по паре (коммит, сценарий). */
   'eval-base': recordFamily('remontnik.eval-base'),
+  /** Дневной расход врача на модель и eval (ключ — день). */
+  spend: recordFamily('remontnik.spend'),
+  /** Сколько расхода модели по случаю уже записано в дни. */
+  'spend-case': recordFamily('remontnik.spend-case'),
 }
 
 /** Семейство документов коллекции записей: для чтения из задач pi-durable (`runtime.snapshot`). */

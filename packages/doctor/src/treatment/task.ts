@@ -12,18 +12,21 @@ import {
   type UsageState,
 } from '@earendil-works/pi-durable'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { Case, CaseState } from '../case-book/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
-import { slugify, type GitGuard } from '../git-guard/index.js'
+import { GitGuardError, slugify, type GitGuard } from '../git-guard/index.js'
 import { diagnoseMessage, fixMessage } from '../model/case-messages.js'
 import { buildRepoMap, buildSystemPrompt } from '../model/system-prompt.js'
 import { matchesAnyMask } from '../path-mask/index.js'
 import type { RecordStore, RecordTransaction } from '../records/index.js'
 import type { ReportType, Reports } from '../reports/index.js'
-import { causeFoundReport, fixReadyReport, noCauseFoundReport, standBrokenReport, type ReportText } from '../reports/texts.js'
+import { causeFoundReport, fixReadyReport, needsHumanReport, noCauseFoundReport, standBrokenReport, type ReportText } from '../reports/texts.js'
 import { durableTxOf, recordFamilyOf, recordTransactionOver } from '../service/harness.js'
 import { createWorkbench, type CommandRunner } from '../workbench/index.js'
 import { TreatmentDoc, type Diagnosis, type FixSummary, type TreatmentDocState } from './doc.js'
+import { findProtectedChanges } from './protected-changes.js'
+import { emptySpendDay, evalSpentUsd, modelSpentUsd, spendDayKey, type CaseSpend, type SpendDay } from './spend.js'
 import { doctorToolGuard, doctorTools } from './tools.js'
 
 // Задача лечения `remontnik.treatment` (R1). Фазы — чекпойнты pi-durable: перезапуск врача продолжает
@@ -31,6 +34,11 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // идемпотентна: копия переиспользуется, запрос модели находится по `requestId`, итог модели лежит в документе.
 //
 //   triage → diagnosing → fixing → verifying → (этап 5: gating и выкатка)
+//
+// Основа — рабочая версия (`deploy.commands.current`); неизвестна — последний коммит основной ветки, и отчёт это говорит.
+// Правка, которая задевает защищённые пути (тесты, eval, зависимости, сборку, Ремонтника), не проверяется
+// и не отправляется. Подменённая копия (git-замок: `escape`) — попытка выхода из верстака: случай останавливается.
+// Расход модели и eval пишется в дневной учёт (`spend.ts`) по ходу работы.
 //
 // Модель работает в отдельном разговоре, которым владеет задача: системный промпт и набор инструментов
 // постоянны для основы, сведения о случае — в сообщениях.
@@ -40,6 +48,8 @@ export type TreatmentInput = { caseId: number }
 type Treating = {
   conversationId: ConversationId
   baseCommit: string
+  /** Основа — рабочая версия; `false` — основная ветка, какая версия работает, неизвестно. */
+  baseRunning: boolean
   branch: string
   worktreePath: string
   /** Потолок расходов модели на случай. */
@@ -52,10 +62,12 @@ export type TreatmentState =
   | ({ phase: 'fixing'; diagnosis: Diagnosis } & Treating)
   | ({ phase: 'verifying'; diagnosis: Diagnosis; fix: FixSummary; fixCommit: string; changedPaths: string[] } & Treating)
 
-export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken'
+export type TreatmentOutcome = 'fix_ready' | 'cause_found' | 'no_cause_found' | 'stand_broken' | 'needs_human'
 
 export type TreatmentResult = {
   outcome: TreatmentOutcome
+  /** Почему нужен человек. */
+  why?: 'protected_paths' | 'escape' | 'eval_worse'
   reportId: number
   branch?: string
   fixCommit?: string
@@ -68,6 +80,8 @@ export interface TreatmentDeps {
   guard: GitGuard
   /** Настройка приложения из основной ветки. */
   loadConfig(): Promise<RemontnikConfig>
+  /** Коммит рабочей версии (`deploy.commands.current`); `undefined` — узнать не удалось. */
+  currentVersion(config: RemontnikConfig): Promise<string | undefined>
   model: { provider: string; modelId: string }
   /** Исполнитель проверок (тесты, eval). */
   checksRunner: CommandRunner
@@ -81,6 +95,7 @@ export interface TreatmentDeps {
   budgetPollMs: number
   /** Новый отчёт записан: пора отправлять. */
   onReport(): void
+  now(): number
 }
 
 export interface Treatment {
@@ -90,6 +105,11 @@ export interface Treatment {
 }
 
 type Runtime = TaskRuntime<TreatmentInput, TreatmentState, TreatmentResult, object>
+type ConverseStatus = 'answered' | 'failed' | 'budget' | 'day_budget'
+type Base = { commit: string; running: boolean }
+
+const BASE_UNKNOWN_NOTE = 'Заметка: основа — main, рабочая версия неизвестна.'
+const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
 
 function spentUsd(usage: UsageState | undefined): number {
   if (!usage) return 0
@@ -133,12 +153,18 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     text: ReportText,
     result: Omit<TreatmentResult, 'reportId'>,
     context: Context,
+    baseRunning = true,
   ): Promise<void> {
+    // Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo.
+    const config = await deps.loadConfig()
+    const knownSecrets = (config.checks.eval?.env ?? []).flatMap((name) => deps.evalEnv[name] ?? [])
+    const short = redactSecrets(text.short, { knownSecrets })
+    const full = redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets })
     await runtime.commit(async (tx) => {
       const records = recordTransactionOver(tx)
       const opened = await caseIn(records, caseId)
       opened.state = state
-      const report = await deps.reports.addIn(records, { type, caseId, short: text.short, full: text.full, telegram: 'pending' })
+      const report = await deps.reports.addIn(records, { type, caseId, short, full, telegram: 'pending' })
       opened.reportIds.push(report.reportId)
       return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId: report.reportId } } }
     }, context)
@@ -146,30 +172,59 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
   }
 
   /**
-   * Один этап работы модели. Пока она работает, расход сверяется с потолком; превысила — разговор прерывается.
-   * После перезапуска тот же `requestId` находит тот же запрос.
+   * Записывает расход модели по случаю в дневной учёт (приращением к уже записанному) и возвращает расход модели за день.
+   */
+  async function recordModelSpend(runtime: Runtime, caseId: number, caseTotalUsd: number, timeZone: string, context: Context): Promise<number> {
+    let dayTotal = 0
+    await runtime.commit(async (tx) => {
+      const records = recordTransactionOver(tx)
+      const day = await records.doc<SpendDay>('spend', spendDayKey(deps.now(), timeZone), emptySpendDay())
+      const recorded = await records.doc<CaseSpend>('spend-case', caseKey(caseId), { recordedModelUsd: 0 })
+      const delta = caseTotalUsd - recorded.recordedModelUsd
+      if (delta > 0) {
+        day.model[caseKey(caseId)] = (day.model[caseKey(caseId)] ?? 0) + delta
+        recorded.recordedModelUsd = caseTotalUsd
+      }
+      dayTotal = modelSpentUsd(day)
+      return undefined
+    }, context)
+    return dayTotal
+  }
+
+  /**
+   * Один этап работы модели. Пока она работает, расход пишется в дневной учёт и сверяется с потолками
+   * случая и дня; превысила — разговор прерывается. После перезапуска тот же `requestId` находит тот же запрос.
    */
   async function converse(
     runtime: Runtime,
     treating: Treating,
+    caseId: number,
     requestId: string,
     content: string,
     context: Context,
-  ): Promise<{ status: 'answered' | 'failed' | 'budget'; spentUsd: number }> {
+  ): Promise<{ status: ConverseStatus; spentUsd: number }> {
+    const config = await deps.loadConfig()
     const spent = async () => spentUsd(await runtime.snapshot(UsageDoc, treating.conversationId, context))
-    if ((await spent()) >= treating.limitUsd) return { status: 'budget', spentUsd: await spent() }
+    const overLimit = async (): Promise<'budget' | 'day_budget' | undefined> => {
+      const total = await spent()
+      const today = await recordModelSpend(runtime, caseId, total, config.app.timeZone, context)
+      if (total >= treating.limitUsd) return 'budget'
+      return today >= config.limits.modelUsdPerDay ? 'day_budget' : undefined
+    }
+    const before = await overLimit()
+    if (before) return { status: before, spentUsd: await spent() }
     const handle = await runtime.conversation(treating.conversationId, context)
     if (!handle) throw new Error('разговор модели пропал')
     const submission = await handle.submit({ type: 'input', content, requestId }, context)
 
     let settled = false
-    let overBudget = false
+    let stopped: 'budget' | 'day_budget' | undefined
     const watcher = (async () => {
       while (!settled && !runtime.signal.aborted) {
         await new Promise<void>((resolve) => runtime.setTimer(resolve, deps.budgetPollMs))
         if (settled || runtime.signal.aborted) return
-        if ((await spent()) >= treating.limitUsd) {
-          overBudget = true
+        stopped = await overLimit()
+        if (stopped) {
           await handle.abort(context)
           return
         }
@@ -180,10 +235,63 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       settled = true
       await watcher
       const total = await spent()
-      if (overBudget) return { status: 'budget', spentUsd: total }
+      await recordModelSpend(runtime, caseId, total, config.app.timeZone, context)
+      if (stopped) return { status: stopped, spentUsd: total }
       return { status: record.status === 'done' ? 'answered' : 'failed', spentUsd: total }
     } finally {
       settled = true
+    }
+  }
+
+  /** Основа лечения: рабочая версия, если её удалось узнать и она есть в origin; иначе — основная ветка. */
+  async function chooseBase(config: RemontnikConfig): Promise<Base> {
+    const version = await deps.currentVersion(config).catch(() => undefined)
+    if (version && COMMIT_SHA.test(version)) {
+      const commit = await deps.guard.resolve(version).catch(() => undefined)
+      if (commit) return { commit, running: true }
+    }
+    return { commit: await deps.guard.resolve(`origin/${config.repo.mainBranch}`), running: false }
+  }
+
+  /** Бронь eval на остаток дневного бюджета. Незакрытая бронь от прерванного прогона считается потраченной целиком. */
+  async function reserveEval(runtime: Runtime, caseId: number, config: RemontnikConfig, context: Context): Promise<{ day: string; id: string; budgetUsd: number }> {
+    const dayKey = spendDayKey(deps.now(), config.app.timeZone)
+    let reservation = { day: dayKey, id: '', budgetUsd: 0 }
+    await runtime.commit(async (tx) => {
+      const day = await recordTransactionOver(tx).doc<SpendDay>('spend', dayKey, emptySpendDay())
+      let attempt = 0
+      while (day.eval[`case-${caseId}-${attempt}`]) {
+        const earlier = day.eval[`case-${caseId}-${attempt}`]!
+        earlier.actualUsd ??= earlier.reservedUsd
+        attempt += 1
+      }
+      const id = `case-${caseId}-${attempt}`
+      const budgetUsd = Math.max(0, config.limits.evalUsdPerDay - evalSpentUsd(day))
+      day.eval[id] = { reservedUsd: budgetUsd }
+      reservation = { day: dayKey, id, budgetUsd }
+      return undefined
+    }, context)
+    return reservation
+  }
+
+  async function settleEval(runtime: Runtime, reservation: { day: string; id: string }, actualUsd: number, context: Context): Promise<void> {
+    await runtime.commit(async (tx) => {
+      const day = await recordTransactionOver(tx).doc<SpendDay>('spend', reservation.day, emptySpendDay())
+      const item = day.eval[reservation.id]
+      if (item) item.actualUsd = actualUsd
+      return undefined
+    }, context)
+  }
+
+  /** Git-замок нашёл подменённую копию: лечение останавливается, нужен человек. Остальные ошибки летят дальше. */
+  async function stopOnEscape(runtime: Runtime, caseId: number, treating: Treating, context: Context, work: () => Promise<void>): Promise<void> {
+    try {
+      await work()
+    } catch (error) {
+      if (!(error instanceof GitGuardError && error.code === 'escape')) throw error
+      const doc = await treatmentDoc(runtime, treating.conversationId, context)
+      const text = needsHumanReport({ case: doc.case, ...(doc.diagnosis ? { diagnosis: doc.diagnosis } : {}), reason: { kind: 'escape', detail: error.message } })
+      await finish(runtime, caseId, 'needs_human', 'needs_human', text, { outcome: 'needs_human', why: 'escape' }, context, treating.baseRunning)
     }
   }
 
@@ -197,7 +305,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const sick = await readCase(runtime, caseId, context)
         const config = await deps.loadConfig()
         await deps.guard.fetch()
-        const baseCommit = await runtime.memo('baseCommit', await deps.guard.resolve(`origin/${config.repo.mainBranch}`), context)
+        const base = (await runtime.memo<Base>('base', context)) ?? (await runtime.memo<Base>('base', await chooseBase(config), context))
+        const baseCommit = base.commit
         const workbench = await createWorkbench({
           guard: deps.guard,
           worktreesDir: deps.worktreesDir,
@@ -213,6 +322,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           repoMap: buildRepoMap(await deps.guard.listFiles(baseCommit), { closedPaths: config.closedPaths }),
           closedPaths: config.closedPaths,
           bashTimeoutSeconds,
+          base: base.running ? 'running' : 'main',
         })
         const limitUsd = config.limits.diagnoseUsdPerCase ?? config.limits.modelUsdPerDay
 
@@ -234,7 +344,15 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'diagnosing'
           return {
             status: 'running',
-            checkpoint: { phase: 'diagnosing', conversationId, baseCommit, branch: workbench.branch, worktreePath: workbench.path, limitUsd },
+            checkpoint: {
+              phase: 'diagnosing',
+              conversationId,
+              baseCommit,
+              baseRunning: base.running,
+              branch: workbench.branch,
+              worktreePath: workbench.path,
+              limitUsd,
+            },
           }
         }, context)
       },
@@ -243,17 +361,18 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const { caseId } = task.input
         const treating = task.state.checkpoint
         let doc = await treatmentDoc(runtime, treating.conversationId, context)
-        let run: { status: 'answered' | 'failed' | 'budget'; spentUsd: number } | undefined
+        let run: { status: ConverseStatus; spentUsd: number } | undefined
         if (!doc.diagnosis) {
-          run = await converse(runtime, treating, `diagnose:${caseId}`, diagnoseMessage(doc.case), context)
+          run = await converse(runtime, treating, caseId, `diagnose:${caseId}`, diagnoseMessage(doc.case), context)
           doc = await treatmentDoc(runtime, treating.conversationId, context)
         }
         const diagnosis = doc.diagnosis
         if (!diagnosis?.found) {
-          const reason = run?.status === 'budget' ? 'budget' : diagnosis ? 'not_found' : 'no_answer'
+          const reason = run?.status === 'budget' || run?.status === 'day_budget' ? run.status : diagnosis ? 'not_found' : 'no_answer'
           const spent = run?.spentUsd ?? spentUsd(await runtime.snapshot(UsageDoc, treating.conversationId, context))
-          const text = noCauseFoundReport({ case: doc.case, reason, spentUsd: spent, limitUsd: treating.limitUsd, ...(diagnosis ? { diagnosis } : {}) })
-          await finish(runtime, caseId, 'no_cause_found', 'no_cause_found', text, { outcome: 'no_cause_found' }, context)
+          const limitUsd = reason === 'day_budget' ? (await deps.loadConfig()).limits.modelUsdPerDay : treating.limitUsd
+          const text = noCauseFoundReport({ case: doc.case, reason, spentUsd: spent, limitUsd, ...(diagnosis ? { diagnosis } : {}) })
+          await finish(runtime, caseId, 'no_cause_found', 'no_cause_found', text, { outcome: 'no_cause_found' }, context, treating.baseRunning)
           return
         }
         await runtime.commit(async (tx) => {
@@ -266,28 +385,40 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const { caseId } = task.input
         const { diagnosis, phase: _phase, ...treating } = task.state.checkpoint
         let doc = await treatmentDoc(runtime, treating.conversationId, context)
-        let run: { status: 'answered' | 'failed' | 'budget' } | undefined
+        let run: { status: ConverseStatus } | undefined
         if (!doc.fix) {
-          run = await converse(runtime, treating, `fix:${caseId}`, fixMessage(diagnosis), context)
+          run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis), context)
           doc = await treatmentDoc(runtime, treating.conversationId, context)
         }
         const fix = doc.fix
-        let fixCommit: string | undefined
-        if (fix) {
-          const made = await deps.guard.commitAll(treating.worktreePath, commitMessage(caseId, fix, diagnosis))
-          fixCommit = made === undefined ? await runtime.memo<string>('fixCommit', context) : await runtime.memo('fixCommit', made, context)
-        }
-        if (!fix || !fixCommit) {
-          const reason = fix ? 'no_changes' : run?.status === 'budget' ? 'budget' : 'no_answer'
-          const text = causeFoundReport({ case: doc.case, diagnosis, reason })
-          await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found' }, context)
-          return
-        }
-        const changedPaths = await deps.guard.changedPaths(treating.worktreePath, treating.baseCommit)
-        await runtime.commit(async (tx) => {
-          ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'verifying'
-          return { status: 'running', checkpoint: { ...treating, phase: 'verifying', diagnosis, fix, fixCommit, changedPaths } }
-        }, context)
+        await stopOnEscape(runtime, caseId, treating, context, async () => {
+          let fixCommit: string | undefined
+          if (fix) {
+            // Сбой между коммитом и памятью: при повторе коммитить нечего, но коммит правки уже в ветке.
+            const made = await deps.guard.commitAll(treating.worktreePath, commitMessage(caseId, fix, diagnosis))
+            const head = made ?? (await runtime.memo<string>('fixCommit', context)) ?? (await deps.guard.resolve('HEAD', { cwd: treating.worktreePath }))
+            fixCommit = head === treating.baseCommit ? undefined : await runtime.memo('fixCommit', head, context)
+          }
+          if (!fix || !fixCommit) {
+            const reason = fix ? 'no_changes' : run?.status === 'budget' || run?.status === 'day_budget' ? run.status : 'no_answer'
+            const text = causeFoundReport({ case: doc.case, diagnosis, reason })
+            await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found' }, context, treating.baseRunning)
+            return
+          }
+          const files = await deps.guard.changedFiles(treating.worktreePath, treating.baseCommit)
+          const changedPaths = [...new Set(files.flatMap((file) => (file.previousPath ? [file.path, file.previousPath] : [file.path])))]
+          const protectedChanges = findProtectedChanges(await deps.loadConfig(), files)
+          if (protectedChanges.length > 0) {
+            const text = needsHumanReport({ case: doc.case, diagnosis, fix, reason: { kind: 'protected_paths', changes: protectedChanges, branch: treating.branch } })
+            const result = { outcome: 'needs_human', why: 'protected_paths', branch: treating.branch, fixCommit, changedPaths } as const
+            await finish(runtime, caseId, 'report_only', 'needs_human', text, result, context, treating.baseRunning)
+            return
+          }
+          await runtime.commit(async (tx) => {
+            ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'verifying'
+            return { status: 'running', checkpoint: { ...treating, phase: 'verifying', diagnosis, fix, fixCommit, changedPaths } }
+          }, context)
+        })
       },
 
       verifying: async (task, runtime, context) => {
@@ -298,12 +429,14 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
         let checks = (await runtime.memo<JsonValue>('checks', context)) as ChecksResult | undefined
         if (!checks) {
+          const reservation = await reserveEval(runtime, caseId, config, context)
           // Проверки идут в своих копиях на закоммиченной правке и на основе: мусор модели в верстаке им не мешает.
           const closed = (await deps.guard.listFiles(checkpoint.baseCommit)).filter((file) => matchesAnyMask(config.closedPaths, file))
           const candidateDir = join(deps.worktreesDir, `case-${caseId}-candidate`)
           const baseDir = join(deps.worktreesDir, `case-${caseId}-base`)
-          await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed })
-          await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed })
+          // Копии проверок всегда заново: после сбоя в старых мог остаться мусор прошлого прогона.
+          await deps.guard.addWorktree({ path: candidateDir, base: checkpoint.fixCommit, exclude: closed, fresh: true })
+          await deps.guard.addWorktree({ path: baseDir, base: checkpoint.baseCommit, exclude: closed, fresh: true })
           try {
             const result = await createChecks({
               runner: deps.checksRunner,
@@ -317,8 +450,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               baseDir,
               baseCommit: checkpoint.baseCommit,
               changedPaths: checkpoint.changedPaths,
-              budgetUsd: config.limits.evalUsdPerDay,
+              budgetUsd: reservation.budgetUsd,
             })
+            await settleEval(runtime, reservation, result.eval.costUsd, context)
             checks = (await runtime.memo('checks', result as unknown as JsonValue, context)) as unknown as ChecksResult
           } finally {
             await deps.guard.removeWorktree(candidateDir).catch(() => {})
@@ -337,10 +471,21 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const result = { branch: checkpoint.branch, fixCommit: checkpoint.fixCommit, changedPaths: checkpoint.changedPaths, checks }
         if (checks.eval.status === 'stand_broken') {
           const text = standBrokenReport({ case: doc.case, branch: checkpoint.branch, checks })
-          await finish(runtime, caseId, 'stand_broken', 'stand_broken', text, { outcome: 'stand_broken', ...result }, context)
+          await finish(runtime, caseId, 'stand_broken', 'stand_broken', text, { outcome: 'stand_broken', ...result }, context, checkpoint.baseRunning)
           return
         }
-        if (checks.tests.status === 'green' || checks.tests.status === 'flaky') {
+        const testsPassed = checks.tests.status === 'green' || checks.tests.status === 'flaky'
+        if (testsPassed && checks.eval.status === 'worse') {
+          const text = needsHumanReport({
+            case: doc.case,
+            diagnosis: checkpoint.diagnosis,
+            fix: checkpoint.fix,
+            reason: { kind: 'eval_worse', branch: checkpoint.branch, checks },
+          })
+          await finish(runtime, caseId, 'report_only', 'needs_human', text, { outcome: 'needs_human', why: 'eval_worse', ...result }, context, checkpoint.baseRunning)
+          return
+        }
+        if (testsPassed) {
           const text = fixReadyReport({
             case: doc.case,
             diagnosis: checkpoint.diagnosis,
@@ -351,11 +496,11 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             pushed,
           })
           // Этап 4 только сообщает: решение о выкатке (gated) добавит этап 5.
-          await finish(runtime, caseId, 'report_only', 'fix_ready', text, { outcome: 'fix_ready', ...result }, context)
+          await finish(runtime, caseId, 'report_only', 'fix_ready', text, { outcome: 'fix_ready', ...result }, context, checkpoint.baseRunning)
           return
         }
         const text = causeFoundReport({ case: doc.case, diagnosis: checkpoint.diagnosis, reason: 'checks_red', branch: checkpoint.branch, checks })
-        await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found', ...result }, context)
+        await finish(runtime, caseId, 'report_only', 'cause_found', text, { outcome: 'cause_found', ...result }, context, checkpoint.baseRunning)
       },
     },
     abort: (_task, runtime, context) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),

@@ -1,6 +1,7 @@
 import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
+import type { ProtectedChange } from '../treatment/protected-changes.js'
 
 // Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
 
@@ -99,13 +100,14 @@ export function fixReadyReport(input: {
 
 export function noCauseFoundReport(input: {
   case: ReportCase
-  reason: 'budget' | 'not_found' | 'no_answer'
+  reason: 'budget' | 'day_budget' | 'not_found' | 'no_answer'
   spentUsd: number
   limitUsd: number
   diagnosis?: Diagnosis
 }): ReportText {
   const why = {
     budget: `кончился бюджет (${usd(input.spentUsd)} из ${usd(input.limitUsd)})`,
+    day_budget: `кончился дневной бюджет модели (${usd(input.limitUsd)} в день), на случай потрачено ${usd(input.spentUsd)}`,
     not_found: 'модель не нашла причину',
     no_answer: 'модель не дала диагноза',
   }[input.reason]
@@ -117,13 +119,14 @@ export function noCauseFoundReport(input: {
 export function causeFoundReport(input: {
   case: ReportCase
   diagnosis: Diagnosis
-  reason: 'budget' | 'no_answer' | 'no_changes' | 'checks_red'
+  reason: 'budget' | 'day_budget' | 'no_answer' | 'no_changes' | 'checks_red'
   branch?: string
   checks?: ChecksResult
 }): ReportText {
   const failed = input.checks?.tests.failed ?? []
   const what = {
     budget: 'правку не сделал: кончился бюджет',
+    day_budget: 'правку не сделал: кончился дневной бюджет модели',
     no_answer: 'правку не сделал: модель не закончила',
     no_changes: 'правку не сделал: модель ничего не изменила',
     checks_red: `правка в ветке ${input.branch ?? '—'} не прошла тесты${failed.length > 0 ? `: ${failed.join(', ')}` : ''}`,
@@ -136,5 +139,37 @@ export function causeFoundReport(input: {
 export function standBrokenReport(input: { case: ReportCase; branch: string; checks: ChecksResult }): ReportText {
   const short = `${head(input.case)}: стенд проверки сломан, правку в ветке ${input.branch} оценить не смог. Нужен человек.`
   const full = [short, '', ...caseLines(input.case), ...checksLines(input.checks)].join('\n')
+  return { short, full }
+}
+
+export type NeedsHumanReason =
+  | { kind: 'protected_paths'; changes: readonly ProtectedChange[]; branch: string }
+  | { kind: 'escape'; detail: string }
+  | { kind: 'eval_worse'; branch: string; checks: ChecksResult }
+
+/** Врач остановился и ничего не выкатит: правку должен посмотреть человек. */
+export function needsHumanReport(input: { case: ReportCase; diagnosis?: Diagnosis; fix?: FixSummary; reason: NeedsHumanReason }): ReportText {
+  const { reason } = input
+  const what = (() => {
+    switch (reason.kind) {
+      case 'protected_paths':
+        return `правка задевает защищённые пути (${reason.changes.map((change) => change.path).join(', ')}): я её не проверял и не отправлял`
+      case 'escape':
+        return 'модель пыталась выбраться из верстака: копия подменена, лечение остановлено'
+      case 'eval_worse':
+        return `правка в ветке ${reason.branch} проходит тесты, но ${evalShort(reason.checks.eval)}`
+    }
+  })()
+  const short = `${head(input.case)}: ${what}. Нужен человек.`
+  const full = [
+    short,
+    '',
+    ...caseLines(input.case),
+    ...diagnosisLines(input.diagnosis),
+    ...(input.fix ? [`Правка: ${input.fix.summary}`] : []),
+    ...(reason.kind === 'protected_paths' ? ['Защищённые пути:', ...reason.changes.map((change) => `- ${change.path}: ${change.why}`), `Ветка (только у врача): ${reason.branch}`] : []),
+    ...(reason.kind === 'escape' ? [`Что нашёл git-замок: ${reason.detail}`] : []),
+    ...(reason.kind === 'eval_worse' ? checksLines(reason.checks) : []),
+  ].join('\n')
   return { short, full }
 }

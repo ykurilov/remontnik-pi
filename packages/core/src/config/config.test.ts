@@ -133,7 +133,7 @@ describe('defineRemontnikConfig', () => {
       expect.arrayContaining(['**/.env*', '**/*.env', '**/*.pem', '**/*.key', '**/*secret*', '**/*credential*']),
     )
     expect(BUILT_IN_FORBIDDEN.agentChatSdkMasks.length).toBeGreaterThan(0)
-    expect(BUILT_IN_FORBIDDEN.remontnikMasks).toEqual(expect.arrayContaining(['**/remontnik.config.*']))
+    expect(BUILT_IN_FORBIDDEN.remontnikMasks).toEqual(expect.arrayContaining(['**/remontnik.config.*', '**/.remontnik*', '**/.remontnik*/**']))
     expect(BUILT_IN_FORBIDDEN.protectedPackages).toEqual(
       expect.arrayContaining(['@ykurilov/agent-chat-*', '@ykurilov/remontnik-*']),
     )

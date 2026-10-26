@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { CommandRunner, RunResult } from '../workbench/index.js'
 import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 
@@ -8,6 +9,10 @@ import { ALL_SCENARIOS, selectEvalScenarios } from './eval-scope.js'
 // на закоммиченной правке. Итог — CheckResult из data-model.md без поля браузера (его добавляет лечение).
 // Упавшие тесты повторяются один раз: разный итог = flaky. Eval сравнивается с основой по каждому сценарию,
 // итог основы кэшируется по паре (коммит, сценарий).
+//
+// Ключи eval получает только процесс eval. Итог eval лежит вне копий, и писать туда может только он.
+// Расход eval сверяется с его долей бюджета, пока он идёт: превысил — прогон прерывается.
+// Хвосты вывода и заметки вычищаются от ключей до того, как попадут в отчёт.
 
 export interface EvalScenarioResult {
   id: string
@@ -69,10 +74,12 @@ export interface ChecksOptions {
   /** Окружение врача, из которого eval получает только переменные `checks.eval.env`. */
   evalEnv: Readonly<Record<string, string | undefined>>
   baseCache: EvalBaseCache
-  /** Папка для итогов eval (`{outDir}`). */
+  /** Папка для итогов eval (`{outDir}`), вне копий: команды правки до неё не дотягиваются. */
   workDir: string
   /** Тайм-аут одной команды. */
   timeoutSeconds: number
+  /** Как часто сверять расход идущего eval с его бюджетом. */
+  costPollMs?: number
   now?: () => number
 }
 
@@ -90,6 +97,7 @@ export interface ChecksInput {
 const FAILED_LINE = /^REMONTNIK_FAILED=(.*)$/m
 const TESTCASE = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g
 const OUTPUT_TAIL_CHARS = 4_000
+const COST_POLL_MS = 2_000
 
 function xmlAttribute(attributes: string, name: string): string | undefined {
   const match = attributes.match(new RegExp(`\\b${name}="([^"]*)"`))
@@ -116,10 +124,6 @@ export function parseFailedTests(output: string): string[] {
   return failed
 }
 
-function tail(output: string): string {
-  return output.slice(-OUTPUT_TAIL_CHARS)
-}
-
 function formatUsd(value: number): string {
   return String(Math.max(0, Number(value.toFixed(4))))
 }
@@ -141,6 +145,8 @@ function isScenarioResult(value: unknown): value is EvalScenarioResult {
 
 interface EvalRun {
   ok: boolean
+  /** Прерван: потратил свой бюджет. */
+  overBudget?: boolean
   scenarios: EvalScenarioResult[]
   costUsd: number
   note?: string
@@ -149,9 +155,24 @@ interface EvalRun {
 export function createChecks(options: ChecksOptions) {
   const now = options.now ?? Date.now
   const { config } = options
+  const evalSecrets = Object.values(evalEnv()).filter((value) => value.length >= 8)
 
-  function run(command: string, cwd: string, env: Record<string, string> = {}): Promise<RunResult> {
-    return options.runner.run(command, { cwd, env, timeoutSeconds: options.timeoutSeconds })
+  function tail(output: string): string {
+    return redactSecrets(output, { knownSecrets: evalSecrets }).slice(-OUTPUT_TAIL_CHARS)
+  }
+
+  /** Команда в копии `cwd`; писать вне копии можно только в `writableDirs`. */
+  function run(command: string, cwd: string, extra: { env?: Record<string, string>; writableDirs?: string[]; signal?: AbortSignal } = {}): Promise<RunResult> {
+    return options.runner.run(command, { cwd, copyDir: cwd, env: extra.env ?? {}, timeoutSeconds: options.timeoutSeconds, ...(extra.writableDirs ? { writableDirs: extra.writableDirs } : {}), ...(extra.signal ? { signal: extra.signal } : {}) })
+  }
+
+  function readCostUsd(file: string): number | undefined {
+    try {
+      const record = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+      return typeof record.costUsd === 'number' && record.costUsd >= 0 ? record.costUsd : undefined
+    } catch {
+      return undefined
+    }
   }
 
   function failedStep(name: string, result: RunResult, startedAt: number): TestsOutcome {
@@ -200,10 +221,23 @@ export function createChecks(options: ChecksOptions) {
       .replaceAll('{repeat}', String(evalConfig.repeat))
       .replaceAll('{maxCostUsd}', formatUsd(maxCostUsd))
       .replaceAll('{outDir}', shellWord(outDir))
-    const result = await run(command, dir, evalEnv())
+    const resultFile = join(outDir, evalConfig.resultFile)
+    const cutoff = new AbortController()
+    const watcher = setInterval(() => {
+      if ((readCostUsd(resultFile) ?? 0) >= maxCostUsd) cutoff.abort()
+    }, options.costPollMs ?? COST_POLL_MS)
+    let result: RunResult
+    try {
+      result = await run(command, dir, { env: evalEnv(), writableDirs: [outDir], signal: cutoff.signal })
+    } finally {
+      clearInterval(watcher)
+    }
+    if (cutoff.signal.aborted) {
+      return { ok: false, overBudget: true, scenarios: [], costUsd: readCostUsd(resultFile) ?? maxCostUsd, note: `eval (${label}) прерван: потратил свой бюджет $${formatUsd(maxCostUsd)}` }
+    }
     let parsed: unknown
     try {
-      parsed = JSON.parse(readFileSync(join(outDir, evalConfig.resultFile), 'utf8'))
+      parsed = JSON.parse(readFileSync(resultFile, 'utf8'))
     } catch {
       return { ok: false, scenarios: [], costUsd: 0, note: `eval (${label}) не оставил итог: код ${result.exitCode ?? '—'}\n${tail(result.output)}` }
     }
@@ -229,6 +263,7 @@ export function createChecks(options: ChecksOptions) {
 
     const candidate = await runEval(input.candidateDir, 'candidate', selection.scenarios, input.budgetUsd)
     let costUsd = candidate.costUsd
+    if (candidate.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: candidate.note! }
     if (!candidate.ok) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, ...(candidate.note ? { note: candidate.note } : {}) }
 
     // «Всё» — список сценариев знает только сам eval, поэтому основа для него не кэшируется.
@@ -249,6 +284,7 @@ export function createChecks(options: ChecksOptions) {
       if (baseInstall.exitCode !== 0) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `установка зависимостей основы: код ${baseInstall.exitCode ?? '—'}` }
       const baseRun = await runEval(input.baseDir, 'base', missing, remaining)
       costUsd += baseRun.costUsd
+      if (baseRun.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: baseRun.note! }
       if (!baseRun.ok) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, ...(baseRun.note ? { note: baseRun.note } : {}) }
       for (const result of baseRun.scenarios) {
         base.set(result.id, result)
