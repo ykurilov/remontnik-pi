@@ -1,5 +1,5 @@
 import { defineDoc } from '@earendil-works/pi-durable'
-import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
+import type { BadAnswer, IncidentKind } from '@ykurilov/remontnik-core/incident'
 
 // Документ лечения в разговоре модели-врача. Задача пишет в него верстак и сведения о случае,
 // инструменты `finish_*` — диагноз и итог правки. Окружение выполнения строится по нему же.
@@ -20,6 +20,9 @@ export type FixSummary = {
   notes?: string
 }
 
+/** Плохой ответ бота как тип, а не интерфейс: документу pi-durable нужен JSON-объект. */
+export type CaseBadAnswer = { [K in keyof BadAnswer]: BadAnswer[K] }
+
 export type TreatmentCaseInfo = {
   caseId: number
   appName: string
@@ -28,6 +31,8 @@ export type TreatmentCaseInfo = {
   message: string
   stack: string
   events: number
+  /** Плохой ответ бота, уже вычищенный: данные приложения, а не поручение модели. */
+  badAnswer?: CaseBadAnswer
 }
 
 export type TreatmentDocState = {

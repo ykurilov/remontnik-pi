@@ -190,7 +190,7 @@ description: "Задачи реализации Ремонтника Pi"
 
 - [X] T077 [US6] Чтение разговоров в `packages/watch/src/review/`
 - [X] T078 [US6] `watch.conversationFinished` и события `bad_answer` с полями `badAnswer` (`excerpt` «≤ 500», `confidence` «0..1») в `packages/watch/src/index.ts`
-- [ ] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
+- [X] T079 [US6] Лечение `bad_answer` у врача: сценарии eval по карте промптов, выдержка разговора в `case_info` в `packages/doctor/src/treatment/`
 - [X] T080 [US6] «Пациент»: бот с заложенным плохим ответом и вызов `conversationFinished` в `apps/patient/src/bot/`; тест `apps/patient/test/cycle/us6-review.test.ts`
 
 ---

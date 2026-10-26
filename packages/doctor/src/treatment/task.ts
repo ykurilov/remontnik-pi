@@ -12,7 +12,7 @@ import {
   type UsageState,
 } from '@earendil-works/pi-durable'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
-import { redactSecrets } from '@ykurilov/remontnik-core/redact'
+import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
 import type { Case, CaseState } from '../case-book/index.js'
 import { createChecks, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import type { EvalProxy, EvalSpend } from '../eval-proxy/index.js'
@@ -55,6 +55,8 @@ import { doctorToolGuard, doctorTools } from './tools.js'
 // без проверок и не отправляется. Причина в Agent Chat SDK — правки нет, отчёт с задачей для агента SDK.
 // Подменённая копия (git-замок: `escape`) — попытка выхода из верстака: случай останавливается.
 // Расход модели и eval пишется в дневной учёт (`spend.ts`) по ходу работы.
+// Плохой ответ бота (`bad_answer`) лечится так же: выдержка разговора идёт модели вычищенной и помеченной как данные,
+// правку проверяет eval по карте `evalScope`; карта не даёт сценариев — eval «не запускался», и выкатки нет.
 //
 // Модель работает в отдельном разговоре, которым владеет задача: системный промпт и набор инструментов
 // постоянны для основы, сведения о случае — в сообщениях.
@@ -175,6 +177,12 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return state
   }
 
+  /** Ключи eval: их значения вырезаются из всего, что уходит наружу или модели. */
+  function knownSecretsOf(config: RemontnikConfig): string[] {
+    const evalNames = [...(config.checks.eval?.env ?? []), ...(config.checks.eval?.providers ?? []).map((provider) => provider.keyEnv)]
+    return evalNames.flatMap((name) => deps.evalEnv[name] ?? [])
+  }
+
   /** Отчёт, состояние случая и итог задачи — одной фиксацией. */
   async function finish(
     runtime: Runtime,
@@ -187,9 +195,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     baseRunning = true,
   ): Promise<void> {
     // Ключи eval и всё похожее на секреты вырезается из отчёта: он уходит в Telegram и Paseo.
-    const config = await deps.loadConfig()
-    const evalNames = [...(config.checks.eval?.env ?? []), ...(config.checks.eval?.providers ?? []).map((provider) => provider.keyEnv)]
-    const knownSecrets = evalNames.flatMap((name) => deps.evalEnv[name] ?? [])
+    const knownSecrets = knownSecretsOf(await deps.loadConfig())
     const short = redactSecrets(text.short, { knownSecrets })
     const full = redactSecrets(baseRunning ? text.full : `${text.full}\n${BASE_UNKNOWN_NOTE}`, { knownSecrets })
     await runtime.commit(async (tx) => {
@@ -402,6 +408,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             message: sick.message,
             stack: sick.stack,
             events: sick.events,
+            // Выдержка пришла из разговора с пользователем: вычищается ещё раз, сторож приложения мог вычистить хуже.
+            ...(sick.badAnswer ? { badAnswer: redactValue(sick.badAnswer, { knownSecrets: knownSecretsOf(config) }) } : {}),
           }
           ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'diagnosing'
           return {
@@ -458,7 +466,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           let doc = await treatmentDoc(runtime, treating.conversationId, context)
           let run: { status: ConverseStatus } | undefined
           if (!doc.fix) {
-            run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis), context)
+            run = await converse(runtime, treating, caseId, `fix:${caseId}`, fixMessage(diagnosis, doc.case), context)
             doc = await treatmentDoc(runtime, treating.conversationId, context)
           }
           const fix = doc.fix
@@ -522,6 +530,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
               baseDir,
               baseCommit: checkpoint.baseCommit,
               changedPaths: checkpoint.changedPaths,
+              // Правку плохого ответа проверяет только eval: без сценариев по карте её нечем проверить.
+              evalRequired: doc.case.kind === 'bad_answer',
               reserveEval: async () => {
                 reservation = await reserveEval(runtime, caseId, config, context)
                 evalSpend = evalSpendRecorder(runtime, reservation, context)
