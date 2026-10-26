@@ -128,17 +128,17 @@ description: "Задачи реализации Ремонтника Pi"
 
 ### Тесты
 
-- [ ] T052 [P] [US4] Тест запретных зон `packages/doctor/src/forbidden-zones/forbidden-zones.test.ts`: встроенные (`.env*`, имена с `secret`/`credential`, `@ykurilov/agent-chat-*` в `node_modules` и патчах, `remontnik.config.*`, зависимости, файл-замок, `Dockerfile`, выкатка, CI) + маски приложения + признаки SQL
-- [ ] T053 [P] [US4] Тест осмотра диффа `packages/doctor/src/diff-inspector/diff-inspector.test.ts`: изменён или удалён существующий тест, сценарий eval, рубрика (новые — можно); подозрительное: `process.env`, новые внешние адреса, `child_process`, `eval`/`new Function`, файлы вне проекта; пределы 300 строк / 15 файлов
-- [ ] T054 [P] [US4] Тест решения `packages/doctor/src/deploy-gate/deploy-gate.test.ts`: каждый код из `GateReason` (`tests_not_green`, `eval_worse`, `forbidden_zone`, `existing_test_changed`, `suspicious_change`, `diff_too_large`, `stop_switch`, `attempts_exhausted`, `needs_human_after_rollback`, `budget_exhausted`, `rebase_conflict`) даёт `report_only`; всё зелёное → `deploy`
-- [ ] T055 [P] [US4] Тест источника настройки `packages/doctor/src/service/config-source.test.ts`: настройка читается только из рабочей копии основной ветки, правка настройки в ветке врача не действует
+- [X] T052 [P] [US4] Тест запретных зон `packages/doctor/src/forbidden-zones/forbidden-zones.test.ts`: встроенные (`.env*`, имена с `secret`/`credential`, `@ykurilov/agent-chat-*` в `node_modules` и патчах, `remontnik.config.*`, зависимости, файл-замок, `Dockerfile`, выкатка, CI) + маски приложения + признаки SQL
+- [X] T053 [P] [US4] Тест осмотра диффа `packages/doctor/src/diff-inspector/diff-inspector.test.ts`: изменён или удалён существующий тест, сценарий eval, рубрика (новые — можно); подозрительное: `process.env`, новые внешние адреса, `child_process`, `eval`/`new Function`, файлы вне проекта; пределы 300 строк / 15 файлов
+- [X] T054 [P] [US4] Тест решения `packages/doctor/src/deploy-gate/deploy-gate.test.ts`: каждый код из `GateReason` (`tests_not_green`, `eval_worse`, `forbidden_zone`, `existing_test_changed`, `suspicious_change`, `diff_too_large`, `stop_switch`, `attempts_exhausted`, `needs_human_after_rollback`, `budget_exhausted`, `rebase_conflict`) даёт `report_only`; всё зелёное → `deploy`
+- [X] T055 [P] [US4] Тест источника настройки `packages/doctor/src/service/config-source.test.ts`: настройка читается только из рабочей копии основной ветки, правка настройки в ветке врача не действует
 
 ### Реализация
 
-- [ ] T056 [P] [US4] Запретные зоны в `packages/doctor/src/forbidden-zones/`
-- [ ] T057 [P] [US4] Осмотр диффа в `packages/doctor/src/diff-inspector/`
-- [ ] T058 [US4] Решение о выкатке — чистая функция в `packages/doctor/src/deploy-gate/`
-- [ ] T059 [US4] Источник настройки в `packages/doctor/src/service/config-source.ts`
+- [X] T056 [P] [US4] Запретные зоны в `packages/doctor/src/forbidden-zones/`
+- [X] T057 [P] [US4] Осмотр диффа в `packages/doctor/src/diff-inspector/`
+- [X] T058 [US4] Решение о выкатке — чистая функция в `packages/doctor/src/deploy-gate/`
+- [X] T059 [US4] Источник настройки в `packages/doctor/src/service/config-source.ts`
 - [ ] T060 [US4] Фаза `gated` в задаче лечения; отчёты `report_only` и `needs_human`; при причине в SDK — готовый текст задачи для агента SDK, в `packages/doctor/src/treatment/`
 - [ ] T061 [US4] Шаблон правил GitHub `deploy/github-ruleset.json` (основная ветка: запрет принудительной записи и удаления; метки `remontnik/**`: запрет изменения и удаления) и раздел о правах git в `docs/security.md`
 - [ ] T062 [US4] Интеграционный тест `apps/patient/test/cycle/us4-forbidden.test.ts`: сценарии money, test-edit, «причина в SDK»

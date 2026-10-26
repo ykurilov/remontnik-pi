@@ -129,7 +129,9 @@ describe('defineRemontnikConfig', () => {
 
     expect(config.forbidden.access).toEqual(expect.arrayContaining(['src/auth/**', ...BUILT_IN_FORBIDDEN.accessMasks]))
     expect(config.forbidden.builtIn).toBe(BUILT_IN_FORBIDDEN)
-    expect(BUILT_IN_FORBIDDEN.accessMasks).toEqual(expect.arrayContaining(['**/.env*']))
+    expect(BUILT_IN_FORBIDDEN.accessMasks).toEqual(
+      expect.arrayContaining(['**/.env*', '**/*.env', '**/*.pem', '**/*.key', '**/*secret*', '**/*credential*']),
+    )
     expect(BUILT_IN_FORBIDDEN.agentChatSdkMasks.length).toBeGreaterThan(0)
     expect(BUILT_IN_FORBIDDEN.remontnikMasks).toEqual(expect.arrayContaining(['**/remontnik.config.*']))
     expect(BUILT_IN_FORBIDDEN.protectedPackages).toEqual(

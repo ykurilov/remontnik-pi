@@ -14,7 +14,7 @@ function deepFreeze<T>(value: T): T {
 /** Запреты, которые нельзя убрать настройкой. Маски — glob от корня репозитория, без учёта регистра. */
 export const BUILT_IN_FORBIDDEN = deepFreeze({
   /** Доступы и ключи: добавляются к `forbidden.access` приложения. */
-  accessMasks: ['**/.env*', '**/*secret*', '**/*credential*'],
+  accessMasks: ['**/.env*', '**/*.env', '**/*secret*', '**/*credential*', '**/*.pem', '**/*.key'],
   /** Код Agent Chat SDK и его патчи. */
   agentChatSdkMasks: [
     '**/node_modules/@ykurilov/agent-chat-*/**',
