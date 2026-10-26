@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createGitGuard, GitGuardError, slugify, treatmentBranch, type GitGuardOptions } from './index.js'
 
 const dirs: string[] = []
+const HOUR = 60 * 60_000
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
@@ -107,11 +108,12 @@ describe('git-замок', () => {
     // Контейнер копии 4 не удалился: в ней, возможно, ещё пишет git. Копию 5 бросил убитый врач.
     writeFileSync(join(git(live, 'rev-parse', '--absolute-git-dir'), 'index.lock'), '')
     writeFileSync(join(git(dead, 'rev-parse', '--absolute-git-dir'), 'index.lock'), '')
-    // Убитый fetch из слияния в main оставил замки веток origin и packed-refs.
+    // Убитый fetch из слияния в main час назад оставил замки веток origin и packed-refs.
     mkdirSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'remontnik'), { recursive: true })
-    writeFileSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'main.lock'), '')
-    writeFileSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'remontnik', '5-x.lock'), '')
-    writeFileSync(join(commonGitDir, 'packed-refs.lock'), '')
+    for (const lock of ['refs/remotes/origin/main.lock', 'refs/remotes/origin/remontnik/5-x.lock', 'packed-refs.lock']) {
+      writeFileSync(join(commonGitDir, lock), '')
+      utimesSync(join(commonGitDir, lock), new Date(Date.now() - HOUR), new Date(Date.now() - HOUR))
+    }
     writeFileSync(join(commonGitDir, 'index.lock'), '')
 
     const removed = await guard.clearStaleLocks({ inUse: (copy) => copy === live })
@@ -145,6 +147,42 @@ describe('git-замок', () => {
     const path = join(r.worktreesDir, '2')
     await guard.addWorktree({ path, branch: treatmentBranch(2, 'x'), base })
     await guard.addWorktree({ path, branch: treatmentBranch(2, 'x'), base })
+  })
+
+  it('свежие замки веток origin и packed-refs не трогает: их может держать живой fetch или gc человека', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const commonGitDir = join(r.repoDir, '.git')
+    mkdirSync(join(commonGitDir, 'refs', 'remotes', 'origin'), { recursive: true })
+    writeFileSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'main.lock'), '')
+    writeFileSync(join(commonGitDir, 'packed-refs.lock'), '')
+
+    expect(await guard.clearStaleLocks()).toEqual([])
+    expect(existsSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'main.lock'))).toBe(true)
+    expect(existsSync(join(commonGitDir, 'packed-refs.lock'))).toBe(true)
+    // Пока замок живой, fetch врача честно падает, а не ломает чужой git.
+    humanCommitOnOrigin(r)
+    expect((await rejection(guard.fetch())).code).toBe('failed')
+  })
+
+  it('копия, недосозданная убитым врачом (worktree add без checkout), пересоздаётся при повторе', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const base = await guard.resolve('HEAD')
+    const path = join(r.worktreesDir, '6')
+    const branch = treatmentBranch(6, 'x')
+    // Врач умер сразу после `worktree add --no-checkout`: папка и ветка есть, файлов нет.
+    mkdirSync(r.worktreesDir, { recursive: true })
+    git(r.repoDir, 'worktree', 'add', '--no-checkout', '-b', branch, path, base)
+
+    await guard.addWorktree({ path, branch, base })
+
+    expect(readFileSync(join(path, 'app.ts'), 'utf8')).toBe('export const answer = 1\n')
+    expect(git(path, 'status', '--porcelain')).toBe('')
+    // Готовую копию повтор не пересоздаёт: правка в ней остаётся.
+    writeFileSync(join(path, 'app.ts'), 'export const answer = 6\n')
+    await guard.addWorktree({ path, branch, base })
+    expect(readFileSync(join(path, 'app.ts'), 'utf8')).toBe('export const answer = 6\n')
   })
 
   it('замки git, брошенные убитым врачом в его копиях, убираются на старте; замки основной копии — нет', async () => {

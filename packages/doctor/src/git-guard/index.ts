@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import type { ChangedFile } from '../changed-files/index.js'
@@ -17,6 +17,15 @@ import type { ChangedFile } from '../changed-files/index.js'
 export const TREATMENT_BRANCH_PREFIX = 'remontnik/'
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+/**
+ * Замки веток origin и `packed-refs.lock` общие с человеком: ими пользуется его fetch, gc и ручная выкатка. Живой git
+ * держит их, только пока пишет ветки, — доли секунды, у больших fetch и gc секунды; сам git ждёт `packed-refs.lock`
+ * всего секунду. Свой git врач убивает через `DEFAULT_TIMEOUT_MS`. Десять минут с запасом больше всего этого: замок
+ * старше брошен, моложе — может быть живым, и его врач не трогает.
+ */
+export const STALE_SHARED_LOCK_MS = 10 * 60_000
+/** Отметка в gitdir копии: `checkout` закончен. Копия без неё недосоздана — врач упал посреди создания. */
+const COPY_READY_MARK = 'remontnik-ready'
 
 /** `diverged` — основная ветка origin ушла вперёд мимо правки: влить её вперёд нельзя. */
 export type GitGuardErrorCode = 'forbidden' | 'failed' | 'timeout' | 'escape' | 'diverged'
@@ -102,9 +111,9 @@ export interface GitGuard {
   /** Ревизия `commit` уже в основной ветке origin (по свежему fetch). */
   isInMainline(commit: string): Promise<boolean>
   /**
-   * Замки git, брошенные убитым врачом (его git убит вместе с ним): в gitdir копий врача, у веток и меток `remontnik/…`,
-   * у веток origin и `packed-refs.lock` — их оставляет убитый fetch или push. Только на старте врача, пока его git
-   * не идёт. Замки основной копии (индекс, её ветки) не трогает. Копию, где ещё может писать живой git (`inUse`:
+   * Замки git, брошенные убитым врачом (его git убит вместе с ним): в gitdir копий врача, у веток и меток `remontnik/…`.
+   * Замки веток origin и `packed-refs.lock` — общие с человеком — только старше `STALE_SHARED_LOCK_MS`. Только на
+   * старте врача, пока его git не идёт. Замки основной копии (индекс, её ветки) не трогает. Копию, где ещё может писать живой git (`inUse`:
    * её контейнер не удалось убрать), не трогает тоже. Возвращает убранные пути относительно общего gitdir.
    */
   clearStaleLocks(options?: { inUse?: (copyDir: string) => boolean }): Promise<string[]>
@@ -425,7 +434,33 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
   }
 
   /** Основная ветка origin сейчас: fetch и её ревизия. */
+  /**
+   * Брошенные замки веток origin и `packed-refs.lock` (см. `STALE_SHARED_LOCK_MS`): перед каждым fetch, чтобы замок,
+   * ещё молодой на старте врача, не держал fetch вечно. Возвращает убранные пути относительно общего gitdir.
+   */
+  function dropStaleSharedLocks(): string[] {
+    const removed: string[] = []
+    const remotes = join(commonGitDir, 'refs/remotes', remote)
+    const locks = [
+      ...(existsSync(remotes) ? readdirSync(remotes, { recursive: true, encoding: 'utf8' }).filter((file) => file.endsWith('.lock')).map((file) => join(remotes, file)) : []),
+      join(commonGitDir, 'packed-refs.lock'),
+    ]
+    for (const lock of locks) {
+      let age: number
+      try {
+        age = Date.now() - statSync(lock).mtimeMs
+      } catch {
+        continue
+      }
+      if (age < STALE_SHARED_LOCK_MS) continue
+      rmSync(lock, { force: true })
+      removed.push(relative(commonGitDir, lock))
+    }
+    return removed
+  }
+
   async function fetchedMainline(): Promise<string> {
+    dropStaleSharedLocks()
     await run(['fetch', remote])
     return (await run(['rev-parse', '--verify', `refs/remotes/${remote}/${options.mainBranch}^{commit}`])).trim()
   }
@@ -456,8 +491,9 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     const path = resolve(add.path)
     if (add.fresh) await removeCopy(path)
     else if (existsSync(path)) {
-      verifiedGitDir(path)
-      return
+      if (existsSync(join(verifiedGitDir(path), COPY_READY_MARK))) return
+      // Врач упал посреди создания копии: в ней нет файлов или только часть. Её ветка (если была) осталась.
+      await removeCopy(path)
     }
     const target =
       add.branch === undefined
@@ -469,6 +505,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     const patterns = ['/*', ...(add.exclude ?? []).map((file) => `!/${escapeSparsePath(file)}`)]
     await run(['sparse-checkout', 'set', '--no-cone', '--stdin'], { cwd: path }, `${patterns.join('\n')}\n`)
     await run(['checkout'], { cwd: path })
+    writeFileSync(join(verifiedGitDir(path), COPY_READY_MARK), '')
   }
 
   /** Удаляет копию целиком (с мусором проверок) и забывает её в git. Только внутри папки копий. */
@@ -523,6 +560,7 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
     },
 
     async fetch() {
+      dropStaleSharedLocks()
       await run(['fetch', remote])
     },
 
@@ -576,13 +614,11 @@ export function createGitGuard(options: GitGuardOptions): GitGuard {
         if (clearOptions.inUse?.(join(worktreesDir, relative(ownDir, copy)))) continue
         for (const file of readdirSync(admin)) if (file.endsWith('.lock')) drop(join(admin, file))
       }
-      const lockDirs = [join(commonGitDir, 'refs/heads', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/tags', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/remotes', remote)]
-      for (const own of lockDirs) {
+      for (const own of [join(commonGitDir, 'refs/heads', TREATMENT_BRANCH_PREFIX), join(commonGitDir, 'refs/tags', TREATMENT_BRANCH_PREFIX)]) {
         if (!existsSync(own)) continue
         for (const file of readdirSync(own, { recursive: true, encoding: 'utf8' })) if (file.endsWith('.lock')) drop(join(own, file))
       }
-      if (existsSync(join(commonGitDir, 'packed-refs.lock'))) drop(join(commonGitDir, 'packed-refs.lock'))
-      return removed
+      return [...removed, ...dropStaleSharedLocks()]
     },
 
     async commitAll(cwd, message) {
