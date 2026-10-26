@@ -1,12 +1,13 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { testRemontnikConfig } from '../testing/config.js'
-import { doctorStartPlan, egressProxyEnv, parseListen, startDoctorFromEnv, type DoctorEnv } from './start.js'
+import { caseWorkbenchEnv, doctorStartPlan, parseListen, startDoctorFromEnv, type DoctorEnv } from './start.js'
 
-// Боевой запуск врача: окружение сервера → служба с исполнителем в контейнере, закрытыми сетями и прокси eval.
+// Боевой запуск врача: окружение сервера → служба с исполнителем в контейнере, сетями случая, зеркалом реестра
+// и прокси eval; приём событий — только в сети приложения.
 
 const dirs: string[] = []
 afterEach(() => {
@@ -18,11 +19,8 @@ function serverEnv(overrides: Record<string, string | undefined> = {}): DoctorEn
     REMONTNIK_CONFIG_REPO_DIR: '/srv/remontnik/app',
     REMONTNIK_STATE_DIR: '/srv/remontnik/state',
     REMONTNIK_SHARED_SECRET: 'shared-test-secret',
-    REMONTNIK_WORKBENCH_NETWORK: 'remontnik-workbench',
-    REMONTNIK_CHECKS_NETWORK: 'remontnik-checks',
-    REMONTNIK_EGRESS_PROXY_URL: 'http://172.30.98.2:3128',
-    REMONTNIK_EVAL_PROXY_LISTEN: '172.30.99.2:7810',
-    REMONTNIK_EVAL_PROXY_URL: 'http://172.30.99.2:7810',
+    REMONTNIK_GATEWAY_CONTAINER: 'remontnik-doctor',
+    REMONTNIK_LISTEN_NETWORK: 'remontnik-app',
     DEEPSEEK_API_KEY: 'test-deepseek',
     OPENROUTER_API_KEY: 'test-openrouter',
     TEST_ALERT_BOT_TOKEN: '123456:test-bot-token',
@@ -32,32 +30,34 @@ function serverEnv(overrides: Record<string, string | undefined> = {}): DoctorEn
 }
 
 describe('настройка запуска из окружения', () => {
-  it('служба, исполнитель в контейнере и прокси eval — из окружения и настройки', () => {
+  it('служба, сети случая и приём событий — из окружения и настройки', () => {
     const plan = doctorStartPlan(serverEnv({ REMONTNIK_REPORTS_TOKEN: 'reports-test-token' }), testRemontnikConfig())
-    expect(plan.networks).toEqual({ workbench: 'remontnik-workbench', checks: 'remontnik-checks' })
+    expect(plan.listen).toEqual({ network: 'remontnik-app', port: 7800 })
+    expect(plan.gateway).toEqual({ container: 'remontnik-doctor', subnetPool: '10.213.0.0/16' })
     const { service } = plan
-    expect(service.listen).toEqual({ host: '0.0.0.0', port: 7800 })
     expect(service.telegram).toEqual({ botToken: '123456:test-bot-token', chatId: 'owner-chat' })
     expect(service.reportsFeed).toEqual({ token: 'reports-test-token' })
-    expect(service.treatment?.runner?.isolation).toBe('container')
-    expect(service.treatment?.allowUnisolatedRunner).toBeUndefined()
-    expect(service.treatment?.worktreesDir).toBe('/srv/remontnik/state/worktrees')
-    expect(service.treatment?.evalProxy).toEqual({ listen: { host: '172.30.99.2', port: 7810 }, publicUrl: 'http://172.30.99.2:7810' })
+    expect(service.treatment.worktreesDir).toBe('/srv/remontnik/state/worktrees')
+    expect(service.treatment.allowUnisolatedRunner).toBeUndefined()
+    expect(plan.runner).toMatchObject({ image: testRemontnikConfig().workbench.image, homesDir: '/srv/remontnik/state/homes' })
+  })
+
+  it('приём событий на явном адресе', () => {
+    expect(doctorStartPlan(serverEnv({ REMONTNIK_LISTEN_NETWORK: undefined, REMONTNIK_LISTEN: '10.5.0.3:7800' }), testRemontnikConfig()).listen).toEqual({ host: '10.5.0.3', port: 7800 })
   })
 
   it.each([
-    ['REMONTNIK_WORKBENCH_NETWORK', undefined, /REMONTNIK_WORKBENCH_NETWORK/],
-    ['REMONTNIK_CHECKS_NETWORK', undefined, /REMONTNIK_CHECKS_NETWORK/],
-    ['REMONTNIK_WORKBENCH_NETWORK', 'bridge', /не годится/],
-    ['REMONTNIK_CHECKS_NETWORK', 'host', /не годится/],
-    ['REMONTNIK_CHECKS_NETWORK', 'remontnik-workbench', /разными/],
+    ['REMONTNIK_GATEWAY_CONTAINER', undefined, /REMONTNIK_GATEWAY_CONTAINER/],
+    ['REMONTNIK_LISTEN_NETWORK', undefined, /REMONTNIK_LISTEN/],
+    ['REMONTNIK_LISTEN', '0.0.0.0:7800', /все адреса/],
+    ['REMONTNIK_LISTEN', '[::]:7800', /все адреса/],
+    ['REMONTNIK_CASE_SUBNETS', '10.213.0.0/30', /подсет/],
     ['REMONTNIK_SHARED_SECRET', undefined, /REMONTNIK_SHARED_SECRET/],
     ['TEST_ALERT_BOT_TOKEN', undefined, /TEST_ALERT_BOT_TOKEN/],
     ['DEEPSEEK_API_KEY', undefined, /DEEPSEEK_API_KEY/],
-    ['REMONTNIK_EVAL_PROXY_LISTEN', '172.30.99.2', /host:port/],
-    ['REMONTNIK_EGRESS_PROXY_URL', 'http://user:pass@10.0.0.2:3128', /http:\/\/host:port/],
   ])('%s = %s → врач не стартует', (name, value, error) => {
-    expect(() => doctorStartPlan(serverEnv({ [name]: value }), testRemontnikConfig())).toThrow(error)
+    const env = serverEnv({ [name]: value, ...(name === 'REMONTNIK_LISTEN' ? { REMONTNIK_LISTEN_NETWORK: undefined } : {}) })
+    expect(() => doctorStartPlan(env, testRemontnikConfig())).toThrow(error)
   })
 
   it('без чата тревог в настройке — отказ', () => {
@@ -65,12 +65,10 @@ describe('настройка запуска из окружения', () => {
     expect(() => doctorStartPlan(serverEnv(), config)).toThrow(/chatIdEnv/)
   })
 
-  it('прокси выхода: адрес для pnpm, npm, corepack и fetch Node', () => {
-    expect(egressProxyEnv('http://172.30.98.2:3128')).toMatchObject({
-      HTTPS_PROXY: 'http://172.30.98.2:3128',
-      https_proxy: 'http://172.30.98.2:3128',
-      HTTP_PROXY: 'http://172.30.98.2:3128',
-      NODE_USE_ENV_PROXY: '1',
+  it('верстак берёт пакеты только через зеркало врача', () => {
+    expect(caseWorkbenchEnv()).toMatchObject({
+      npm_config_registry: 'http://remontnik-gateway:7801/',
+      COREPACK_NPM_REGISTRY: 'http://remontnik-gateway:7801',
     })
   })
 
@@ -80,7 +78,7 @@ describe('настройка запуска из окружения', () => {
   })
 })
 
-describe('старт врача проверяет сети Docker', () => {
+describe('старт врача', () => {
   function appRepo(): string {
     const root = mkdtempSync(join(tmpdir(), 'remontnik-start-'))
     dirs.push(root)
@@ -91,19 +89,48 @@ describe('старт врача проверяет сети Docker', () => {
     return repoDir
   }
 
-  function fakeDocker(internal: string): string {
+  /** Подставной docker: адреса врача по сетям и одна старая сеть случая; вызовы — в журнал. */
+  function fakeDocker(networks: Record<string, string>): { docker: string; calls: () => string[] } {
     const root = mkdtempSync(join(tmpdir(), 'remontnik-docker-'))
     dirs.push(root)
     const docker = join(root, 'docker')
-    writeFileSync(docker, `#!/bin/sh\necho ${internal}\n`, { mode: 0o755 })
-    return docker
+    const log = join(root, 'calls.log')
+    const answer = JSON.stringify(Object.fromEntries(Object.entries(networks).map(([name, ip]) => [name, { IPAddress: ip }])))
+    writeFileSync(
+      docker,
+      [
+        '#!/bin/sh',
+        `echo "$*" >> '${log}'`,
+        'case "$1 $2" in',
+        `  "inspect --format") printf '%s\n' '${answer}';;`,
+        "  \"network ls\") echo stale-network-id;;",
+        'esac',
+        'exit 0',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    )
+    return { docker, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) }
   }
 
-  it('сеть верстака не закрыта → служба не стартует, хранилище не создаётся', async () => {
+  it('приём событий — только на адресе врача в сети приложения; старые сети случая удаляются', async () => {
+    const repoDir = appRepo()
+    const fake = fakeDocker({ 'remontnik-app': '127.0.0.1', 'remontnik-outside': '10.9.0.5' })
+    const env = serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: join(repoDir, '..', 'state'), REMONTNIK_LISTEN_PORT: '0' })
+    const doctor = await startDoctorFromEnv(env, { docker: fake.docker })
+    try {
+      expect(doctor.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+      expect(fake.calls()).toEqual(expect.arrayContaining(['inspect --format {{json .NetworkSettings.Networks}} remontnik-doctor', 'network rm stale-network-id']))
+    } finally {
+      await doctor.close()
+    }
+  })
+
+  it('врача нет в сети приложения → служба не стартует, хранилище не создаётся', async () => {
     const repoDir = appRepo()
     const stateDir = join(repoDir, '..', 'state')
     const env = serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: stateDir })
-    await expect(startDoctorFromEnv(env, { docker: fakeDocker("'false bridge true'") })).rejects.toThrow(/не закрыта/)
-    expect(() => execFileSync('ls', [stateDir], { stdio: 'pipe' })).toThrow()
+    await expect(startDoctorFromEnv(env, { docker: fakeDocker({ 'remontnik-outside': '10.9.0.5' }).docker })).rejects.toThrow(/remontnik-app/)
+    expect(existsSync(stateDir)).toBe(false)
   })
 })

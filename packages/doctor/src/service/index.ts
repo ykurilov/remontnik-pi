@@ -59,9 +59,10 @@ export interface DoctorTreatmentOptions {
   evalEnv?: Readonly<Record<string, string | undefined>>
   /**
    * Прокси модели для eval (`eval-proxy`): слушает там, где его видит внутренняя сеть проверок, `publicUrl` — его адрес
-   * из контейнера. Не задан — eval с провайдерами (`checks.eval.providers`) не запускается.
+   * из контейнера. Готовый прокси (`EvalProxy`) закрывает тот, кто его создал. Не задан — eval с провайдерами
+   * (`checks.eval.providers`) не запускается.
    */
-  evalProxy?: { listen: { host: string; port: number }; publicUrl?: string }
+  evalProxy?: { listen: { host: string; port: number }; publicUrl?: string } | EvalProxy
   appDescription?: string
   budgetPollMs?: number
 }
@@ -174,9 +175,12 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   reportsRef = reports
 
   let evalProxy: EvalProxy | undefined
-  if (treatmentOptions?.evalProxy) {
+  let ownEvalProxy: EvalProxy | undefined
+  const evalProxyOption = treatmentOptions?.evalProxy
+  if (evalProxyOption && 'openRun' in evalProxyOption) evalProxy = evalProxyOption
+  else if (evalProxyOption) {
     try {
-      evalProxy = await createEvalProxy(treatmentOptions.evalProxy)
+      evalProxy = ownEvalProxy = await createEvalProxy(evalProxyOption)
     } catch (error) {
       await opened.close().catch(() => {})
       throw error
@@ -254,7 +258,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       onError: (error) => log(`[врач] сбой приёма событий: ${describeError(error)}`),
     })
   } catch (error) {
-    await evalProxy?.close()
+    await ownEvalProxy?.close()
     await opened.close().catch(() => {})
     throw error
   }
@@ -270,7 +274,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       })
     } catch (error) {
       await intake.close()
-      await evalProxy?.close()
+      await ownEvalProxy?.close()
       await opened.close().catch(() => {})
       throw error
     }
@@ -293,7 +297,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       await intake.close()
       await bridgeIntake?.close()
       if (harnessState === 'open') await opened.close().catch((error: unknown) => log(`[врач] Harness не закрылся: ${describeError(error)}`))
-      await evalProxy?.close()
+      await ownEvalProxy?.close()
     },
   }
 }

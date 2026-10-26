@@ -6,9 +6,9 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 // Живая проверка шаблона deploy/compose.remontnik.yml на настоящем Docker: сборка образов врача и верстака,
-// подставное приложение в своей сети, врач поднимается из окружения. Команды в верстаке запускает сам врач
-// (`doctorStartPlan` → `createDockerRunner` внутри контейнера врача, через сокет хоста), а пробы изнутри
-// контейнеров верстака смотрят, что видно в сети верстака и в сети проверок.
+// подставное приложение в своей сети, врач поднимается из окружения. Сценарии случаев идут внутри контейнера
+// врача боевым кодом (`doctorStartPlan` → `createCaseGateway`): сети случая, зеркало реестра, прокси eval,
+// исполнитель команд через сокет хоста. Пробы изнутри контейнеров верстака смотрят, что видно в сетях случая.
 // Запуск: pnpm exec vitest run -c vitest.live.config.ts packages/doctor/test/live/compose.live.test.ts
 
 const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
@@ -22,8 +22,8 @@ const HOST_SERVICE_PORT = 18_999
 const CANARY = ['canary', 'secret', 'must', 'not', 'leak'].join('-')
 // Адрес интернета собран из частей: проверка открытости репозитория не пускает его в текст как есть.
 const INTERNET_V4 = [1, 1, 1, 1].join('.')
-const EGRESS_IP = '10.213.98.2'
-const EVAL_PROXY_IP = '10.213.99.2'
+const GATEWAY = 'remontnik-gateway'
+const MIRROR = `http://${GATEWAY}:7801`
 
 const dockerReady = spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0
 
@@ -39,6 +39,11 @@ function logs(container: string): string {
 
 function quietly(args: string[], env?: NodeJS.ProcessEnv): void {
   spawnSync('docker', args, { cwd: repoRoot, stdio: 'ignore', env: { ...process.env, ...env } })
+}
+
+/** Сети случая, оставшиеся после сценария: их быть не должно. */
+function caseNetworks(): string[] {
+  return docker(['network', 'ls', '--filter', 'label=remontnik.case-network', '--format', '{{.Name}}']).split('\n').filter(Boolean)
 }
 
 /** Проба изнутри контейнера: что видно по сети, есть ли git, сокет, чужие переменные. Пишет JSON. */
@@ -58,18 +63,29 @@ function tcp(host, port) {
   })
 }
 
-function viaProxy(proxy, target) {
-  const [host, port] = proxy.split(':')
+/** Сырой запрос (base64) к host:port: код ответа. Так проверяются CONNECT, чужой Host и адрес в строке запроса. */
+function raw(address, request) {
+  const at = address.lastIndexOf(':')
   return new Promise((resolve) => {
-    const socket = connect({ host, port: Number(port) })
-    socket.setTimeout(10000, () => { socket.destroy(); resolve('timeout') })
+    const socket = connect({ host: address.slice(0, at), port: Number(address.slice(at + 1)) })
+    socket.setTimeout(30000, () => { socket.destroy(); resolve('timeout') })
     socket.once('error', (error) => resolve(error.code ?? 'error'))
-    socket.once('connect', () => socket.write('CONNECT ' + target + ' HTTP/1.1\r\nHost: ' + target + '\r\n\r\n'))
+    socket.once('connect', () => socket.write(Buffer.from(request, 'base64')))
     socket.once('data', (chunk) => { socket.destroy(); resolve(Number(/^HTTP\/1\.1 (\d+)/.exec(chunk.toString())?.[1])) })
   })
 }
 
-async function http(url) {
+async function get(url) {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(60000) })
+    const body = await response.text()
+    return { status: response.status, mirrorTarballs: body.split('${MIRROR}/').length - 1, registryTarballs: body.split('https://registry.npmjs.org/').length - 1 }
+  } catch (error) {
+    return { status: error.cause?.code ?? error.name }
+  }
+}
+
+async function post(url) {
   try {
     const response = await fetch(url, { method: 'POST', body: '{}', signal: AbortSignal.timeout(5000) })
     return response.status
@@ -87,29 +103,52 @@ const result = {
   canaryInEnv: Object.values(process.env).some((value) => value?.includes('${CANARY}')),
   dns: await lookup('example.com').then((found) => found.address, (error) => error.code ?? 'error'),
   tcp: {},
-  proxy: {},
-  http: {},
+  raw: {},
+  get: {},
+  post: {},
 }
 for (const target of targets) {
-  const [kind, value] = target.split('=')
-  if (kind === 'tcp') { const at = value.lastIndexOf(':'); result.tcp[value] = await tcp(value.slice(0, at), Number(value.slice(at + 1))) }
-  if (kind === 'proxy') { const [proxy, connectTo] = value.split('>'); result.proxy[connectTo] = await viaProxy(proxy, connectTo) }
-  if (kind === 'http') result.http[value] = await http(value)
+  const at = target.indexOf('=')
+  const [kind, value] = [target.slice(0, at), target.slice(at + 1)]
+  if (kind === 'tcp') { const port = value.lastIndexOf(':'); result.tcp[value] = await tcp(value.slice(0, port), Number(value.slice(port + 1))) }
+  if (kind === 'raw') { const [address, name, request] = value.split('>'); result.raw[name] = await raw(address, request) }
+  if (kind === 'get') result.get[value] = await get(value)
+  if (kind === 'post') result.post[value] = await post(value)
 }
 process.stdout.write('PROBE' + JSON.stringify(result) + 'PROBE')
 `
 
-/** Команда в верстаке, как её запускает врач: исполнитель из боевой настройки запуска, внутри контейнера врача. */
-const RUN_IN_WORKBENCH = String.raw`
+/**
+ * Сценарий случаев внутри контейнера врача, боевым кодом: сети случая, зеркало, прокси eval и исполнитель команд.
+ * В теле доступны `gateway`, `run(copyDir, command, network?)`, `probe(copyDir, targets, network?)`, `docker(...args)`,
+ * `arg` и `out`. После тела сети закрываются; итог — `out`.
+ */
+function scenario(body: string): string {
+  return String.raw`
 import { readFileSync } from 'node:fs'
-const { doctorStartPlan } = await import('/app/dist/index.js')
+import { execFileSync } from 'node:child_process'
+const { createCaseGateway, doctorStartPlan } = await import('/app/dist/index.js')
 const { defineRemontnikConfig } = await import('@ykurilov/remontnik-core/config')
 const config = defineRemontnikConfig(JSON.parse(readFileSync(process.env.REMONTNIK_CONFIG_REPO_DIR + '/remontnik.config.json', 'utf8')))
-const runner = doctorStartPlan(process.env, config).service.treatment.runner
-const [copyDir, network, command] = JSON.parse(process.argv[1])
-const result = await runner.run(command, { cwd: copyDir, copyDir, timeoutSeconds: 300, ...(network === 'internal' ? { network } : {}) })
-process.stdout.write(JSON.stringify({ isolation: runner.isolation, ...result }))
+const gateway = await createCaseGateway(doctorStartPlan(process.env, config))
+const run = (copyDir, command, network) => gateway.runner.run(command, { cwd: copyDir, copyDir, timeoutSeconds: 300, ...(network === 'internal' ? { network } : {}) })
+const probe = async (copyDir, targets, network) => {
+  const result = await run(copyDir, ['node', 'probe.mjs', ...targets], network)
+  const json = /PROBE(.*)PROBE/s.exec(result.output)?.[1]
+  if (!json) throw new Error('проба не ответила: ' + JSON.stringify(result))
+  return JSON.parse(json)
+}
+const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8' }).trim()
+const arg = JSON.parse(process.argv[1])
+const out = {}
+try {
+${body}
+} finally {
+  await gateway.close()
+}
+process.stdout.write('RESULT' + JSON.stringify(out) + 'RESULT')
 `
+}
 
 interface Probe {
   git: string | null
@@ -119,35 +158,49 @@ interface Probe {
   canaryInEnv: boolean
   dns: string
   tcp: Record<string, string>
-  proxy: Record<string, number | string>
-  http: Record<string, number | string>
+  raw: Record<string, number | string>
+  get: Record<string, { status: number | string; mirrorTarballs?: number; registryTarballs?: number }>
+  post: Record<string, number | string>
 }
+
+const rawRequest = (name: string, text: string) => `raw=${GATEWAY}:7801>${name}>${Buffer.from(text).toString('base64')}`
 
 describe.skipIf(!dockerReady)('шаблон compose на настоящем Docker', () => {
   let root: string
-  let copyDir: string
+  let stateDir: string
   let composeEnv: NodeJS.ProcessEnv
   let appIp: string
+  let doctorAppIp: string
 
-  function workbench(network: 'workbench' | 'internal', command: string): { exitCode: number | null; output: string; isolation: string; spawnError?: string } {
-    const out = docker(['exec', '-w', '/app', 'remontnik-doctor', 'node', '--input-type=module', '-e', RUN_IN_WORKBENCH, JSON.stringify([copyDir, network, command])])
-    return JSON.parse(out)
+  /** Новая копия случая с пробой и package.json. */
+  function copy(name: string): string {
+    const dir = join(stateDir, 'copies', name)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'probe.mjs'), PROBE)
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'probe', private: true, dependencies: { 'is-number': '7.0.0' } }))
+    return dir
   }
 
-  function probe(network: 'workbench' | 'internal', targets: string[]): Probe {
-    const result = workbench(network, `node probe.mjs ${targets.map((target) => `'${target}'`).join(' ')}`)
-    const json = /PROBE(.*)PROBE/s.exec(result.output)?.[1]
-    if (!json) throw new Error(`проба не ответила: ${JSON.stringify(result)}`)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function inDoctor(body: string, arg: unknown = {}): any {
+    const output = docker(['exec', '-w', '/app', 'remontnik-doctor', 'node', '--input-type=module', '-e', scenario(body), JSON.stringify(arg)])
+    const json = /RESULT(.*)RESULT/s.exec(output)?.[1]
+    if (!json) throw new Error(`сценарий не ответил: ${output}`)
     return JSON.parse(json)
+  }
+
+  /** TCP-соединение из временного контейнера в сети `network`. */
+  function tcpFrom(network: string, host: string, port: number): string {
+    const code = `const s=require('net').connect(${port},'${host}');s.setTimeout(3000,()=>{console.log('timeout');process.exit()});s.on('connect',()=>{console.log('open');process.exit()});s.on('error',e=>{console.log(e.code);process.exit()})`
+    return docker(['run', '--rm', '--network', network, '--entrypoint', 'node', `remontnik-doctor:${TAG}`, '-e', code]).trim()
   }
 
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'remontnik-compose-')))
     const appDir = join(root, 'app')
-    const stateDir = join(root, 'state')
-    copyDir = join(stateDir, 'copies', 'probe')
+    stateDir = join(root, 'state')
     mkdirSync(appDir, { recursive: true })
-    mkdirSync(copyDir, { recursive: true })
+    mkdirSync(join(stateDir, 'copies'), { recursive: true })
 
     const config = {
       app: { name: 'live-patient' },
@@ -169,8 +222,6 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     git('-c', 'user.name=live', '-c', 'user.email=live@example.com', 'add', '-A')
     git('-c', 'user.name=live', '-c', 'user.email=live@example.com', 'commit', '--quiet', '-m', 'подставное приложение')
 
-    writeFileSync(join(copyDir, 'probe.mjs'), PROBE)
-    writeFileSync(join(copyDir, 'package.json'), JSON.stringify({ name: 'probe', private: true, dependencies: { 'is-number': '7.0.0' } }))
     const envFile = join(root, 'doctor.env')
     writeFileSync(
       envFile,
@@ -208,7 +259,8 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     quietly(['network', 'create', APP_NETWORK])
     docker(['run', '-d', '--rm', '--name', APP_CONTAINER, '--network', APP_NETWORK, '--entrypoint', 'node', `remontnik-doctor:${TAG}`, '-e', "require('http').createServer((q,s)=>s.end('patient')).listen(8080)"])
     docker(['run', '-d', '--rm', '--name', HOST_SERVICE, '--network', 'host', '--entrypoint', 'node', `remontnik-doctor:${TAG}`, '-e', `require('net').createServer(s=>s.end('host')).listen(${HOST_SERVICE_PORT},'0.0.0.0')`])
-    appIp = docker(['inspect', '-f', `{{(index .NetworkSettings.Networks "${APP_NETWORK}").IPAddress}}`, APP_CONTAINER]).trim()
+    const ipIn = (container: string, network: string) => docker(['inspect', '-f', `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, container]).trim()
+    appIp = ipIn(APP_CONTAINER, APP_NETWORK)
 
     docker(['compose', '-p', PROJECT, '-f', composeFile, 'up', '-d', '--wait'], { env: composeEnv })
     const deadline = Date.now() + 60_000
@@ -216,11 +268,16 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
       if (Date.now() > deadline) throw new Error(`врач не поднялся:\n${logs('remontnik-doctor')}`)
       execFileSync('sleep', ['1'])
     }
+    doctorAppIp = ipIn('remontnik-doctor', APP_NETWORK)
   }, 900_000)
 
   afterAll(() => {
     // REMONTNIK_KEEP_STACK=1 — оставить стенд для разбора руками.
     if (!composeEnv || process.env.REMONTNIK_KEEP_STACK === '1') return
+    for (const network of caseNetworks()) {
+      quietly(['network', 'disconnect', '--force', network, 'remontnik-doctor'])
+      quietly(['network', 'rm', network])
+    }
     quietly(['compose', '-p', PROJECT, '-f', composeFile, 'down', '--volumes', '--remove-orphans'], composeEnv)
     quietly(['rm', '-f', APP_CONTAINER, HOST_SERVICE])
     quietly(['network', 'rm', APP_NETWORK])
@@ -229,65 +286,133 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     rmSync(root, { recursive: true, force: true })
   }, 120_000)
 
-  it('врач поднялся из окружения: проверил закрытые сети, слушает приём и прокси eval', () => {
-    expect(logs('remontnik-doctor')).toContain('слушаю http://0.0.0.0:7800')
-    const networks = (name: string) => docker(['network', 'inspect', '-f', '{{.Internal}}', name]).trim()
-    expect(networks('remontnik-workbench')).toBe('true')
-    expect(networks('remontnik-checks')).toBe('true')
-    expect(networks('remontnik-outside')).toBe('false')
-    const mounts = docker(['inspect', '-f', '{{range .Mounts}}{{.Destination}} {{end}}', 'remontnik-doctor'])
-    expect(mounts).toContain('/var/run/docker.sock')
-    expect(docker(['inspect', '-f', '{{range .Mounts}}{{.Destination}} {{end}}', 'remontnik-egress-proxy']).trim()).not.toContain('docker.sock')
+  it('врач поднялся из окружения: слушает приём только на своём адресе в сети приложения', () => {
+    expect(logs('remontnik-doctor')).toContain(`слушаю http://${doctorAppIp}:7800`)
+    expect(docker(['network', 'inspect', '-f', '{{.Internal}}', 'remontnik-outside']).trim()).toBe('false')
+    expect(docker(['network', 'ls', '--format', '{{.Name}}'])).not.toMatch(/remontnik-(workbench|checks)\b/)
+    expect(docker(['inspect', '-f', '{{range .Mounts}}{{.Destination}} {{end}}', 'remontnik-doctor'])).toContain('/var/run/docker.sock')
+    // Из сети приложения порт 7800 открыт, из внешней сети врача — нет.
+    expect(tcpFrom(APP_NETWORK, 'remontnik-doctor', 7800)).toBe('open')
+    expect(tcpFrom('remontnik-outside', 'remontnik-doctor', 7800)).not.toBe('open')
   })
 
-  it('сеть верстака: нет git, сокета, секретов врача; интернета, метаданных, хоста и приложения не видно', () => {
-    const seen = probe('workbench', [
-      `tcp=${INTERNET_V4}:443`,
-      `tcp=169.254.169.254:80`,
-      `tcp=10.213.98.1:${HOST_SERVICE_PORT}`,
-      `tcp=${appIp}:8080`,
-      `tcp=${EVAL_PROXY_IP}:7810`,
-      `proxy=${EGRESS_IP}:3128>registry.npmjs.org:443`,
-      `proxy=${EGRESS_IP}:3128>example.com:443`,
-      `proxy=${EGRESS_IP}:3128>169.254.169.254:80`,
-      `proxy=${EGRESS_IP}:3128>registry.npmjs.org:22`,
-    ])
+  it('сеть верстака: только зеркало реестра; установка через него проходит, чужое через него недостижимо', () => {
+    const dir = copy('workbench')
+    const out = inDoctor(
+      String.raw`
+  out.probe = await probe(arg.dir, arg.targets)
+  out.install = await run(arg.dir, 'pnpm install && node -e "process.exit(require(\'is-number\')(5) ? 0 : 1)"')
+  out.isolation = gateway.runner.isolation
+  out.networks = docker('network', 'ls', '--filter', 'label=remontnik.case-network', '--format', '{{.Name}} {{.Internal}}')
+`,
+      {
+        dir,
+        targets: [
+          `tcp=${INTERNET_V4}:443`,
+          'tcp=169.254.169.254:80',
+          `tcp=${appIp}:8080`,
+          `tcp=${doctorAppIp}:7800`,
+          `tcp=${GATEWAY}:7800`,
+          `tcp=${GATEWAY}:7810`,
+          `get=${MIRROR}/is-number`,
+          `post=${MIRROR}/is-number`,
+          rawRequest('host-example', 'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'),
+          rawRequest('host-ignored', 'GET /is-number HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'),
+          rawRequest('absolute-url', 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'),
+          rawRequest('double-slash', 'GET //example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'),
+          rawRequest('traversal', 'GET /%2e%2e/%2e%2e/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'),
+          rawRequest('connect', 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'),
+        ],
+      },
+    )
+    const seen: Probe = out.probe
     expect(seen.git).toBeNull()
     expect(seen.dockerSocket).toBe(false)
     expect(seen.dockerClient).toBeNull()
     expect(seen.canaryInEnv).toBe(false)
     expect(seen.envNames).not.toEqual(expect.arrayContaining(['DEEPSEEK_API_KEY']))
-    expect(seen.envNames).toEqual(expect.arrayContaining(['HTTPS_PROXY', 'HOME']))
+    expect(seen.envNames).not.toContain('HTTPS_PROXY')
+    expect(seen.envNames).toEqual(expect.arrayContaining(['npm_config_registry', 'HOME']))
     expect(seen.dns).not.toMatch(/^\d/)
     for (const [target, state] of Object.entries(seen.tcp)) expect(state, target).not.toBe('open')
-    expect(seen.proxy['registry.npmjs.org:443']).toBe(200)
-    expect(seen.proxy['example.com:443']).toBe(403)
-    expect(seen.proxy['169.254.169.254:80']).toBe(400)
-    expect(seen.proxy['registry.npmjs.org:22']).toBe(403)
+    const metadata = seen.get[`${MIRROR}/is-number`]!
+    expect(metadata.status).toBe(200)
+    expect(metadata.mirrorTarballs).toBeGreaterThan(0)
+    expect(metadata.registryTarballs).toBe(0)
+    expect(seen.post[`${MIRROR}/is-number`]).toBe(405)
+    expect(seen.raw).toEqual({ 'host-example': 400, 'host-ignored': 200, 'absolute-url': 400, 'double-slash': 400, traversal: 400, connect: 405 })
+    expect(out.isolation).toBe('container')
+    expect(out.install.exitCode, out.install.output).toBe(0)
+    expect(out.networks).toMatch(/^remontnik-case-\S+-workbench-\S+ true$/)
+    expect(caseNetworks()).toEqual([])
   })
 
-  it('установка зависимостей идёт через прокси выхода к реестру', () => {
-    const result = workbench('workbench', 'pnpm install && node -e "process.exit(require(\'is-number\')(5) ? 0 : 1)"')
-    expect(result.isolation).toBe('container')
-    expect(result.exitCode, result.output).toBe(0)
-  })
-
-  it('сеть проверок: виден только прокси eval врача; интернета, прокси выхода, хоста и приложения нет', () => {
-    const seen = probe('internal', [
-      `tcp=${INTERNET_V4}:443`,
-      `tcp=169.254.169.254:80`,
-      `tcp=10.213.99.1:${HOST_SERVICE_PORT}`,
-      `tcp=${EGRESS_IP}:3128`,
-      `tcp=${appIp}:8080`,
-      `http=http://${EVAL_PROXY_IP}:7810/unknown-run/provider/v1/chat/completions`,
-    ])
+  it('сеть проверок: виден только прокси eval врача; зеркала, приёма, хоста и приложения нет', () => {
+    const dir = copy('checks')
+    const out = inDoctor(`out.probe = await probe(arg.dir, arg.targets, 'internal')`, {
+      dir,
+      targets: [
+        `tcp=${INTERNET_V4}:443`,
+        'tcp=169.254.169.254:80',
+        `tcp=${appIp}:8080`,
+        `tcp=${doctorAppIp}:7800`,
+        `tcp=${GATEWAY}:7800`,
+        `tcp=${GATEWAY}:7801`,
+        `post=http://${GATEWAY}:7810/unknown-run/provider/v1/chat/completions`,
+      ],
+    })
+    const seen: Probe = out.probe
     expect(seen.git).toBeNull()
     expect(seen.dockerSocket).toBe(false)
     expect(seen.canaryInEnv).toBe(false)
-    expect(seen.envNames).not.toContain('HTTPS_PROXY')
+    expect(seen.envNames).not.toContain('npm_config_registry')
     expect(seen.dns).not.toMatch(/^\d/)
     for (const [target, state] of Object.entries(seen.tcp)) expect(state, target).not.toBe('open')
     // Прокси eval отвечает: прогона с таким пропуском нет.
-    expect(seen.http[`http://${EVAL_PROXY_IP}:7810/unknown-run/provider/v1/chat/completions`]).toBe(401)
+    expect(seen.post[`http://${GATEWAY}:7810/unknown-run/provider/v1/chat/completions`]).toBe(401)
+    expect(caseNetworks()).toEqual([])
+  })
+
+  it('соседние случаи друг друга не видят, контейнеры одного случая — видят', () => {
+    const [a, b] = [copy('neighbor-a'), copy('neighbor-b')]
+    const out = inDoctor(
+      String.raw`
+  const server = run(arg.a, ['node', '-e', "require('http').createServer((q, s) => s.end('a')).listen(9000, '0.0.0.0'); setTimeout(() => process.exit(0), 30000)"])
+  await new Promise((resolve) => setTimeout(resolve, 8000))
+  const lease = await gateway.caseNetworks.use(arg.a, 'workbench')
+  lease.done()
+  const base = lease.network.gatewayIp.split('.').map(Number)
+  const targets = Array.from({ length: 15 }, (_, i) => 'tcp=' + [base[0], base[1], base[2], base[3] - 2 + 16 + i].join('.') + ':9000')
+  out.fromNeighbor = (await probe(arg.b, targets)).tcp
+  out.fromSameCase = (await probe(arg.a, targets)).tcp
+  out.server = await server
+`,
+      { a, b },
+    )
+    expect(Object.values(out.fromSameCase)).toContain('open')
+    expect(Object.values(out.fromNeighbor)).not.toContain('open')
+    expect(caseNetworks()).toEqual([])
+  })
+
+  it('сеть случая подменили под тем же именем — команда не запускается', () => {
+    const dir = copy('substituted')
+    const out = inDoctor(
+      String.raw`
+  const lease = await gateway.caseNetworks.use(arg.dir, 'workbench')
+  lease.done()
+  docker('network', 'disconnect', '--force', lease.network.id, 'remontnik-doctor')
+  docker('network', 'rm', lease.network.id)
+  docker('network', 'create', lease.network.name)
+  try {
+    out.result = await run(arg.dir, ['true'])
+  } finally {
+    docker('network', 'rm', lease.network.name)
+  }
+`,
+      { dir },
+    )
+    expect(out.result.exitCode).toBeNull()
+    expect(out.result.spawnError).toMatch(/по ID/)
+    expect(caseNetworks()).toEqual([])
   })
 })

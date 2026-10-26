@@ -1,6 +1,6 @@
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 import { reportsCommand, REPORTS_USAGE } from './reports-commands.js'
-import { egressProxyCommand, SERVICE_USAGE, startCommand } from './service-commands.js'
+import { SERVICE_USAGE, startCommand } from './service-commands.js'
 
 // Консольная `remontnik-doctor`: разбор команды и вызов нужной. Каждая группа команд — свой файл со своей справкой.
 
@@ -11,7 +11,6 @@ type CommandGroup = (args: string[], io: DoctorCommandIo) => Promise<number>
 const COMMAND_GROUPS: Readonly<Record<string, CommandGroup>> = {
   reports: reportsCommand,
   start: startCommand,
-  'egress-proxy': egressProxyCommand,
 }
 
 const USAGE = `Использование:\n${SERVICE_USAGE}${REPORTS_USAGE}`

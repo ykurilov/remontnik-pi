@@ -1,4 +1,4 @@
-# Ремонтник на сервере приложения: врач, прокси выхода верстака и (по желанию) браузер.
+# Ремонтник на сервере приложения: врач и (по желанию) браузер.
 # Шаблон: скопируйте к себе, задайте переменные ниже и запускайте из корня репозитория Ремонтника
 #   docker compose -f deploy/compose.remontnik.yml up -d --build
 #   docker compose -f deploy/compose.remontnik.yml --profile browser up -d --build   # с браузером
@@ -10,8 +10,8 @@
 #   REMONTNIK_APP_NETWORK  сеть Docker приложения: в ней сторож шлёт события врачу (http://remontnik-doctor:7800)
 #   DOCKER_GID             группа сокета Docker на сервере: stat -c %g /var/run/docker.sock
 #   REMONTNIK_UID/GID      владелец папок выше (по умолчанию 10001)
-#   REMONTNIK_EGRESS_ALLOW имена, куда можно ходить установке и модели (через запятую; по умолчанию реестр npm)
-#   *_SUBNET, *_IP         если подсети ниже заняты на сервере (они нарочно вне пулов Docker 172.17–31 и 192.168)
+#   REMONTNIK_CASE_SUBNETS пул подсетей для сетей случая (по умолчанию 10.213.0.0/16; не должен пересекаться
+#                          с сетями сервера — занятые подсети врач пропускает сам)
 #
 # Секреты (общий секрет сторожа, ключи моделей, токен бота, ключ git) — только в REMONTNIK_ENV_FILE,
 # который кладёт на сервер secret-handoff. В этот файл, образы и репозиторий они не попадают.
@@ -19,26 +19,19 @@
 # Пути. Врач создаёт контейнеры верстака через сокет хоста, и Docker монтирует в них папки по путям ХОСТА.
 # Поэтому папка приложения и состояние врача смонтированы в контейнер врача по тем же путям, что на хосте.
 #
-# Сети:
-#   outside    — обычная: врачу к моделям, Telegram и GitHub; прокси выхода — к реестру пакетов; браузеру — к сайту.
-#   workbench  — закрытая (internal): команды модели врача и установка зависимостей. Шлюза нет: ни интернета,
-#                ни локальной сети, ни адреса метаданных облака. Наружу — только прокси выхода к именам из
-#                REMONTNIK_EGRESS_ALLOW, порт 443. Врача, приложения и браузера в ней нет.
-#   checks     — закрытая (internal): тесты, проверка типов и eval. В ней только прокси eval врача (на отдельном
-#                адресе) и службы тестов приложения. Прокси выхода в ней нет.
-#   app        — сеть приложения (внешняя): врач принимает события сторожа. Контейнеров верстака в ней нет.
-# Врач проверяет на старте, что workbench и checks закрытые, и иначе не запускается.
+# Сети в этом файле:
+#   outside — обычная: врачу к моделям, реестру пакетов, Telegram и GitHub; браузеру — к сайту.
+#   app     — сеть приложения (внешняя): врач принимает события сторожа и слушает порт 7800 только на своём
+#             адресе в ней. Контейнеров верстака в ней нет.
+# Сети случая врач создаёт сам, по две на каждую копию случая: верстак (команды модели, установка зависимостей)
+# и проверки (тесты, проверка типов, eval). Обе закрытые (internal, у моста нет адреса на хосте): ни интернета,
+# ни локальной сети, ни адреса метаданных облака, ни соседних случаев. В сети верстака врач слушает только зеркало
+# реестра пакетов, в сети проверок — только прокси eval; после случая сети удаляются. Поэтому статических
+# закрытых сетей, ip_range и aux_addresses в этом файле нет: адрес врача в сети случая (.2) лежит вне диапазона,
+# из которого Docker выдаёт адреса контейнерам, и врач подключается раньше любого контейнера.
 #
-# Службы тестов приложения (checks.services, например временная база) подключаются к сети проверок
-# в своём файле compose:
-#   services:
-#     test-db:
-#       image: postgres:17
-#       networks: [remontnik-checks]
-#   networks:
-#     remontnik-checks:
-#       external: true
-# Боевых баз и служб в этой сети быть не должно.
+# Службы тестов приложения (checks.services, например временная база) пока не поднимаются: им нужна сеть
+# проверок своего случая, а общей сети проверок больше нет. Тесты, которым нужна база, до этого падают.
 
 name: remontnik
 
@@ -68,12 +61,11 @@ services:
       HOME: /tmp
       REMONTNIK_CONFIG_REPO_DIR: ${REMONTNIK_APP_DIR:?REMONTNIK_APP_DIR — рабочая копия основной ветки приложения}
       REMONTNIK_STATE_DIR: ${REMONTNIK_STATE_DIR:?REMONTNIK_STATE_DIR — папка состояния врача}
-      REMONTNIK_LISTEN: 0.0.0.0:7800
-      REMONTNIK_WORKBENCH_NETWORK: remontnik-workbench
-      REMONTNIK_CHECKS_NETWORK: remontnik-checks
-      REMONTNIK_EGRESS_PROXY_URL: http://${REMONTNIK_EGRESS_IP:-10.213.98.2}:3128
-      REMONTNIK_EVAL_PROXY_LISTEN: ${REMONTNIK_EVAL_PROXY_IP:-10.213.99.2}:7810
-      REMONTNIK_EVAL_PROXY_URL: http://${REMONTNIK_EVAL_PROXY_IP:-10.213.99.2}:7810
+      # Приём событий — только на адресе врача в сети приложения, не на всех адресах.
+      REMONTNIK_LISTEN_NETWORK: ${REMONTNIK_APP_NETWORK}
+      # Имя контейнера врача: врач подключает себя к сетям случая.
+      REMONTNIK_GATEWAY_CONTAINER: remontnik-doctor
+      REMONTNIK_CASE_SUBNETS: ${REMONTNIK_CASE_SUBNETS:-10.213.0.0/16}
       REMONTNIK_BROWSER_URL: http://remontnik-browser:7700
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -82,22 +74,6 @@ services:
     networks:
       outside: {}
       app: {}
-      checks:
-        ipv4_address: ${REMONTNIK_EVAL_PROXY_IP:-10.213.99.2}
-    depends_on: [egress-proxy]
-
-  egress-proxy:
-    <<: *hardening
-    image: remontnik-doctor:${REMONTNIK_IMAGE_TAG:-local}
-    container_name: remontnik-egress-proxy
-    command: [egress-proxy]
-    environment:
-      REMONTNIK_EGRESS_LISTEN: ${REMONTNIK_EGRESS_IP:-10.213.98.2}:3128
-      REMONTNIK_EGRESS_ALLOW: ${REMONTNIK_EGRESS_ALLOW:-registry.npmjs.org}
-    networks:
-      outside: {}
-      workbench:
-        ipv4_address: ${REMONTNIK_EGRESS_IP:-10.213.98.2}
 
   # По желанию: docker compose --profile browser up -d. Адрес для врача — http://remontnik-browser:7700,
   # порт наружу не публикуется. Ключи браузера — в своём файле окружения (REMONTNIK_BROWSER_ENV_FILE).
@@ -125,23 +101,6 @@ volumes:
 networks:
   outside:
     name: remontnik-outside
-  workbench:
-    name: remontnik-workbench
-    internal: true
-    driver_opts:
-      # У моста закрытой сети нет адреса на хосте: службы хоста, слушающие все адреса, отсюда не видны.
-      com.docker.network.bridge.inhibit_ipv4: "true"
-    ipam:
-      config:
-        - subnet: ${REMONTNIK_WORKBENCH_SUBNET:-10.213.98.0/24}
-  checks:
-    name: remontnik-checks
-    internal: true
-    driver_opts:
-      com.docker.network.bridge.inhibit_ipv4: "true"
-    ipam:
-      config:
-        - subnet: ${REMONTNIK_CHECKS_SUBNET:-10.213.99.0/24}
   app:
     name: ${REMONTNIK_APP_NETWORK:?REMONTNIK_APP_NETWORK — сеть Docker приложения}
     external: true

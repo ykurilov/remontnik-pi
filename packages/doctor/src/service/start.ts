@@ -1,19 +1,25 @@
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
+import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
-import { assertInternalDockerNetwork, createDockerRunner } from '../workbench/index.js'
+import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
+import { CASE_GATEWAY_HOST, createDockerRunner, type CommandRunner, type DockerRunnerOptions } from '../workbench/index.js'
 import { loadMainBranchConfig } from './config-source.js'
-import { startDoctorService, type DoctorService, type DoctorServiceOptions } from './index.js'
+import { startDoctorService, type DoctorService, type DoctorServiceOptions, type DoctorTreatmentOptions } from './index.js'
 
 // Боевой запуск врача (`remontnik-doctor start`): всё берётся из окружения сервера и настройки основной ветки.
-// Команды модели и проверки идут только в контейнерах (`createDockerRunner`). Сеть верстака и сеть проверок
-// должны быть закрытыми сетями Docker (`internal: true`): врач проверяет это до старта и иначе не запускается.
-// Наружу из сети верстака ведёт только прокси выхода к реестру пакетов (`REMONTNIK_EGRESS_PROXY_URL`).
+// Команды модели и проверки идут только в контейнерах (`createDockerRunner`), у каждой копии случая — свои
+// закрытые сети (`case-networks`). Врач подключается к ним сам: в сети верстака слушает зеркало реестра пакетов,
+// в сети проверок — прокси eval. Приём событий сторожа слушает только адрес врача в сети приложения.
 
 export type DoctorEnv = Readonly<Record<string, string | undefined>>
 
-const DEFAULT_LISTEN = '0.0.0.0:7800'
+const DEFAULT_PORT = 7800
+const DEFAULT_CASE_SUBNETS = '10.213.0.0/16'
+export const MIRROR_PORT = 7801
+export const EVAL_PROXY_PORT = 7810
 
 function required(env: DoctorEnv, name: string): string {
   const value = env[name]?.trim()
@@ -29,14 +35,10 @@ export function parseListen(text: string, name: string): { host: string; port: n
   return { host: (match[1] ?? match[2])!, port }
 }
 
-/** Переменные прокси выхода для команд в сети верстака: их читают pnpm, npm, corepack, curl и `fetch` Node. */
-export function egressProxyEnv(proxyUrl: string): Record<string, string> {
-  const url = new URL(proxyUrl)
-  if (url.protocol !== 'http:' || url.username || url.password || (url.pathname !== '/' && url.pathname !== '')) {
-    throw new Error('REMONTNIK_EGRESS_PROXY_URL: нужен адрес вида http://host:port')
-  }
-  const value = url.origin
-  return { HTTPS_PROXY: value, https_proxy: value, HTTP_PROXY: value, http_proxy: value, NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '1' }
+/** Переменные команд в сети верстака: pnpm, npm, yarn и corepack берут пакеты только через зеркало врача. */
+export function caseWorkbenchEnv(): Record<string, string> {
+  const mirror = `http://${CASE_GATEWAY_HOST}:${MIRROR_PORT}`
+  return { npm_config_registry: `${mirror}/`, COREPACK_NPM_REGISTRY: mirror, npm_config_audit: 'false', npm_config_fund: 'false' }
 }
 
 /** Доступ git к origin по токену (HTTPS): заголовок через `GIT_CONFIG_*`, без записи в настройки репозитория. */
@@ -47,53 +49,63 @@ function gitTokenEnv(token: string | undefined): Record<string, string> {
 }
 
 export interface DoctorStartPlan {
-  service: DoctorServiceOptions
-  /** Сети, которые должны быть закрытыми (`internal: true`). */
-  networks: { workbench: string; checks: string }
+  /** Служба без исполнителя и прокси eval: их создаёт `createCaseGateway`. */
+  service: Omit<DoctorServiceOptions, 'treatment' | 'listen'> & { treatment: Omit<DoctorTreatmentOptions, 'runner' | 'evalProxy'> }
+  /** Где слушать приём событий: явный адрес или адрес врача в сети приложения. */
+  listen: { host: string; port: number } | { network: string; port: number }
+  runner: Omit<DockerRunnerOptions, 'caseNetworks' | 'workbenchEnv'>
+  /** Контейнер врача и пул подсетей сетей случая. */
+  gateway: { container: string; subnetPool: string }
+}
+
+function listenOf(env: DoctorEnv): DoctorStartPlan['listen'] {
+  const explicit = env.REMONTNIK_LISTEN?.trim()
+  if (explicit) {
+    const listen = parseListen(explicit, 'REMONTNIK_LISTEN')
+    // На всех адресах приём был бы виден и из сетей случая, где идёт чужой код.
+    if (['0.0.0.0', '::'].includes(listen.host)) throw new Error('REMONTNIK_LISTEN: нельзя слушать все адреса — только адрес в сети приложения')
+    return listen
+  }
+  const network = env.REMONTNIK_LISTEN_NETWORK?.trim()
+  if (!network) throw new Error('врачу нужна REMONTNIK_LISTEN_NETWORK (сеть приложения) или REMONTNIK_LISTEN (адрес в ней)')
+  const port = Number(env.REMONTNIK_LISTEN_PORT?.trim() || DEFAULT_PORT)
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('REMONTNIK_LISTEN_PORT: нужен номер порта')
+  return { network, port }
 }
 
 /**
- * Настройка службы из окружения и настройки приложения. Без побочных действий: сети проверяет и службу
- * запускает `startDoctorFromEnv`.
+ * Настройка службы из окружения и настройки приложения. Без побочных действий: сети, зеркало и прокси eval
+ * создаёт `createCaseGateway`, службу запускает `startDoctorFromEnv`.
  */
 export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
   const worktreesDir = env.REMONTNIK_WORKTREES_DIR?.trim() || join(stateDir, 'worktrees')
-  const workbenchNetwork = required(env, 'REMONTNIK_WORKBENCH_NETWORK')
-  const checksNetwork = required(env, 'REMONTNIK_CHECKS_NETWORK')
-  for (const network of [workbenchNetwork, checksNetwork]) {
-    if (['bridge', 'host', 'default'].includes(network)) throw new Error(`сеть «${network}» не годится для верстака: нужна закрытая сеть Docker (internal: true)`)
-  }
-  if (workbenchNetwork === checksNetwork) throw new Error('сеть верстака и сеть проверок должны быть разными: в сети проверок нет прокси выхода')
+  const gateway = { container: required(env, 'REMONTNIK_GATEWAY_CONTAINER'), subnetPool: env.REMONTNIK_CASE_SUBNETS?.trim() || DEFAULT_CASE_SUBNETS }
+  // Пул проверяется сразу: ошибка видна до старта, а не на первом случае.
+  createCaseNetworks({ gatewayContainer: gateway.container, subnetPool: gateway.subnetPool, attach: { workbench: async () => async () => {}, checks: async () => async () => {} } })
+  const listen = listenOf(env)
 
   const telegram = config.reports.telegram
   const chatIdEnv = telegram.chatIdEnv
   if (!chatIdEnv) throw new Error('врачу нужен чат тревог: reports.telegram.chatIdEnv в настройке')
   const apiBaseUrl = telegram.apiBaseUrlEnv ? env[telegram.apiBaseUrlEnv]?.trim() : undefined
   const proxyToken = telegram.proxyTokenEnv ? env[telegram.proxyTokenEnv]?.trim() : undefined
-
-  const egressProxyUrl = env.REMONTNIK_EGRESS_PROXY_URL?.trim()
-  const runner = createDockerRunner({
-    image: config.workbench.image,
-    homesDir: join(stateDir, 'homes'),
-    network: workbenchNetwork,
-    internalNetwork: checksNetwork,
-    ...(egressProxyUrl ? { outsideEnv: egressProxyEnv(egressProxyUrl) } : {}),
-    ...(env.REMONTNIK_WORKBENCH_MEMORY?.trim() ? { memory: env.REMONTNIK_WORKBENCH_MEMORY.trim() } : {}),
-    ...(env.REMONTNIK_WORKBENCH_CPUS?.trim() ? { cpus: env.REMONTNIK_WORKBENCH_CPUS.trim() } : {}),
-  })
   const model = createDoctorModels(env)
-  const evalProxyListen = env.REMONTNIK_EVAL_PROXY_LISTEN?.trim()
-  const evalProxyUrl = env.REMONTNIK_EVAL_PROXY_URL?.trim()
   const reportsToken = env.REMONTNIK_REPORTS_TOKEN?.trim()
 
   return {
-    networks: { workbench: workbenchNetwork, checks: checksNetwork },
+    listen,
+    gateway,
+    runner: {
+      image: config.workbench.image,
+      homesDir: join(stateDir, 'homes'),
+      ...(env.REMONTNIK_WORKBENCH_MEMORY?.trim() ? { memory: env.REMONTNIK_WORKBENCH_MEMORY.trim() } : {}),
+      ...(env.REMONTNIK_WORKBENCH_CPUS?.trim() ? { cpus: env.REMONTNIK_WORKBENCH_CPUS.trim() } : {}),
+    },
     service: {
       stateDir,
       sharedSecret: required(env, 'REMONTNIK_SHARED_SECRET'),
-      listen: parseListen(env.REMONTNIK_LISTEN?.trim() || DEFAULT_LISTEN, 'REMONTNIK_LISTEN'),
       telegram: {
         botToken: required(env, telegram.botTokenEnv),
         chatId: required(env, chatIdEnv),
@@ -114,21 +126,77 @@ export function doctorStartPlan(env: DoctorEnv, config: RemontnikConfig): Doctor
         worktreesDir,
         models: model.models,
         model: model.model,
-        runner,
         evalEnv: env,
-        ...(evalProxyListen ? { evalProxy: { listen: parseListen(evalProxyListen, 'REMONTNIK_EVAL_PROXY_LISTEN'), ...(evalProxyUrl ? { publicUrl: evalProxyUrl } : {}) } } : {}),
       },
     },
   }
 }
 
-/** Запуск врача из окружения сервера: настройка основной ветки, проверка сетей Docker, служба. */
+export interface CaseGateway {
+  runner: CommandRunner
+  caseNetworks: CaseNetworks
+  mirror: RegistryMirror
+  evalProxy: EvalProxy
+  close(): Promise<void>
+}
+
+/** Зеркало реестра, прокси eval и сети случая, к которым они подключаются; исполнитель команд поверх них. */
+export async function createCaseGateway(plan: DoctorStartPlan, options: { docker?: string; log?: (line: string) => void } = {}): Promise<CaseGateway> {
+  const mirror = createRegistryMirror({ publicUrl: `http://${CASE_GATEWAY_HOST}:${MIRROR_PORT}`, ...(options.log ? { log: options.log } : {}) })
+  const evalProxy = await createEvalProxy({ port: EVAL_PROXY_PORT, publicUrl: `http://${CASE_GATEWAY_HOST}:${EVAL_PROXY_PORT}` })
+  const listenerCloser = (listener: { close(): Promise<void> }) => () => listener.close()
+  const caseNetworks = createCaseNetworks({
+    ...(options.docker ? { docker: options.docker } : {}),
+    gatewayContainer: plan.gateway.container,
+    subnetPool: plan.gateway.subnetPool,
+    attach: {
+      workbench: async (ip) => listenerCloser(await mirror.listen(ip, MIRROR_PORT)),
+      checks: async (ip) => listenerCloser(await evalProxy.listen(ip)),
+    },
+    ...(options.log ? { log: options.log } : {}),
+  })
+  const runner = createDockerRunner({ ...plan.runner, ...(options.docker ? { docker: options.docker } : {}), caseNetworks, workbenchEnv: caseWorkbenchEnv() })
+  return {
+    runner,
+    caseNetworks,
+    mirror,
+    evalProxy,
+    async close() {
+      await caseNetworks.close()
+      await mirror.close()
+      await evalProxy.close()
+    },
+  }
+}
+
+/** Запуск врача из окружения сервера: настройка основной ветки, адрес приёма, сети случая, служба. */
 export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string } = {}): Promise<DoctorService> {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
   const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
   const plan = doctorStartPlan(env, config)
-  await assertInternalDockerNetwork(plan.networks.workbench, options.docker)
-  await assertInternalDockerNetwork(plan.networks.checks, options.docker)
-  return startDoctorService({ ...plan.service, ...(options.log ? { log: options.log } : {}) })
+  const listen = 'network' in plan.listen
+    ? { host: await containerAddress(plan.gateway.container, plan.listen.network, options.docker), port: plan.listen.port }
+    : plan.listen
+  const gateway = await createCaseGateway(plan, options)
+  let service: DoctorService
+  try {
+    await gateway.caseNetworks.removeStale()
+    service = await startDoctorService({
+      ...plan.service,
+      listen,
+      treatment: { ...plan.service.treatment, runner: gateway.runner, evalProxy: gateway.evalProxy },
+      ...(options.log ? { log: options.log } : {}),
+    })
+  } catch (error) {
+    await gateway.close()
+    throw error
+  }
+  return {
+    ...service,
+    async close() {
+      await service.close()
+      await gateway.close()
+    },
+  }
 }

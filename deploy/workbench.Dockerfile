@@ -3,14 +3,15 @@
 # Сборка: docker build -f deploy/workbench.Dockerfile -t remontnik-workbench deploy
 #
 # Чего здесь нет и быть не должно: git (история и удалённый репозиторий модели не нужны), клиента и сокета
-# Docker, секретов. Сеть контейнеру даёт врач: закрытая сеть верстака с прокси выхода к реестру пакетов
-# или закрытая сеть проверок с прокси eval. Сети приложения в этом списке нет.
+# Docker, секретов. Сеть контейнеру даёт врач: закрытая сеть верстака своего случая с зеркалом реестра пакетов
+# или закрытая сеть проверок своего случая с прокси eval. Сети приложения в этом списке нет.
 # Приложению нужно больше (Python, системные библиотеки) — свой образ на основе этого, с теми же правилами.
-FROM node:22-bookworm-slim
-# pnpm ставится заранее: в контейнере корень только для чтения, а скачивать его на каждую команду незачем.
-RUN npm install --global pnpm@10.33.2 \
- && npm cache clean --force \
- && rm -rf /root/.npm \
+# Базовые образы закреплены по digest: тег можно перезаписать, digest — нет. Обновление — новый digest здесь.
+FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
+# pnpm ставится заранее (в контейнере корень только для чтения) и только после сверки хеша архива.
+COPY install-pnpm.mjs /tmp/install-pnpm.mjs
+RUN node /tmp/install-pnpm.mjs \
+ && rm -rf /tmp/install-pnpm.mjs /root/.npm \
  && if command -v git >/dev/null; then echo 'в образе верстака не должно быть git' >&2; exit 1; fi \
  && if command -v docker >/dev/null; then echo 'в образе верстака не должно быть docker' >&2; exit 1; fi
 ENV CI=1 \

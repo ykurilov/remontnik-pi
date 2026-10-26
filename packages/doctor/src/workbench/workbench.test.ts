@@ -6,7 +6,8 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createGitGuard } from '../git-guard/index.js'
 import { bashCallPolicy } from '../treatment/tools.js'
-import { assertInternalDockerNetwork, ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, type CommandRunner } from './index.js'
+import type { CaseNetworks } from '../case-networks/index.js'
+import { ContainerExecutionEnv, createDockerRunner, createLocalRunner, createWorkbench, type CommandRunner } from './index.js'
 
 const dirs: string[] = []
 
@@ -297,14 +298,36 @@ describe('исполнитель в контейнере', () => {
     expect(mountSources(args!)).toEqual([b.workbench.path, expect.stringContaining(join(b.root, 'homes')), outDir])
   })
 
-  it('проверки во внутренней сети: видно только прокси модели; установка — во внешней', async () => {
+  /** Подставные сети случая: выдают сеть по копии и виду, считают незакрытые аренды. */
+  function fakeCaseNetworks(fail?: string) {
+    const uses: string[] = []
+    let open = 0
+    const networks: CaseNetworks = {
+      async use(copyDir, kind) {
+        uses.push(`${kind} ${copyDir}`)
+        if (fail) throw new Error(fail)
+        open += 1
+        const network = { id: `${kind}-id`, name: `remontnik-case-${kind}`, kind, gatewayIp: kind === 'workbench' ? '10.213.0.2' : '10.213.0.34' }
+        return { network, done: () => void (open -= 1) }
+      },
+      removeStale: async () => {},
+      close: async () => {},
+    }
+    return { networks, uses, open: () => open }
+  }
+
+  it('сети случая: установка — в сети верстака, проверки — в сети проверок; сеть по ID, врач — по имени remontnik-gateway', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
-    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, network: 'remontnik-install', internalNetwork: 'remontnik-eval' })
+    const caseNetworks = fakeCaseNetworks()
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, caseNetworks: caseNetworks.networks })
     await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5 })
     await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    expect(caseNetworks.uses).toEqual([`workbench ${b.workbench.path}`, `checks ${b.workbench.path}`])
     const creates = fake.calls().filter((call) => call[0] === 'create')
-    expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['remontnik-install', 'remontnik-eval'])
+    expect(creates.map((args) => flagValue(args, '--network'))).toEqual(['workbench-id', 'checks-id'])
+    expect(creates.map((args) => flagValue(args, '--add-host'))).toEqual(['remontnik-gateway:10.213.0.2', 'remontnik-gateway:10.213.0.34'])
+    expect(caseNetworks.open()).toBe(0)
   })
 
   it('сеть не задана → у контейнера нет сети совсем', async () => {
@@ -315,32 +338,41 @@ describe('исполнитель в контейнере', () => {
     expect(flagValue(fake.calls()[0]!, '--network')).toBe('none')
   })
 
-  it('адрес прокси выхода — только командам во внешней сети, не проверкам', async () => {
+  it('адрес зеркала реестра — только командам в сети верстака, не проверкам; модель его не подменит', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
     const runner = createDockerRunner({
       image: 'example.test/app-dev:1',
       homesDir: join(b.root, 'homes'),
       docker: fake.docker,
-      network: 'remontnik-workbench',
-      internalNetwork: 'remontnik-checks',
-      outsideEnv: { HTTPS_PROXY: 'http://10.0.0.2:3128' },
+      caseNetworks: fakeCaseNetworks().networks,
+      workbenchEnv: { npm_config_registry: 'http://remontnik-gateway:7801/' },
     })
-    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { HTTPS_PROXY: 'http://model.example.com' }, timeoutSeconds: 5 })
+    await runner.run('pnpm install', { cwd: b.workbench.path, copyDir: b.workbench.path, env: { npm_config_registry: 'http://model.example.com/' }, timeoutSeconds: 5 })
     await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
     const [install, tests] = fake.envFile().split(/^-rw-------/m).filter(Boolean)
-    expect(install).toContain('HTTPS_PROXY=http://10.0.0.2:3128\n')
+    expect(install).toContain('npm_config_registry=http://remontnik-gateway:7801/\n')
     expect(install).not.toContain('model.example.com')
-    expect(tests).not.toContain('HTTPS_PROXY')
+    expect(tests).not.toContain('npm_config_registry')
   })
 
-  it('внутренняя сеть не задана → команда для неё не запускается', async () => {
+  it('сеть случая не прошла сверку → команда не запускается', async () => {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker, caseNetworks: fakeCaseNetworks('сеть случая не закрыта').networks })
+    const result = await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
+    expect(result.exitCode).toBeNull()
+    expect(result.spawnError).toContain('не закрыта')
+    expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
+  })
+
+  it('сетей случая нет → проверки не запускаются', async () => {
     const b = await bench()
     const fake = fakeDocker(b.root)
     const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
     const result = await runner.run('pnpm test', { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 5, network: 'internal' })
     expect(result.exitCode).toBeNull()
-    expect(result.spawnError).toContain('внутренн')
+    expect(result.spawnError).toContain('сет')
     expect(existsSync(join(b.root, 'docker.log'))).toBe(false)
   })
 
@@ -444,40 +476,4 @@ describe('исполнитель в контейнере', () => {
       expect(args![args!.length - 1]).toBe(command)
     },
   )
-})
-
-describe('проверка закрытой сети на старте', () => {
-  function fakeInspect(root: string, internal: string, exit = 0) {
-    const docker = join(root, 'docker-inspect')
-    writeFileSync(docker, `#!/bin/sh\nprintf '%s\\n' "$@" > '${root}/inspect.args'\n${exit === 0 ? `echo ${internal}` : "echo 'Error: No such network' >&2"}\nexit ${exit}\n`, { mode: 0o755 })
-    return docker
-  }
-
-  it('закрытая сеть без адреса моста на хосте → можно', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
-    dirs.push(root)
-    await expect(assertInternalDockerNetwork('remontnik-workbench', fakeInspect(root, "'true bridge true'"))).resolves.toBeUndefined()
-    const args = readFileSync(join(root, 'inspect.args'), 'utf8').split('\n')
-    expect(args.slice(0, 3)).toEqual(['network', 'inspect', '--format'])
-    expect(args[4]).toBe('remontnik-workbench')
-  })
-
-  it.each([
-    ['обычная сеть', "'false bridge <no value>'", /не закрыта/],
-    ['закрытая, но мост с адресом на хосте', "'true bridge <no value>'", /inhibit_ipv4/],
-  ])('%s → врач не стартует', async (_what, answer, error) => {
-    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
-    dirs.push(root)
-    await expect(assertInternalDockerNetwork('remontnik-workbench', fakeInspect(root, answer))).rejects.toThrow(error)
-  })
-
-  it('сети нет → врач не стартует', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'remontnik-net-'))
-    dirs.push(root)
-    await expect(assertInternalDockerNetwork('remontnik-missing', fakeInspect(root, '', 1))).rejects.toThrow(/не найдена/)
-  })
-
-  it('`none` — сети нет, проверять нечего', async () => {
-    await expect(assertInternalDockerNetwork('none', '/nonexistent/docker')).resolves.toBeUndefined()
-  })
 })

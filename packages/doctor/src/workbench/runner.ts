@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import type { CaseNetworkLease, CaseNetworks } from '../case-networks/index.js'
 
 // Исполнитель команд верстака и проверок. Окружение процесса собирается с нуля: PATH, свой HOME у каждой копии
 // и только явно переданные переменные. Окружение врача (ключи моделей, git, Telegram) не наследуется.
@@ -21,7 +22,7 @@ export interface RunOptions {
   timeoutSeconds: number
   onOutput?: (text: string, stream: 'stdout' | 'stderr') => void
   signal?: AbortSignal
-  /** `internal` — внутренняя сеть проверок, где видно только прокси модели и службы тестов. По умолчанию — внешняя. */
+  /** `internal` — сеть проверок копии, где видно только прокси eval. По умолчанию — сеть верстака с зеркалом реестра. */
   network?: 'internal'
 }
 
@@ -159,6 +160,8 @@ export interface DockerRunSpec {
   workdir: string
   writableDirs: readonly string[]
   network: string
+  /** Записи `/etc/hosts` контейнера: имя → адрес (врач в сети случая). */
+  hosts?: Record<string, string>
   user?: string
   /** Файл переменных (`--env-file`): значения не видны в `ps` и аргументах клиента. */
   envFile: string
@@ -195,6 +198,7 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     '--name', spec.name,
     '--label', 'remontnik.workbench=1',
     '--network', spec.network,
+    ...Object.entries(spec.hosts ?? {}).flatMap(([host, ip]) => ['--add-host', `${host}:${ip}`]),
     ...(spec.user ? ['--user', spec.user] : []),
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
@@ -224,17 +228,13 @@ export interface DockerRunnerOptions {
   /** Где лежат HOME копий (на сервере, вне папки копий). */
   homesDir: string
   /**
-   * Сеть команд модели и установки зависимостей: внутренняя сеть Docker, где наружу ведёт только прокси выхода
-   * (`outsideEnv`) к реестру пакетов. Не сеть приложения. Не задана — `none`: сети у контейнера нет совсем.
+   * Сети случая: у каждой копии своя закрытая сеть верстака (команды модели, установка; там зеркало реестра)
+   * и своя сеть проверок (тесты, типы, eval; там прокси eval). Сеть берётся по ID и сверяется перед каждой командой.
+   * Не заданы — у команд нет сети совсем, а проверки не запускаются.
    */
-  network?: string
-  /** Постоянные переменные команд в сети `network` (адрес прокси выхода). Во внутреннюю сеть проверок не уходят. */
-  outsideEnv?: Record<string, string>
-  /**
-   * Внутренняя сеть Docker (`internal: true`) для тестов, проверки типов и eval: выхода наружу нет, видны только
-   * прокси модели и службы тестов приложения. Не задана — такие команды не запускаются.
-   */
-  internalNetwork?: string
+  caseNetworks?: CaseNetworks
+  /** Переменные команд в сети верстака (адрес зеркала реестра). Сильнее переданных; в сеть проверок не уходят. */
+  workbenchEnv?: Record<string, string>
   /** Пользователь в контейнере; по умолчанию — тот же, что у врача, чтобы файлы копии оставались его. */
   user?: string
   /** Лимит памяти контейнера (без подкачки). По умолчанию `4g`. */
@@ -245,9 +245,11 @@ export interface DockerRunnerOptions {
 }
 
 const DOCKER_STEP_TIMEOUT_SECONDS = 120
+/** Имя врача в контейнере случая: по нему зеркало реестра и прокси eval, адрес — свой в каждой сети. */
+export const CASE_GATEWAY_HOST = 'remontnik-gateway'
 
 /** Окружение клиента `docker`: только то, что ему нужно, без ключей врача. */
-function dockerClientEnv(): Record<string, string> {
+export function dockerClientEnv(): Record<string, string> {
   return {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
@@ -280,6 +282,47 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
     return inspected.exitCode !== null && /no such (object|container)/i.test(inspected.output)
   }
 
+  /** Одна команда в своём контейнере; сеть (если есть) уже сверена. */
+  async function runInContainer(command: string | readonly string[], runOptions: RunOptions, copyDir: string, lease: CaseNetworkLease | undefined): Promise<RunResult> {
+    const internal = runOptions.network === 'internal'
+    const name = `remontnik-${randomBytes(6).toString('hex')}`
+    const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
+    const envFile = join(envDir, 'env')
+    let created: RunResult
+    try {
+      const env = internal ? (runOptions.env ?? {}) : { ...runOptions.env, ...options.workbenchEnv }
+      writeFileSync(envFile, envFileText(env), { mode: 0o600 })
+      const args = dockerCreateArgs({
+        name,
+        image: options.image,
+        copyDir,
+        home: homeOf(options.homesDir, copyDir),
+        workdir: resolve(runOptions.cwd),
+        writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
+        network: lease?.network.id ?? 'none',
+        ...(lease ? { hosts: { [CASE_GATEWAY_HOST]: lease.network.gatewayIp } } : {}),
+        ...(user ? { user } : {}),
+        envFile,
+        memory: options.memory ?? '4g',
+        cpus: options.cpus ?? '2',
+        command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
+      })
+      created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
+    } catch (error) {
+      return failed((error as Error).message)
+    } finally {
+      rmSync(envDir, { recursive: true, force: true })
+    }
+    if (created.exitCode !== 0) {
+      return { ...created, exitCode: null, spawnError: created.spawnError ?? `контейнер не создан: ${created.output.trim().slice(-500)}` }
+    }
+    const result = await spawnWithTimeout({ file: docker, args: ['start', '--attach', name], cwd: copyDir, env: clientEnv }, runOptions, 0, () =>
+      killContainer(name, copyDir),
+    )
+    if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
+    return result
+  }
+
   return {
     isolation: 'container',
     spoiled: (copyDir) => existsSync(spoiledMark(resolve(copyDir))),
@@ -288,67 +331,19 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
       const inCopy = relative(copyDir, resolve(runOptions.cwd))
       if (inCopy.startsWith('..') || isAbsolute(inCopy)) return failed(`папка ${runOptions.cwd} вне копии ${copyDir}`)
       if (existsSync(spoiledMark(copyDir))) return failed(new SpoiledCopyError(copyDir).message)
-      if (runOptions.network === 'internal' && !options.internalNetwork) return failed('внутренняя сеть проверок не задана (internalNetwork)')
-      const name = `remontnik-${randomBytes(6).toString('hex')}`
-      const envDir = mkdtempSync(join(tmpdir(), 'remontnik-env-'))
-      const envFile = join(envDir, 'env')
-      let created: RunResult
+      const internal = runOptions.network === 'internal'
+      if (internal && !options.caseNetworks) return failed('сети случая не заданы (caseNetworks): проверки без закрытой сети не запускаются')
+      let lease: CaseNetworkLease | undefined
       try {
-        const env = runOptions.network === 'internal' ? (runOptions.env ?? {}) : { ...runOptions.env, ...options.outsideEnv }
-        writeFileSync(envFile, envFileText(env), { mode: 0o600 })
-        const args = dockerCreateArgs({
-          name,
-          image: options.image,
-          copyDir,
-          home: homeOf(options.homesDir, copyDir),
-          workdir: resolve(runOptions.cwd),
-          writableDirs: (runOptions.writableDirs ?? []).map((dir) => resolve(dir)),
-          network: runOptions.network === 'internal' ? options.internalNetwork! : (options.network ?? 'none'),
-          ...(user ? { user } : {}),
-          envFile,
-          memory: options.memory ?? '4g',
-          cpus: options.cpus ?? '2',
-          command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
-        })
-        created = await dockerStep(args, copyDir, DOCKER_STEP_TIMEOUT_SECONDS, runOptions.signal)
+        lease = await options.caseNetworks?.use(copyDir, internal ? 'checks' : 'workbench')
       } catch (error) {
         return failed((error as Error).message)
+      }
+      try {
+        return await runInContainer(command, runOptions, copyDir, lease)
       } finally {
-        rmSync(envDir, { recursive: true, force: true })
+        lease?.done()
       }
-      if (created.exitCode !== 0) {
-        return { ...created, exitCode: null, spawnError: created.spawnError ?? `контейнер не создан: ${created.output.trim().slice(-500)}` }
-      }
-      const result = await spawnWithTimeout({ file: docker, args: ['start', '--attach', name], cwd: copyDir, env: clientEnv }, runOptions, 0, () =>
-        killContainer(name, copyDir),
-      )
-      if (result.stillRunning) writeFileSync(spoiledMark(copyDir), `${name}\n`)
-      return result
     },
-  }
-}
-
-/**
- * Сеть Docker существует и закрыта: `internal: true` (нет шлюза наружу), а у моста нет адреса на хосте
- * (`com.docker.network.bridge.inhibit_ipv4`). Без второго контейнер видит службы самого сервера, слушающие
- * все адреса, по адресу моста. Врач проверяет это на старте для сети верстака и сети проверок, чтобы ошибка
- * в compose не открыла контейнерам интернет, локальную сеть или сервер.
- */
-export async function assertInternalDockerNetwork(name: string, docker = 'docker'): Promise<void> {
-  if (name === 'none') return
-  const result = await spawnWithTimeout(
-    {
-      file: docker,
-      args: ['network', 'inspect', '--format', '{{.Internal}} {{.Driver}} {{index .Options "com.docker.network.bridge.inhibit_ipv4"}}', name],
-      cwd: tmpdir(),
-      env: dockerClientEnv(),
-    },
-    { cwd: tmpdir(), timeoutSeconds: DOCKER_STEP_TIMEOUT_SECONDS },
-  )
-  if (result.exitCode !== 0) throw new Error(`сеть Docker «${name}» не найдена: ${(result.spawnError ?? result.output).trim().slice(-300)}`)
-  const [internal, driver, inhibitIpv4] = result.output.trim().split(/\s+/)
-  if (internal !== 'true') throw new Error(`сеть Docker «${name}» не закрыта: нужна internal: true, иначе контейнеры верстака видят интернет и локальную сеть`)
-  if (driver === 'bridge' && inhibitIpv4 !== 'true') {
-    throw new Error(`у сети Docker «${name}» мост с адресом на хосте: нужна опция com.docker.network.bridge.inhibit_ipv4: "true", иначе контейнеры видят службы сервера`)
   }
 }
