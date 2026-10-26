@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RemontnikConfigError } from '@ykurilov/remontnik-core/config'
@@ -34,6 +34,10 @@ function git(directory: string, ...args: string[]): void {
   })
 }
 
+function loadMain(directory: string, mainBranch = 'main') {
+  return loadMainBranchConfig({ mainCheckoutDirectory: directory, mainBranch })
+}
+
 let root: string
 let mainCheckout: string
 
@@ -58,7 +62,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject()))
     commitAll(mainCheckout, 'config')
 
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })
+    const loaded = await loadMain(mainCheckout)
 
     expect(loaded.file).toBe(join(mainCheckout, 'remontnik.config.mjs'))
     expect(loaded.config.app.name).toBe('demo')
@@ -70,7 +74,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
   it('читает JSON-настройку', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.json'), JSON.stringify(configObject()))
     commitAll(mainCheckout, 'config')
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })
+    const loaded = await loadMain(mainCheckout)
     expect(loaded.config.app.name).toBe('demo')
   })
 
@@ -84,7 +88,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     writeFileSync(join(doctorCheckout, 'remontnik.config.mjs'), moduleText(configObject({ moneyMask: 'nothing/**', timeoutMs: 1 })))
     commitAll(doctorCheckout, 'ослабить настройку')
 
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })
+    const loaded = await loadMain(mainCheckout)
 
     expect(loaded.config.forbidden.money).toEqual(['src/payments/**'])
     expect(loaded.config.workbench.bashTimeoutMs).toBe(600_000)
@@ -96,7 +100,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     const doctorCheckout = join(root, 'doctor')
     git(mainCheckout, 'worktree', 'add', '-b', 'remontnik/7-fix', doctorCheckout)
 
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: doctorCheckout })).rejects.toMatchObject({
+    await expect(loadMain(doctorCheckout)).rejects.toMatchObject({
       name: 'ConfigSourceError',
       code: 'branch_mismatch',
     })
@@ -106,11 +110,11 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     const file = join(mainCheckout, 'remontnik.config.mjs')
     writeFileSync(file, moduleText(configObject({ timeoutMs: 1000 })))
     commitAll(mainCheckout, 'first')
-    expect((await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).config.workbench.bashTimeoutMs).toBe(1000)
+    expect((await loadMain(mainCheckout)).config.workbench.bashTimeoutMs).toBe(1000)
 
     writeFileSync(file, moduleText(configObject({ timeoutMs: 2000 })))
     commitAll(mainCheckout, 'second')
-    expect((await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).config.workbench.bashTimeoutMs).toBe(2000)
+    expect((await loadMain(mainCheckout)).config.workbench.bashTimeoutMs).toBe(2000)
   })
 
   it('принимает уже собранную defineRemontnikConfig настройку (со встроенными запретами)', async () => {
@@ -119,7 +123,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(resolved))
     commitAll(mainCheckout, 'config')
 
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })
+    const loaded = await loadMain(mainCheckout)
 
     expect(loaded.config.forbidden.access).toEqual(resolved.forbidden.access)
   })
@@ -129,7 +133,7 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(tampered))
     commitAll(mainCheckout, 'config')
 
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })
+    const loaded = await loadMain(mainCheckout)
 
     expect(loaded.config.forbidden.builtIn.accessMasks).toContain('**/.env*')
     expect(loaded.config.forbidden.access).toContain('**/.env*')
@@ -138,38 +142,38 @@ describe('loadMainBranchConfig: чтение из основной ветки', 
 
 describe('loadMainBranchConfig: ошибки', () => {
   it('нет файла настройки', async () => {
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toMatchObject({ code: 'not_found' })
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'not_found' })
   })
 
   it('два файла настройки — неоднозначно', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject()))
     writeFileSync(join(mainCheckout, 'remontnik.config.json'), JSON.stringify(configObject()))
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toMatchObject({ code: 'ambiguous' })
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'ambiguous' })
   })
 
   it('настройка с ошибками — понятная ошибка проверки', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText({ app: { name: 'demo' } }))
     commitAll(mainCheckout, 'broken')
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toBeInstanceOf(RemontnikConfigError)
+    await expect(loadMain(mainCheckout)).rejects.toBeInstanceOf(RemontnikConfigError)
   })
 
   it('файл не читается как модуль', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), 'export default {{{')
     commitAll(mainCheckout, 'broken')
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toMatchObject({ code: 'unreadable' })
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'unreadable' })
   })
 
   it('имя основной ветки в настройке не совпадает с веткой рабочей копии', async () => {
     writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject({ mainBranch: 'trunk' })))
     commitAll(mainCheckout, 'config')
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toMatchObject({ code: 'branch_mismatch' })
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'branch_mismatch' })
   })
 
   it('файл настройки — ссылка за пределы рабочей копии', async () => {
     const outside = join(root, 'outside.mjs')
     writeFileSync(outside, moduleText(configObject()))
     symlinkSync(outside, join(mainCheckout, 'remontnik.config.mjs'))
-    await expect(loadMainBranchConfig({ mainCheckoutDirectory: mainCheckout })).rejects.toMatchObject({ code: 'outside_checkout' })
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'outside_checkout' })
   })
 
   it('ConfigSourceError — обычная ошибка с кодом', () => {
@@ -178,11 +182,85 @@ describe('loadMainBranchConfig: ошибки', () => {
     expect(error.code).toBe('not_found')
   })
 
-  it('рабочая копия без git: ветку проверить нечем, настройка читается', async () => {
+  it('рабочая копия без git: ветку проверить нечем — отказ', async () => {
     const plain = join(root, 'plain')
     mkdirSync(plain)
     writeFileSync(join(plain, 'remontnik.config.mjs'), moduleText(configObject()))
-    const loaded = await loadMainBranchConfig({ mainCheckoutDirectory: plain })
-    expect(loaded.config.app.name).toBe('demo')
+    await expect(loadMain(plain)).rejects.toMatchObject({ code: 'branch_unknown' })
+  })
+
+  it('отдельная голова (detached HEAD) — отказ, даже на коммите основной ветки', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject()))
+    commitAll(mainCheckout, 'config')
+    git(mainCheckout, 'checkout', '--detach')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'branch_unknown' })
+  })
+
+  it('отдельная голова на коммите ветки врача — отказ', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject()))
+    commitAll(mainCheckout, 'config')
+    const doctorCheckout = join(root, 'doctor')
+    git(mainCheckout, 'worktree', 'add', '-b', 'remontnik/7-fix', doctorCheckout)
+    writeFileSync(join(doctorCheckout, 'remontnik.config.mjs'), moduleText(configObject({ moneyMask: 'nothing/**' })))
+    commitAll(doctorCheckout, 'ослабить настройку')
+    git(doctorCheckout, 'checkout', '--detach')
+    await expect(loadMain(doctorCheckout)).rejects.toMatchObject({ code: 'branch_unknown' })
+  })
+
+  it('любая другая ветка, не только remontnik/*, — отказ', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject()))
+    commitAll(mainCheckout, 'config')
+    git(mainCheckout, 'checkout', '-b', 'feature/x')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'branch_mismatch' })
+  })
+
+  it('имя основной ветки приходит от вызывающего, а не из файла', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject({ mainBranch: 'trunk' })))
+    commitAll(mainCheckout, 'config')
+    git(mainCheckout, 'checkout', '-b', 'trunk')
+    // Копия стоит на "trunk" и файл говорит "trunk", но вызывающий считает основной "main".
+    await expect(loadMain(mainCheckout, 'main')).rejects.toMatchObject({ code: 'branch_mismatch' })
+    expect((await loadMain(mainCheckout, 'trunk')).config.repo.mainBranch).toBe('trunk')
+  })
+
+  it('файл из чужой ветки не выполняется: ветка проверяется до чтения', async () => {
+    const marker = join(root, 'executed.marker')
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'x')\nexport default ${JSON.stringify(configObject())}\n`,
+    )
+    commitAll(mainCheckout, 'config')
+    git(mainCheckout, 'checkout', '-b', 'remontnik/9-evil')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'branch_mismatch' })
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('подключённые файлы настройки перечитываются, а не берутся из кэша', async () => {
+    const imported = join(mainCheckout, 'masks.mjs')
+    const entry = join(mainCheckout, 'remontnik.config.mjs')
+    const configWithImport = `import { money } from './masks.mjs'\nconst base = ${JSON.stringify(configObject())}\nexport default { ...base, forbidden: { ...base.forbidden, money } }\n`
+    writeFileSync(entry, configWithImport)
+    writeFileSync(imported, "export const money = ['src/payments/**']\n")
+    commitAll(mainCheckout, 'first')
+    expect((await loadMain(mainCheckout)).config.forbidden.money).toEqual(['src/payments/**'])
+
+    writeFileSync(imported, "export const money = ['src/billing/**']\n")
+    commitAll(mainCheckout, 'second')
+    expect((await loadMain(mainCheckout)).config.forbidden.money).toEqual(['src/billing/**'])
+  })
+
+  it('вывод в консоль из файла настройки не ломает чтение', async () => {
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `console.log('hello {"not":"config"}')\nexport default ${JSON.stringify(configObject())}\n`,
+    )
+    commitAll(mainCheckout, 'config')
+    expect((await loadMain(mainCheckout)).config.app.name).toBe('demo')
+  })
+
+  it('маска с неподдерживаемым синтаксисом — ошибка настройки', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), moduleText(configObject({ moneyMask: '@(payments|billing)/**' })))
+    commitAll(mainCheckout, 'config')
+    await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'invalid_mask' })
   })
 })

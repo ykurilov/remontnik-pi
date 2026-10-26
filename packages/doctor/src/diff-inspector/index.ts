@@ -1,8 +1,13 @@
-import { changedLinesOf, type ChangedFile } from '../changed-files/index.js'
+import { changedLinesOf, isDocumentationPath, type ChangedFile } from '../changed-files/index.js'
 import { matchesAnyMask, normalizeRepoPath } from '../path-mask/index.js'
 
 // Осмотр диффа правки врача (R6, пункты 3–5): ослабленные тесты и eval, подозрительный код, размер.
 // Чистая функция: ни файлов, ни сети; выводы идут в `deploy-gate`.
+//
+// Осмотр рассчитан на ошибки и самоуверенность модели, а не на намеренную подмену: признаки ищутся
+// шаблонами по тексту, и хитро собранный обход (адрес из кусочков, `require` по вычисленному имени) они не поймают.
+// Против такого стоят остальные замки: запретные зоны, права git, метка прежней версии и откат.
+// Сомнение или нехватка данных (нет диффа, размер неизвестен) считаются находкой: ложная тревога лучше пропуска.
 
 export type SuspiciousSignal =
   | 'environment_access'
@@ -10,6 +15,7 @@ export type SuspiciousSignal =
   | 'process_spawn'
   | 'dynamic_code'
   | 'outside_project'
+  | 'special_file_mode'
   | 'patch_unavailable'
 
 export interface SuspiciousFinding {
@@ -28,7 +34,8 @@ export interface DiffInspection {
   /** Изменены, удалены или переименованы существующие тест, сценарий eval, рубрика, судья. Новые файлы — можно. */
   existingTestChanges: ExistingTestChange[]
   suspicious: SuspiciousFinding[]
-  size: { files: number; lines: number; exceeds: Array<'lines' | 'files'> }
+  /** `unknown` — размер определить нельзя (пустая правка, число строк не число, предел не число). */
+  size: { files: number; lines: number; exceeds: Array<'lines' | 'files' | 'unknown'> }
 }
 
 export interface DiffLimits {
@@ -37,7 +44,7 @@ export interface DiffLimits {
 }
 
 export interface InspectDiffOptions {
-  /** Хосты, которые приложению уже известны (например, из `browser.allowedOrigins`): новыми не считаются. */
+  /** Хосты или полные адреса, которые приложению уже известны (например, `browser.allowedOrigins`): новыми не считаются. */
   knownHosts?: readonly string[]
 }
 
@@ -51,7 +58,9 @@ const TEST_AND_EVAL_MASKS = [
   '**/__mocks__/**',
   '**/fixtures/**',
   '**/e2e/**',
+  '**/vite.config.*',
   '**/vitest.config.*',
+  '**/vitest.workspace.*',
   '**/vitest.setup.*',
   '**/jest.config.*',
   '**/jest.setup.*',
@@ -63,20 +72,27 @@ const TEST_AND_EVAL_MASKS = [
   '**/*judge*',
 ]
 
-const DOCUMENT_FILE = /\.(?:md|mdx|txt|rst)$/i
-const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*|#|<!--)/
+const BLOCK_COMMENT = /\/\*.*?\*\//g
+const LINE_COMMENT_ONLY = /^\s*\/\//
 const IMPORT_LINE = /^\s*(?:import\b|export\b.*\bfrom\b)|\brequire\s*\(/
 const URL_WITH_HOST = /\b(?:https?|wss?|ftp):\/\/([^\s/'"`?#)]+)/gi
+const SCHEME_RELATIVE_HOST = /(?<=['"`])\/\/([a-z0-9][^\s/'"`?#)]*\.[^\s/'"`?#)]+)/gi
 const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g
-const LOCAL_HOSTS = new Set(['localhost', '[::1]', '0.0.0.0'])
+const LOCAL_HOSTS = new Set(['localhost', '[::1]'])
 
-const ENVIRONMENT_ACCESS = /\bprocess\.env\b|\bimport\.meta\.env\b/
-const PROCESS_SPAWN = /\bchild_process\b|\bBun\.spawn\b|\bDeno\.Command\b/
-const DYNAMIC_CODE = /\beval\s*\(|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]/
+const ENVIRONMENT_ACCESS = /\bprocess\s*(?:\.\s*env\b|\[\s*['"`]env['"`]\s*\])|\bimport\.meta\.env\b/
+const PROCESS_SPAWN =
+  /\bchild_process\b|\bBun\.spawn\b|\bDeno\.Command\b|(?<![.\w])(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\.(?:execSync|execFileSync|execFile|spawn|spawnSync)\s*\(/
+const DYNAMIC_CODE =
+  /(?<![\w./-])eval(?![\w./-])(?!\s*:)|\b(?:globalThis|window|self|global)\.eval\b|\bnew\s+Function\b|\bFunction\s*\(|(?:from\s+|require\(\s*|import\(\s*)['"](?:node:)?vm['"]/
 const SYSTEM_PATH_LITERAL = /['"`](?:\/(?:etc|root|proc|usr|Users|Volumes|home|var|opt|mnt|sys)\/|~\/|[A-Za-z]:\\)/
 const HOME_DIRECTORY = /\bhomedir\s*\(/
 const FILE_CALL_WITH_PARENT_PATH =
   /\b(?:readFile|writeFile|appendFile|readdir|readFileSync|writeFileSync|appendFileSync|readdirSync|createReadStream|createWriteStream|unlink|unlinkSync|rm|rmSync|rmdir|copyFile|rename|mkdir|mkdirSync|open|openSync|stat|existsSync)\s*\(\s*['"`]\.\.[/\\]/
+const SUBMODULE_IN_PATCH = /^Subproject commit\b/
+
+const LINK_AND_SUBMODULE_MODES = new Set(['120000', '160000'])
+const EXECUTABLE_MODE = '100755'
 
 export function isTestOrEvalPath(path: string): boolean {
   return matchesAnyMask(TEST_AND_EVAL_MASKS, path)
@@ -87,28 +103,43 @@ function isOutsideProject(path: string): boolean {
   return normalized === '..' || normalized.startsWith('../') || normalized.startsWith('/') || normalized.startsWith('~') || /^[A-Za-z]:/.test(normalized)
 }
 
-function hostOf(rawHost: string): string {
-  return rawHost.replace(/:\d+$/, '').replace(/[.,;]+$/, '').toLowerCase()
+/** Хост из адреса или из голого хоста: без схемы, имени пользователя, порта, пути; строчными буквами. */
+function hostOf(address: string): string {
+  const withoutScheme = address.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/^\/\//, '')
+  const authority = withoutScheme.split(/[/?#]/)[0] ?? ''
+  const afterUser = authority.slice(authority.lastIndexOf('@') + 1)
+  return afterUser.replace(/:\d+$/, '').replace(/[.,;]+$/, '').toLowerCase()
+}
+
+function parseIpv4(host: string): number[] | undefined {
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return undefined
+  const octets = host.split('.').map(Number)
+  return octets.every((octet) => octet <= 255) ? octets : undefined
 }
 
 function isLocalHost(host: string): boolean {
-  return LOCAL_HOSTS.has(host) || host.endsWith('.localhost') || host.startsWith('127.')
-}
-
-function isIpv4(candidate: string): boolean {
-  return candidate.split('.').every((octet) => Number(octet) <= 255)
+  if (LOCAL_HOSTS.has(host) || host.endsWith('.localhost')) return true
+  const octets = parseIpv4(host)
+  return octets !== undefined && (octets[0] === 127 || octets.every((octet) => octet === 0))
 }
 
 /** Адреса из строки: хосты ссылок и «голые» IPv4. Хост, собранный из переменных (`${host}`), узнать нельзя — пропускается. */
 function addressesIn(line: string): string[] {
   const hosts: string[] = []
-  const rest = line.replace(URL_WITH_HOST, (_match, rawHost: string) => {
+  const collect = (_match: string, rawHost: string) => {
     const host = hostOf(rawHost)
-    if (!host.includes('$') && !host.includes('{')) hosts.push(host)
+    if (host !== '' && !host.includes('$') && !host.includes('{')) hosts.push(host)
     return ' '
-  })
-  for (const candidate of rest.match(IPV4) ?? []) if (isIpv4(candidate)) hosts.push(candidate)
+  }
+  const rest = line.replace(URL_WITH_HOST, collect).replace(SCHEME_RELATIVE_HOST, collect)
+  for (const candidate of rest.match(IPV4) ?? []) if (parseIpv4(candidate)) hosts.push(candidate)
   return hosts
+}
+
+/** Код строки без комментариев: блочные `/* .. */` вырезаются, строка целиком из `//` — пустая. Всё остальное — код. */
+function withoutComments(line: string): string {
+  const stripped = line.replace(BLOCK_COMMENT, ' ')
+  return LINE_COMMENT_ONLY.test(stripped) ? '' : stripped
 }
 
 function hostsAlreadyInFile(patch: string): Set<string> {
@@ -137,12 +168,23 @@ function findingsInAddedLines(file: ChangedFile, patch: string, knownHosts: Read
       report('outside_project', line)
     }
 
-    if (!COMMENT_LINE.test(line)) {
-      const isNewExternal = addressesIn(line).some((host) => !isLocalHost(host) && !knownHosts.has(host) && !hostsInFile.has(host))
-      if (isNewExternal) report('new_external_address', line)
-    }
+    const isNewExternal = addressesIn(withoutComments(line)).some(
+      (host) => !isLocalHost(host) && !knownHosts.has(host) && !hostsInFile.has(host),
+    )
+    if (isNewExternal) report('new_external_address', line)
   }
   return findings
+}
+
+function hasSpecialMode(file: ChangedFile): boolean {
+  const { mode, previousMode } = file
+  if ((mode && LINK_AND_SUBMODULE_MODES.has(mode)) || (previousMode && LINK_AND_SUBMODULE_MODES.has(previousMode))) return true
+  if (mode === EXECUTABLE_MODE && previousMode !== EXECUTABLE_MODE) return true
+  return Boolean(mode && previousMode && mode !== previousMode)
+}
+
+function isPureRename(file: ChangedFile): boolean {
+  return file.status === 'renamed' && file.added === 0 && file.removed === 0
 }
 
 function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySet<string>): SuspiciousFinding[] {
@@ -151,9 +193,14 @@ function inspectSuspicious(files: readonly ChangedFile[], knownHosts: ReadonlySe
     if (isOutsideProject(file.path) || (file.previousPath && isOutsideProject(file.previousPath))) {
       findings.push({ path: file.path, signal: 'outside_project', line: '' })
     }
-    if (DOCUMENT_FILE.test(file.path)) continue
-    if (file.patch === undefined) {
-      if (file.status !== 'deleted') findings.push({ path: file.path, signal: 'patch_unavailable', line: '' })
+    if (hasSpecialMode(file)) findings.push({ path: file.path, signal: 'special_file_mode', line: '' })
+    if (file.patch !== undefined && changedLinesOf(file.patch).added.concat(changedLinesOf(file.patch).removed).some((line) => SUBMODULE_IN_PATCH.test(line))) {
+      findings.push({ path: file.path, signal: 'special_file_mode', line: '' })
+    }
+
+    if (isDocumentationPath(file.path)) continue
+    if (file.patch === undefined || file.patch.trim() === '') {
+      if (file.status !== 'deleted' && !isPureRename(file)) findings.push({ path: file.path, signal: 'patch_unavailable', line: '' })
       continue
     }
     findings.push(...findingsInAddedLines(file, file.patch, knownHosts))
@@ -171,17 +218,24 @@ function inspectExistingTests(files: readonly ChangedFile[]): ExistingTestChange
   return changes
 }
 
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
 function inspectSize(files: readonly ChangedFile[], limits: DiffLimits): DiffInspection['size'] {
-  const lines = files.reduce((sum, file) => sum + file.added + file.removed, 0)
-  const exceeds: Array<'lines' | 'files'> = []
-  if (lines > limits.maxDiffLines) exceeds.push('lines')
-  if (files.length > limits.maxDiffFiles) exceeds.push('files')
+  const counts = files.flatMap((file) => [file.added, file.removed])
+  const lines = counts.filter(isCount).reduce((sum, count) => sum + count, 0)
+  const exceeds: DiffInspection['size']['exceeds'] = []
+  if (isCount(limits.maxDiffLines) && lines > limits.maxDiffLines) exceeds.push('lines')
+  if (isCount(limits.maxDiffFiles) && files.length > limits.maxDiffFiles) exceeds.push('files')
+  const unknown = files.length === 0 || !counts.every(isCount) || !isCount(limits.maxDiffLines) || !isCount(limits.maxDiffFiles)
+  if (unknown) exceeds.push('unknown')
   return { files: files.length, lines, exceeds }
 }
 
 /** Осмотр диффа правки: что не должно уходить в выкатку само. Решение принимает `deploy-gate`. */
 export function inspectDiff(files: readonly ChangedFile[], limits: DiffLimits, options: InspectDiffOptions = {}): DiffInspection {
-  const knownHosts = new Set((options.knownHosts ?? []).map((host) => host.toLowerCase()))
+  const knownHosts = new Set((options.knownHosts ?? []).map(hostOf))
   return {
     existingTestChanges: inspectExistingTests(files),
     suspicious: inspectSuspicious(files, knownHosts),

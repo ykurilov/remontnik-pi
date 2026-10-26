@@ -2,7 +2,7 @@ import type { DiffInspection } from '../diff-inspector/index.js'
 import type { ForbiddenZoneHit } from '../forbidden-zones/index.js'
 
 // Решение о выкатке (R6, FR-020): чистая функция от фактов. Любой непройденный пункт → `report_only`.
-// Модель на решение не влияет: факты собирает код, а неуверенность (нет данных) считается непройденным пунктом.
+// Модель на решение не влияет: факты собирает код, а неуверенность (нет данных, невозможные числа) считается непройденным пунктом.
 
 export type GateReasonCode =
   | 'tests_not_green'
@@ -16,6 +16,7 @@ export type GateReasonCode =
   | 'needs_human_after_rollback'
   | 'budget_exhausted'
   | 'rebase_conflict'
+  | 'facts_invalid'
 
 export interface GateReason {
   code: GateReasonCode
@@ -63,12 +64,97 @@ const EVAL_PROBLEM: Record<Exclude<DeployFacts['eval']['status'], 'not_needed' |
   not_run: 'eval не запускался, хотя должен был',
 }
 
+const TESTS_STATUSES = ['green', 'red', 'flaky', 'not_run']
+const EVAL_STATUSES = ['not_needed', 'not_worse', 'worse', 'stand_broken', 'not_run']
+const EXCEEDS_VALUES = ['lines', 'files', 'unknown']
+const REBASE_VALUES = ['clean', 'conflict']
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+function isListOf(value: unknown, allowed?: readonly string[]): boolean {
+  return Array.isArray(value) && value.every((item) => (allowed ? typeof item === 'string' && allowed.includes(item) : true))
+}
+
+/** Названия фактов, которые отсутствуют или невозможны. Пусто — факты годятся. */
+function invalidFactNames(facts: unknown): string[] {
+  if (!isRecord(facts)) return ['facts']
+  const bad: string[] = []
+  const check = (name: string, ok: boolean) => {
+    if (!ok) bad.push(name)
+  }
+  const section = (name: string): Record<string, unknown> => {
+    const value = facts[name]
+    if (!isRecord(value)) {
+      bad.push(name)
+      return {}
+    }
+    return value
+  }
+
+  const tests = section('tests')
+  check('tests.status', typeof tests.status === 'string' && TESTS_STATUSES.includes(tests.status))
+  check('tests.failed', isListOf(tests.failed))
+
+  const evalFacts = section('eval')
+  check('eval.status', typeof evalFacts.status === 'string' && EVAL_STATUSES.includes(evalFacts.status))
+  check('eval.worseScenarios', isListOf(evalFacts.worseScenarios))
+
+  check('forbiddenZones', isListOf(facts.forbiddenZones))
+
+  const diff = section('diff')
+  check('diff.existingTestChanges', isListOf(diff.existingTestChanges))
+  check('diff.suspicious', isListOf(diff.suspicious))
+  const size = isRecord(diff.size) ? diff.size : undefined
+  if (!size) bad.push('diff.size')
+  else {
+    // Правка без файлов — не «всё чисто», а «нечего проверять».
+    check('diff.size.files', isCount(size.files) && size.files > 0)
+    check('diff.size.lines', isCount(size.lines))
+    check('diff.size.exceeds', isListOf(size.exceeds, EXCEEDS_VALUES))
+  }
+
+  check('stopSwitch', typeof facts.stopSwitch === 'boolean')
+  check('rebase', typeof facts.rebase === 'string' && REBASE_VALUES.includes(facts.rebase))
+
+  const attempts = section('attempts')
+  for (const key of ['autoDeploysForFingerprint', 'maxPerFingerprintPerDay', 'autoDeploysToday', 'maxPerDay']) {
+    check(`attempts.${key}`, isCount(attempts[key]))
+  }
+  check('attempts.needsHumanAfterRollback', typeof attempts.needsHumanAfterRollback === 'boolean')
+
+  const spend = section('spend')
+  for (const key of ['modelUsd', 'modelLimitUsd', 'evalUsd', 'evalLimitUsd']) {
+    check(`spend.${key}`, isCount(spend[key]))
+  }
+  return bad
+}
+
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)]
 }
 
 /** Выкатывать правку самому или только сообщить. Возвращает все причины отказа, а не первую. */
 export function decideDeploy(facts: DeployFacts): GateDecision {
+  const invalid = invalidFactNames(facts)
+  if (invalid.length > 0) {
+    return {
+      verdict: 'report_only',
+      reasons: [
+        {
+          code: 'facts_invalid',
+          message: `Выкатки нет: факты неполные или невозможные (${invalid.join(', ')}). Нет данных — нет выкатки.`,
+          paths: invalid,
+        },
+      ],
+    }
+  }
+
   const reasons: GateReason[] = []
 
   if (facts.tests.status !== 'green') {

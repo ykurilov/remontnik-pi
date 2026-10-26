@@ -1,18 +1,29 @@
-import { createHash } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { defineRemontnikConfig, type RemontnikConfig } from '@ykurilov/remontnik-core/config'
+import { assertValidMask, PathMaskError } from '../path-mask/index.js'
 
 // Источник настройки (R7): врач читает `remontnik.config.*` только из рабочей копии ОСНОВНОЙ ветки.
 // Настройка в ветке врача на выкатку не влияет: ветка врача — не то место, откуда берутся запреты.
+// Файл настройки — это код. Поэтому ветка проверяется ДО его выполнения, а читается он в отдельном
+// процессе Node: подключённые файлы каждый раз читаются заново, а не берутся из кэша модулей.
 
 const CONFIG_FILE_NAMES = ['remontnik.config.ts', 'remontnik.config.mts', 'remontnik.config.js', 'remontnik.config.mjs', 'remontnik.config.json']
 
-/** Ветки врача называются `remontnik/<номер-случая>-<коротко>` (R8). */
-const DOCTOR_BRANCH_PREFIX = 'remontnik/'
+const READ_TIMEOUT_MS = 30_000
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
-export type ConfigSourceErrorCode = 'not_found' | 'ambiguous' | 'outside_checkout' | 'unreadable' | 'branch_mismatch'
+export type ConfigSourceErrorCode =
+  | 'not_found'
+  | 'ambiguous'
+  | 'outside_checkout'
+  | 'unreadable'
+  | 'branch_mismatch'
+  | 'branch_unknown'
+  | 'invalid_mask'
 
 export class ConfigSourceError extends Error {
   readonly code: ConfigSourceErrorCode
@@ -27,6 +38,8 @@ export class ConfigSourceError extends Error {
 export interface LoadMainBranchConfigOptions {
   /** Рабочая копия основной ветки приложения (не копия ветки врача). */
   mainCheckoutDirectory: string
+  /** Имя основной ветки, как его знает вызывающий (не файл настройки): копия должна стоять ровно на ней. */
+  mainBranch: string
 }
 
 export interface LoadedConfig {
@@ -67,14 +80,38 @@ function findConfigFile(checkout: string): string {
   return file
 }
 
-async function readRawConfig(file: string): Promise<unknown> {
-  const text = readFileSync(file, 'utf8')
+const CHILD_SCRIPT = `
+import { pathToFileURL } from 'node:url'
+const loaded = await import(pathToFileURL(process.argv[1]).href)
+process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + JSON.stringify(loaded.default ?? null))
+`
+
+function runConfigProcess(file: string, checkout: string): Promise<string> {
+  const marker = `@@remontnik-config-${randomUUID()}@@`
+  return new Promise((resolveOutput, reject) => {
+    execFile(
+      process.execPath,
+      ['--no-warnings', '--input-type=module', '-e', CHILD_SCRIPT, file],
+      {
+        cwd: checkout,
+        timeout: READ_TIMEOUT_MS,
+        maxBuffer: MAX_OUTPUT_BYTES,
+        env: { PATH: process.env.PATH ?? '', REMONTNIK_RESULT_MARKER: marker },
+      },
+      (error, stdout, stderr) => {
+        if (error) return reject(new Error(stderr.trim() || error.message))
+        const at = stdout.lastIndexOf(marker)
+        if (at === -1) return reject(new Error('процесс чтения не вернул результат'))
+        resolveOutput(stdout.slice(at + marker.length))
+      },
+    )
+  })
+}
+
+async function readRawConfig(file: string, checkout: string): Promise<unknown> {
   try {
-    if (file.endsWith('.json')) return JSON.parse(text)
-    // Отпечаток содержимого в адресе: изменившийся файл читается заново, прежний не берётся из кэша модулей.
-    const version = createHash('sha256').update(text).digest('hex').slice(0, 16)
-    const loaded = (await import(`${pathToFileURL(file).href}?version=${version}`)) as { default?: unknown }
-    return loaded.default
+    if (file.endsWith('.json')) return JSON.parse(readFileSync(file, 'utf8'))
+    return JSON.parse(await runConfigProcess(file, checkout))
   } catch (error) {
     throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${error instanceof Error ? error.message : String(error)}`, {
       cause: error,
@@ -91,30 +128,58 @@ function withoutResolvedBuiltIn(raw: unknown): unknown {
   return { ...raw, forbidden: ownForbidden }
 }
 
+/** Маска, которую наш разбор не понимает, молча не сработала бы: запрет оказался бы дырой. Поэтому — ошибка настройки. */
+function assertMasksUnderstood(config: RemontnikConfig, file: string): void {
+  const masks = [
+    ...config.forbidden.schema,
+    ...config.forbidden.money,
+    ...config.forbidden.access,
+    ...(config.forbidden.extra ?? []),
+    ...config.closedPaths,
+    ...config.evalScope.flatMap((scope) => scope.paths),
+  ]
+  for (const mask of masks) {
+    try {
+      assertValidMask(mask)
+    } catch (error) {
+      if (error instanceof PathMaskError) {
+        throw new ConfigSourceError('invalid_mask', `В настройке ${file} маска «${mask}» не поддерживается: ${error.message}`, { cause: error })
+      }
+      throw error
+    }
+  }
+}
+
 /**
  * Читает и проверяет настройку приложения из рабочей копии основной ветки.
- * Если копия стоит на другой ветке (например, на ветке врача) — отказ: ветка узнаётся по `.git/HEAD`.
- * Если ветку узнать нельзя (нет `.git`, отдельная голова), копии доверяют как переданной.
+ * Копия обязана стоять ровно на основной ветке из параметров. Отдельная голова (detached HEAD),
+ * чужая ветка, ветка врача и «не git» — отказ, и файл при этом не выполняется.
  */
 export async function loadMainBranchConfig(options: LoadMainBranchConfigOptions): Promise<LoadedConfig> {
   const checkout = isAbsolute(options.mainCheckoutDirectory) ? options.mainCheckoutDirectory : resolve(options.mainCheckoutDirectory)
   const file = findConfigFile(checkout)
 
-  // Файл — это код, который выполняется при чтении: из ветки врача его не открываем вовсе.
   const branch = currentBranchOf(checkout)
-  if (branch?.startsWith(DOCTOR_BRANCH_PREFIX)) {
+  if (branch === undefined) {
     throw new ConfigSourceError(
-      'branch_mismatch',
-      `Рабочая копия ${checkout} стоит на ветке врача "${branch}". Настройка читается только из основной ветки.`,
+      'branch_unknown',
+      `Не удалось узнать ветку рабочей копии ${checkout} (нет git или отдельная голова). Настройка читается только из основной ветки "${options.mainBranch}".`,
     )
   }
-  const config = defineRemontnikConfig(withoutResolvedBuiltIn(await readRawConfig(file)) as Parameters<typeof defineRemontnikConfig>[0])
+  if (branch !== options.mainBranch) {
+    throw new ConfigSourceError(
+      'branch_mismatch',
+      `Рабочая копия ${checkout} стоит на ветке "${branch}", а основная — "${options.mainBranch}". Настройка читается только из основной.`,
+    )
+  }
 
-  if (branch !== undefined && branch !== config.repo.mainBranch) {
+  const config = defineRemontnikConfig(withoutResolvedBuiltIn(await readRawConfig(file, checkout)) as Parameters<typeof defineRemontnikConfig>[0])
+  if (config.repo.mainBranch !== options.mainBranch) {
     throw new ConfigSourceError(
       'branch_mismatch',
-      `Рабочая копия ${checkout} стоит на ветке "${branch}", а основная ветка по настройке — "${config.repo.mainBranch}". Настройка читается только из основной.`,
+      `Основная ветка по настройке — "${config.repo.mainBranch}", а вызывающий считает основной "${options.mainBranch}".`,
     )
   }
+  assertMasksUnderstood(config, file)
   return { config, file }
 }

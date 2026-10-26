@@ -14,7 +14,7 @@ function greenFacts(): DeployFacts {
     tests: { status: 'green', failed: [] },
     eval: { status: 'not_worse', worseScenarios: [] },
     forbiddenZones: [],
-    diff: cleanDiff,
+    diff: structuredClone(cleanDiff),
     stopSwitch: false,
     attempts: {
       autoDeploysForFingerprint: 0,
@@ -167,5 +167,74 @@ describe('decideDeploy: подробности и несколько причи�
     const before = structuredClone(facts)
     decideDeploy(facts)
     expect(facts).toEqual(before)
+  })
+})
+
+describe('decideDeploy: нет данных или данные невозможны — нет выкатки', () => {
+  const broken: Array<[string, (facts: DeployFacts) => void]> = [
+    ['stopSwitch не задан', (f) => void ((f as unknown as Record<string, unknown>).stopSwitch = undefined)],
+    ['stopSwitch — строка "false"', (f) => void ((f as unknown as Record<string, unknown>).stopSwitch = 'false')],
+    ['rebase не задан', (f) => void ((f as unknown as Record<string, unknown>).rebase = undefined)],
+    ['rebase — неизвестное слово', (f) => void ((f as unknown as Record<string, unknown>).rebase = 'maybe')],
+    ['tests.status — неизвестное слово', (f) => void ((f.tests as unknown as Record<string, unknown>).status = 'passed')],
+    ['tests.failed не список', (f) => void ((f.tests as unknown as Record<string, unknown>).failed = undefined)],
+    ['eval.status — неизвестное слово', (f) => void ((f.eval as unknown as Record<string, unknown>).status = 'fine')],
+    ['eval не задан', (f) => void ((f as unknown as Record<string, unknown>).eval = undefined)],
+    ['forbiddenZones не список', (f) => void ((f as unknown as Record<string, unknown>).forbiddenZones = undefined)],
+    ['diff не задан', (f) => void ((f as unknown as Record<string, unknown>).diff = undefined)],
+    ['diff.existingTestChanges не список', (f) => void ((f.diff as unknown as Record<string, unknown>).existingTestChanges = undefined)],
+    ['diff.suspicious не список', (f) => void ((f.diff as unknown as Record<string, unknown>).suspicious = null)],
+    ['diff.size.exceeds не список', (f) => void ((f.diff.size as unknown as Record<string, unknown>).exceeds = undefined)],
+    ['diff.size.exceeds с неизвестным словом', (f) => void ((f.diff.size as unknown as Record<string, unknown>).exceeds = ['huge'])],
+    ['diff.size.files = 0 (пустая правка)', (f) => void (f.diff = { ...cleanDiff, size: { files: 0, lines: 0, exceeds: [] } })],
+    ['diff.size.lines = NaN', (f) => void (f.diff = { ...cleanDiff, size: { files: 2, lines: Number.NaN, exceeds: [] } })],
+    ['счётчик по отпечатку NaN', (f) => void (f.attempts.autoDeploysForFingerprint = Number.NaN)],
+    ['счётчик за сутки undefined', (f) => void ((f.attempts as unknown as Record<string, unknown>).autoDeploysToday = undefined)],
+    ['лимит по отпечатку NaN', (f) => void (f.attempts.maxPerFingerprintPerDay = Number.NaN)],
+    ['лимит за сутки undefined', (f) => void ((f.attempts as unknown as Record<string, unknown>).maxPerDay = undefined)],
+    ['счётчик отрицательный', (f) => void (f.attempts.autoDeploysToday = -1)],
+    ['needsHumanAfterRollback не задан', (f) => void ((f.attempts as unknown as Record<string, unknown>).needsHumanAfterRollback = undefined)],
+    ['attempts не задан', (f) => void ((f as unknown as Record<string, unknown>).attempts = undefined)],
+    ['расход модели NaN', (f) => void (f.spend.modelUsd = Number.NaN)],
+    ['расход eval undefined', (f) => void ((f.spend as unknown as Record<string, unknown>).evalUsd = undefined)],
+    ['потолок модели Infinity', (f) => void (f.spend.modelLimitUsd = Number.POSITIVE_INFINITY)],
+    ['потолок eval NaN', (f) => void (f.spend.evalLimitUsd = Number.NaN)],
+    ['расход отрицательный', (f) => void (f.spend.modelUsd = -0.5)],
+    ['spend не задан', (f) => void ((f as unknown as Record<string, unknown>).spend = undefined)],
+  ]
+
+  it.each(broken)('%s', (_name, break_) => {
+    const facts = greenFacts()
+    break_(facts)
+    const decision = decideDeploy(facts)
+    expect(decision.verdict).toBe('report_only')
+    expect(decision.reasons.map((reason) => reason.code)).toEqual(['facts_invalid'])
+  })
+
+  it('причина называет, какие факты не годятся', () => {
+    const facts = greenFacts()
+    facts.spend.modelUsd = Number.NaN
+    ;(facts as unknown as Record<string, unknown>).stopSwitch = undefined
+    const [reason] = decideDeploy(facts).reasons
+    expect(reason?.paths).toEqual(expect.arrayContaining(['spend.modelUsd', 'stopSwitch']))
+  })
+
+  it('факты — не объект: нет выкатки', () => {
+    for (const facts of [undefined, null, 'ok', 42]) {
+      expect(decideDeploy(facts as unknown as DeployFacts).verdict).toBe('report_only')
+    }
+  })
+
+  it('«размер неизвестен» от осмотра диффа — это diff_too_large', () => {
+    const facts = greenFacts()
+    facts.diff = { ...cleanDiff, size: { files: 2, lines: 10, exceeds: ['unknown'] } }
+    expect(codesOf(facts)).toEqual(['diff_too_large'])
+  })
+
+  it('нулевые лимиты и счётчики — не ошибка данных', () => {
+    const facts = greenFacts()
+    facts.attempts.autoDeploysToday = 0
+    facts.spend.modelUsd = 0
+    expect(decideDeploy(facts).verdict).toBe('deploy')
   })
 })

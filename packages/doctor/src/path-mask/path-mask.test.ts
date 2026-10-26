@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { matchesAnyMask, matchesMask, normalizeRepoPath } from './index.js'
+import { PathMaskError, assertValidMask, matchesAnyMask, matchesMask, normalizeRepoPath } from './index.js'
 
 describe('matchesMask', () => {
   it('** охватывает любую глубину, в том числе нулевую', () => {
@@ -55,5 +55,42 @@ describe('normalizeRepoPath', () => {
 
   it('путь, выходящий за корень, остаётся с ..', () => {
     expect(normalizeRepoPath('../outside.txt')).toBe('../outside.txt')
+  })
+})
+
+describe('matchesMask: папка без * охватывает всё внутри', () => {
+  it('маска-папка рекурсивна', () => {
+    expect(matchesMask('migrations', 'migrations/001.sql')).toBe(true)
+    expect(matchesMask('src/payments', 'src/payments/stripe/charge.ts')).toBe(true)
+    expect(matchesMask('migrations', 'migrations')).toBe(true)
+    expect(matchesMask('migrations', 'migrationsx/001.sql')).toBe(false)
+    expect(matchesMask('migrations', 'app/migrations/001.sql')).toBe(false)
+  })
+
+  it('маска с * сработает и на файлы внутри подошедшей папки', () => {
+    expect(matchesMask('src/pay*', 'src/payments/charge.ts')).toBe(true)
+    expect(matchesMask('src/*.ts', 'src/deep/a.ts')).toBe(false)
+  })
+
+  it('./ и ведущий / в маске не мешают', () => {
+    expect(matchesMask('./src/payments/**', 'src/payments/a.ts')).toBe(true)
+    expect(matchesMask('/src/payments/**', 'src/payments/a.ts')).toBe(true)
+    expect(matchesMask('/migrations', 'migrations/001.sql')).toBe(true)
+  })
+})
+
+describe('неподдерживаемый синтаксис масок — ошибка, а не тихое несовпадение', () => {
+  it.each(['@(a|b)/x.ts', '!(a)/x.ts', '+(a|b).ts', '?(a).ts', '*(a|b).ts', '!src/**', 'src/[abc', 'src/{a,b'])(
+    '%s',
+    (mask) => {
+      expect(() => assertValidMask(mask)).toThrow(PathMaskError)
+      expect(() => matchesMask(mask, 'src/a.ts')).toThrow(PathMaskError)
+    },
+  )
+
+  it('обычные маски проходят проверку', () => {
+    for (const mask of ['**/.env*', 'src/payments/**', 'a?.ts', 'src/*.{ts,tsx}', 'file[12].txt', '<нет>']) {
+      expect(() => assertValidMask(mask)).not.toThrow()
+    }
   })
 })
