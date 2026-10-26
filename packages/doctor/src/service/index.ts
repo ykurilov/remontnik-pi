@@ -86,7 +86,7 @@ export interface DoctorTreatmentOptions {
    * Служба браузера врача (`browserClientFromEnv`) и окружение для ссылки на живой экран (`browser.live.linkEnv`).
    * Без клиента инструменты `browser_*` отвечают `unavailable`, а выкатка идёт «без проверки в браузере».
    */
-  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>> }
+  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>>; pollMs?: number }
 }
 
 export interface DoctorService {

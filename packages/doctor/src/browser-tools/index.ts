@@ -1,5 +1,5 @@
 export { type BrowserAnswer, type BrowserClient, browserClientFromEnv, createBrowserClient } from './client.js'
-export { addCaseScreenshotIn, CASE_BROWSER_COLLECTION, takeCaseScreenshotsIn } from './case-browser.js'
+export { addCaseScreenshotIn, CASE_BROWSER_COLLECTION, type CaseBrowser, takeCaseScreenshotsIn } from './case-browser.js'
 export { checkPages, type PageCheck, type PageCheckStatus, withPageCheck } from './page-check.js'
 export {
   BROWSER_HUMAN_WAIT_MS,
@@ -10,4 +10,5 @@ export {
   createBrowserTools,
   liveLinkOf,
   runBrowserCommand,
+  runHumanWait,
 } from './tools.js'

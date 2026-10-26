@@ -188,7 +188,7 @@ export interface TreatmentDeps {
   /** Новый отчёт записан: пора отправлять. */
   onReport(): void
   /** Служба браузера врача (`REMONTNIK_BROWSER_*`) и окружение для ссылки на живой экран. Нет — браузера нет. */
-  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>> }
+  browser?: { client?: BrowserClient; env?: Readonly<Record<string, string | undefined>>; pollMs?: number }
   now(): number
 }
 
@@ -494,12 +494,16 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     }
   }
 
-  /** Страницы из `browser.pagesToCheck` сразу после выкатки; итог запоминается — повтор шага браузер не гоняет. */
-  async function pageCheckOf(runtime: Runtime, context: Context): Promise<PageCheck | undefined> {
-    const kept = await runtime.memo<JsonValue>('pageCheck', context)
+  /**
+   * Страницы из `browser.pagesToCheck` сразу после выкатки; итог запоминается по выкатке — повтор шага браузер не
+   * гоняет, а следующая выкатка того же случая проверяется заново.
+   */
+  async function pageCheckOf(runtime: Runtime, deploymentId: number, context: Context): Promise<PageCheck | undefined> {
+    const key = `pageCheck:${deploymentId}`
+    const kept = await runtime.memo<JsonValue>(key, context)
     if (kept !== undefined) return (kept ?? undefined) as unknown as PageCheck | undefined
-    const check = await checkPages(deps.browser?.client, (await deps.loadConfig()).browser)
-    await runtime.memo('pageCheck', (check ?? null) as unknown as JsonValue, context)
+    const check = await checkPages(deps.browser?.client, (await deps.loadConfig()).browser, context.abortSignal)
+    await runtime.memo(key, (check ?? null) as unknown as JsonValue, context)
     return check
   }
 
@@ -530,7 +534,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
       await deps.guard.removeWorktree(candidateDir).catch(() => {})
       const deployed =
         step.stage === 'observing'
-          ? await redactedReport(withPageCheck(deploymentReport({ case: doc.case, deployment }), await pageCheckOf(runtime, context)), checkpoint.baseRunning)
+          ? await redactedReport(withPageCheck(deploymentReport({ case: doc.case, deployment }), await pageCheckOf(runtime, deployment.deploymentId, context)), checkpoint.baseRunning)
           : undefined
       await runtime.commit(async (tx) => {
         const records = recordTransactionOver(tx)
@@ -935,6 +939,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         createBrowserTools({
           ...(deps.browser?.client ? { client: deps.browser.client } : {}),
           ...(deps.browser?.env ? { env: deps.browser.env } : {}),
+          ...(deps.browser?.pollMs ? { pollMs: deps.browser.pollMs } : {}),
           loadConfig: deps.loadConfig,
           reports: deps.reports,
           onReport: deps.onReport,

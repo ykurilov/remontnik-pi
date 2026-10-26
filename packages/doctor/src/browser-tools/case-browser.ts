@@ -8,8 +8,11 @@ export const CASE_BROWSER_COLLECTION = 'case-browser'
 
 export interface CaseBrowser {
   pendingShots: string[]
-  /** Отчёт `needs_human` уже отправлен; снимается, когда браузер снова слушается врача. */
-  humanWait?: { reportId: number; since: number }
+  /**
+   * Открытая проверка для человека: с какого момента (от него считается срок ожидания) и отчёт `needs_human`, если он
+   * был, — повтор на той же проверке второго не шлёт. Снимается, когда браузер снова слушается врача или вышел срок.
+   */
+  humanWait?: { since: number; reportId?: number }
 }
 
 const emptyCaseBrowser = (): CaseBrowser => ({ pendingShots: [] })

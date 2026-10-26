@@ -14,11 +14,13 @@ import {
   createBrowserTools,
   liveLinkOf,
   runBrowserCommand,
+  runHumanWait,
   takeCaseScreenshotsIn,
   withPageCheck,
   type BrowserAnswer,
   type BrowserClient,
   type BrowserToolsDeps,
+  type CaseBrowser,
 } from './index.js'
 
 const PROFILE = 'remontnik'
@@ -57,7 +59,7 @@ async function seededStore(): Promise<RecordStore> {
 
 function clock() {
   let now = 1_000_000
-  return { now: () => now, sleep: async (ms: number) => void (now += ms) }
+  return { now: () => now, sleep: async (ms: number) => void (now += ms), advance: (ms: number) => void (now += ms) }
 }
 
 function depsWith(client: BrowserClient | undefined, config: RemontnikConfig, extra: Partial<BrowserToolsDeps> = {}): BrowserToolsDeps {
@@ -74,6 +76,14 @@ function depsWith(client: BrowserClient | undefined, config: RemontnikConfig, ex
 
 async function run(deps: BrowserToolsDeps, store: RecordStore, command: string, input: Record<string, unknown> = {}, now = () => 1_000_000) {
   return runBrowserCommand(deps, { command, input }, { caseId: 1, reportCase: REPORT_CASE, records: store, now })
+}
+
+async function wait(deps: BrowserToolsDeps, store: RecordStore, now = () => 1_000_000, signal?: AbortSignal) {
+  return runHumanWait(deps, { caseId: 1, reportCase: REPORT_CASE, records: store, now, ...(signal ? { signal } : {}) })
+}
+
+function takeCaseScreenshots(store: RecordStore): Promise<string[]> {
+  return store.transaction((records) => takeCaseScreenshotsIn(records, 1))
 }
 
 describe('набор инструментов браузера', () => {
@@ -152,16 +162,11 @@ describe('нужен человек: капча или код', () => {
     expect(liveLinkOf(configWith({}).browser!, liveEnv)).toBeUndefined()
   })
 
-  it('отчёт needs_human со ссылкой; владелец вернул управление → врач продолжает с той же страницы', async () => {
-    let released = false
+  it('отчёт needs_human со ссылкой; команда не ждёт, а зовёт browser_wait_human; владелец вернул управление → страница', async () => {
     let polls = 0
     const fake = fakeClient((command) => {
       if (command === 'url') return { ok: false, code: 'needs_human', message: 'капча на странице: нужен человек, браузер остановился' }
-      if (command === 'status') {
-        polls += 1
-        if (polls === 3) released = true
-        return { ok: true, state: released ? 'ready' : 'needs_human' }
-      }
+      if (command === 'status') return { ok: true, state: ++polls >= 3 ? 'ready' : 'needs_human' }
       if (command === 'read') return snapshotOf('Кабинет: вход выполнен')
       throw new Error(`неожиданная команда ${command}`)
     })
@@ -170,18 +175,26 @@ describe('нужен человек: капча или код', () => {
     let reported = 0
     const deps = depsWith(fake.client, liveConfig, { env: liveEnv, reports, onReport: () => void (reported += 1) })
 
-    const answer = await run(deps, store, 'url', { url: `${SITE}/captcha` })
+    const stopped = await run(deps, store, 'url', { url: `${SITE}/captcha` })
 
-    expect(answer.isError).toBe(false)
-    expect(answer.text).toContain('вернул управление')
-    expect(answer.text).toContain('Кабинет: вход выполнен')
-    expect(fake.calls.map((call) => call.command)).toEqual(['url', 'status', 'status', 'status', 'read'])
+    expect(stopped.isError).toBe(true)
+    expect(stopped.text).toContain('browser_wait_human')
+    expect(fake.calls.map((call) => call.command)).toEqual(['url'])
     const [report] = await reports.list({ after: 0, limit: 10 })
     expect(report).toMatchObject({ type: 'needs_human', caseId: 1, telegram: { state: 'pending' } })
     expect(report!.short).toContain(`${LIVE_BASE}/live?profile=${PROFILE}`)
     expect(report!.short).toContain('Вернуть')
     expect(reported).toBe(1)
     expect((await store.read<Case>('case', '1'))!.reportIds).toEqual([report!.reportId])
+
+    const answer = await wait(deps, store)
+
+    expect(answer.isError).toBe(false)
+    expect(answer.text).toContain('вернул управление')
+    expect(answer.text).toContain('Кабинет: вход выполнен')
+    expect(fake.calls.map((call) => call.command)).toEqual(['url', 'status', 'status', 'status', 'read'])
+    expect(await reports.list({ after: 0, limit: 10 })).toHaveLength(1)
+    expect((await store.read<CaseBrowser>('case-browser', '1'))?.humanWait).toBeUndefined()
   })
 
   it('без живого экрана: отчёт без ссылки, врач не ждёт; повтор той же проверки — без второго отчёта', async () => {
@@ -203,21 +216,65 @@ describe('нужен человек: капча или код', () => {
     expect(list[0]!.short).not.toContain('/live')
   })
 
-  it('человек не пришёл за отведённое время — врач продолжает без браузера', async () => {
+  it('срок — от записанного момента проверки, а не от начала ожидания; после срока метка снята и новая капча — новый отчёт', async () => {
     const time = clock()
     const fake = fakeClient((command) => (command === 'status' ? { ok: true, state: 'needs_human' } : { ok: false, code: 'needs_human', message: 'капча' }))
     const store = await seededStore()
-    const deps = depsWith(fake.client, liveConfig, { env: liveEnv, sleep: time.sleep, pollMs: 60_000 })
+    const reports = createReports({ store })
+    const deps = depsWith(fake.client, liveConfig, { env: liveEnv, reports, sleep: time.sleep, pollMs: 60_000 })
+    await run(deps, store, 'url', { url: `${SITE}/captcha` }, time.now)
+    time.advance(20 * 60_000)
 
-    const answer = await run(deps, store, 'url', { url: `${SITE}/captcha` }, time.now)
+    const answer = await wait(deps, store, time.now)
 
     expect(answer.isError).toBe(true)
     expect(answer.text).toContain('без браузера')
-    const polls = fake.calls.filter((call) => call.command === 'status').length
-    expect(polls).toBe(BROWSER_HUMAN_WAIT_MS / 60_000)
+    // Опросы в минуты 20…30 от проверки: осталось 10 минут из 30, а не новые 30.
+    expect(fake.calls.filter((call) => call.command === 'status')).toHaveLength(11)
+    expect((await store.read<CaseBrowser>('case-browser', '1'))?.humanWait).toBeUndefined()
+
+    await run(deps, store, 'url', { url: `${SITE}/captcha` }, time.now)
+    expect((await reports.list({ after: 0, limit: 10 })).map((report) => report.type)).toEqual(['needs_human', 'needs_human'])
   })
 
-  it('управление взял владелец сам — врач ждёт без отчёта и продолжает, когда вернули', async () => {
+  it('перезапуск посреди ожидания: повтор инструмента продолжает тот же срок, отчёт один', async () => {
+    const time = clock()
+    const restart = new AbortController()
+    let polls = 0
+    const fake = fakeClient((command) => {
+      if (command !== 'status') return { ok: false, code: 'needs_human', message: 'капча' }
+      if (++polls === 2) restart.abort()
+      return { ok: true, state: 'needs_human' }
+    })
+    const store = await seededStore()
+    const reports = createReports({ store })
+    const deps = depsWith(fake.client, liveConfig, { env: liveEnv, reports, sleep: time.sleep, pollMs: 60_000 })
+    await run(deps, store, 'url', { url: `${SITE}/captcha` }, time.now)
+
+    await expect(wait(deps, store, time.now, restart.signal)).rejects.toThrow()
+    time.advance(28 * 60_000)
+    const answer = await wait(deps, store, time.now)
+
+    expect(answer.text).toContain('без браузера')
+    // До перезапуска — 2 опроса (минуты 0 и 1), после — минуты 29 и 30 до срока, а не ещё 30 минут.
+    expect(polls).toBe(4)
+    expect(await reports.list({ after: 0, limit: 10 })).toHaveLength(1)
+  })
+
+  it('пока ждём человека, другие команды в службу не идут: сначала browser_wait_human', async () => {
+    const fake = fakeClient(() => ({ ok: false, code: 'needs_human', message: 'капча' }))
+    const store = await seededStore()
+    const deps = depsWith(fake.client, liveConfig, { env: liveEnv, reports: createReports({ store }) })
+    await run(deps, store, 'url', { url: `${SITE}/captcha` })
+
+    const answer = await run(deps, store, 'read')
+
+    expect(answer.isError).toBe(true)
+    expect(answer.text).toContain('browser_wait_human')
+    expect(fake.calls.map((call) => call.command)).toEqual(['url'])
+  })
+
+  it('управление взял владелец сам — без отчёта; browser_wait_human ждёт и показывает страницу, когда вернули', async () => {
     let polls = 0
     const fake = fakeClient((command) => {
       if (command === 'click') return { ok: false, code: 'refused_human_control', message: 'управление у владельца' }
@@ -226,11 +283,58 @@ describe('нужен человек: капча или код', () => {
     })
     const store = await seededStore()
     const reports = createReports({ store })
-    const answer = await run(depsWith(fake.client, liveConfig, { env: liveEnv, reports }), store, 'click', { ref: 'e2', danger: 'none' })
+    const deps = depsWith(fake.client, liveConfig, { env: liveEnv, reports })
 
+    const stopped = await run(deps, store, 'click', { ref: 'e2', danger: 'none' })
+    const answer = await wait(deps, store)
+
+    expect(stopped.text).toContain('browser_wait_human')
     expect(answer.isError).toBe(false)
     expect(answer.text).toContain('страница после владельца')
     expect(await reports.list({ after: 0, limit: 10 })).toEqual([])
+  })
+
+  it('ждать нечего — browser_wait_human просто показывает страницу', async () => {
+    const fake = fakeClient(() => snapshotOf('обычная страница'))
+    const store = await seededStore()
+    const answer = await wait(depsWith(fake.client, liveConfig, { env: liveEnv }), store)
+    expect(answer.text).toContain('обычная страница')
+    expect(fake.calls.map((call) => call.command)).toEqual(['read'])
+  })
+})
+
+describe('что видит модель', () => {
+  it('пароль и кадры живого экрана из ответа службы не доходят до модели и отчёта', async () => {
+    const leaks = { frame: 'data:image/jpeg;base64,/9j/4AAQSkZJRg', password: 'owner-pass-value-77', live: { frame: 'AAAAframe' } }
+    const fake = fakeClient((command) =>
+      command === 'read'
+        ? { ...snapshotOf('Вход: поле пароля ••••••'), ...leaks }
+        : { ok: false, code: 'needs_human', message: 'капча', ...leaks },
+    )
+    const store = await seededStore()
+    const reports = createReports({ store })
+    const deps = depsWith(fake.client, configWith({}), { reports })
+
+    const page = await run(deps, store, 'read')
+    const stopped = await run(deps, store, 'url', { url: `${SITE}/captcha` })
+
+    const seen = [page.text, stopped.text, ...(await reports.list({ after: 0, limit: 10 })).flatMap((report) => [report.short, report.full ?? ''])]
+    for (const text of seen) {
+      expect(text).not.toContain('base64')
+      expect(text).not.toContain('AAAAframe')
+      expect(text).not.toContain('owner-pass-value-77')
+    }
+    expect(page.text).toContain('Вход: поле пароля ••••••')
+  })
+
+  it('опасное действие: отказ службы refused_danger доходит до модели как ошибка с причиной', async () => {
+    const fake = fakeClient(() => ({ ok: false, code: 'refused_danger', message: 'оплата запрещена: кнопка «Оплатить тариф Про»' }))
+    const store = await seededStore()
+    const answer = await run(depsWith(fake.client, configWith({})), store, 'click', { ref: 'e7', danger: 'none' })
+    expect(answer.isError).toBe(true)
+    expect(answer.text).toContain('refused_danger')
+    expect(answer.text).toContain('оплата запрещена')
+    expect(await takeCaseScreenshots(store)).toEqual([])
   })
 })
 
@@ -266,6 +370,31 @@ describe('проверка страниц после выкатки', () => {
     const text = withPageCheck({ short: 'Выкатил.', full: 'Выкатил.' }, check)
     expect(text.short).toContain('без проверки в браузере')
     expect(text.full).toContain('без проверки в браузере')
+  })
+
+  it('служба упала посреди проверки: проверенные страницы сохранены, остальные — «не проверена»', async () => {
+    const all = [...pages, { url: `${SITE}/cabinet` }]
+    let opened = 0
+    const fake = fakeClient((command) => {
+      if (command === 'shot') return { ok: true, path: `/data/shots/p-${opened}.jpg` }
+      return ++opened === 1 ? snapshotOf('Чат готов') : { ok: false, code: 'unavailable', message: 'служба браузера не отвечает' }
+    })
+    const check = await checkPages(fake.client, configWith({ pagesToCheck: all }).browser)
+
+    expect(check).toMatchObject({
+      status: 'unavailable',
+      screenshots: ['/data/shots/p-1.jpg'],
+      pages: [
+        { url: `${SITE}/chat`, ok: true },
+        { url: `${SITE}/`, ok: false, unchecked: true },
+        { url: `${SITE}/cabinet`, ok: false, unchecked: true },
+      ],
+    })
+    const text = withPageCheck({ short: 'Выкатил.', full: 'Выкатил.' }, check)
+    expect(text.short).toContain('без проверки в браузере')
+    expect(text.full).toContain(`${SITE}/chat: работает`)
+    expect(text.full).toContain(`${SITE}/: не проверена`)
+    expect(text.screenshots).toEqual(['/data/shots/p-1.jpg'])
   })
 
   it('браузера в настройке нет или страниц для проверки нет — проверки нет и пометки нет', async () => {

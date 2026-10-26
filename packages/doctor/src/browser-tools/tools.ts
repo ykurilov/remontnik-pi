@@ -8,14 +8,16 @@ import type { Reports } from '../reports/index.js'
 import { browserNeedsHumanReport, type ReportCase } from '../reports/texts.js'
 import { recordTransactionOver } from '../service/harness.js'
 import { TreatmentDoc } from '../treatment/doc.js'
-import { addCaseScreenshotIn, caseBrowserIn } from './case-browser.js'
+import { addCaseScreenshotIn, caseBrowserIn, type CaseBrowser } from './case-browser.js'
 import type { BrowserAnswer, BrowserClient } from './client.js'
 
 // Инструменты `browser_*` модели-врача: команды службы браузера (contracts/browser-api.md) от профиля из настройки.
 // Набор постоянный: инструменты есть всегда, а без браузера (нет в настройке, выключен, служба не отвечает) отвечают
 // `unavailable` — модель лечит без него, кэш модели не сбрасывается. Снимки экрана копятся у случая и уходят
-// в ближайший отчёт. Проверка для человека (капча, код) — отчёт `needs_human`; есть живой экран — ссылка на него,
-// врач ждёт, пока владелец не нажмёт «Вернуть», и продолжает с той же страницы. Кадры живого экрана сюда не идут.
+// в ближайший отчёт. Проверка для человека (капча, код) — отчёт `needs_human`, есть живой экран — со ссылкой на него.
+// Команда не ждёт: ждёт отдельный `browser_wait_human`, повторяемый после перезапуска врача. Срок — от записанного
+// начала проверки, поэтому перезапуск его не продлевает. Модель видит только известные поля ответа службы:
+// кадры живого экрана и всё лишнее отбрасываются.
 
 export const BROWSER_TOOL_NAMES = [
   'browser_url',
@@ -28,11 +30,13 @@ export const BROWSER_TOOL_NAMES = [
   'browser_shot',
   'browser_logins',
   'browser_fill_password',
+  'browser_wait_human',
 ] as const
 
-/** Сколько врач ждёт, пока человек пройдёт проверку на живом экране. */
+/** Сколько врач ждёт, пока человек пройдёт проверку на живом экране: от начала проверки, а не от каждого вызова. */
 export const BROWSER_HUMAN_WAIT_MS = 30 * 60_000
 const STATUS_POLL_MS = 5_000
+const WAIT_TOOL = 'browser_wait_human'
 
 type BrowserSection = NonNullable<RemontnikConfig['browser']>
 
@@ -45,7 +49,7 @@ export interface BrowserToolsDeps {
   reports?: Pick<Reports, 'addIn'>
   /** Записан отчёт: пора отправлять. */
   onReport?(): void
-  sleep?(ms: number): Promise<void>
+  sleep?(ms: number, signal?: AbortSignal): Promise<void>
   pollMs?: number
 }
 
@@ -54,6 +58,8 @@ export interface BrowserCommandScope {
   reportCase: ReportCase
   records: Pick<RecordStore, 'transaction'>
   now(): number
+  /** Врач закрывается: ожидание обрывается, а после перезапуска инструмент повторяется. */
+  signal?: AbortSignal
 }
 
 export type BrowserToolAnswer = { text: string; isError: boolean }
@@ -65,22 +71,32 @@ export function liveLinkOf(browser: BrowserSection, env: Readonly<Record<string,
   return base ? `${base.replace(/\/+$/, '')}/live?profile=${encodeURIComponent(browser.profile)}` : undefined
 }
 
+/** Входы — только номер, сайт, логин и профиль: что бы служба ни прислала, пароль сюда не попадёт. */
+function loginsOf(logins: unknown): unknown[] {
+  if (!Array.isArray(logins)) return []
+  return logins.map((entry) => {
+    const { id, site, login, profile } = (entry ?? {}) as Record<string, unknown>
+    return { id, site, login, profile }
+  })
+}
+
+/** Текст для модели — только из известных полей ответа: кадры и прочее лишнее от службы дальше не идут. */
 function describeAnswer(answer: BrowserAnswer): BrowserToolAnswer {
   if (!answer.ok) return { isError: true, text: `${answer.code}: ${answer.message}` }
-  const { ok: _ok, url, title, snapshot, path, logins, state, ...rest } = answer
+  const { url, title, snapshot, path, logins, state } = answer
   const lines = [
     ...(typeof url === 'string' ? [`Адрес: ${url}`] : []),
     ...(typeof title === 'string' ? [`Заголовок: ${title}`] : []),
     ...(typeof path === 'string' ? [`Снимок экрана: ${path} (попадёт в отчёт)`] : []),
-    ...(logins !== undefined ? [`Входы: ${JSON.stringify(logins)}`] : []),
+    ...(logins !== undefined ? [`Входы: ${JSON.stringify(loginsOf(logins))}`] : []),
     ...(typeof state === 'string' ? [`Состояние: ${state}`] : []),
-    ...(Object.keys(rest).length > 0 ? [JSON.stringify(rest)] : []),
     ...(typeof snapshot === 'string' ? ['', snapshot] : []),
   ]
   return { isError: false, text: lines.length > 0 ? lines.join('\n') : 'Готово.' }
 }
 
 const UNAVAILABLE: BrowserAnswer = { ok: false, code: 'unavailable', message: 'браузер недоступен — работай без него' }
+const error = (text: string): BrowserToolAnswer => ({ isError: true, text })
 
 /** Одна команда браузера от имени случая. Профиль — только из настройки. */
 export async function runBrowserCommand(
@@ -91,22 +107,82 @@ export async function runBrowserCommand(
   const browser = (await deps.loadConfig()).browser
   const client = deps.client
   if (!browser?.enabled || !client) return describeAnswer(UNAVAILABLE)
-  const { profile: _ignored, ...input } = request.input
-  let answer = await client.call(request.command, { ...input, profile: browser.profile })
-  let prefix = ''
-  if (!answer.ok && (answer.code === 'needs_human' || answer.code === 'refused_human_control')) {
-    const waited = await waitForHuman(deps, client, browser, answer, scope)
-    answer = waited.answer
-    prefix = waited.prefix
-  } else if (answer.ok) {
-    await clearHumanWait(scope)
+  const liveLink = liveLinkOf(browser, deps.env ?? {})
+  if (liveLink && (await openHumanWait(scope))) {
+    return error(`Браузер ждёт человека: проверку проходит владелец. Вызови ${WAIT_TOOL} — он дождётся, пока владелец вернёт управление.`)
   }
+  const { profile: _ignored, ...input } = request.input
+  const answer = await client.call(request.command, { ...input, profile: browser.profile })
+  if (!answer.ok && (answer.code === 'needs_human' || answer.code === 'refused_human_control')) {
+    await startHumanWait(deps, answer, liveLink, scope)
+    const next = liveLink
+      ? `Вызови ${WAIT_TOOL}: он дождётся, пока владелец вернёт управление (до ${BROWSER_HUMAN_WAIT_MS / 60_000} мин от начала проверки).`
+      : 'Владельцу сообщено, живого экрана нет: продолжай без браузера.'
+    return error(`${answer.code}: ${answer.message}. ${next}`)
+  }
+  if (answer.ok) await clearHumanWait(scope)
   if (answer.ok && typeof answer.path === 'string') {
     const path = answer.path
     await scope.records.transaction((records) => addCaseScreenshotIn(records, scope.caseId, path))
   }
-  const described = describeAnswer(answer)
-  return prefix ? { ...described, text: `${prefix}\n${described.text}` } : described
+  return describeAnswer(answer)
+}
+
+/**
+ * `browser_wait_human`: ждать, пока браузер снова готов (владелец нажал «Вернуть»), и показать модели страницу, где он
+ * её оставил. Срок — от записанного начала проверки. Сначала опрос, потом сон: повтор после перезапуска сразу видит,
+ * что управление уже вернули или срок вышел. Закрытие врача обрывает сон; инструмент повторяется после перезапуска.
+ */
+export async function runHumanWait(deps: BrowserToolsDeps, scope: BrowserCommandScope): Promise<BrowserToolAnswer> {
+  const browser = (await deps.loadConfig()).browser
+  const client = deps.client
+  if (!browser?.enabled || !client) return describeAnswer(UNAVAILABLE)
+  // Вышедший срок здесь не снимается заранее: цикл ниже сначала спросит службу, а потом скажет «не вернул управление».
+  const waiting = await openHumanWait(scope, { keepExpired: true })
+  if (!waiting) return describeAnswer(await client.call('read', { profile: browser.profile }))
+  if (!liveLinkOf(browser, deps.env ?? {})) return error('Живого экрана нет, ждать нечего: продолжай без браузера.')
+  const sleep = deps.sleep ?? sleepUnlessAborted
+  const deadline = waiting.since + BROWSER_HUMAN_WAIT_MS
+  for (;;) {
+    const status = await client.call('status', { profile: browser.profile })
+    if (!status.ok) return describeAnswer(status)
+    if (status.state === 'ready') {
+      await clearHumanWait(scope)
+      const page = describeAnswer(await client.call('read', { profile: browser.profile }))
+      return { ...page, text: `Владелец вернул управление. Страница сейчас:\n${page.text}` }
+    }
+    const left = deadline - scope.now()
+    if (left <= 0) {
+      await clearHumanWait(scope)
+      return error(`Человек не вернул управление за ${BROWSER_HUMAN_WAIT_MS / 60_000} мин: продолжай без браузера.`)
+    }
+    scope.signal?.throwIfAborted()
+    await sleep(Math.min(deps.pollMs ?? STATUS_POLL_MS, left), scope.signal)
+  }
+}
+
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+/** Открытое ожидание человека; вышедшее за срок снимается: следующая проверка — новый отчёт. */
+async function openHumanWait(scope: BrowserCommandScope, options: { keepExpired?: boolean } = {}): Promise<CaseBrowser['humanWait']> {
+  return scope.records.transaction(async (records) => {
+    const state = await caseBrowserIn(records, scope.caseId)
+    if (!options.keepExpired && state.humanWait && scope.now() - state.humanWait.since >= BROWSER_HUMAN_WAIT_MS) delete state.humanWait
+    return state.humanWait ? { ...state.humanWait } : undefined
+  })
 }
 
 async function clearHumanWait(scope: BrowserCommandScope): Promise<void> {
@@ -117,45 +193,22 @@ async function clearHumanWait(scope: BrowserCommandScope): Promise<void> {
 }
 
 /**
- * Проверка для человека. `needs_human` — отчёт владельцу (один на проверку). Есть живой экран — ждать, пока браузер
- * снова готов (владелец вернул управление), и показать модели страницу, где он её оставил. Управление владелец взял
- * сам (`refused_human_control`) — просто ждать. Не дождались — модель продолжает без браузера.
+ * Проверка для человека началась: метка с моментом начала (от него считается срок) и для `needs_human` — отчёт
+ * владельцу, один на проверку. Управление владелец взял сам (`refused_human_control`) — без отчёта.
  */
-async function waitForHuman(
+async function startHumanWait(
   deps: BrowserToolsDeps,
-  client: BrowserClient,
-  browser: BrowserSection,
   refusal: Extract<BrowserAnswer, { ok: false }>,
+  liveLink: string | undefined,
   scope: BrowserCommandScope,
-): Promise<{ answer: BrowserAnswer; prefix: string }> {
-  const liveLink = liveLinkOf(browser, deps.env ?? {})
-  if (refusal.code === 'needs_human') await reportHumanCheck(deps, refusal.message, liveLink, scope)
-  const withoutBrowser = (why: string): { answer: BrowserAnswer; prefix: string } => ({
-    answer: { ok: false, code: refusal.code, message: `${refusal.message}. ${why}: продолжай без браузера.` },
-    prefix: '',
-  })
-  if (!liveLink) return withoutBrowser('Владельцу сообщено, живого экрана нет')
-
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
-  const deadline = scope.now() + BROWSER_HUMAN_WAIT_MS
-  while (scope.now() < deadline) {
-    await sleep(deps.pollMs ?? STATUS_POLL_MS)
-    const status = await client.call('status', { profile: browser.profile })
-    if (!status.ok) return { answer: status, prefix: '' }
-    if (status.state !== 'ready') continue
-    await clearHumanWait(scope)
-    return { answer: await client.call('read', { profile: browser.profile }), prefix: 'Владелец вернул управление. Страница сейчас:' }
-  }
-  return withoutBrowser(`Человек не вернул управление за ${BROWSER_HUMAN_WAIT_MS / 60_000} мин`)
-}
-
-async function reportHumanCheck(deps: BrowserToolsDeps, reason: string, liveLink: string | undefined, scope: BrowserCommandScope): Promise<void> {
-  const reports = deps.reports
-  if (!reports) return
-  const text = browserNeedsHumanReport({ case: scope.reportCase, reason, ...(liveLink ? { liveLink } : {}), waitMinutes: BROWSER_HUMAN_WAIT_MS / 60_000 })
+): Promise<void> {
+  const reports = refusal.code === 'needs_human' ? deps.reports : undefined
+  const text = browserNeedsHumanReport({ case: scope.reportCase, reason: refusal.message, ...(liveLink ? { liveLink } : {}), waitMinutes: BROWSER_HUMAN_WAIT_MS / 60_000 })
   const reported = await scope.records.transaction(async (records: RecordTransaction) => {
     const state = await caseBrowserIn(records, scope.caseId)
-    if (state.humanWait) return false
+    if (state.humanWait && scope.now() - state.humanWait.since < BROWSER_HUMAN_WAIT_MS) return false
+    state.humanWait = { since: scope.now() }
+    if (!reports) return false
     const report = await reports.addIn(records, {
       type: 'needs_human',
       caseId: scope.caseId,
@@ -165,7 +218,7 @@ async function reportHumanCheck(deps: BrowserToolsDeps, reason: string, liveLink
     })
     const sick = await records.doc<Case>('case', String(scope.caseId), {} as Case)
     if (sick.caseId === scope.caseId && !sick.reportIds.includes(report.reportId)) sick.reportIds.push(report.reportId)
-    state.humanWait = { reportId: report.reportId, since: scope.now() }
+    state.humanWait.reportId = report.reportId
     return true
   })
   if (reported) deps.onReport?.()
@@ -248,6 +301,14 @@ const BROWSER_TOOL_SPECS = [
     parameters: Type.Object({ entryId: Type.Number({ description: 'Номер входа из browser_logins' }), ref: Type.String({ description: 'Номер поля пароля' }) }),
     replay: 'unsafe',
   },
+  {
+    name: WAIT_TOOL,
+    command: undefined,
+    description:
+      'Ждать, пока владелец пройдёт проверку на живом экране и вернёт управление; потом снимок страницы. Звать после ответа needs_human или refused_human_control.',
+    parameters: Type.Object({}),
+    replay: 'safe',
+  },
 ] as const
 
 /** Инструменты браузера врача; без `deps` — все отвечают `unavailable`. */
@@ -262,16 +323,17 @@ export function createBrowserTools(deps?: BrowserToolsDeps) {
         const state = await api.snapshot(TreatmentDoc, api.conversationId, context)
         if (!deps || !state?.case) return { output: [{ type: 'text', text: describeAnswer(UNAVAILABLE).text }], isError: true }
         const { caseId, appName, kind, where, message } = state.case
-        const answer = await runBrowserCommand(
-          deps,
-          { command: spec.command, input: { ...(args as Record<string, unknown>) } },
-          {
-            caseId,
-            reportCase: { caseId, appName, kind, where, message },
-            records: { transaction: (change) => api.commit((tx) => change(recordTransactionOver(tx)), context) },
-            now: () => api.now(),
-          },
-        )
+        const scope: BrowserCommandScope = {
+          caseId,
+          reportCase: { caseId, appName, kind, where, message },
+          records: { transaction: (change) => api.commit((tx) => change(recordTransactionOver(tx)), context) },
+          now: () => api.now(),
+          ...(context.abortSignal ? { signal: context.abortSignal } : {}),
+        }
+        const answer =
+          spec.command === undefined
+            ? await runHumanWait(deps, scope)
+            : await runBrowserCommand(deps, { command: spec.command, input: { ...(args as Record<string, unknown>) } }, scope)
         return { output: [{ type: 'text', text: answer.text }], ...(answer.isError ? { isError: true } : {}) }
       },
     }),
