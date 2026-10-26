@@ -33,6 +33,7 @@ const KNOWN_PUBLIC_DOMAINS = [
   'semver.org',
 ]
 // Настоящие верхние зоны. Расширения файлов (.md, .sh, .ts, .json) сюда не входят.
+// После домена не может идти «.слово»: `config.app.name` — обращение к полю в коде, а не адрес.
 const REAL_TOP_LEVEL_DOMAINS = [
   'com', 'org', 'net', 'io', 'ru', 'su', 'cloud', 'dev', 'app', 'ai', 'shop', 'info', 'biz',
   'xyz', 'online', 'site', 'tech', 'co', 'de', 'fr', 'uk', 'us', 'eu', 'ua', 'by', 'kz', 'club',
@@ -41,7 +42,7 @@ const REAL_TOP_LEVEL_DOMAINS = [
 
 const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d]|\.\d)/g
 const DOMAIN = new RegExp(
-  `(?<![\\w@.-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${REAL_TOP_LEVEL_DOMAINS.join('|')}))(?![\\w-])`,
+  `(?<![\\w@.-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${REAL_TOP_LEVEL_DOMAINS.join('|')}))(?![\\w-])(?!\\.\\w)`,
   'gi',
 )
 const SECRET_PATTERNS = [

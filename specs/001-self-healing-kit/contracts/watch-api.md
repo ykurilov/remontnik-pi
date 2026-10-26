@@ -62,4 +62,4 @@ const hooks = agentChatWatchHooks(watch, { inner: appHooks }); // logError, afte
 
 ## Отправка врачу
 
-`POST {doctor.url}/v1/events` — тело `{ events: IncidentEvent[] }` (до 50), заголовки `X-Remontnik-Signature: sha256=<HMAC тела>`, `X-Remontnik-Timestamp`. Ответ `200 { accepted: eventId[] }`. Повторная доставка того же `eventId` безопасна. Повторы: 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин.
+`POST {doctor.url}/v1/events` — тело `{ events: IncidentEvent[] }` (до 50), заголовки `X-Remontnik-Signature: sha256=<HMAC от «отметка времени + тело»>`, `X-Remontnik-Timestamp` (секунды; допуск 5 минут). Ответ `200 { accepted: eventId[] }`. Повторная доставка того же `eventId` безопасна. Повторы: 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин.

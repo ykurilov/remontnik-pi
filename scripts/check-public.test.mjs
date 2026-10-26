@@ -54,6 +54,11 @@ describe('checkPublic', () => {
     expect(checkPublic(root)).toEqual([])
   })
 
+  it('не принимает обращение к полям в коде за домен', () => {
+    writeFile('src/a.ts', 'const name = config.app.name; const live = options.dev.enabled')
+    expect(checkPublic(root)).toEqual([])
+  })
+
   it('пропускает известные публичные сервисы', () => {
     writeFile('README.md', 'https://github.com/x/y и https://www.npmjs.com/package/z')
     expect(checkPublic(root)).toEqual([])
