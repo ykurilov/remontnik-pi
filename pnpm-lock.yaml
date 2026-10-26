@@ -26,6 +26,12 @@ importers:
       '@ykurilov/remontnik-core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@ykurilov/remontnik-doctor':
+        specifier: workspace:*
+        version: link:../../packages/doctor
+      '@ykurilov/remontnik-watch':
+        specifier: workspace:*
+        version: link:../../packages/watch
 
   packages/browser: {}
 
@@ -46,10 +52,17 @@ importers:
       '@earendil-works/pi-durable':
         specifier: 1.4.0
         version: 1.4.0(@aws-sdk/credential-provider-node@3.972.88)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.6.7)
+      '@ykurilov/remontnik-core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/paseo-bridge: {}
 
-  packages/watch: {}
+  packages/watch:
+    dependencies:
+      '@ykurilov/remontnik-core':
+        specifier: workspace:*
+        version: link:../core
 
 packages:
 
