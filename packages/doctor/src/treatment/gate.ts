@@ -55,14 +55,28 @@ function sdkFrameOf(incident: { where: string; stack: string }): { location: str
   return undefined
 }
 
-export function inspectFix(config: RemontnikConfig, files: readonly ChangedFile[], incident: { where: string; stack: string }): FixInspection {
+/** `configFiles` — файлы, которые подключает настройка на основе и на правке (`configFilesOfFix`): их правка — зона `remontnik`. */
+const MAINLINE_CONFIG_RULE = 'файл подключает настройка Ремонтника (remontnik.config) на текущей основной ветке'
+
+/**
+ * Основная ветка могла уйти вперёд после проверки правки: файлы, которые её настройка подключает теперь, правка
+ * тоже менять не может. Такие файлы — та же запретная зона `remontnik`, что и при проверке.
+ */
+export function withMainlineConfigFiles(inspection: FixInspection, changedPaths: readonly string[], mainlineConfigFiles: readonly string[]): FixInspection {
+  const known = new Set(inspection.forbiddenZones.filter((hit) => hit.zone === 'remontnik').map((hit) => hit.path))
+  const current = new Set(mainlineConfigFiles)
+  const hits = changedPaths.filter((path) => current.has(path) && !known.has(path)).map((path) => ({ path, zone: 'remontnik' as const, rule: MAINLINE_CONFIG_RULE }))
+  return hits.length === 0 ? inspection : { ...inspection, forbiddenZones: [...inspection.forbiddenZones, ...hits] }
+}
+
+export function inspectFix(config: RemontnikConfig, files: readonly ChangedFile[], incident: { where: string; stack: string }, configFiles: readonly string[]): FixInspection {
   const sdkFrame = sdkFrameOf(incident)
   return {
     forbiddenZones: [
-      ...findForbiddenZones(config, files),
+      ...findForbiddenZones(config, files, configFiles),
       ...(sdkFrame ? [{ path: sdkFrame.location, zone: 'agent_chat_sdk' as const, rule: `стек случая: сбой в коде ${sdkFrame.packageName}` }] : []),
     ],
-    protectedChanges: findProtectedChanges(config, files),
+    protectedChanges: findProtectedChanges(config, files, configFiles),
     diff: inspectDiff(files, config.limits, {
       knownHosts: config.browser?.allowedOrigins ?? [],
       ...(config.checks.eval ? { evalResultFile: config.checks.eval.resultFile } : {}),

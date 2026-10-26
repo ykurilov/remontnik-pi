@@ -120,6 +120,12 @@ describe('findForbiddenZones: встроенные запреты', () => {
     expect(zonesOf(forbidden, file('apps/web/remontnik.config.mjs'))).toEqual(['remontnik'])
   })
 
+  it('файл, который подключает настройка, — тоже настройка Ремонтника; флаги allow* это не снимают', () => {
+    const allowed = forbiddenOf({ access: ['<нет>'], allowDependencyChanges: true, allowBuildAndDeployChanges: true })
+    const hits = findForbiddenZones(allowed, [file('src/bot/description.ts'), file('src/bot/greeting.ts')], ['remontnik.config.ts', 'src/bot/description.ts'])
+    expect(hits).toEqual([{ path: 'src/bot/description.ts', zone: 'remontnik', rule: expect.stringMatching(/настройка Ремонтника/) }])
+  })
+
   it('встроенные запреты нельзя снять флагами allow*', () => {
     const allowed = forbiddenOf({ access: ['<нет>'], allowDependencyChanges: true, allowBuildAndDeployChanges: true })
     expect(zonesOf(allowed, file('.env'), file('node_modules/@ykurilov/agent-chat-core/index.js'))).toEqual([

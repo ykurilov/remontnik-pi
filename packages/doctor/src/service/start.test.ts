@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -144,6 +144,8 @@ describe('старт врача', () => {
     const repoDir = appRepo()
     const fake = fakeDocker({ 'remontnik-app': '127.0.0.1', 'remontnik-outside': '10.9.0.5' })
     const env = serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: join(repoDir, '..', 'state'), REMONTNIK_LISTEN_PORT: '0' })
+    // Копия файлов настройки от чтения, которое оборвало падение врача.
+    mkdirSync(join(repoDir, '..', 'state', 'config-read', 'config-old'), { recursive: true })
     const doctor = await startDoctorFromEnv(env, { docker: fake.docker })
     try {
       expect(doctor.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
@@ -160,9 +162,23 @@ describe('старт врача', () => {
       const staleServices = calls.indexOf('ps -aq --filter label=remontnik.case-services')
       expect(staleServices).toBeGreaterThan(-1)
       expect(staleServices).toBeLessThan(calls.findIndex((call) => call.startsWith('network ls')))
+      // Остатки чтений настройки прошлого запуска: контейнеры с меткой этого врача и копии файлов.
+      expect(calls).toContain('ps -aq --filter label=remontnik.config-read=remontnik-doctor')
+      expect(readdirSync(join(repoDir, '..', 'state', 'config-read'))).toEqual([])
     } finally {
       await doctor.close()
     }
+  })
+
+  it('первое чтение настройки упало — остатки прошлых чтений всё равно убраны', async () => {
+    const repoDir = appRepo()
+    writeFileSync(join(repoDir, 'remontnik.config.json'), '{ не JSON')
+    const stateDir = join(repoDir, '..', 'state')
+    const fake = fakeDocker({ 'remontnik-app': '127.0.0.1' })
+    mkdirSync(join(stateDir, 'config-read', 'config-old'), { recursive: true })
+    await expect(startDoctorFromEnv(serverEnv({ REMONTNIK_CONFIG_REPO_DIR: repoDir, REMONTNIK_STATE_DIR: stateDir }), { docker: fake.docker })).rejects.toThrow()
+    expect(fake.calls()).toContain('ps -aq --filter label=remontnik.config-read=remontnik-doctor')
+    expect(readdirSync(join(stateDir, 'config-read'))).toEqual([])
   })
 
   it('врача нет в сети приложения → служба не стартует, хранилище не создаётся', async () => {

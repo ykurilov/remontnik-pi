@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { EVAL_SCENARIOS } from '../eval/run-eval.ts'
 import config from '../remontnik.config.ts'
+import { PLANS } from '../src/bot/plans.ts'
 
 describe('remontnik.config.ts «Пациента»', () => {
   it('проходит проверку и называет зоны оплаты и доступа', () => {
@@ -23,5 +24,11 @@ describe('remontnik.config.ts «Пациента»', () => {
       if (scope.scenarios === 'all') continue
       for (const id of scope.scenarios) expect(known.has(id)).toBe(true)
     }
+  })
+
+  it('описание бота называет те же тарифы и цены, что код бота', () => {
+    const description = config.review?.botDescription ?? ''
+    for (const plan of PLANS) expect(description).toContain(`«${plan.name}» — ${plan.priceRub} ₽ в месяц`)
+    expect(description.match(/«[^»]+» — \d+ ₽/g)).toHaveLength(PLANS.length)
   })
 })
