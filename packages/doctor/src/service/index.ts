@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
@@ -177,7 +177,9 @@ async function reportStorageFailure(stateDir: string, records: RecordStore, repo
   if (!existsSync(path)) return
   let mark: StorageFailureMark
   let raw = ''
+  let writtenAt = 0
   try {
+    writtenAt = statSync(path).mtimeMs
     raw = readFileSync(path, 'utf8')
     mark = JSON.parse(raw) as StorageFailureMark
   } catch (error) {
@@ -185,8 +187,9 @@ async function reportStorageFailure(stateDir: string, records: RecordStore, repo
     log(`[врач] пометка об отказе хранилища не прочитана: ${describeError(error)}`)
     mark = { at: 'время неизвестно', reason: 'причина неизвестна', telegramSent: false }
   }
-  // Пометка без ключа (недописана или от прежней версии врача) — ключ по её содержимому.
-  const key = mark.id ?? createHash('sha256').update(raw).digest('hex').slice(0, 32)
+  // Пометка без ключа (недописана или от прежней версии врача) — ключ по её содержимому и времени записи: у каждого
+  // отказа свой, а повтор после падения врача (тот же файл) даёт тот же.
+  const key = mark.id ?? createHash('sha256').update(`${writtenAt}\0${raw}`).digest('hex').slice(0, 32)
   try {
     await records.transaction(async (tx) => {
       const reported = await tx.doc<{ reportId?: number }>(STORAGE_FAILURE_REPORTS, key, {})

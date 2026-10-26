@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
@@ -187,6 +187,21 @@ describe('каркас врача', () => {
     const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
     expect(problems).toHaveLength(1)
     expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
+  })
+
+  it('два отказа хранилища подряд с недописанной пометкой → два отчёта, а не один общий', async () => {
+    const markPath = join(stateDir, 'storage-failure.json')
+    // Врач умирал посреди записи пометки: оба раза файл пустой, различаются только временем.
+    writeFileSync(markPath, '')
+    utimesSync(markPath, new Date('2026-10-26T10:00:00Z'), new Date('2026-10-26T10:00:00Z'))
+    await (await start()).close()
+    writeFileSync(markPath, '')
+    utimesSync(markPath, new Date('2026-10-26T11:00:00Z'), new Date('2026-10-26T11:00:00Z'))
+
+    const restarted = await start()
+
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(2)
   })
 
   it('тревога об отказе хранилища не ушла → после перезапуска отчёт doctor_problem идёт в Telegram', async () => {
