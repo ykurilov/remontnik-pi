@@ -56,8 +56,8 @@ export default defineRemontnikConfig({
     newFingerprintsToRollback?: number, // 3
   },
   limits?: {
-    modelUsdPerDay?: number,          // открытый вопрос 4
-    evalUsdPerDay?: number,
+    modelUsdPerDay?: number,          // 5 (сторож + врач)
+    evalUsdPerDay?: number,           // 5
     autoDeploysPerFingerprintPerDay?: number, // 2
     autoDeploysPerDay?: number,       // 5
     maxDiffLines?: number,            // 300
@@ -72,7 +72,16 @@ export default defineRemontnikConfig({
       apiBaseUrlEnv?: string,
       proxyTokenEnv?: string,
     },
-    paseo?: { enabled: boolean },     // забор отчётов с Мака, R13
+  },
+  handoff?: {                         // режим лечения, R18; по умолчанию { mode: "self" }
+    mode: "self" | "paseo-first",
+    paseo?: {                         // обязателен при "paseo-first"
+      bridgeUrlEnv: string,           // имя переменной с адресом моста в частной сети
+      bridgeSecretEnv: string,        // имя переменной с общим секретом моста
+      listenEnv: string,              // имя переменной с адресом частной сети, где врач слушает мост
+      acceptTimeoutMs?: number,       // 300_000
+      workTimeoutMs?: number,         // 3_600_000
+    },
   },
   review?: {                          // чтение законченных разговоров
     botDescription: string,           // что бот должен делать, для рубрики

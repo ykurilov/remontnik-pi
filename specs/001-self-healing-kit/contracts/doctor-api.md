@@ -1,14 +1,14 @@
 # Контракт: врач `@ykurilov/remontnik-doctor`
 
-Служба на сервере приложения. Один процесс на приложение (R1). Слушает только внутреннюю сеть Docker.
+Служба на сервере приложения. Один процесс на приложение (R1). Приём событий и стоп-кран слушают только внутреннюю сеть Docker. Адреса для моста Paseo (`/v1/handoffs/*`, `/v1/reports*`) — только адрес частной сети из настройки `handoff.paseo.listenEnv` (R18); из интернета врача не видно.
 
 ## Окружение (только имена)
 
-`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_GIT_TOKEN`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`.
+`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_GIT_TOKEN`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`, переменные из `handoff.paseo.*Env` (адрес моста, секрет моста, адрес частной сети для приёма).
 
 ## HTTP
 
-Все запросы, кроме `/health`, подписаны HMAC общего секрета (как у сторожа) или несут `Authorization: Bearer <REMONTNIK_REPORTS_TOKEN>` (только `/v1/reports*`).
+Все запросы, кроме `/health`, подписаны HMAC: от сторожа — общим секретом сторожа, от моста — секретом моста. `/v1/reports*` можно ещё забирать с `Authorization: Bearer <REMONTNIK_REPORTS_TOKEN>` (командами по SSH, если моста нет).
 
 | Метод и путь | Тело / ответ | Назначение |
 |---|---|---|
@@ -16,6 +16,8 @@
 | `POST /v1/control/deploys` | `{ action: "stop" \| "resume", by }` → `{ autoDeploy }` | стоп-кран (кнопка Telegram через приложение) |
 | `GET /v1/reports?after=<reportId>&limit=50` | `{ reports: Report[], last }` | забор отчётов для Paseo |
 | `POST /v1/reports/ack` | `{ upTo: reportId }` | подтверждение доставки в Paseo |
+| `POST /v1/handoffs/:caseId/accepted` | `{ taskId, agent }` | агент взял случай (через мост) |
+| `POST /v1/handoffs/:caseId/result` | `{ taskId, kind: "done", commit?, deployed, version? }` \| `{ taskId, kind: "cannot", reason }` | итог агента (через мост) |
 | `GET /v1/cases/:id` | `Case` + `Treatment` + отчёты | подробности для агентов |
 | `GET /health` | `{ ok, harness, queue, autoDeploy, lastError? }` | здоровье врача |
 

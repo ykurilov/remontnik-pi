@@ -62,7 +62,27 @@ observing → not_helped         (тот же отпечаток повтори�
 diagnosing → no_cause_found    (бюджет исчерпан)
 любое → deferred_budget        (потолок расходов; продолжится завтра)
 любое → stand_broken           (сломан стенд проверок)
+
+режим «сначала Paseo» (R18):
+received → handoff_check → triage                 (мост не отвечает)
+handoff_check → handed_off → paseo_working
+paseo_working → observing                         (агент выкатил)
+paseo_working → healed_by_paseo                   (агент сделал без выкатки; итог — у агента)
+handed_off | paseo_working → reclaimed → triage    (срок вышел, «не смог», мост пропал)
 ```
+
+### Handoff — передача агенту Paseo (документ `remontnik.handoff/<caseId>`)
+
+| Поле | Тип | Правила |
+|---|---|---|
+| `caseId` | число | один документ на случай |
+| `owner` | `paseo` \| `doctor` | врач лечит сам только после записи `doctor` |
+| `taskId` | ULID | номер задачи у моста |
+| `sentAt`, `acceptedAt?`, `finishedAt?` | время | |
+| `acceptDeadline`, `workDeadline` | время | из `handoff.paseo.acceptTimeoutMs` / `workTimeoutMs` |
+| `result?` | `{ kind: "done", commit?, deployed: boolean, version? }` \| `{ kind: "cannot", reason ≤ 1000 }` | |
+| `reclaimReason?` | `bridge_unreachable` \| `accept_timeout` \| `work_timeout` \| `cannot` | |
+| `lateResult?` | как `result` | итог, пришедший после `reclaimed`; только в отчёт |
 
 ### Treatment — лечение (чекпойнт задачи `remontnik.treatment`)
 
@@ -122,7 +142,7 @@ diagnosing → no_cause_found    (бюджет исчерпан)
 |---|---|
 | `reportId` | число, по порядку (курсор для Paseo) |
 | `caseId` | число? |
-| `type` | `case_received` \| `cause_found` \| `fix_ready` \| `deployed` \| `rolled_back` \| `not_helped` \| `needs_human` \| `no_cause_found` \| `budget_reached` \| `stand_broken` \| `doctor_problem` |
+| `type` | `case_received` \| `cause_found` \| `fix_ready` \| `deployed` \| `rolled_back` \| `not_helped` \| `needs_human` \| `no_cause_found` \| `budget_reached` \| `stand_broken` \| `doctor_problem` \| `handed_off` \| `paseo_done` \| `reclaimed` |
 | `short` | string ≤ 1000 (для Telegram) |
 | `full` | Markdown |
 | `screenshots` | пути к снимкам браузера? |
