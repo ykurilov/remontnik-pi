@@ -6,6 +6,7 @@ import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createCaseBook } from '../../src/case-book/index.js'
+import type { CaseSpend } from '../../src/ledgers/spend-ledger.js'
 import { openDoctorHarness } from '../../src/service/harness.js'
 
 // Живой цикл целиком (quickstart, раздел 6): образы врача, браузера и верстака собираются на настоящем Docker,
@@ -320,11 +321,21 @@ describe.skipIf(!dockerReady || !deepseekKey || !openRouterKey)('живой ци
     })
     expect(doctorMessages.every((message) => message.chatId === 'owner-chat')).toBe(true)
 
+    // Модель — основным путём: врач не уходил на OpenRouter (иначе строка в журнале и расход у openrouter).
+    const doctorLog = logs('remontnik-doctor')
+    expect(doctorLog, doctorLog.slice(-5_000)).not.toContain('запасной путь (OpenRouter)')
+
     // Итог случая по книге врача: врач остановлен, хранилище читается с хоста.
+    const caseId = healedReport.caseId
+    if (caseId === undefined) throw new Error(`у отчёта «держится» нет номера случая: ${JSON.stringify(healedReport)}`)
     compose('stop', 'doctor')
     const opened = await openDoctorHarness({ stateDir, onReport: () => {} })
     try {
-      expect((await createCaseBook(opened.records).getCase(healedReport.caseId ?? 1))?.state).toBe('healed')
+      expect((await createCaseBook(opened.records).getCase(caseId))?.state).toBe('healed')
+      const spend = await opened.records.read<CaseSpend>('spend-case', String(caseId))
+      writeFileSync(join(tmpdir(), 'remontnik-crash-spend.json'), `${JSON.stringify(spend)}\n`)
+      expect(spend?.byProvider?.deepseek ?? 0, JSON.stringify(spend)).toBeGreaterThan(0)
+      expect(spend?.byProvider?.openrouter, JSON.stringify(spend)).toBeUndefined()
     } finally {
       await opened.close()
     }

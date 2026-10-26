@@ -221,6 +221,16 @@ describe('выкатка «Пациента» на папках', () => {
       expect(current().version).toBe('v2')
     })
 
+    it.each([[0], [-5], ['10'], [null]])('startTimeoutSeconds %j — не положительное число: ждёт по умолчанию, а не сдаётся сразу', async (startTimeoutSeconds) => {
+      buildAndPromote('v1', 'one')
+      writeFileSync(join(workCopy, 'app.txt'), 'two')
+      expect(run('build', { REMONTNIK_VERSION: 'v2' }).code).toBe(0)
+      answers = ['v1', 'v1', 'v1', 'v2']
+      writeSettings({ versionUrl, startTimeoutSeconds })
+
+      expect(await runAsync('promote')).toMatchObject({ code: 0 })
+    })
+
     it('rollback возвращается, когда приложение отвечает прежней версией', async () => {
       buildAndPromote('v1', 'one')
       buildAndPromote('v2', 'two')

@@ -134,8 +134,9 @@ async function versionAnswered(url: string): Promise<string | null> {
 
 /** Ждёт, пока работающее приложение ответит нужной версией. Без versionUrl — сразу. */
 async function waitForRunningVersion(root: string, version: string): Promise<void> {
-  const { versionUrl: url, startTimeoutSeconds: seconds = DEFAULT_START_TIMEOUT_SECONDS } = readSettings(root)
+  const { versionUrl: url, startTimeoutSeconds } = readSettings(root)
   if (!url) return
+  const seconds = typeof startTimeoutSeconds === 'number' && Number.isFinite(startTimeoutSeconds) && startTimeoutSeconds > 0 ? startTimeoutSeconds : DEFAULT_START_TIMEOUT_SECONDS
   const deadline = Date.now() + seconds * 1000
   let answered: string | null = null
   while (Date.now() < deadline) {
