@@ -31,7 +31,7 @@ import { openDoctorHarness, type DoctorHarness } from './harness.js'
 
 // Каркас врача: хранилище pi-durable, приём событий, книга случаев, отчёты и Telegram.
 // Отказ хранилища закрывает Harness; тогда врач шлёт тревогу напрямую, оставляет пометку в папке состояния и выходит
-// с кодом 1 — его перезапустит systemd. После перезапуска пометка становится отчётом doctor_problem.
+// с кодом 1 — контейнер перезапустится сам. После перезапуска пометка становится отчётом doctor_problem.
 
 export interface DoctorServiceOptions {
   stateDir: string
