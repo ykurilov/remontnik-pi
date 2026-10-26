@@ -95,6 +95,37 @@ describe('git-замок', () => {
     expect(git(r.origin, 'rev-parse', 'main')).toBe(base)
   })
 
+  it('замки убитого fetch и push врача (ветки origin, packed-refs) убираются; копия, где мог остаться живой git, — нет', async () => {
+    const r = repo()
+    const guard = guardFor(r)
+    const base = await guard.resolve('HEAD')
+    const live = join(r.worktreesDir, '4')
+    const dead = join(r.worktreesDir, '5')
+    await guard.addWorktree({ path: live, branch: treatmentBranch(4, 'x'), base })
+    await guard.addWorktree({ path: dead, branch: treatmentBranch(5, 'x'), base })
+    const commonGitDir = join(r.repoDir, '.git')
+    // Контейнер копии 4 не удалился: в ней, возможно, ещё пишет git. Копию 5 бросил убитый врач.
+    writeFileSync(join(git(live, 'rev-parse', '--absolute-git-dir'), 'index.lock'), '')
+    writeFileSync(join(git(dead, 'rev-parse', '--absolute-git-dir'), 'index.lock'), '')
+    // Убитый fetch из слияния в main оставил замки веток origin и packed-refs.
+    mkdirSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'remontnik'), { recursive: true })
+    writeFileSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'main.lock'), '')
+    writeFileSync(join(commonGitDir, 'refs', 'remotes', 'origin', 'remontnik', '5-x.lock'), '')
+    writeFileSync(join(commonGitDir, 'packed-refs.lock'), '')
+    writeFileSync(join(commonGitDir, 'index.lock'), '')
+
+    const removed = await guard.clearStaleLocks({ inUse: (copy) => copy === live })
+
+    expect(removed.sort()).toEqual(['packed-refs.lock', 'refs/remotes/origin/main.lock', 'refs/remotes/origin/remontnik/5-x.lock', 'worktrees/5/index.lock'])
+    expect(existsSync(join(git(live, 'rev-parse', '--absolute-git-dir'), 'index.lock'))).toBe(true)
+    // Основная копия — человека и выкаток: её замок врач не трогает.
+    expect(existsSync(join(commonGitDir, 'index.lock'))).toBe(true)
+    // fetch снова обновляет ветку origin: человек отправил правку в main, врач её видит.
+    const human = humanCommitOnOrigin(r)
+    await guard.fetch()
+    expect(git(r.repoDir, 'rev-parse', 'refs/remotes/origin/main')).toBe(human)
+  })
+
   it('повторное создание той же копии после перезапуска не падает', async () => {
     const r = repo()
     const guard = guardFor(r)

@@ -3,13 +3,29 @@ import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-cor
 // Общее для стенда падений и врача в дочернем процессе: точки падения, приложение-пациент и пути на диске.
 
 /**
- * Где врача убивают: по одной точке на фазу лечения, у выкатки — до и после переключения версии. `mid_commit` — посреди
- * коммита правки: git тоже убит и оставил замок индекса (так бывает, когда перезапускают весь контейнер врача).
+ * Где врача убивают: по одной точке на фазу лечения, у выкатки — после метки прежней версии, до и после переключения
+ * версии и после `confirm`, а ещё — когда правка уже в main, а отчёт ещё не записан. `mid_commit` — посреди коммита
+ * правки: git тоже убит и оставил замок индекса (так бывает, когда перезапускают весь контейнер врача).
  */
-export const CRASH_POINTS = ['triage', 'diagnosing', 'fixing', 'mid_commit', 'verifying', 'gated', 'before_promote', 'after_promote', 'observing'] as const
+export const CRASH_POINTS = [
+  'triage',
+  'diagnosing',
+  'fixing',
+  'mid_commit',
+  'verifying',
+  'gated',
+  'after_tag',
+  'before_promote',
+  'after_promote',
+  'observing',
+  'after_confirm',
+  'after_merge_push',
+] as const
 /** Правка делает хуже: врача убивают сразу после отката. */
 export const ROLLBACK_CRASH_POINT = 'after_rollback'
-export type CrashPoint = (typeof CRASH_POINTS)[number] | typeof ROLLBACK_CRASH_POINT
+/** Браузер врача ждёт человека: отчёт `needs_human` уже записан, врача убивают на первом опросе службы браузера. */
+export const BROWSER_CRASH_POINT = 'browser_wait_human'
+export type CrashPoint = (typeof CRASH_POINTS)[number] | typeof ROLLBACK_CRASH_POINT | typeof BROWSER_CRASH_POINT
 
 /** Секрет владельца врача на стенде: им подписывается `case <id> retry`. */
 export const CONTROL_SECRET = 'owner-test-secret'
@@ -24,6 +40,8 @@ export interface ChildWorld {
   telegramUrl: string
   appStatePath: string
   clockPath: string
+  /** Подставная служба браузера на диске (`FakeBrowserState`). */
+  browserStatePath: string
   /** Правка делает хуже: здоровье приложения плохое, пока она работает. */
   sickFix: boolean
 }
@@ -35,6 +53,14 @@ export interface FakeAppState {
   candidate: string | null
   promotes: number
   rollbacks: number
+  calls: string[]
+  /** Кто-то правит рабочую копию основной ветки: изменённые файлы и их sha256. */
+  mainCopyDirty?: Record<string, string>
+}
+
+/** Подставная служба браузера: проверка для человека на странице, пока владелец не вернул управление. */
+export interface FakeBrowserState {
+  ownerReturned: boolean
   calls: string[]
 }
 

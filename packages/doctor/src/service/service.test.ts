@@ -174,6 +174,21 @@ describe('каркас врача', () => {
     expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
   })
 
+  it('врач упал между отчётом об отказе хранилища и удалением пометки → после перезапуска отчёт не повторяется', async () => {
+    const mark = JSON.stringify({ id: 'mark-1', at: '2026-10-26T10:00:00.000Z', reason: 'disk I/O error', telegramSent: true })
+    writeFileSync(join(stateDir, 'storage-failure.json'), mark)
+    const first = await start()
+    await first.close()
+    // Пометка осталась: врача убили сразу после записи отчёта.
+    writeFileSync(join(stateDir, 'storage-failure.json'), mark)
+
+    const restarted = await start()
+
+    const problems = (await restarted.reports.list({ after: 0, limit: 10 })).filter((report) => report.type === 'doctor_problem')
+    expect(problems).toHaveLength(1)
+    expect(existsSync(join(stateDir, 'storage-failure.json'))).toBe(false)
+  })
+
   it('тревога об отказе хранилища не ушла → после перезапуска отчёт doctor_problem идёт в Telegram', async () => {
     writeFileSync(join(stateDir, 'storage-failure.json'), JSON.stringify({ at: '2026-10-26T10:00:00.000Z', reason: 'disk I/O error', telegramSent: false }))
 

@@ -9,7 +9,8 @@ import { createCaseRetry, type CaseRetryDeps } from './case-retry.js'
 
 type TaskView = 'terminal' | 'parked' | 'running'
 
-async function world(state: CaseState, task: TaskView, options: { treatment?: boolean } = {}) {
+async function world(state: CaseState, initial: TaskView, options: { treatment?: boolean } = {}) {
+  let task = initial
   const records = createMemoryRecordStore()
   await records.transaction(async (tx) => {
     const opened = await tx.doc<Case>('case', '1', {} as Case)
@@ -24,8 +25,12 @@ async function world(state: CaseState, task: TaskView, options: { treatment?: bo
       submissions: [],
       tasks: task === 'terminal' ? [] : [{ record: { id: 5 }, state: task === 'parked' ? { kind: 'blocked', reason: 'restart_limit' } : { kind: 'running' } }],
     })) as never,
+    // Как в pi-durable: снятие с остановки — своя фиксация; задачу, которая не стоит, повтор не трогает.
     retryTask: async (id) => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      if (task !== 'parked') return
       retried.push(Number(id))
+      task = 'running'
     },
   }
   const treatment = {
@@ -49,6 +54,17 @@ describe('повтор лечения случая', () => {
     expect(w.retried).toEqual([5])
     expect(w.restarted).toEqual([])
     expect(await w.read()).toMatchObject({ retriedBy: 'owner', retriedAt: '2026-10-26T10:00:00.000Z', treatmentTaskId: '5' })
+  })
+
+  it('две команды повтора остановленной задачи сразу → одна ставит в работу, вторая получает already_running', async () => {
+    const w = await world('fixing', 'parked')
+
+    const answers = await Promise.all([w.retryCase(1, 'owner'), w.retryCase(1, 'second')])
+
+    expect(answers).toContainEqual({ retried: 'parked', attempt: 1 })
+    expect(answers).toContainEqual({ error: 'already_running', state: 'fixing' })
+    expect(w.retried).toEqual([5])
+    expect(await w.read()).toMatchObject({ retriedBy: 'owner' })
   })
 
   it('задача упала насовсем → новая попытка со своей задачей', async () => {

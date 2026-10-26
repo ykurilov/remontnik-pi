@@ -3,6 +3,8 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Wake } from '@earendil-works/pi-durable'
 import { fauxAssistantMessage, fauxToolCall, type AssistantMessage, type TranscriptContext } from '@earendil-works/pi-ai'
+import type { BrowserAnswer, BrowserClient } from '../../src/browser-tools/index.js'
+import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
 import type { AppCommands, CommandOutcome } from '../../src/deployer/app-commands.js'
 import { createDeployer, createDeployLock } from '../../src/deployer/index.js'
 import { createGitGuard, GitGuardError, type GitGuard } from '../../src/git-guard/index.js'
@@ -10,22 +12,50 @@ import { startDoctorService, type DoctorService } from '../../src/service/index.
 import { testRemontnikConfig } from '../../src/testing/config.js'
 import { createScriptedModel } from '../../src/testing/scripted-model.js'
 import { createLocalRunner, type CommandRunner } from '../../src/workbench/index.js'
-import { CONTROL_SECRET, CRASH_POINTS, FIXED, ROLLBACK_CRASH_POINT, NEW_TEST, priceCrash, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
+import {
+  BROWSER_CRASH_POINT,
+  CONTROL_SECRET,
+  CRASH_POINTS,
+  FIXED,
+  NEW_TEST,
+  priceCrash,
+  ROLLBACK_CRASH_POINT,
+  type ChildWorld,
+  type CrashPoint,
+  type FakeAppState,
+  type FakeBrowserState,
+} from './world.js'
 
 // Врач в отдельном процессе для проверок падений (T081). Всё, что должно пережить перезапуск, — на диске: записи
 // врача, git, состояние подставного приложения и сдвиг часов. С `REMONTNIK_TEST_CRASH_AT=<точка>` процесс убивает
 // себя (SIGKILL) в этой точке, как убил бы его сбой сервера; без неё — работает, пока его не остановят (SIGTERM).
+// `REMONTNIK_TEST_STOP_BEFORE_CRASH` — перед смертью владелец жмёт стоп-кран; `REMONTNIK_TEST_BROWSER` — у врача есть
+// браузер, и диагноз начинается со страницы, где нужна проверка человеком.
 
 const world = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as ChildWorld
 const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
 /** `fixing` — коммит правки один раз падает обычной ошибкой: задача лечения падает насовсем (task_faulted). */
 let faultAt = process.env.REMONTNIK_TEST_FAULT_AT
-if (crashAt && crashAt !== ROLLBACK_CRASH_POINT && !CRASH_POINTS.includes(crashAt)) throw new Error(`нет такой точки падения: ${crashAt}`)
+const stopBeforeCrash = process.env.REMONTNIK_TEST_STOP_BEFORE_CRASH === '1'
+const withBrowser = process.env.REMONTNIK_TEST_BROWSER === '1'
+const knownPoints: readonly string[] = [...CRASH_POINTS, ROLLBACK_CRASH_POINT, BROWSER_CRASH_POINT]
+if (crashAt && !knownPoints.includes(crashAt)) throw new Error(`нет такой точки падения: ${crashAt}`)
+const SITE = 'http://127.0.0.1:4100'
 
 function crash(point: CrashPoint): void {
   if (crashAt !== point) return
   process.stdout.write(`CRASH ${point}\n`)
   process.kill(process.pid, 'SIGKILL')
+}
+
+/** Как `crash`, но перед смертью владелец, если так задано, жмёт стоп-кран той же командой, что в консоли. */
+async function crashAfterOwner(point: CrashPoint): Promise<void> {
+  if (crashAt !== point) return
+  if (stopBeforeCrash) {
+    const io = { env: { REMONTNIK_DOCTOR_URL: doctor!.url, REMONTNIK_CONTROL_SECRET: CONTROL_SECRET }, stdout: () => {}, stderr: (text: string) => void process.stderr.write(text) }
+    if ((await runDoctorCommand(['deploys', 'stop', '--by', 'owner'], io)) !== 0) throw new Error('стоп-кран не нажался')
+  }
+  crash(point)
 }
 
 /** Часы врача: идут как настоящие, у спящей задачи перескакивают на время пробуждения; сдвиг переживает перезапуск. */
@@ -47,7 +77,7 @@ function persistentClock() {
 }
 
 /** Подставное приложение, как `createFakeDeployApp`, но с состоянием в файле: выкатка видна и после перезапуска. */
-function fileBackedApp(): { commands: AppCommands; running: () => string | null } {
+function fileBackedApp(): { commands: AppCommands; running: () => string | null; mainCopyDirty: () => Record<string, string> } {
   const read = (): FakeAppState => JSON.parse(readFileSync(world.appStatePath, 'utf8')) as FakeAppState
   const change = (edit: (state: FakeAppState) => void): FakeAppState => {
     const state = read()
@@ -92,6 +122,7 @@ function fileBackedApp(): { commands: AppCommands; running: () => string | null 
     },
     async confirm() {
       change((s) => s.calls.push('confirm'))
+      crash('after_confirm')
       return done('подтверждено')
     },
     async rollback() {
@@ -106,7 +137,31 @@ function fileBackedApp(): { commands: AppCommands; running: () => string | null 
       return done(`откат на ${state.running}`)
     },
   }
-  return { commands, running: () => read().running }
+  return { commands, running: () => read().running, mainCopyDirty: () => read().mainCopyDirty ?? {} }
+}
+
+/** Подставная служба браузера на диске: на странице капча, пока владелец не вернул управление. */
+function fileBackedBrowser(): BrowserClient {
+  const change = (edit: (state: FakeBrowserState) => void): FakeBrowserState => {
+    const state = JSON.parse(readFileSync(world.browserStatePath, 'utf8')) as FakeBrowserState
+    edit(state)
+    writeFileSync(world.browserStatePath, JSON.stringify(state))
+    return state
+  }
+  let statusCalls = 0
+  return {
+    async call(command): Promise<BrowserAnswer> {
+      const state = change((s) => s.calls.push(command))
+      if (command === 'url') return { ok: false, code: 'needs_human', message: 'капча на странице: нужен человек' }
+      if (command === 'status') {
+        statusCalls += 1
+        if (statusCalls === 1) crash(BROWSER_CRASH_POINT)
+        return { ok: true, state: state.ownerReturned ? 'ready' : 'needs_human' }
+      }
+      if (command === 'read') return { ok: true, url: `${SITE}/cabinet`, snapshot: 'Кабинет: вход выполнен' }
+      throw new Error(`неожиданная команда браузера ${command}`)
+    },
+  }
 }
 
 /** Модель по истории разговора: что уже сделано — видно по вызовам инструментов, поэтому после перезапуска она продолжает. */
@@ -117,6 +172,13 @@ function nextStep(context: TranscriptContext): AssistantMessage {
   const called = (name: string, path?: string) => calls.some((call) => call.name === name && (path === undefined || call.arguments.path === path))
   const tool = (name: string, args: Record<string, unknown>) =>
     fauxAssistantMessage(fauxToolCall(name, args as Parameters<typeof fauxToolCall>[1]), { stopReason: 'toolUse' })
+  const results = context.messages.filter((message) => message.role === 'toolResult').map((message) => JSON.stringify(message.content))
+  if (withBrowser && !called('browser_url')) return tool('browser_url', { url: `${SITE}/captcha` })
+  if (withBrowser && !called('browser_wait_human')) return tool('browser_wait_human', {})
+  if (withBrowser && !called('read')) {
+    if (results.some((text) => text.includes('Владелец вернул управление'))) process.stdout.write('HUMAN returned seen\n')
+    if (results.some((text) => text.includes('не вернул управление'))) process.stdout.write('HUMAN timeout seen\n')
+  }
   if (!called('finish_diagnosis')) {
     if (!called('read')) return tool('read', { path: 'src/price.mjs' })
     crash('diagnosing')
@@ -143,6 +205,10 @@ function crashingGuard(guard: GitGuard): GitGuard {
       const made = await guard.addWorktree(options)
       if (options.path === world.workbenchPath) crash('triage')
       return made
+    },
+    async mergeIntoMain(branch, commit) {
+      await guard.mergeIntoMain(branch, commit)
+      await crashAfterOwner('after_merge_push')
     },
     async commitAll(cwd, message) {
       if (faultAt === 'fixing') {
@@ -179,6 +245,18 @@ const config = testRemontnikConfig({
   evalScope: [],
   limits: { ...testRemontnikConfig().limits, diagnoseUsdPerCase: 1 },
   observe: { ...testRemontnikConfig().observe, windowMinutes: 1, healthWindowTicks: 3 },
+  ...(withBrowser
+    ? {
+        browser: {
+          enabled: true,
+          profile: 'remontnik',
+          allowedOrigins: [SITE],
+          allowedMutations: [],
+          pagesToCheck: [],
+          live: { enabled: true, linkEnv: 'REMONTNIK_LIVE_LINK' },
+        },
+      }
+    : {}),
 })
 let caseState: string | undefined
 let reportCount = 0
@@ -194,11 +272,12 @@ const guard = crashingGuard(
 const deployer = createDeployer({
   loadConfig,
   commandsFor: () => app.commands,
-  mainCopyFor: () => ({ snapshot: async () => ({ commit: 'f'.repeat(40), dirty: {}, files: { 'remontnik.config.ts': 'sha-1' } }) }),
+  mainCopyFor: () => ({ snapshot: async () => ({ commit: 'f'.repeat(40), dirty: app.mainCopyDirty(), files: { 'remontnik.config.ts': 'sha-1' } }) }),
   lockFor: () => createDeployLock(world.lockPath),
   async tagPreDeploy(name, version) {
     try {
       await guard.tagPreDeploy(name, version)
+      crash('after_tag')
       return { ok: true }
     } catch (error) {
       if (error instanceof GitGuardError) return { ok: false, reason: error.message }
@@ -230,6 +309,7 @@ const service = await startDoctorService({
     checksRunner: crashingChecks(runner),
     allowUnisolatedRunner: true,
     deployer,
+    ...(withBrowser ? { browser: { client: fileBackedBrowser(), env: { REMONTNIK_LIVE_LINK: 'http://127.0.0.1:7701' }, pollMs: 50 } } : {}),
   },
 })
 

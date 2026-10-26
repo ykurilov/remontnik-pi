@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,7 +9,7 @@ import { copyRecord } from '../../src/records/index.js'
 import { seedDoctorRecords } from '../../src/testing/doctor-records.js'
 import { workbenchPath } from '../../src/workbench/index.js'
 import { runDoctorCommand } from '../../src/cli/run-doctor-command.js'
-import { BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState } from './world.js'
+import { BUGGY, CONTROL_SECRET, OLD_TEST, type ChildWorld, type CrashPoint, type FakeAppState, type FakeBrowserState } from './world.js'
 
 // Стенд падений (T081): врач идёт отдельным процессом (`doctor-child.ts`), его убивают в заданной точке
 // (`REMONTNIK_TEST_CRASH_AT`) и запускают снова на тех же записях, git и приложении. Итог читается после остановки.
@@ -31,8 +31,21 @@ export interface CrashWorld extends ChildWorld {
   worldPath: string
   telegram: FakeTelegramServer
   appState(): FakeAppState
+  editAppState(edit: (state: FakeAppState) => void): void
+  browserState(): FakeBrowserState
+  editBrowserState(edit: (state: FakeBrowserState) => void): void
+  /** Сдвинуть часы врача: столько времени прошло, пока он лежал. */
+  advanceClock(ms: number): void
   ledger(): Promise<FingerprintLedger>
   close(): Promise<void>
+}
+
+const readJson = <T>(path: string): T => JSON.parse(readFileSync(path, 'utf8')) as T
+
+function editJson<T>(path: string, edit: (state: T) => void): void {
+  const state = readJson<T>(path)
+  edit(state)
+  writeFileSync(path, JSON.stringify(state))
 }
 
 /** Репозиторий приложения с ошибкой, подставное приложение на прежней версии и подставной Telegram. */
@@ -64,10 +77,12 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
     telegramUrl: telegram.baseUrl,
     appStatePath: join(root, 'app.json'),
     clockPath: join(root, 'clock-offset'),
+    browserStatePath: join(root, 'browser.json'),
     sickFix: options.sickFix ?? false,
   }
   const initial: FakeAppState = { running: base, previous: null, candidate: null, promotes: 0, rollbacks: 0, calls: [] }
   writeFileSync(world.appStatePath, JSON.stringify(initial))
+  writeFileSync(world.browserStatePath, JSON.stringify({ ownerReturned: false, calls: [] } satisfies FakeBrowserState))
   const worldPath = join(root, 'world.json')
   writeFileSync(worldPath, JSON.stringify(world))
   return {
@@ -77,7 +92,14 @@ export async function createCrashWorld(options: { sickFix?: boolean } = {}): Pro
     base,
     worldPath,
     telegram,
-    appState: () => JSON.parse(readFileSync(world.appStatePath, 'utf8')) as FakeAppState,
+    appState: () => readJson<FakeAppState>(world.appStatePath),
+    editAppState: (edit) => editJson(world.appStatePath, edit),
+    browserState: () => readJson<FakeBrowserState>(world.browserStatePath),
+    editBrowserState: (edit) => editJson(world.browserStatePath, edit),
+    advanceClock(ms) {
+      const offset = existsSync(world.clockPath) ? Number(readFileSync(world.clockPath, 'utf8')) : 0
+      writeFileSync(world.clockPath, String(offset + ms))
+    },
     async ledger() {
       let found = emptyFingerprintLedger()
       await seedDoctorRecords(world.stateDir, async (tx) => {
@@ -112,15 +134,33 @@ export interface DoctorProcess {
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
   waitForState(states: readonly string[], timeoutMs?: number): Promise<ChildState>
   waitForReport(type: string, timeoutMs?: number): Promise<ChildReport>
+  /** Ждать условия со стороны (файлы мира), пока врач жив. */
+  waitFor(check: () => boolean, what: string, timeoutMs?: number): Promise<void>
   stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
 
-/** Запустить врача на мире стенда; `crashAt` — где ему умереть, `sendEvent` — прислать сбой «Пациента» сразу после старта. */
-export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; faultAt?: 'fixing'; sendEvent?: boolean } = {}): DoctorProcess {
+export interface RunDoctorOptions {
+  /** Где врачу умереть. */
+  crashAt?: CrashPoint
+  faultAt?: 'fixing'
+  /** Прислать сбой «Пациента» сразу после старта. */
+  sendEvent?: boolean
+  /** Перед смертью врача владелец нажимает стоп-кран. */
+  stopBeforeCrash?: boolean
+  /** У врача есть браузер, и модель начинает диагноз со страницы, где нужна проверка человеком. */
+  browser?: boolean
+}
+
+/** Запустить врача на мире стенда. */
+export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): DoctorProcess {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' }
   delete env.REMONTNIK_TEST_CRASH_AT
   delete env.REMONTNIK_TEST_FAULT_AT
   delete env.REMONTNIK_TEST_SEND_EVENT
+  delete env.REMONTNIK_TEST_STOP_BEFORE_CRASH
+  delete env.REMONTNIK_TEST_BROWSER
+  if (options.stopBeforeCrash) env.REMONTNIK_TEST_STOP_BEFORE_CRASH = '1'
+  if (options.browser) env.REMONTNIK_TEST_BROWSER = '1'
   if (options.crashAt) env.REMONTNIK_TEST_CRASH_AT = options.crashAt
   if (options.faultAt) env.REMONTNIK_TEST_FAULT_AT = options.faultAt
   if (options.sendEvent) env.REMONTNIK_TEST_SEND_EVENT = '1'
@@ -193,6 +233,7 @@ export function runDoctor(world: CrashWorld, options: { crashAt?: CrashPoint; fa
     exited,
     waitForState: (wanted, timeoutMs = 60_000) => until(() => states.find((state) => wanted.includes(state.state)), `случай в ${wanted.join('/')}`, timeoutMs),
     waitForReport: (type, timeoutMs = 60_000) => until(() => states.findLast((state) => state.reports.some((report) => report.type === type))?.reports.find((report) => report.type === type), `отчёт ${type}`, timeoutMs),
+    waitFor: async (check, what, timeoutMs = 60_000) => void (await until(() => (check() ? true : undefined), what, timeoutMs)),
     async stop() {
       if (!gone) child.kill('SIGTERM')
       return exited
@@ -209,9 +250,17 @@ export interface CrashOutcome {
   restartOutput: string
 }
 
-/** Убить врача в точке `crashAt`, запустить снова и дождаться итога случая. */
-export async function crashAndRestart(world: CrashWorld, crashAt: CrashPoint): Promise<CrashOutcome> {
-  const first = runDoctor(world, { crashAt, sendEvent: true })
+/**
+ * Убить врача в точке `crashAt`, запустить снова и дождаться итога случая. `whileDown` — что случилось, пока врач
+ * лежал; `afterRestart` — что делать с перезапущенным врачом, пока он лечит.
+ */
+export async function crashAndRestart(
+  world: CrashWorld,
+  crashAt: CrashPoint,
+  options: Omit<RunDoctorOptions, 'crashAt' | 'sendEvent'> & { whileDown?: () => void; afterRestart?: (doctor: DoctorProcess) => Promise<void> } = {},
+): Promise<CrashOutcome> {
+  const { whileDown, afterRestart, ...run } = options
+  const first = runDoctor(world, { ...run, crashAt, sendEvent: true })
   const died = await Promise.race([
     first.exited,
     new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 60_000)),
@@ -223,8 +272,10 @@ export async function crashAndRestart(world: CrashWorld, crashAt: CrashPoint): P
   if (died.signal !== 'SIGKILL' || !first.output().includes(`CRASH ${crashAt}`)) {
     throw new Error(`врач вышел не в точке ${crashAt} (${died.signal ?? died.code}): ${first.states.at(-1)?.state}\n${first.output().slice(-4000)}`)
   }
-  const second = runDoctor(world)
+  whileDown?.()
+  const second = runDoctor(world, { ...(run.browser ? { browser: true } : {}) })
   try {
+    await afterRestart?.(second)
     const final = await second.waitForState(FINAL_STATES, 90_000)
     return { final, beforeCrash: first.states.map((state) => state.state), restartOutput: second.output() }
   } finally {

@@ -34,6 +34,37 @@ describe.concurrent('врач падает посреди лечения и пр
     }, 180_000)
   }
 
+  it('падение после confirm, пока врач лежал, кто-то поправил рабочую копию main → подтверждённая выкатка не откатывается', async ({ onTestFinished }) => {
+    const world = await createCrashWorld()
+    onTestFinished(() => world.close())
+
+    const { final } = await crashAndRestart(world, 'after_confirm', {
+      whileDown: () => world.editAppState((state) => void (state.mainCopyDirty = { 'src/hotfix.mjs': 'sha-owner-edit' })),
+    })
+
+    expect(final.state).toBe('healed')
+    const app = world.appState()
+    expect(app.promotes).toBe(1)
+    expect(app.rollbacks).toBe(0)
+    expect(app.calls).not.toContain('rollback')
+    expect(final.reports.map((report) => report.type)).toEqual(['case_received', 'deployed', 'deployed'])
+  }, 180_000)
+
+  it('падение, когда правка уже в main, а отчёт не записан; владелец нажал стоп-кран → отчёт «влил», а не «слияние остановлено»', async ({ onTestFinished }) => {
+    const world = await createCrashWorld()
+    onTestFinished(() => world.close())
+
+    const { final } = await crashAndRestart(world, 'after_merge_push', { stopBeforeCrash: true })
+
+    expect(final.state).toBe('healed')
+    const branch = git(world.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/, '')
+    expect(git(world.origin, 'rev-parse', 'main')).toBe(git(world.origin, 'rev-parse', branch))
+    const closing = final.reports.at(-1)!
+    expect(closing.type).toBe('deployed')
+    expect(closing.short).toContain('Правку влил в основную ветку main')
+    expect(closing.short).not.toContain('стоп-кран')
+  }, 180_000)
+
   it('падение сразу после отката плохой правки → случай rolled_back, откат один, main не тронута', async ({ onTestFinished }) => {
     const world = await createCrashWorld({ sickFix: true })
     onTestFinished(() => world.close())
