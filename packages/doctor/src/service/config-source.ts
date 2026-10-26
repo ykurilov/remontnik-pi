@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { isAbsolute, join, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { defineRemontnikConfig, type RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { assertValidMask, matchesAllowMask, normalizeRepoPath, PathMaskError } from '../path-mask/index.js'
 
@@ -47,6 +47,8 @@ export interface LoadedConfig {
   config: RemontnikConfig
   /** Файл, из которого прочитана настройка. */
   file: string
+  /** Файлы рабочей копии, которые настройка подключила (пути от корня копии). */
+  localImports: string[]
 }
 
 /** Имя ветки, на которой стоит рабочая копия. `undefined` — не git, отдельная голова (detached) или файл не читается. */
@@ -81,18 +83,88 @@ function findConfigFile(checkout: string): string {
   return file
 }
 
-const CHILD_SCRIPT = `
-import { pathToFileURL } from 'node:url'
-const loaded = await import(pathToFileURL(process.argv[1]).href)
-process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + JSON.stringify(loaded.default ?? null))
+// Настройка исполняется как код, в отдельном процессе Node. Это не защита: файл основной ветки доверенный, а подсказка
+// владельцу нужна, чтобы настройка не падала с ERR_MODULE_NOT_FOUND на сервере, где нет зависимостей приложения.
+// Поэтому импорты самой настройки и её соседних файлов разрешаются так:
+//  - пакеты Ремонтника, которые есть у врача (его зависимости `@ykurilov/remontnik-*`), — на пакеты врача: из `dist` в образе,
+//    из исходников, когда сам врач запущен из исходников (тесты до сборки);
+//  - относительные пути и встроенные модули Node — как обычно;
+//  - любой другой пакет — понятная ошибка, даже если он лежит в `node_modules` рабочей копии.
+// Файлы, которые настройка подключила из рабочей копии, возвращаются в ответе: `check-config` предупреждает о тех из них,
+// что вне запретных зон (враче не стоит менять настройку косвенно).
+const RESOLVE_HOOKS = `
+import { isBuiltin } from 'node:module'
+let data
+export function initialize(value) { data = value }
+const inside = (url) => typeof url === 'string' && url.startsWith(data.checkout)
+export async function resolve(specifier, context, next) {
+  if (data.sourceRoot && context.parentURL?.startsWith(data.sourceRoot) && /^\\.\\.?\\//.test(specifier) && specifier.endsWith('.js')) {
+    return next(specifier.slice(0, -3) + '.ts', context)
+  }
+  if (!inside(context.parentURL)) return next(specifier, context)
+  const own = /^(@ykurilov\\/remontnik-[a-z-]+)(?:\\/(.+))?$/.exec(specifier)
+  if (own) {
+    if (!data.allowed.includes(own[1])) {
+      throw new Error('настройка может импортировать только пакеты Ремонтника, которые есть у врача (' + data.allowed.join(', ') + '); импорт ' + specifier + ' не поддерживается')
+    }
+    if (data.sourceRoot) {
+      const name = own[1].slice('@ykurilov/remontnik-'.length)
+      const url = data.sourceRoot + name + '/src/' + (own[2] ? own[2] + '/' : '') + 'index.ts'
+      return next(url, context)
+    }
+    return next(specifier, { ...context, parentURL: data.base })
+  }
+  if (!/^(\\.{0,2}\\/|file:|data:|node:)/.test(specifier) && !isBuiltin(specifier)) {
+    throw new Error('настройка должна быть данными; импорт ' + specifier + ' не поддерживается')
+  }
+  const resolved = await next(specifier, context)
+  if (!resolved.url.startsWith('node:') && !resolved.url.includes('/node_modules/')) data.port.postMessage(resolved.url)
+  return resolved
+}
 `
 
-function runConfigProcess(file: string, checkout: string): Promise<string> {
+const CHILD_SCRIPT = `
+import { register } from 'node:module'
+import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads'
+import { pathToFileURL } from 'node:url'
+const { port1, port2 } = new MessageChannel()
+const options = JSON.parse(process.argv[3])
+register('data:text/javascript,' + encodeURIComponent(process.argv[2]), { parentURL: import.meta.url, data: { ...options, port: port1 }, transferList: [port1] })
+try {
+  const loaded = await import(pathToFileURL(process.argv[1]).href)
+  const imports = []
+  for (let message = receiveMessageOnPort(port2); message; message = receiveMessageOnPort(port2)) imports.push(message.message)
+  process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + JSON.stringify({ config: loaded.default ?? null, imports }))
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exit(1)
+}
+process.exit(0)
+`
+
+/** Пакеты Ремонтника, которые есть у врача: только их настройка вправе импортировать. */
+function ownRemontnikPackages(): string[] {
+  const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { dependencies?: Record<string, string> }
+  return Object.keys(manifest.dependencies ?? {}).filter((name) => name.startsWith('@ykurilov/remontnik-'))
+}
+
+function hookOptions(checkout: string): string {
+  const fromSource = import.meta.url.endsWith('.ts')
+  return JSON.stringify({
+    checkout: pathToFileURL(`${realpathSync(checkout)}${sep}`).href,
+    allowed: ownRemontnikPackages(),
+    base: import.meta.url,
+    // Врач запущен из исходников (тесты до сборки): пакеты набора лежат рядом, `packages/<имя>/src`.
+    sourceRoot: fromSource ? new URL('../../../', import.meta.url).href : null,
+  })
+}
+
+function runConfigProcess(file: string, checkout: string): Promise<{ config: unknown; imports: string[] }> {
   const marker = `@@remontnik-config-${randomUUID()}@@`
   return new Promise((resolveOutput, reject) => {
     execFile(
       process.execPath,
-      ['--no-warnings', '--input-type=module', '-e', CHILD_SCRIPT, file],
+      ['--no-warnings', '--input-type=module', '-e', CHILD_SCRIPT, file, RESOLVE_HOOKS, hookOptions(checkout)],
       {
         cwd: checkout,
         timeout: READ_TIMEOUT_MS,
@@ -103,16 +175,21 @@ function runConfigProcess(file: string, checkout: string): Promise<string> {
         if (error) return reject(new Error(stderr.trim() || error.message))
         const at = stdout.lastIndexOf(marker)
         if (at === -1) return reject(new Error('процесс чтения не вернул результат'))
-        resolveOutput(stdout.slice(at + marker.length))
+        resolveOutput(JSON.parse(stdout.slice(at + marker.length)) as { config: unknown; imports: string[] })
       },
     )
   })
 }
 
-async function readRawConfig(file: string, checkout: string): Promise<unknown> {
+async function readRawConfig(file: string, checkout: string): Promise<{ raw: unknown; imports: string[] }> {
   try {
-    if (file.endsWith('.json')) return JSON.parse(readFileSync(file, 'utf8'))
-    return JSON.parse(await runConfigProcess(file, checkout))
+    if (file.endsWith('.json')) return { raw: JSON.parse(readFileSync(file, 'utf8')), imports: [] }
+    const { config, imports } = await runConfigProcess(file, checkout)
+    const realCheckout = realpathSync(checkout)
+    const own = [...new Set(imports.map((url) => fileURLToPath(url)))]
+      .filter((path) => path !== realpathSync(file))
+      .map((path) => relative(realCheckout, path).split(sep).join('/'))
+    return { raw: config, imports: own }
   } catch (error) {
     throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${error instanceof Error ? error.message : String(error)}`, {
       cause: error,
@@ -189,7 +266,8 @@ export async function loadMainBranchConfig(options: LoadMainBranchConfigOptions)
     )
   }
 
-  const config = defineRemontnikConfig(withoutResolvedBuiltIn(await readRawConfig(file, checkout)) as Parameters<typeof defineRemontnikConfig>[0])
+  const { raw, imports } = await readRawConfig(file, checkout)
+  const config = defineRemontnikConfig(withoutResolvedBuiltIn(raw) as Parameters<typeof defineRemontnikConfig>[0])
   if (config.repo.mainBranch !== options.mainBranch) {
     throw new ConfigSourceError(
       'branch_mismatch',
@@ -198,5 +276,5 @@ export async function loadMainBranchConfig(options: LoadMainBranchConfigOptions)
   }
   assertMasksUnderstood(config, file)
   assertServicesNotFixable(config, file)
-  return { config, file }
+  return { config, file, localImports: imports }
 }

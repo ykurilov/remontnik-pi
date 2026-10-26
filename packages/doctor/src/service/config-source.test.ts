@@ -281,3 +281,102 @@ describe('loadMainBranchConfig: ошибки', () => {
     await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'invalid_mask', message: expect.stringContaining(mask) })
   })
 })
+
+describe('loadMainBranchConfig: импорты из настройки', () => {
+  const importingConfig = (specifier: string) =>
+    `import { defineRemontnikConfig } from '${specifier}'\nexport default defineRemontnikConfig(${JSON.stringify(configObject())})\n`
+
+  it('пакеты Ремонтника разрешаются на пакеты врача: в копии нет node_modules', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), importingConfig('@ykurilov/remontnik-core/config'))
+    commitAll(mainCheckout, 'config')
+
+    const loaded = await loadMain(mainCheckout)
+
+    expect(loaded.config.app.name).toBe('demo')
+  })
+
+  it('соседний файл настройки по относительному пути импортируется', async () => {
+    writeFileSync(join(mainCheckout, 'description.mjs'), `export const NAME = 'from-neighbour'\n`)
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { NAME } from './description.mjs'\nexport default ${JSON.stringify(configObject())}\nexport const unused = NAME\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    await expect(loadMain(mainCheckout)).resolves.toMatchObject({ config: { app: { name: 'demo' } } })
+  })
+
+  it('посторонний пакет — понятная ошибка, а не ERR_MODULE_NOT_FOUND', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import dotenv from 'dotenv'\nexport default ${JSON.stringify(configObject())}\nvoid dotenv\n`)
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('настройка должна быть данными; импорт dotenv не поддерживается')
+    expect((failure as Error).message).not.toContain('ERR_MODULE_NOT_FOUND')
+  })
+
+  it('настройка на TypeScript: типы вырезаются, пакет Ремонтника подключается без node_modules', async () => {
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.ts'),
+      `import { defineRemontnikConfig } from '@ykurilov/remontnik-core'\nconst name: string = 'demo'\nexport default defineRemontnikConfig({ ...(${JSON.stringify(configObject())} as never), app: { name } })\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    const loaded = await loadMain(mainCheckout)
+
+    expect(loaded.config.app.name).toBe('demo')
+    expect(loaded.localImports).toEqual([])
+  })
+
+  it('встроенный модуль Node с префиксом и без него импортируется', async () => {
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { join } from 'node:path'\nimport { platform } from 'os'\nexport default { ...${JSON.stringify(configObject())}, app: { name: join('de', 'mo').length > 0 && platform() ? 'demo' : 'x' } }\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    await expect(loadMain(mainCheckout)).resolves.toMatchObject({ config: { app: { name: 'demo' } } })
+  })
+
+  it('соседний файл тоже подключает пакет Ремонтника, а загрузчик сообщает о нём в localImports', async () => {
+    mkdirSync(join(mainCheckout, 'src'))
+    writeFileSync(join(mainCheckout, 'src/zones.mjs'), `import { BUILT_IN_FORBIDDEN } from '@ykurilov/remontnik-core/config'\nexport const ACCESS = BUILT_IN_FORBIDDEN.accessMasks.length\n`)
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { ACCESS } from './src/zones.mjs'\nexport default { ...${JSON.stringify(configObject())}, app: { name: ACCESS > 0 ? 'demo' : 'x' } }\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    const loaded = await loadMain(mainCheckout)
+
+    expect(loaded.config.app.name).toBe('demo')
+    expect(loaded.localImports).toEqual(['src/zones.mjs'])
+  })
+
+  it('пакет Ремонтника, которого нет у врача, — понятная ошибка', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), importingConfig('@ykurilov/remontnik-watch'))
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('@ykurilov/remontnik-watch не поддерживается')
+  })
+
+  it('чужой пакет не берётся из node_modules рабочей копии', async () => {
+    const stranger = join(mainCheckout, 'node_modules', 'stranger')
+    mkdirSync(stranger, { recursive: true })
+    writeFileSync(join(stranger, 'package.json'), JSON.stringify({ name: 'stranger', type: 'module', exports: './index.js' }))
+    writeFileSync(join(stranger, 'index.js'), `export default 'loaded'\n`)
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import stranger from 'stranger'\nexport default { ...${JSON.stringify(configObject())}, app: { name: stranger } }\n`)
+    writeFileSync(join(mainCheckout, '.gitignore'), 'node_modules\n')
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('импорт stranger не поддерживается')
+  })
+})

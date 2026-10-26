@@ -115,7 +115,7 @@ describe('defineRemontnikConfig', () => {
     })
     expect(config.limits.evalUsdPerCase).toBe(1)
     expect(config.review?.minConfidence).toBe(0.7)
-    expect(config.handoff.paseo).toMatchObject({ acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 })
+    expect(config.handoff.paseo).toMatchObject({ acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000, bridgeSilenceMs: 300_000 })
   })
 
   it('провайдеры модели для eval: ключ — имя переменной у врача, в контейнер идут адрес прокси и токен', () => {

@@ -55,6 +55,19 @@ describe('настройка запуска из окружения', () => {
     expect(() => doctorStartPlan(serverEnv({ REMONTNIK_CONTROL_SECRET: 'shared-test-secret' }), testRemontnikConfig())).toThrow(/REMONTNIK_CONTROL_SECRET/)
   })
 
+  it('режим «сначала Paseo»: адрес для моста, его секрет и адрес моста — из переменных, названных в настройке', () => {
+    const paseo = { bridgeUrlEnv: 'TEST_BRIDGE_URL', bridgeSecretEnv: 'TEST_BRIDGE_SECRET', listenEnv: 'TEST_BRIDGE_LISTEN', acceptTimeoutMs: 300_000, workTimeoutMs: 3_600_000 }
+    const config = testRemontnikConfig({ handoff: { mode: 'paseo-first', paseo } })
+    const env = serverEnv({ REMONTNIK_REPORTS_TOKEN: 'reports-test-token', TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_SECRET: 'bridge-test-secret', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' })
+    const { service } = doctorStartPlan(env, config)
+    expect(service.reportsFeed).toEqual({ token: 'reports-test-token', bridge: { listen: { host: '10.0.0.1', port: 7820 }, secret: 'bridge-test-secret', appName: config.app.name } })
+    expect(service.paseoBridge).toEqual({ url: 'http://10.0.0.2:7900' })
+    // Режим «сам»: лента для моста есть, а случаи мосту не уходят.
+    expect(doctorStartPlan(env, testRemontnikConfig({ handoff: { mode: 'self', paseo } })).service.paseoBridge).toBeUndefined()
+    expect(() => doctorStartPlan(serverEnv({ TEST_BRIDGE_URL: 'http://10.0.0.2:7900', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' }), config)).toThrow(/TEST_BRIDGE_SECRET/)
+    expect(() => doctorStartPlan(serverEnv({ TEST_BRIDGE_SECRET: 'bridge-test-secret', TEST_BRIDGE_LISTEN: '10.0.0.1:7820' }), config)).toThrow(/TEST_BRIDGE_URL/)
+  })
+
   it('приём событий на явном адресе', () => {
     expect(doctorStartPlan(serverEnv({ REMONTNIK_LISTEN_NETWORK: undefined, REMONTNIK_LISTEN: '10.5.0.3:7800' }), testRemontnikConfig()).listen).toEqual({ host: '10.5.0.3', port: 7800 })
   })

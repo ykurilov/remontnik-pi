@@ -5,6 +5,7 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
 import { CASE_NETWORK_LABEL } from '../case-networks/index.js'
 import { parseServicesFile } from '../case-services/index.js'
+import { findForbiddenZones } from '../forbidden-zones/index.js'
 import { loadMainBranchConfig } from '../service/config-source.js'
 import { doctorStartPlan, type DoctorEnv } from '../service/start.js'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
@@ -67,13 +68,24 @@ function configEnvNames(config: RemontnikConfig): string[] {
   return names
 }
 
+/** Файл, который подключает настройка, врач может поправить так же, как любой другой, — и тем изменить саму настройку. */
+function importsOutsideForbiddenZones(config: RemontnikConfig, localImports: string[]): Finding[] {
+  const outside = localImports.filter((path) => findForbiddenZones(config, [{ path, status: 'modified', added: 0, removed: 0 }]).length === 0)
+  return outside.map((path) => ({
+    level: 'warning',
+    area: 'настройка',
+    problem: `настройка подключает файл ${path}, а он вне запретных зон: врач может его изменить и этим изменить настройку`,
+    fix: `держите файлы настройки в запретных зонах: назовите его remontnik.config.<имя>.ts или добавьте ${path} в forbidden.extra`,
+  }))
+}
+
 async function checkSettings(env: DoctorEnv): Promise<{ findings: Finding[]; config?: RemontnikConfig }> {
   const repoDir = value(env, 'REMONTNIK_CONFIG_REPO_DIR')
   if (!repoDir) return { findings: [] }
   const mainBranch = value(env, 'REMONTNIK_MAIN_BRANCH') ?? 'main'
   try {
-    const { config } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
-    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }] }
+    const { config, localImports } = await loadMainBranchConfig({ mainCheckoutDirectory: repoDir, mainBranch })
+    return { config, findings: [{ level: 'ok', area: 'настройка', problem: 'настройка основной ветки читается без ошибок', fix: '' }, ...importsOutsideForbiddenZones(config, localImports)] }
   } catch (error) {
     const issues = (error as { issues?: unknown }).issues
     if (Array.isArray(issues)) {

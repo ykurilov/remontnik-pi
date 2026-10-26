@@ -106,6 +106,7 @@ export default defineRemontnikConfig({
       listenEnv: string,              // имя переменной с адресом частной сети, где врач слушает мост
       acceptTimeoutMs?: number,       // 300_000
       workTimeoutMs?: number,         // 3_600_000
+      bridgeSilenceMs?: number,       // 300_000; столько мост может молчать, пока агент работает
     },
   },
   review?: {                          // чтение законченных разговоров
