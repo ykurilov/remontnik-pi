@@ -81,10 +81,35 @@ function findConfigFile(checkout: string): string {
   return file
 }
 
+// Настройка — это данные. Пакеты Ремонтника из неё разрешаются на пакеты самого врача, поэтому в рабочей копии
+// сервера не нужны установленные зависимости приложения. Относительные пути и встроенные модули Node работают как
+// обычно; любой другой пакет — понятная ошибка вместо ERR_MODULE_NOT_FOUND.
+const RESOLVE_HOOKS = `
+import { isBuiltin } from 'node:module'
+let doctorBase
+let checkoutUrl
+export function initialize(data) { doctorBase = data.base; checkoutUrl = data.checkout }
+export function resolve(specifier, context, next) {
+  // Проверяются только импорты самой настройки и её соседних файлов; зависимости пакетов врача (zod и др.) идут как обычно.
+  if (!context.parentURL || !context.parentURL.startsWith(checkoutUrl)) return next(specifier, context)
+  if (specifier.startsWith('@ykurilov/remontnik-')) return next(specifier, { ...context, parentURL: doctorBase })
+  const bare = !/^(\\.{0,2}\\/|file:|data:|node:)/.test(specifier) && !isBuiltin(specifier)
+  if (bare) throw new Error('настройка должна быть данными; импорт ' + specifier + ' не поддерживается')
+  return next(specifier, context)
+}
+`
+
 const CHILD_SCRIPT = `
+import { register } from 'node:module'
 import { pathToFileURL } from 'node:url'
-const loaded = await import(pathToFileURL(process.argv[1]).href)
-process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + JSON.stringify(loaded.default ?? null))
+register('data:text/javascript,' + encodeURIComponent(process.argv[2]), { parentURL: import.meta.url, data: { base: process.argv[3], checkout: process.argv[4] } })
+try {
+  const loaded = await import(pathToFileURL(process.argv[1]).href)
+  process.stdout.write(process.env.REMONTNIK_RESULT_MARKER + JSON.stringify(loaded.default ?? null))
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exit(1)
+}
 `
 
 function runConfigProcess(file: string, checkout: string): Promise<string> {
@@ -92,7 +117,7 @@ function runConfigProcess(file: string, checkout: string): Promise<string> {
   return new Promise((resolveOutput, reject) => {
     execFile(
       process.execPath,
-      ['--no-warnings', '--input-type=module', '-e', CHILD_SCRIPT, file],
+      ['--no-warnings', '--input-type=module', '-e', CHILD_SCRIPT, file, RESOLVE_HOOKS, import.meta.url, pathToFileURL(`${realpathSync(checkout)}${sep}`).href],
       {
         cwd: checkout,
         timeout: READ_TIMEOUT_MS,

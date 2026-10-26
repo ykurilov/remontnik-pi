@@ -281,3 +281,39 @@ describe('loadMainBranchConfig: ошибки', () => {
     await expect(loadMain(mainCheckout)).rejects.toMatchObject({ code: 'invalid_mask', message: expect.stringContaining(mask) })
   })
 })
+
+describe('loadMainBranchConfig: импорты из настройки', () => {
+  const importingConfig = (specifier: string) =>
+    `import { defineRemontnikConfig } from '${specifier}'\nexport default defineRemontnikConfig(${JSON.stringify(configObject())})\n`
+
+  it('пакеты Ремонтника разрешаются на пакеты врача: в копии нет node_modules', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), importingConfig('@ykurilov/remontnik-core/config'))
+    commitAll(mainCheckout, 'config')
+
+    const loaded = await loadMain(mainCheckout)
+
+    expect(loaded.config.app.name).toBe('demo')
+  })
+
+  it('соседний файл настройки по относительному пути импортируется', async () => {
+    writeFileSync(join(mainCheckout, 'description.mjs'), `export const NAME = 'from-neighbour'\n`)
+    writeFileSync(
+      join(mainCheckout, 'remontnik.config.mjs'),
+      `import { NAME } from './description.mjs'\nexport default ${JSON.stringify(configObject())}\nexport const unused = NAME\n`,
+    )
+    commitAll(mainCheckout, 'config')
+
+    await expect(loadMain(mainCheckout)).resolves.toMatchObject({ config: { app: { name: 'demo' } } })
+  })
+
+  it('посторонний пакет — понятная ошибка, а не ERR_MODULE_NOT_FOUND', async () => {
+    writeFileSync(join(mainCheckout, 'remontnik.config.mjs'), `import dotenv from 'dotenv'\nexport default ${JSON.stringify(configObject())}\nvoid dotenv\n`)
+    commitAll(mainCheckout, 'config')
+
+    const failure = await loadMain(mainCheckout).catch((error: unknown) => error)
+
+    expect(failure).toMatchObject({ code: 'unreadable' })
+    expect((failure as Error).message).toContain('настройка должна быть данными; импорт dotenv не поддерживается')
+    expect((failure as Error).message).not.toContain('ERR_MODULE_NOT_FOUND')
+  })
+})
