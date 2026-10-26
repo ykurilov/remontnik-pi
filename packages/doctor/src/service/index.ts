@@ -246,7 +246,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
       const short =
         caseId === undefined
           ? `Врач: задача ${task.kind} (${task.id}) ${what}: ${problemReason(error)}`
-          : `Врач: лечение случая ${caseId} ${what}: ${problemReason(error)}.` +
+          : `Врач: задача лечения случая ${caseId} ${what}: ${problemReason(error)}.` +
             (RETRYABLE_REPORTS.includes(info.type) ? ` Снова в работу: remontnik-doctor case ${caseId} retry` : '')
       if (!reportsRef || harnessState !== 'open') {
         void sendDirect(short)
