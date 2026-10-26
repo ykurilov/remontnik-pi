@@ -65,6 +65,7 @@ export function chatPage(bug: PatientBug | null): string {
   return layout(
     'Чат',
     `<h1>Чат с ботом</h1>
+<p id="chat-status">Чат загружается…</p>
 <div id="messages"></div>
 <form id="chat-form">
   <input id="chat-input" name="message" autocomplete="off" required>
@@ -83,7 +84,8 @@ export function chatPage(bug: PatientBug | null): string {
   answer.textContent = 'Бот: ' + (result.reply ?? 'ошибка, попробуйте позже');
   messages.append(answer);
   input.value = '';
-});`,
+});
+document.querySelector('#chat-status').textContent = 'Чат готов';`,
   )
 }
 
