@@ -125,6 +125,8 @@ const paseoSchema = z.strictObject({
   listenEnv: envName,
   acceptTimeoutMs: positiveInt.default(300_000),
   workTimeoutMs: positiveInt.default(3_600_000),
+  /** Сколько мост может молчать, пока агент работает: дольше — врач забирает случай. */
+  bridgeSilenceMs: positiveInt.default(300_000),
 })
 
 const handoffSchema = z

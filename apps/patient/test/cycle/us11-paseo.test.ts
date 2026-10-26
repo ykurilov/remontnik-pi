@@ -405,6 +405,71 @@ describe('история 11 на «Пациенте»: сначала Paseo', ()
     expect(await reportTypes(doctor)).toEqual(['case_received', 'handed_off', 'reclaimed', 'deployed', 'deployed'])
   }, 120_000)
 
+  it('мост пропал, пока агент работал → врач забрал случай через 5 минут молчания; свою правку выкатывает только после подтверждённой отмены', async () => {
+    const r = sickPatient()
+    const model = createScriptedModel()
+    model.script(...cure(r))
+    const clock = fakeClock()
+    const bridge = await startBridge()
+    const doctor = await startDoctor(r, model, clock, bridge, [])
+    let downAt: number | undefined
+    let heldWakes = 0
+    let cancelsAtDeploy: number | undefined
+    clock.beforeWake = async () => {
+      const state = (await doctor.caseBook.getCase(1))?.state
+      if (state === 'handed_off') await bridge.accept(1)
+      if (state === 'paseo_working' && downAt === undefined) {
+        bridge.health = 'down'
+        downAt = clock.now()
+      }
+      // Правка готова, отмена не подтверждена: врач ждёт, приложение не трогает.
+      if (state === 'gated' && bridge.health === 'down') {
+        expect(server(r).current).toBe(r.base)
+        heldWakes += 1
+        if (heldWakes === 3) bridge.health = 'up'
+      }
+      if (state === 'observing' && cancelsAtDeploy === undefined) cancelsAtDeploy = bridge.cancels.length
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await caseIn(doctor, SETTLED)
+
+    expect(healed.state).toBe('healed')
+    const handoff = (await doctor.handoffOf(1))!
+    expect(handoff).toMatchObject({ owner: 'doctor', reclaimReason: 'bridge_unreachable', cancelSent: true })
+    expect(Date.parse(handoff.reclaimedAt!) - downAt!).toBeGreaterThanOrEqual(5 * 60_000)
+    expect(heldWakes).toBe(3)
+    expect(cancelsAtDeploy).toBe(1)
+    expect(bridge.cancels).toEqual([{ taskId: handoff.taskId, reason: expect.stringContaining('мост') }])
+    expect(server(r).current).not.toBe(r.base)
+  }, 120_000)
+
+  it('мост так и не вернулся → врач выкатывает свою правку только после срока работы агента', async () => {
+    const r = sickPatient()
+    const model = createScriptedModel()
+    model.script(...cure(r))
+    const clock = fakeClock()
+    const bridge = await startBridge()
+    const doctor = await startDoctor(r, model, clock, bridge, [])
+    let deployedAt: number | undefined
+    clock.beforeWake = async () => {
+      const state = (await doctor.caseBook.getCase(1))?.state
+      if (state === 'handed_off') await bridge.accept(1)
+      if (state === 'paseo_working') bridge.health = 'down'
+      if (state === 'observing' && deployedAt === undefined) deployedAt = clock.now()
+    }
+
+    await doctor.receiveEvents([priceCrash()])
+    const healed = await caseIn(doctor, SETTLED)
+
+    expect(healed.state).toBe('healed')
+    const handoff = (await doctor.handoffOf(1))!
+    expect(handoff).toMatchObject({ owner: 'doctor', reclaimReason: 'bridge_unreachable' })
+    expect(handoff.cancelSent).toBeUndefined()
+    expect(bridge.cancels).toHaveLength(0)
+    expect(deployedAt).toBeGreaterThanOrEqual(Date.parse(handoff.workDeadline!))
+  }, 120_000)
+
   it('поздняя выкатка агента ждёт общий замок выкатки врача → врач наблюдает её под тем же случаем', async () => {
     const r = sickPatient()
     const model = createScriptedModel()

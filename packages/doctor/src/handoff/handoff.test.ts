@@ -286,23 +286,47 @@ describe('режим «сначала Paseo»', () => {
     expect(world.model.requests.length).toBeGreaterThan(0)
   })
 
-  it('мост пропал, пока агент работал: reclaimed, врач лечит сам', async () => {
+  it('мост молчит bridgeSilenceMs (5 минут), пока агент работал: reclaimed, врач лечит сам', async () => {
     const world = await startWorld()
     noCause(world.model)
-    let accepted = false
+    let downAt: number | undefined
     world.clock.beforeWake = async () => {
-      if (world.bridge.tasks.length === 0 || accepted) return
-      accepted = true
+      if (world.bridge.tasks.length === 0 || downAt !== undefined) return
       await world.bridge.accept(1)
       world.bridge.health = 'down'
+      downAt = world.clock.now()
     }
     await openCase(world.doctor)
 
     expect((await settledCase(world.doctor)).state).toBe('no_cause_found')
     const handoff = (await world.doctor.handoffOf(1))!
     expect(handoff).toMatchObject({ owner: 'doctor', reclaimReason: 'bridge_unreachable' })
-    // Раньше срока работы агента: мост пропал — ждать его итога незачем.
+    // Не по трём проверкам подряд: перезагрузка моста или сон Mac — не повод забирать случай.
+    expect(Date.parse(handoff.reclaimedAt!) - downAt!).toBeGreaterThanOrEqual(300_000)
+    // Раньше срока работы агента: мост пропал надолго — ждать его итога незачем.
     expect(Date.parse(handoff.reclaimedAt!) - Date.parse(handoff.sentAt!)).toBeLessThan(600_000)
+  })
+
+  it('мост молчал 2 минуты и вернулся: врач ждёт агента дальше, случай закрывает агент', async () => {
+    const world = await startWorld()
+    let wakes = 0
+    world.clock.beforeWake = async () => {
+      if (world.bridge.tasks.length === 0) return
+      wakes += 1
+      if (wakes === 1) {
+        await world.bridge.accept(1)
+        world.bridge.health = 'down'
+      }
+      // Четыре проверки по 30 с без ответа, потом мост снова на месте.
+      if (wakes === 5) world.bridge.health = 'up'
+      if (wakes === 6) expect((await world.bridge.done(1, { commit: 'abc1234' })).status).toBe(200)
+    }
+    await openCase(world.doctor)
+
+    expect((await settledCase(world.doctor)).state).toBe('healed_by_paseo')
+    expect(await world.doctor.handoffOf(1)).toMatchObject({ owner: 'paseo', result: { kind: 'done' } })
+    expect(world.bridge.cancels).toHaveLength(0)
+    expect(world.model.requests).toHaveLength(0)
   })
 
   it('агент сделал и выкатил: врач наблюдает его версию (observing), она держится — случай закрыт агентом', async () => {
@@ -330,6 +354,38 @@ describe('режим «сначала Paseo»', () => {
     expect(app.rollbacks).toBe(0)
     expect(app.calls).toContain('confirm')
     expect(await reportTypes(world.doctor)).toEqual(expect.arrayContaining(['handed_off', 'paseo_done']))
+  })
+
+  it('агент выкатил после reclaimed, пока врач ещё лечит: врач бросает своё лечение и наблюдает выкатку агента', async () => {
+    const app = createFakeDeployApp({ running: 'v1-working', previous: 'v0-old' })
+    const world = await startWorld({ app })
+    let step = 0
+    world.clock.beforeWake = async () => {
+      if (world.bridge.tasks.length === 0) return
+      if (step === 0) await world.bridge.accept(1)
+      if (step === 1) await world.bridge.cannot(1, 'не нашёл, где считается цена')
+      step += 1
+    }
+    // Врач ищет причину — в это время агент всё-таки выкатывает свою правку и сообщает итог.
+    let late: { status: number; body: unknown } | undefined
+    world.model.script(async () => {
+      app.humanDeploys('agent-v2')
+      late = await world.bridge.done(1, { commit: 'abc1234', version: 'agent-v2' })
+      return callTool('finish_diagnosis', { found: true, cause: 'нет тарифа starter', evidence: ['price.mjs:1'], confidence: 'high' })
+    })
+    await openCase(world.doctor)
+
+    expect((await settledCase(world.doctor)).state).toBe('healed_by_paseo')
+    expect(late).toEqual({ status: 200, body: { ok: true, late: true } })
+    // Правку врач так и не начал: одна беседа модели — диагноз.
+    expect(world.model.requests).toHaveLength(1)
+    expect((await world.doctor.caseBook.getCase(1))!.treatmentAttempt ?? 1).toBe(1)
+    expect(await world.doctor.handoffOf(1)).toMatchObject({ owner: 'doctor', reclaimReason: 'cannot', adoptedAt: expect.any(String) })
+    expect(app.running).toBe('agent-v2')
+    expect(app.calls).toContain('confirm')
+    const types = await reportTypes(world.doctor)
+    expect(types).not.toContain('fix_ready')
+    expect(types.at(-1)).toBe('paseo_done')
   })
 
   it('итог агента после reclaimed — только lateResult: случай остаётся за врачом', async () => {

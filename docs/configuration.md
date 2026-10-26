@@ -201,6 +201,7 @@ services:
 | `paseo.listenEnv` | имя переменной с адресом частной сети, где врач слушает мост |
 | `paseo.acceptTimeoutMs?` (300 000) | сколько ждать, что агент взял случай |
 | `paseo.workTimeoutMs?` (3 600 000) | сколько ждать итога |
+| `paseo.bridgeSilenceMs?` (300 000) | сколько мост может не отвечать, пока агент работает; дольше — врач забирает случай |
 
 `paseo` обязателен при `"paseo-first"`. Договор — [paseo-bridge.md](../specs/001-self-healing-kit/contracts/paseo-bridge.md).
 

@@ -10,8 +10,8 @@ export * from './doc.js'
 export * from './task-text.js'
 
 export const HANDOFF_POLL_MS = 30_000
-/** Сколько проверок моста подряд должны не пройти, чтобы врач перестал ждать агента. */
-export const BRIDGE_FAILURES_TO_RECLAIM = 3
+/** Сколько мост может молчать, пока агент работает, если в настройке не сказано иначе. */
+export const BRIDGE_SILENCE_MS = 300_000
 
 export type AgentWaitPhase = 'handed_off' | 'paseo_working'
 
