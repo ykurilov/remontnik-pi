@@ -33,6 +33,7 @@ export default defineRemontnikConfig({
   },
   evalScope: Array<{ paths: string[]; scenarios: string[] | "all" }>,
   closedPaths: string[],              // не попадают в рабочую копию врача, не запускаются
+  fixablePaths?: string[],            // где правка врача может менять код; по умолчанию ["src/**"]
   forbidden: {
     schema: string[],                 // маски путей
     money: string[],
@@ -109,3 +110,4 @@ export default defineRemontnikConfig({
 - Маски `forbidden.*` пустыми быть не могут: приложение обязано явно сказать, где у него схема, деньги и доступы. Если чего-то нет — пишется `["<нет>"]` с комментарием.
 - Всегда добавляются встроенные запреты (R7), их нельзя убрать.
 - Адреса в `allowedOrigins` и `pagesToCheck` в открытых примерах — только `https://app.example.com`.
+- `fixablePaths` — белый список правки. Врач проверяет и отправляет правку, только если она меняет код по этим маскам и добавляет новые тесты по маскам тестов (`*.test.*`, `*.spec.*`, `*_test.*`, `*-test.*`, `test_*.py`, папки `test/`, `tests/`, `__tests__/`). Новые файлы в `__mocks__/`, `__fixtures__/`, `fixtures/`, `__snapshots__/` — не новый тест. Всё остальное — «нужен человек» со списком файлов: существующие тесты, настройки запуска тестов и eval, `package.json`, файлы-замки, `.npmrc`, `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `tsconfig*`, `.env*`, сборка, выкатка, сам Ремонтник. Настройки установки, компилятора и окружения защищены и внутри `fixablePaths`. Флаги `allow*` эту защиту не снимают.

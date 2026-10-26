@@ -131,6 +131,8 @@ export const remontnikConfigSchema = z.strictObject({
     }),
   ),
   closedPaths: z.array(z.string().min(1)),
+  /** Где правка врача может менять код; всё остальное, кроме новых тестов, — только человек. */
+  fixablePaths: z.array(z.string().trim().min(1)).min(1, 'хотя бы одна маска; по умолчанию ["src/**"]').default(['src/**']),
   forbidden: z.strictObject({
     schema: masks,
     money: masks,

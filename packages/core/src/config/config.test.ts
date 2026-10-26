@@ -72,6 +72,12 @@ describe('defineRemontnikConfig', () => {
     expect(config.handoff).toEqual({ mode: 'self' })
   })
 
+  it('fixablePaths: по умолчанию src/**, можно свои, пустой список — ошибка', () => {
+    expect(defineRemontnikConfig(minimalConfig()).fixablePaths).toEqual(['src/**'])
+    expect(defineRemontnikConfig({ ...minimalConfig(), fixablePaths: ['app/**', 'lib/**'] }).fixablePaths).toEqual(['app/**', 'lib/**'])
+    expect(errorOf(() => defineRemontnikConfig({ ...minimalConfig(), fixablePaths: [] })).issues.some((issue) => issue.startsWith('fixablePaths'))).toBe(true)
+  })
+
   it('подставляет значения по умолчанию для eval, review и Paseo', () => {
     const input = minimalConfig()
     input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: ['EVAL_KEY'] }
