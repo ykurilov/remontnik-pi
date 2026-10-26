@@ -133,39 +133,88 @@ describe('предел запросов с одного адреса на пут
 })
 
 describe('медленные тела на путях управления', () => {
-  /** Заголовки с годной на вид подписью и началом тела: тело не дописывается, соединение висит. */
-  function slowBody(url: string, target: string): Promise<Socket> {
+  /** Подписанный запрос сырым сокетом: заголовки сразу, тело — через `bodyDelayMs` (или только `{`, и соединение висит). */
+  function rawPost(url: string, target: string, options: { secret?: string; body?: string; bodyDelayMs?: number; signed?: boolean } = {}) {
     const { port } = new URL(url)
-    return new Promise((resolve) => {
+    const body = options.body ?? '{"action":"stop","by":"app"}'
+    const headers = signRequest({ method: 'POST', target, body, secret: options.secret ?? SECRET })
+    const slow = options.bodyDelayMs === undefined
+    let answer = ''
+    return new Promise<{ socket: Socket; answer: () => string }>((resolve) => {
       const socket = connect(Number(port), '127.0.0.1', () => {
-        const headers = signRequest({ method: 'POST', target, body: '{"action":"stop"}', secret: SECRET })
         socket.write(
-          `POST ${target} HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n` +
-            `${SIGNATURE_HEADER}: ${headers[SIGNATURE_HEADER]}\r\n${TIMESTAMP_HEADER}: ${headers[TIMESTAMP_HEADER]}\r\n${NONCE_HEADER}: ${headers[NONCE_HEADER]}\r\n\r\n{`,
+          `POST ${target} HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: ${slow ? 1000 : Buffer.byteLength(body)}\r\n` +
+            (options.signed === false ? '' : `${SIGNATURE_HEADER}: ${headers[SIGNATURE_HEADER]}\r\n${TIMESTAMP_HEADER}: ${headers[TIMESTAMP_HEADER]}\r\n${NONCE_HEADER}: ${headers[NONCE_HEADER]}\r\n`) +
+            `\r\n${slow ? '{' : ''}`,
         )
-        resolve(socket)
+        if (!slow) setTimeout(() => socket.write(body), options.bodyDelayMs)
+        resolve({ socket, answer: () => answer })
       })
+      socket.on('data', (chunk) => (answer += chunk.toString()))
       socket.on('error', () => {})
     })
   }
+  const slowBody = async (url: string, target: string) => (await rawPost(url, target)).socket
   const closed = (socket: Socket) => socket.destroyed || socket.readableEnded
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  it('с одного адреса одновременно читается не больше предела тел: лишнее вытесняет самое старое, команда владельца проходит', async () => {
+  function serveControls(controlBodyReads: Parameters<typeof createIntakeHandler>[0]['controlBodyReads']) {
     const controls = createControls(createMemoryRecordStore(), () => new Date())
-    const url = await serve({
-      deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }),
-      controlBodyReads: { perAddress: 2, total: 10 },
-    })
+    return serve({ deployControls: createDeployControlsHandler({ controls, secret: SECRET, controlSecret: CONTROL_SECRET }), controlBodyReads })
+  }
+
+  it('с одного адреса одновременно читается не больше предела тел: лишнее вытесняет висящее, команда владельца проходит', async () => {
+    const url = await serveControls({ perAddress: 2, total: 10, graceMs: 0 })
     const target = '/v1/control/deploys'
     const sockets: Socket[] = []
     for (let index = 0; index < 5; index += 1) {
       sockets.push(await slowBody(url, target))
-      await new Promise((resolve) => setTimeout(resolve, 30))
+      await pause(30)
     }
     await expect.poll(() => sockets.filter((socket) => !closed(socket)).length).toBe(2)
 
     const owner = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
     expect(owner.status).toBe(200)
     for (const socket of sockets) socket.destroy()
+  })
+
+  it('поток новых медленных тел с того же адреса не вытесняет команду владельца, чьё тело ещё в пути', async () => {
+    const url = await serveControls({ perAddress: 2, total: 10, graceMs: 300 })
+    const target = '/v1/control/deploys'
+    const sockets: Socket[] = []
+    for (let index = 0; index < 2; index += 1) sockets.push(await slowBody(url, target))
+    await pause(400)
+
+    // Тело владельца приходит через 150 мс; всё это время с того же адреса каждые 10 мс открывается новое медленное тело.
+    const owner = await rawPost(url, target, { secret: CONTROL_SECRET, body: JSON.stringify({ action: 'stop', by: 'owner' }), bodyDelayMs: 150 })
+    for (let index = 0; index < 30; index += 1) {
+      sockets.push(await slowBody(url, target))
+      await pause(10)
+    }
+    await expect.poll(() => owner.answer()).toMatch(/^HTTP\/1\.1 200/)
+    for (const socket of [...sockets, owner.socket]) socket.destroy()
+  })
+
+  it('отказ без чтения тела сразу освобождает место: соединение ещё открыто, а команда владельца проходит', async () => {
+    const url = await serveControls({ perAddress: 1, total: 10, graceMs: 60_000 })
+    const target = '/v1/control/deploys'
+    const unsigned = await rawPost(url, target, { signed: false })
+    await expect.poll(() => unsigned.answer()).toMatch(/^HTTP\/1\.1 401/)
+    expect(closed(unsigned.socket)).toBe(false)
+
+    const owner = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
+    expect(owner.status).toBe(200)
+    unsigned.socket.destroy()
+  })
+
+  it('мест нет и вытеснить некого — новый запрос получает 503 body_reads_full', async () => {
+    const url = await serveControls({ perAddress: 1, total: 10, graceMs: 60_000 })
+    const target = '/v1/control/deploys'
+    const hanging = await slowBody(url, target)
+    await pause(30)
+    const refused = await fetch(`${url}${target}`, signedPost(target, JSON.stringify({ action: 'stop', by: 'owner' }), CONTROL_SECRET))
+    expect(refused.status).toBe(503)
+    expect(await refused.json()).toEqual({ error: 'body_reads_full' })
+    hanging.destroy()
   })
 })

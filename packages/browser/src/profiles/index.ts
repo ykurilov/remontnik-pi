@@ -1,8 +1,10 @@
 // Профили Ремонтника: у каждого своя постоянная папка Chromium на томе службы, одна рабочая вкладка
-// и сетевой замок на весь контекст. Прокси выключен, если в профиле не задан.
+// и сетевой замок на весь контекст. В сеть Chromium выходит только через свой прокси службы (egress): там замок
+// и держится. Прокси профиля, если задан, стоит за ним.
 import { join } from 'node:path'
 import { type BrowserContext, type Page, chromium } from 'playwright-core'
-import { type BlockedRequest, installNetworkGuard } from '../guard/index.js'
+import { describeTarget, isAllowedTarget, startEgressProxy } from '../egress/index.js'
+import { type BlockedRequest, type NetworkGuard, installNetworkGuard } from '../guard/index.js'
 import type { BrowserPolicy, BrowserProfileConfig } from '../policy/index.js'
 import type { ServiceLog } from '../log.js'
 import { type SensitiveFields, createSensitiveFields } from '../snapshot/index.js'
@@ -48,21 +50,42 @@ export function createProfiles(options: {
 
   async function launch(profile: BrowserProfileConfig): Promise<ProfileSession> {
     const proxy = proxyOf(profile, env)
+    let blocked: BlockedRequest[] = []
+    const record = (request: BlockedRequest) => {
+      blocked.push(request)
+      log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason })
+    }
+    let guard: NetworkGuard | undefined
+    // Пока замок закрыт, соединения — только с allowedOrigins, что бы ни открывал скрипт страницы: воркеры,
+    // SharedWorker, WebTransport, TURN по TCP, предварительные соединения. Постоянный запрет на весь сеанс —
+    // это `isLocked` всегда истинно и свой список адресов.
+    const egress = await startEgressProxy({
+      allows: (target) => !guard?.isLocked() || isAllowedTarget(target, policy.allowedOrigins),
+      onRefused: (target) => record({ code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: на странице пароль, адрес вне allowedOrigins` }),
+      ...(proxy ? { upstream: proxy } : {}),
+    })
     const context = await chromium.launchPersistentContext(join(dataDir, 'profiles', profile.name), {
       headless,
       viewport: profile.viewport ?? DEFAULT_VIEWPORT,
       locale: 'ru-RU',
       serviceWorkers: 'block',
       acceptDownloads: false,
-      // Второй слой к замку каналов: WebRTC не ходит по UDP мимо прокси (сам WebRTC в страницах убран).
-      args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
-      ...(proxy ? { proxy } : {}),
+      // Петля (localhost) тоже идёт через прокси: Playwright сам добавляет `<-loopback>` к обходу.
+      proxy: { server: egress.url },
+      args: [
+        // Мимо прокси не уходит ничего: QUIC (WebTransport, HTTP/3) выключен, WebRTC — без UDP мимо прокси,
+        // а имена Chromium сам не разрешает вовсе — их разрешает прокси, поэтому пароль в имени хоста дальше
+        // браузера не уходит.
+        '--disable-quic',
+        '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+        `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${new URL(egress.url).hostname}`,
+      ],
+    }).catch(async (error: unknown) => {
+      await egress.close()
+      throw error
     })
-    let blocked: BlockedRequest[] = []
-    const guard = await installNetworkGuard(context, policy, (request) => {
-      blocked.push(request)
-      log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason })
-    })
+    context.on('close', () => void egress.close())
+    guard = await installNetworkGuard(context, policy, record)
     const page = context.pages()[0] ?? (await context.newPage())
     // Рабочая вкладка одна: новые окна закрываются, чтобы ничего не шло мимо снимков и замков.
     context.on('page', (extra) => {
@@ -81,7 +104,10 @@ export function createProfiles(options: {
         blocked = []
         return taken
       },
-      passwordFilled: () => guard.passwordFilled(page),
+      passwordFilled: () => {
+        guard!.passwordFilled(page)
+        egress.dropRefused()
+      },
     }
   }
 

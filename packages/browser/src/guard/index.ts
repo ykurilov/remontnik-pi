@@ -154,6 +154,8 @@ export interface NetworkGuard {
    * через `opener` или ссылку на окно.
    */
   passwordFilled(page: Page): void
+  /** Заперта ли сейчас хоть одна страница: по этому решает и прокси выхода службы. */
+  isLocked(): boolean
 }
 
 /** Адрес WebSocket как адрес сайта: `ws:` — `http:`, `wss:` — `https:`. */
@@ -291,6 +293,7 @@ export async function installNetworkGuard(
       for (const open of new Set([page, ...context.pages()])) lock(open)
       for (const socket of [...foreignSockets]) closeForeign(socket)
     },
+    isLocked: passwordOn,
   }
 }
 

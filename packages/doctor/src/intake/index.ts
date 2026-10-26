@@ -30,8 +30,8 @@ export interface IntakeHandlerOptions {
   caseRetry?: IntakeHandler
   /** Предел чужих запросов с одного адреса на `/v1/control/*` (подпись владельца его не тратит); по умолчанию `DEFAULT_CONTROL_RATE_LIMIT`. */
   controlRateLimit?: RateLimitSettings
-  /** Одновременные чтения тел на `/v1/control/*`: сверх предела вытесняется самое старое; по умолчанию `DEFAULT_CONTROL_BODY_READS`. */
-  controlBodyReads?: BodyReadSlotSettings
+  /** Одновременные чтения тел на `/v1/control/*`: сверх предела вытесняется самое медленное; по умолчанию `DEFAULT_CONTROL_BODY_READS`. */
+  controlBodyReads?: Partial<BodyReadSlotSettings>
 }
 
 export type { IntakeHandler }
@@ -69,7 +69,7 @@ function clampFuture(event: IncidentEvent, receivedAt: number): IncidentEvent {
 
 export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandler {
   const controlAllowed = createRateLimiter(options.controlRateLimit ?? DEFAULT_CONTROL_RATE_LIMIT)
-  const enterBodyRead = createBodyReadSlots(options.controlBodyReads ?? DEFAULT_CONTROL_BODY_READS)
+  const enterBodyRead = createBodyReadSlots({ ...DEFAULT_CONTROL_BODY_READS, ...options.controlBodyReads })
   return async (request, response) => {
     const path = (request.url ?? '/').split('?')[0]!
     if (request.method === 'GET' && path === '/health') {
@@ -79,10 +79,20 @@ export function createIntakeHandler(options: IntakeHandlerOptions): IntakeHandle
     // Команды владельца и стоп-кран: чужие запросы (без подписи владельца) упираются в предел с одного адреса.
     const foreignAllowed = () => controlAllowed(request.socket.remoteAddress ?? '')
     if (path.startsWith('/v1/control/')) {
-      // Место занято, пока тело не дочитано или соединение не закрыто; вытесненное — обрываем.
-      const release = enterBodyRead(request.socket.remoteAddress ?? '', () => request.destroy())
+      // Место занято, пока тело не дочитано, ответ не ушёл или соединение не закрыто; вытесненное — обрываем.
+      const socket = request.socket
+      const release = enterBodyRead(socket.remoteAddress ?? '', {
+        bytesRead: () => socket.bytesRead,
+        complete: () => request.complete,
+        evict: () => request.destroy(),
+      })
+      if (!release) {
+        refuse(request, response, 503, { error: 'body_reads_full' })
+        return
+      }
       request.once('end', release)
       request.once('close', release)
+      response.once('finish', release)
     }
     if (options.deployControls && path === '/v1/control/deploys') {
       await options.deployControls(request, response, foreignAllowed)
