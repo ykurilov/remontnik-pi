@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isProxyOwnedHeader } from '@ykurilov/remontnik-core/config'
 import { assertPrivateAddress } from '@ykurilov/remontnik-core/private-address'
 import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from '../guarded-http/index.js'
 
@@ -32,6 +33,11 @@ export interface EvalProxyProvider {
   /** Настоящий адрес провайдера; путь запроса не выходит за него. */
   upstream: string
   authHeader: 'authorization' | 'x-api-key'
+  /**
+   * Заголовки к upstream: имя в нижнем регистре и значение из окружения врача. Ставит только прокси;
+   * одноимённый заголовок клиента eval не проходит. Заголовки прокси (ключ, `host` и подобные) не ставятся.
+   */
+  upstreamHeaderValues?: Readonly<Record<string, string>>
   /** Белый список моделей с ценами. */
   models: Readonly<Record<string, EvalModelPrice>>
   /** Настоящий ключ — из окружения врача. */
@@ -101,25 +107,6 @@ const UPSTREAM_TIMEOUT_MS = 300_000
 const TOKENS_PER_MTOK = 1_000_000
 // Вход в брони — с запасом: кириллица и служебный JSON дают больше токенов на байт, чем английский текст.
 const RESERVE_BYTES_PER_TOKEN = 3
-// Заголовки, которые не уходят провайдеру: доступ, куки, сведения о сети и то, что fetch ставит сам.
-const DROPPED_HEADERS = new Set([
-  'host',
-  'connection',
-  'keep-alive',
-  'upgrade',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'content-length',
-  'accept-encoding',
-  'authorization',
-  'proxy-authorization',
-  'x-api-key',
-  'api-key',
-  'cookie',
-  'forwarded',
-  'x-real-ip',
-])
 // Закодированный слэш провайдер может раскодировать уже после проверки пути.
 const ENCODED_SEPARATOR = /%2f|%5c|\\/i
 // Белый список путей под адресом провайдера; регистр важен.
@@ -311,8 +298,12 @@ function preparedRequest(raw: Buffer, provider: EvalProxyProvider, endpoint: End
 function forwardedHeaders(request: IncomingMessage, provider: EvalProxyProvider): Headers {
   const headers = new Headers()
   for (const [name, value] of Object.entries(request.headers)) {
-    if (value === undefined || DROPPED_HEADERS.has(name) || name.startsWith('x-forwarded-') || name.startsWith('proxy-')) continue
+    // Провайдеру не уходят доступ, куки, сведения о сети и то, что fetch ставит сам; свои заголовки ставит только прокси.
+    if (value === undefined || isProxyOwnedHeader(name) || Object.hasOwn(provider.upstreamHeaderValues ?? {}, name)) continue
     headers.set(name, Array.isArray(value) ? value.join(', ') : value)
+  }
+  for (const [name, value] of Object.entries(provider.upstreamHeaderValues ?? {})) {
+    if (!isProxyOwnedHeader(name)) headers.set(name, value)
   }
   if (provider.authHeader === 'authorization') headers.set('authorization', `Bearer ${provider.key}`)
   else headers.set('x-api-key', provider.key)

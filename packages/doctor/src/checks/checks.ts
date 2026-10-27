@@ -79,7 +79,7 @@ export function createMemoryEvalBaseCache(): EvalBaseCache {
 export interface ChecksOptions {
   runner: CommandRunner
   config: RemontnikConfig
-  /** Окружение врача: eval получает из него переменные `checks.eval.env`, прокси — ключи `providers[].keyEnv`. */
+  /** Окружение врача: eval получает из него переменные `checks.eval.env`, прокси — ключи `providers[].keyEnv` и значения заголовков `providers[].upstreamHeaders[].valueEnv`. */
   evalEnv: Readonly<Record<string, string | undefined>>
   /** Прокси модели; без него eval с провайдерами не запускается. */
   evalProxy?: Pick<EvalProxy, 'openRun'>
@@ -171,7 +171,10 @@ interface EvalRun {
 export function createChecks(options: ChecksOptions) {
   const now = options.now ?? Date.now
   const { config } = options
-  const evalSecrets = [...Object.values(evalEnv()), ...(config.checks.eval?.providers ?? []).flatMap((provider) => options.evalEnv[provider.keyEnv] ?? [])].filter(
+  const evalSecrets = [
+    ...Object.values(evalEnv()),
+    ...(config.checks.eval?.providers ?? []).flatMap((provider) => [provider.keyEnv, ...provider.upstreamHeaders.map((header) => header.valueEnv)].flatMap((name) => options.evalEnv[name] ?? [])),
+  ].filter(
     (value) => value.length >= 8,
   )
 
@@ -294,7 +297,13 @@ export function createChecks(options: ChecksOptions) {
     for (const provider of config.checks.eval?.providers ?? []) {
       const key = options.evalEnv[provider.keyEnv]
       if (!key) return { providers, missing: provider.keyEnv }
-      providers.push({ ...provider, key })
+      const upstreamHeaderValues: Record<string, string> = {}
+      for (const header of provider.upstreamHeaders) {
+        const headerValue = options.evalEnv[header.valueEnv]
+        if (!headerValue) return { providers, missing: header.valueEnv }
+        upstreamHeaderValues[header.name] = headerValue
+      }
+      providers.push({ ...provider, key, upstreamHeaderValues })
     }
     return { providers }
   }

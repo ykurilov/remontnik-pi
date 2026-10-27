@@ -317,7 +317,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
 
   /** Ключи eval: их значения вырезаются из всего, что уходит наружу или модели. */
   function knownSecretsOf(config: RemontnikConfig): string[] {
-    const evalNames = [...(config.checks.eval?.env ?? []), ...(config.checks.eval?.providers ?? []).map((provider) => provider.keyEnv)]
+    const evalNames = [...(config.checks.eval?.env ?? []), ...(config.checks.eval?.providers ?? []).flatMap((provider) => [provider.keyEnv, ...provider.upstreamHeaders.map((header) => header.valueEnv)])]
     return evalNames.flatMap((name) => deps.evalEnv[name] ?? [])
   }
 
