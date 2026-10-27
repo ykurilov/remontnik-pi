@@ -49,13 +49,14 @@ interface CommandResult {
   /** Программы нет (ENOENT). */
   missing: boolean
   stdout: string
+  stderr: string
 }
 
 function run(binary: string, args: string[], env: DoctorEnv, cwd?: string): Promise<CommandResult> {
   const childEnv = Object.fromEntries(Object.entries({ ...process.env, ...env }).filter((entry): entry is [string, string] => entry[1] !== undefined))
   return new Promise((resolve) => {
-    execFile(binary, args, { env: childEnv, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, ...(cwd ? { cwd } : {}) }, (error, stdout) => {
-      resolve({ ok: !error, missing: (error as NodeJS.ErrnoException | null)?.code === 'ENOENT', stdout: String(stdout) })
+    execFile(binary, args, { env: childEnv, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, ...(cwd ? { cwd } : {}) }, (error, stdout, stderr) => {
+      resolve({ ok: !error, missing: (error as NodeJS.ErrnoException | null)?.code === 'ENOENT', stdout: String(stdout), stderr: String(stderr) })
     })
   })
 }
@@ -272,6 +273,40 @@ const BROWSER_POLICY_FIX = 'исправьте browser-policy.json (поля —
  * Настройку браузера (browser-policy.json) видит только контейнер службы браузера: её проверяет сама служба
  * командой `remontnik-browser check-policy`. Контейнер — по имени хоста из REMONTNIK_BROWSER_URL, как в compose.
  */
+const POLICY_PROBLEMS_SHOWN = 10
+const POLICY_PROBLEM_LENGTH = 200
+
+/** Ответ контейнера идёт в отчёт только буквами, цифрами и обычными знаками и ограниченной длины. */
+function plainText(text: string): string {
+  const plain = text
+    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N} .,:;!?«»"'()[\]{}<>/=+*_#@%&|~-]/gu, '?')
+    .trim()
+  return plain.length > POLICY_PROBLEM_LENGTH ? `${plain.slice(0, POLICY_PROBLEM_LENGTH)}…` : plain
+}
+
+/** Почему проверка в контейнере не ответила списком: старый образ, не задан путь к настройке или что-то ещё. */
+function browserCheckFailure(container: string, stderr: string): Finding {
+  if (stderr.includes('нет команды check-policy')) {
+    return { level: 'warning', area: 'браузер', problem: 'служба браузера не умеет проверять настройку: образ старее врача', fix: 'обновите образ службы браузера до версии врача' }
+  }
+  if (stderr.includes('REMONTNIK_BROWSER_POLICY')) {
+    return {
+      level: 'warning',
+      area: 'браузер',
+      problem: `в контейнере «${container}» не задан REMONTNIK_BROWSER_POLICY: проверке неоткуда взять настройку`,
+      fix: 'путь к настройке задаёт образ службы браузера; уберите пустое REMONTNIK_BROWSER_POLICY из environment службы в compose и перезапустите её',
+    }
+  }
+  const said = plainText(stderr.split('\n').find((line) => line.trim() !== '') ?? '')
+  return {
+    level: 'warning',
+    area: 'браузер',
+    problem: `проверка настройки в контейнере «${container}» не ответила${said ? `: ${said}` : ''}`,
+    fix: `запустите её вручную: docker exec ${container} remontnik-browser check-policy`,
+  }
+}
+
 async function checkBrowserPolicy(env: DoctorEnv, docker: string): Promise<Finding[]> {
   const url = value(env, 'REMONTNIK_BROWSER_URL')
   if (!url) return []
@@ -294,11 +329,15 @@ async function checkBrowserPolicy(env: DoctorEnv, docker: string): Promise<Findi
     const parsed = JSON.parse(checked.stdout) as { problems?: unknown }
     if (Array.isArray(parsed.problems)) problems = parsed.problems.map(String)
   } catch {}
-  if (!problems) {
-    return [{ level: 'warning', area: 'браузер', problem: 'служба браузера не умеет проверять настройку: образ старее врача', fix: 'обновите образ службы браузера до версии врача' }]
-  }
+  if (!problems) return [browserCheckFailure(container, checked.stderr)]
   if (problems.length === 0) return [{ level: 'ok', area: 'браузер', problem: 'настройка службы браузера верна', fix: '' }]
-  return problems.map((problem) => ({ level: 'error', area: 'браузер', problem: `настройка браузера: ${problem}`, fix: BROWSER_POLICY_FIX }))
+  const shown: Finding[] = problems
+    .slice(0, POLICY_PROBLEMS_SHOWN)
+    .map((problem) => ({ level: 'error', area: 'браузер', problem: `настройка браузера: ${plainText(problem)}`, fix: BROWSER_POLICY_FIX }))
+  if (problems.length > POLICY_PROBLEMS_SHOWN) {
+    shown.push({ level: 'error', area: 'браузер', problem: `настройка браузера: ещё ${problems.length - POLICY_PROBLEMS_SHOWN} ошибок`, fix: `полный список: docker exec ${container} remontnik-browser check-policy` })
+  }
+  return shown
 }
 
 interface Ruleset {

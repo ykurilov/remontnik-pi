@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ElementHandle, Locator, Page } from 'playwright-core'
-import { checkDanger, findHumanCheck, isAllowedOrigin, isFrameAllowed, isLoginOrigin, refuseDangerousTarget } from '../guard/index.js'
+import { LOCKED_HINT, checkDanger, findHumanCheck, isAllowedOrigin, isFrameAllowed, isLoginOrigin, refuseDangerousTarget } from '../guard/index.js'
 import { type ControlLock, refuseIfHumanControl } from '../live/control.js'
 import type { ServiceLog } from '../log.js'
 import type { SitePolicy } from '../policy/index.js'
@@ -25,12 +25,15 @@ const fail = (code: string, message: string): ActionResult => ({ ok: false, code
 
 const LOCKED_SUMMARY_LIMIT = 10
 
-/** Закрытые адреса запертого сеанса — по одной строке на адрес: что вписать в extraOrigins, если нужно приложению. */
-export function lockedSummary(requests: readonly { origin?: string }[]): string[] {
-  const origins = [...new Set(requests.flatMap((request) => (request.origin ? [request.origin] : [])))]
-  const lines = origins.slice(0, LOCKED_SUMMARY_LIMIT).map((origin) => `${origin}: закрыт после входа паролем; нужен приложению — впишите в extraOrigins`)
-  if (origins.length > LOCKED_SUMMARY_LIMIT) lines.push(`ещё ${origins.length - LOCKED_SUMMARY_LIMIT} адресов закрыто`)
-  if (requests.some((request) => !request.origin)) lines.push('другие отказы — в журнале службы')
+/**
+ * Закрытые сайты запертого сеанса — по строке на сайт из `siteOf`, для отчёта владельцу: что вписать в extraOrigins,
+ * если сайт нужен приложению. Модели врач показывает только их число.
+ */
+export function lockedSummary(requests: readonly { domain?: string }[]): string[] {
+  const sites = [...new Set(requests.flatMap((request) => (request.domain ? [request.domain] : [])))]
+  const lines = sites.slice(0, LOCKED_SUMMARY_LIMIT).map((site) => `${site}: закрыт после входа паролем; ${LOCKED_HINT}`)
+  if (sites.length > LOCKED_SUMMARY_LIMIT) lines.push(`ещё ${sites.length - LOCKED_SUMMARY_LIMIT} сайтов закрыто`)
+  if (requests.some((request) => !request.domain)) lines.push('другие отказы — в журнале службы')
   return lines
 }
 const REF = /^(?:f\d+)?e\d+$/
@@ -194,10 +197,12 @@ export function createBrowserActions(options: {
   async function outcome(session: ProfileSession, passwordStep = false): Promise<ActionResult> {
     await settle(session.page)
     const page = session.page
+    // Пароль уже вписан и сеанс заперт: что бы ни случилось дальше, повторять вход незачем.
+    const filled = passwordStep ? 'пароль вписан, замок сеанса взведён — вход не повторяйте; ' : ''
     if (page.url() !== 'about:blank' && !isAllowedOrigin(page.url(), policy.allowedOrigins)) {
       await page.goto('about:blank').catch(() => {})
       session.takeBlocked()
-      return fail('refused_origin', 'страница ушла на сайт вне allowedOrigins и закрыта')
+      return fail('refused_origin', `${filled}страница ушла на сайт вне allowedOrigins и закрыта`)
     }
     const snapshot = await takeSnapshot(page, session.fields, snapshotOptions)
     const human = await findHumanCheck(page, snapshot.text)
@@ -208,9 +213,9 @@ export function createBrowserActions(options: {
     const locked = passwordStep ? [] : taken.filter((request) => request.code === 'refused_leak')
     const blocked = taken.filter((request) => !locked.includes(request))
     if (blocked.length > 0) {
-      return fail(blocked[0]!.code, `заблокировано замком: ${blocked.map((request) => request.reason).join('; ')}`)
+      return fail(blocked[0]!.code, `${filled}заблокировано замком: ${blocked.map((request) => request.reason).join('; ')}`)
     }
-    if (human.needsHuman) return fail('needs_human', `${human.reason}: нужен человек, браузер остановился`)
+    if (human.needsHuman) return fail('needs_human', `${filled}${human.reason}: нужен человек, браузер остановился`)
     return { ok: true, url: snapshot.url, title: snapshot.title, snapshot: snapshot.snapshot, ...(locked.length > 0 ? { blocked: lockedSummary(locked) } : {}) }
   }
 

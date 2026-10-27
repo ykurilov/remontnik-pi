@@ -1,5 +1,6 @@
 // Замки браузера: опасные действия, разрешённые сайты, сетевой замок изменяющих запросов, признаки капчи и кодов.
 // Решения — чистые функции; установка на контекст Chromium — installNetworkGuard.
+import { isIP } from 'node:net'
 import type { BrowserContext, Frame, Page, Route, WebSocketRoute } from 'playwright-core'
 import { type SitePolicy, sessionOrigins } from '../policy/index.js'
 
@@ -117,33 +118,64 @@ export interface RequestFacts {
 }
 
 export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak' | 'refused_internal'
-export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string; origin?: string }
+export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string; domain?: string; suspect?: string }
 
 export function describeRequest(method: string, url: string): string {
   const origin = originOf(url)
   return origin ? `${method.toUpperCase()} ${new URL(url).pathname}` : `${method.toUpperCase()} ${url.split(/[?#]/)[0]?.slice(0, 40)}`
 }
 
-/** Почему адрес закрыт после входа и что вписать владельцу, если адрес нужен приложению. */
-export function lockedReason(origin: string): string {
-  return `после входа паролем сеанс профиля заперт, адрес вне allowedOrigins и extraOrigins; нужен приложению — впишите ${origin} в extraOrigins настройки браузера`
+/**
+ * Сайт закрытого адреса для владельца: домен второго уровня без поддоменов и порта (у зон вида `co.<страна>` — третьего).
+ * Имя хоста после входа выбирает скрипт страницы, и в поддомене он мог спрятать пароль: поддомены не показываются
+ * никому, а числовой адрес — вовсе. Что осталось, проходит через фильтр паролей журнала и ответов службы.
+ */
+export function siteOf(url: string): string {
+  let host: string
+  try {
+    host = new URL(url.replace(/^ws(s?):/i, 'http$1:')).hostname.toLowerCase().replace(/\.+$/, '')
+  } catch {
+    return 'адрес без сайта'
+  }
+  if (host === '' || host.startsWith('[') || isIP(host) !== 0) return 'числовой адрес'
+  const labels = host.split('.')
+  const keep = labels.length >= 3 && /^[a-z]{2}$/.test(labels.at(-1)!) && SECOND_LEVEL_SUFFIXES.has(labels.at(-2)!) ? 3 : 2
+  return labels.slice(-keep).join('.')
 }
 
+const SECOND_LEVEL_SUFFIXES = new Set(['ac', 'co', 'com', 'edu', 'gov', 'net', 'org'])
+
+/** Почему адрес закрыт после входа. Без адреса: причину читает модель, а имя хоста выбрал скрипт страницы. */
+export const LOCKED_REASON = 'после входа паролем сеанс профиля заперт, сайт вне allowedOrigins и extraOrigins'
+/** Подсказка владельцу — только в журнал службы и отчёт, рядом с сайтом из `siteOf`. */
+export const LOCKED_HINT = 'если сайт нужен приложению, впишите его точный адрес (origin) в extraOrigins настройки браузера'
+
 export function decideRequest(request: RequestFacts, policy: SitePolicy): RequestDecision {
+  const origin = originOf(request.url)
+  // Скрипт страницы прочитал бы вписанный пароль — из поля или из хранилища страницы, куда его спрятали раньше, —
+  // и унёс в адресе картинки, скрипта, формы или перехода на другой сайт. Адрес такого запроса дальше не уходит:
+  // ни в причину для модели, ни в журнал — только сайт из `siteOf`.
+  if (request.sessionLocked === true && origin !== null && !sessionOrigins(policy).includes(origin)) {
+    const domain = siteOf(request.url)
+    if (request.isNavigation && !request.isMainFrame) return { allow: false, code: 'refused_frame', reason: `фрейм с другого сайта: ${LOCKED_REASON}`, domain }
+    if (request.isNavigation) return { allow: false, code: 'refused_origin', reason: `переход на другой сайт: ${LOCKED_REASON}`, domain }
+    const method = request.method.toUpperCase()
+    return {
+      allow: false,
+      code: 'refused_leak',
+      reason: `${method} на другой сайт: ${LOCKED_REASON}`,
+      domain,
+      ...(isMutatingMethod(method) ? { suspect: `${method} на другой сайт` } : {}),
+    }
+  }
   if (request.isNavigation && request.url !== 'about:blank' && !isAllowedOrigin(request.url, policy.allowedOrigins)) {
-    const where = originOf(request.url) ?? 'адрес без сайта'
+    const where = origin ?? 'адрес без сайта'
     if (!request.isMainFrame) return { allow: false, code: 'refused_frame', reason: `фрейм с ${where} вне allowedOrigins` }
     return { allow: false, code: 'refused_origin', reason: `переход на ${where} вне allowedOrigins` }
   }
   if (isMutatingMethod(request.method) && !matchesMutation(request.method, request.url, policy)) {
-    const where = originOf(request.url) ?? 'адрес без сайта'
+    const where = origin ?? 'адрес без сайта'
     return { allow: false, code: 'refused_mutation', reason: `${describeRequest(request.method, request.url)} на ${where} вне allowedMutations` }
-  }
-  // Скрипт страницы прочитал бы вписанный пароль — из поля или из хранилища страницы, куда его спрятали раньше, —
-  // и унёс в адресе картинки или скрипта с другого сайта.
-  const origin = originOf(request.url)
-  if (request.sessionLocked && origin !== null && !sessionOrigins(policy).includes(origin)) {
-    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: ${lockedReason(origin)}`, origin }
   }
   return { allow: true }
 }
@@ -151,13 +183,17 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
 export interface BlockedRequest {
   code: BlockCode
   reason: string
-  /** У отказа запертого сеанса — закрытый адрес: его владелец впишет в extraOrigins, если он нужен приложению. */
-  origin?: string
+  /** Сайт закрытого адреса из `siteOf`: владелец по нему поймёт, что вписать в extraOrigins. Модели не показывается. */
+  domain?: string
+  /** Отказ похож на попытку утечки, а не на безобидный счётчик: запись или сокет на другой сайт, пароль в адресе. */
+  suspect?: string
+  /** Полный адрес — только чтобы служба проверила его на пароль; ни в журнал, ни в ответы не попадает. */
+  url?: string
 }
 
 export interface NetworkGuard {
   /**
-   * В профиль вписывается пароль: запросы и WebSocket вне allowedOrigins и extraOrigins закрыты во всём контексте
+   * В профиль вписывается пароль: запросы вне allowedOrigins и extraOrigins и WebSocket вне allowedOrigins закрыты во всём контексте
    * до конца сеанса. Страница могла спрятать пароль в localStorage, IndexedDB, cookie или `window.name`, и унесёт его
    * любая следующая страница или окно — поэтому замок не снимается ни новым документом, ни закрытием окон.
    */
@@ -213,7 +249,6 @@ export async function installNetworkGuard(
   options: { locked?: boolean } = {},
 ): Promise<NetworkGuard> {
   let locked = options.locked === true
-  const origins = sessionOrigins(policy)
 
   await context.addInitScript(sealNetworkChannels)
 
@@ -231,7 +266,8 @@ export async function installNetworkGuard(
       policy,
     )
     if (decision.allow) return route.fallback()
-    onBlocked({ code: decision.code, reason: decision.reason, ...(decision.origin ? { origin: decision.origin } : {}) })
+    const { allow: _allow, ...blocked } = decision
+    onBlocked({ ...blocked, ...(decision.code === 'refused_leak' ? { url: request.url() } : {}) })
     if (request.isNavigationRequest()) return route.abort('blockedbyclient')
     return route.fulfill({
       status: 403,
@@ -241,20 +277,22 @@ export async function installNetworkGuard(
   })
 
   // WebSocket — через замок с самого начала: сокет на другой сайт, открытый до пароля, закрывается, как только
-  // пароль вписан, иначе скрипт отправил бы пароль по уже открытому сокету.
+  // пароль вписан, иначе скрипт отправил бы пароль по уже открытому сокету. После входа сокет пускается только
+  // к allowedOrigins: extraOrigins — для подресурсов (CDN, шрифты), а по сокету скрипт унёс бы что угодно.
   const foreignSockets = new Set<WebSocketRoute>()
   const closeForeign = (socket: WebSocketRoute) => {
     foreignSockets.delete(socket)
-    const origin = originOf(webSocketSite(socket.url()))
     onBlocked({
       code: 'refused_leak',
-      reason: `WebSocket на ${origin ?? 'адрес без сайта'}: ${origin ? lockedReason(origin) : 'после входа паролем сеанс профиля заперт'}`,
-      ...(origin ? { origin } : {}),
+      reason: `WebSocket на сайт вне allowedOrigins: ${LOCKED_REASON}`,
+      domain: siteOf(socket.url()),
+      suspect: 'WebSocket на другой сайт',
+      url: socket.url(),
     })
     void socket.close({ code: 1008, reason: 'blocked' }).catch(() => {})
   }
   await context.routeWebSocket(/.*/, (socket: WebSocketRoute) => {
-    if (isAllowedOrigin(webSocketSite(socket.url()), origins)) {
+    if (isAllowedOrigin(webSocketSite(socket.url()), policy.allowedOrigins)) {
       socket.connectToServer()
       return
     }

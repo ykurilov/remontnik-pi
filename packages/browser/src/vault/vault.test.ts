@@ -126,6 +126,15 @@ describe('фильтр выхода', () => {
     for (const form of forms) expect(filter.text(`[${form}]`), form).toBe('[[пароль скрыт]]')
   })
 
+  it('ловит пароль в имени хоста: браузер переводит его в строчные буквы — base64 без регистра, base32', () => {
+    const secret = 'Hunter2-Secret'
+    const filter = createOutputFilter(() => [secret])
+    const bytes = Buffer.from(secret)
+    for (const label of [secret.toLowerCase(), bytes.toString('hex'), bytes.toString('base64url').toLowerCase(), 'jb2w45dfoizc2u3fmnzgk5a']) {
+      expect(filter.text(`https://${label}.evil.test`)).toBe('https://[пароль скрыт].evil.test')
+    }
+  })
+
   it('короткий пароль из старого хранилища тоже вырезается', () => {
     expect(createOutputFilter(() => ['abc']).text('x abc y')).toBe('x [пароль скрыт] y')
   })

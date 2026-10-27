@@ -104,9 +104,16 @@ async function logins(action: string | undefined, rest: string[], flags: Map<str
 /** Проверка файла настройки без запуска службы: её зовёт и `remontnik-doctor check-config`. */
 function checkPolicy(path: string | undefined, io: CliIo): number {
   if (!path) throw new UsageError('нужен путь к настройке или REMONTNIK_BROWSER_POLICY')
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    io.stdout(`${JSON.stringify({ ok: false, problems: [`файл настройки не читается: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}`] })}\n`)
+    return 1
+  }
   let problems: string[]
   try {
-    problems = browserPolicyProblems(JSON.parse(readFileSync(path, 'utf8')))
+    problems = browserPolicyProblems(JSON.parse(text))
   } catch (error) {
     problems = [`файл не читается как JSON: ${(error as Error).message}`]
   }

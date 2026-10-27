@@ -81,7 +81,7 @@ interface DockerScenario {
   /** Как у врача смонтирована папка состояния: по умолчанию — тем же путём, что на хосте. */
   stateMount?: 'same' | 'volume'
   /** Контейнер службы браузера `remontnik-browser`: запущен ли и что отвечает `remontnik-browser check-policy`. */
-  browser?: { running: boolean; problems?: string[]; oldImage?: boolean }
+  browser?: { running: boolean; problems?: string[]; oldImage?: boolean; noPolicy?: boolean }
 }
 
 const HEALTHY_DOCKER: DockerScenario = {
@@ -115,7 +115,8 @@ if (a[0] === 'inspect' && a[2].includes('Mounts')) {
 if (a[0] === 'inspect' && a.at(-1) === 'remontnik-browser') { if (!s.browser) { process.stderr.write('No such object: remontnik-browser'); process.exit(1) } out(String(s.browser.running)) }
 if (a[0] === 'exec' && a[1] === 'remontnik-browser' && a[2] === 'remontnik-browser' && a[3] === 'check-policy') {
   if (!s.browser || !s.browser.running) fail()
-  if (s.browser.oldImage) { process.stdout.write('remontnik-browser: нет команды check-policy\\n'); process.exit(2) }
+  if (s.browser.oldImage) { process.stderr.write('remontnik-browser: нет команды check-policy\\n'); process.exit(2) }
+  if (s.browser.noPolicy) { process.stderr.write('remontnik-browser: нужен путь к настройке или REMONTNIK_BROWSER_POLICY\\n\\nremontnik-browser check-policy [путь]\\n'); process.exit(2) }
   const problems = s.browser.problems || []
   process.stdout.write(JSON.stringify({ ok: problems.length === 0, problems }) + '\\n')
   process.exit(problems.length === 0 ? 0 : 1)
@@ -464,6 +465,24 @@ describe('check-config: настройка службы браузера', () =>
   it('контейнер не запущен, не найден или со старым образом — предупреждение, не ошибка', async () => {
     for (const browser of [{ running: false }, undefined, { running: true, oldImage: true }]) {
       expect((await browserFindings(browser)).map((finding) => finding.level)).toEqual(['warning'])
+    }
+    expect((await browserFindings({ running: true, oldImage: true }))[0]!.problem).toMatch(/образ старее врача/)
+  })
+
+  it('в контейнере не задан REMONTNIK_BROWSER_POLICY — так и сказано, а не «образ старее»', async () => {
+    const [finding] = await browserFindings({ running: true, noPolicy: true })
+    expect(finding).toMatchObject({ level: 'warning', problem: expect.stringContaining('не задан REMONTNIK_BROWSER_POLICY') })
+    expect(finding!.problem).not.toMatch(/старее/)
+  })
+
+  it('ответ контейнера ограничен: не больше 10 ошибок, короткие строки, без управляющих знаков', async () => {
+    const many = Array.from({ length: 14 }, (_, index) => `поле${index}: ${'x'.repeat(500)}\u001b[31m\u202e`)
+    const findings = await browserFindings({ running: true, problems: many })
+    expect(findings).toHaveLength(11)
+    expect(findings.at(-1)!.problem).toContain('ещё 4 ошибок')
+    for (const finding of findings) {
+      expect(finding.problem.length).toBeLessThan(260)
+      expect(finding.problem).not.toMatch(/[\u0000-\u001f\u202e]/)
     }
   })
 })

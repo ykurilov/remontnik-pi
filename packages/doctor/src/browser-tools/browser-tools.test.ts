@@ -365,12 +365,14 @@ describe('что видит модель', () => {
     expect(page.text).toContain('Вход: поле пароля ••••••')
   })
 
-  it('закрытые после входа подресурсы — не ошибка: модель видит страницу и подсказку про extraOrigins', async () => {
-    const hint = 'https://counter.example.net: закрыт после входа паролем; нужен приложению — впишите в extraOrigins'
+  it('закрытые после входа подресурсы — не ошибка: модель видит страницу и число закрытых, но не имена сайтов', async () => {
+    const hint = 'example.net: закрыт после входа паролем; если сайт нужен приложению, впишите его точный адрес (origin) в extraOrigins'
     const fake = fakeClient(() => ({ ...snapshotOf('Чат готов'), blocked: [hint, 42] }))
     const answer = await run(depsWith(fake.client, configWith({})), await seededStore(), 'read')
     expect(answer.isError).toBe(false)
-    expect(answer.text).toContain(`Закрыто замком (страница работает без них): ${hint}`)
+    expect(answer.text).toContain('Закрыто замком запросов к другим сайтам: записей 1')
+    expect(answer.text).not.toContain('example.net')
+    expect(answer.text).not.toContain('extraOrigins')
     expect(answer.text).not.toContain('42')
   })
 
@@ -401,7 +403,7 @@ describe('проверка страниц после выкатки', () => {
   })
 
   it('страница работает, но подресурс закрыт замком — checked, подсказка в подробностях отчёта', async () => {
-    const hint = 'https://cdn.example.net: закрыт после входа паролем; нужен приложению — впишите в extraOrigins'
+    const hint = 'example.net: закрыт после входа паролем; если сайт нужен приложению, впишите его точный адрес (origin) в extraOrigins'
     const fake = fakeClient((command) => (command === 'shot' ? { ok: false, code: 'timeout', message: 'нет' } : { ...snapshotOf('Чат готов'), blocked: [hint] }))
     const check = await checkPages(fake.client, configWith({ pagesToCheck: [pages[0]!] }).browser)
     expect(check).toMatchObject({ status: 'checked', pages: [{ ok: true, blocked: [hint] }] })

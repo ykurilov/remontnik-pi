@@ -88,7 +88,8 @@ function describeAnswer(answer: BrowserAnswer): BrowserToolAnswer {
   const lines = [
     ...(typeof url === 'string' ? [`Адрес: ${url}`] : []),
     ...(typeof title === 'string' ? [`Заголовок: ${title}`] : []),
-    ...(blocked.length > 0 ? [`Закрыто замком (страница работает без них): ${blocked.join('; ')}`] : []),
+    // Имена закрытых сайтов выбирал скрипт страницы — модели только их число, имена — владельцу в журнале службы.
+    ...(blocked.length > 0 ? [`Закрыто замком запросов к другим сайтам: записей ${blocked.length}; страница работает без них, какие сайты — в журнале службы браузера`] : []),
     ...(typeof path === 'string' ? [`Снимок экрана: ${path} (попадёт в отчёт)`] : []),
     ...(logins !== undefined ? [`Входы: ${JSON.stringify(loginsOf(logins))}`] : []),
     ...(typeof state === 'string' ? [`Состояние: ${state}`] : []),

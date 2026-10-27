@@ -19,6 +19,8 @@ describe('настройка браузера: extraOrigins', () => {
       'wss://cdn.example.net',
       'cdn.example.net',
       'http://localhost:8080',
+      'https://localhost.',
+      'https://printer.local.',
       'http://app.localhost',
       'http://printer.local',
       'http://metadata.google.internal',
@@ -36,5 +38,12 @@ describe('настройка браузера: extraOrigins', () => {
 
   it('allowedOrigins может быть внутренним адресом: приложение бывает в частной сети', () => {
     expect(browserPolicyProblems({ ...base, allowedOrigins: ['http://10.0.0.5:3000'] })).toEqual([])
+  })
+
+  it('опечатка в имени поля — ошибка, а не молча пропущенное поле', () => {
+    expect(browserPolicyProblems({ ...base, extraOrgins: ['https://cdn.example.net'] })).toEqual([expect.stringMatching(/extraOrgins/)])
+    expect(browserPolicyProblems({ ...base, profiles: [{ name: 'remontnik', viewprt: { width: 800, height: 600 } }] })).toEqual([
+      expect.stringMatching(/^profiles\.0: .*viewprt/),
+    ])
   })
 })

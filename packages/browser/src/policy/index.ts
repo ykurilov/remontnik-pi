@@ -14,9 +14,12 @@ const origin = z.string().refine((value) => {
   }
 }, 'ожидается origin вида https://app.example.com без пути, масок и косой черты в конце')
 
-/** Имя без точки (`db`, `patient`) — сервис внутренней сети; `localhost`, `.local`, `.internal` — машина и локальная сеть. */
+/**
+ * Имя без точки (`db`, `patient`) — сервис внутренней сети; `localhost`, `.local`, `.internal` — машина и локальная сеть.
+ * Точка в конце (`localhost.`) — то же имя, записанное полностью: её отрезаем.
+ */
 function isInternalHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.+$/, '')
   if (isIP(host)) return isInternalAddress(host)
   return !host.includes('.') || host === 'localhost' || /\.(localhost|local|internal)$/.test(host)
 }
@@ -30,26 +33,27 @@ const externalOrigin = origin.refine((value) => {
   }
 }, 'внутренний адрес (петля, частная сеть, имя без точки, .local, .internal) в extraOrigins не пускается')
 
-const profileSchema = z.object({
+// Объекты строгие: опечатка в имени поля (`extraOrgins`) — ошибка настройки, а не молча пропущенное поле.
+const profileSchema = z.strictObject({
   name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/i, 'имя профиля: буквы, цифры, «-» и «_», до 64 знаков'),
   proxy: z
-    .object({
+    .strictObject({
       server: z.string().min(1),
       usernameEnv: z.string().optional(),
       passwordEnv: z.string().optional(),
     })
     .optional(),
-  viewport: z.object({ width: z.number().int().min(320).max(3840), height: z.number().int().min(320).max(2160) }).optional(),
+  viewport: z.strictObject({ width: z.number().int().min(320).max(3840), height: z.number().int().min(320).max(2160) }).optional(),
 })
 
-export const browserPolicySchema = z.object({
+export const browserPolicySchema = z.strictObject({
   allowedOrigins: z.array(origin).min(1),
   /**
    * Сторонние адреса, нужные страницам приложения (CDN, шрифты): после первого ввода пароля сеанс профиля заперт,
    * и подресурсы с других сайтов не грузятся. Это только подресурсы: переходы и фреймы — по-прежнему allowedOrigins.
    */
   extraOrigins: z.array(externalOrigin).optional(),
-  allowedMutations: z.array(z.object({ method: z.string().min(1), pathPattern: z.string().startsWith('/') })),
+  allowedMutations: z.array(z.strictObject({ method: z.string().min(1), pathPattern: z.string().startsWith('/') })),
   profiles: z.array(profileSchema).min(1),
 })
 
@@ -60,7 +64,11 @@ export type SitePolicy = Pick<BrowserPolicy, 'allowedOrigins' | 'allowedMutation
 /** Неверные поля настройки: пусто — настройка верна. */
 export function browserPolicyProblems(value: unknown): string[] {
   const parsed = browserPolicySchema.safeParse(value)
-  return parsed.success ? [] : parsed.error.issues.map((issue) => `${issue.path.join('.') || '(корень)'}: ${issue.message}`)
+  if (parsed.success) return []
+  return parsed.error.issues.map((issue) => {
+    const message = issue.code === 'unrecognized_keys' ? `неизвестное поле ${issue.keys.map((key) => `«${key}»`).join(', ')} — опечатка?` : issue.message
+    return `${issue.path.join('.') || '(корень)'}: ${message}`
+  })
 }
 
 export function parseBrowserPolicy(value: unknown): BrowserPolicy {

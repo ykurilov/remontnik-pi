@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { checkDanger, dangerInText, decideRequest, detectHumanCheck, isAllowedOrigin, isLoginOrigin, isAllowedFrameUrl, matchesMutation } from './index.js'
+import { checkDanger, dangerInText, decideRequest, detectHumanCheck, isAllowedOrigin, isLoginOrigin, isAllowedFrameUrl, matchesMutation, siteOf } from './index.js'
 
 const policy = {
   allowedOrigins: ['https://app.example.com', 'http://127.0.0.1:4100'],
@@ -74,8 +74,16 @@ describe('сетевой замок', () => {
     expect(decideRequest(request('GET', 'data:image/gif;base64,R0lGOD'), policy)).toEqual({ allow: true })
     expect(decideRequest(request('GET', 'https://app.example.com/app.js'), policy)).toEqual({ allow: true })
     expect(decideRequest(request('POST', 'https://app.example.com/login'), policy)).toEqual({ allow: true })
-    // Причина говорит владельцу, что вписать, если адрес нужен приложению.
-    expect(decideRequest(request('GET', 'https://cdn.example.com/x'), policy)).toMatchObject({ reason: expect.stringContaining('впишите https://cdn.example.com в extraOrigins') })
+    // Владельцу — сайт, что вписать в extraOrigins; в причине для модели адреса нет.
+    const pixel = decideRequest(request('GET', 'https://cdn.example.com/x'), policy)
+    expect(pixel).toMatchObject({ domain: 'example.com', reason: expect.stringContaining('extraOrigins') })
+    expect(JSON.stringify(pixel)).not.toContain('cdn.example.com')
+    expect(pixel).not.toHaveProperty('suspect')
+    // Запись и переход на другой сайт после входа — тоже без адреса; запись — подозрение на утечку.
+    expect(decideRequest(request('POST', 'https://tracker.example.com/collect'), policy)).toMatchObject({ code: 'refused_leak', domain: 'example.com', suspect: 'POST на другой сайт' })
+    const away = decideRequest({ ...request('GET', 'https://evil.example.com/p'), isNavigation: true, isMainFrame: true }, policy)
+    expect(away).toMatchObject({ code: 'refused_origin', domain: 'example.com' })
+    expect(JSON.stringify(away)).not.toContain('evil')
     // До входа сеанс открыт — подресурсы с других сайтов грузятся.
     expect(decideRequest({ ...request('GET', 'https://cdn.example.com/app.js'), sessionLocked: false }, policy)).toEqual({ allow: true })
     // extraOrigins — только подресурсы: изменения и переходы на них по-прежнему закрыты.
@@ -84,6 +92,23 @@ describe('сетевой замок', () => {
     expect(decideRequest(request('POST', 'https://cdn.example.com/upload'), withCdn)).toMatchObject({ allow: false, code: 'refused_mutation' })
     expect(decideRequest({ ...request('GET', 'https://cdn.example.com/'), isNavigation: true, isMainFrame: true }, withCdn)).toMatchObject({ allow: false, code: 'refused_origin' })
     expect(decideRequest({ ...request('GET', 'https://cdn.example.com/frame'), isNavigation: true }, withCdn)).toMatchObject({ allow: false, code: 'refused_frame' })
+  })
+
+  it('пароль в имени хоста не доходит до причины и сайта: поддомены и числовые адреса не показываются', () => {
+    const request = (url: string) => ({ method: 'GET', url, isNavigation: false, isMainFrame: false, sessionLocked: true })
+    const password = 'Hunter2-Secret'
+    const encoded = [password.toLowerCase(), Buffer.from(password).toString('hex'), Buffer.from(password).toString('base64url').toLowerCase()]
+    for (const label of encoded) {
+      const decision = decideRequest(request(`https://${label}.evil.test/p/${label}?q=${label}`), policy)
+      expect(decision).toMatchObject({ code: 'refused_leak', domain: 'evil.test' })
+      expect(JSON.stringify(decision)).not.toContain(label)
+    }
+    expect(siteOf('https://a.b.shop.example.com./x')).toBe('example.com')
+    expect(siteOf('https://hunter2.example.com:8443/')).toBe('example.com')
+    expect(siteOf('wss://ws.example.org/socket')).toBe('example.org')
+    expect(siteOf('http://10.1.2.3/')).toBe('числовой адрес')
+    expect(siteOf('http://[fd00::1]/')).toBe('числовой адрес')
+    expect(siteOf('не адрес')).toBe('адрес без сайта')
   })
 
   it('фрейм виден врачу, только если он и все его родители — с разрешённых сайтов', () => {

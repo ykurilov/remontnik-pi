@@ -5,7 +5,7 @@ import { existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type BrowserContext, type Page, chromium } from 'playwright-core'
 import { type EgressTarget, describeTarget, isAllowedTarget, startEgressProxy } from '../egress/index.js'
-import { type BlockedRequest, type NetworkGuard, installNetworkGuard, lockedReason } from '../guard/index.js'
+import { type BlockedRequest, LOCKED_HINT, LOCKED_REASON, type NetworkGuard, installNetworkGuard, siteOf } from '../guard/index.js'
 import { createBlockedJournal } from './blocked-journal.js'
 import { type BrowserPolicy, type BrowserProfileConfig, sessionOrigins } from '../policy/index.js'
 import type { ServiceLog } from '../log.js'
@@ -35,11 +35,9 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 }
  */
 const SESSION_LOCK_FILE = 'remontnik-session-locked'
 
-/** Origin для подсказки владельцу: у туннеля схемы не видно — 443 значит https, 80 — http. */
-function originHint(target: EgressTarget): string {
-  if (target.origin !== undefined) return target.origin
-  const host = target.host.includes(':') ? `[${target.host}]` : target.host
-  return target.port === 443 ? `https://${host}` : target.port === 80 ? `http://${host}` : `https://${host}:${target.port}`
+/** Адрес соединения для `siteOf` и проверки на пароль: у туннеля схемы не видно, но сайту она не нужна. */
+function targetUrl(target: EgressTarget): string {
+  return target.origin ?? `https://${target.host.includes(':') ? `[${target.host}]` : target.host}:${target.port}`
 }
 
 function proxyOf(profile: BrowserProfileConfig, env: NodeJS.ProcessEnv) {
@@ -60,17 +58,26 @@ export function createProfiles(options: {
   headless?: boolean
   /** Только для тестов: внутренние `ip:port` (IPv6 — в скобках), куда прокси службы всё же пускает. */
   reachableInternal?: readonly string[]
+  /** Есть ли в тексте сохранённый пароль (в любом виде, который знает фильтр службы): так отказ замка — попытка утечки. */
+  passwordIn?: (text: string) => boolean
 }): Profiles {
-  const { dataDir, policy, log, env = process.env, headless = true } = options
+  const { dataDir, policy, log, env = process.env, headless = true, passwordIn = () => false } = options
   const sessions = new Map<string, Promise<ProfileSession>>()
 
   async function launch(profile: BrowserProfileConfig): Promise<ProfileSession> {
     const proxy = proxyOf(profile, env)
     const blocked = createBlockedJournal(
-      (request) => log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason }),
+      (request) => {
+        const domain = request.domain ? { domain: request.domain, hint: LOCKED_HINT } : {}
+        log({ event: 'blocked', profile: profile.name, code: request.code, reason: request.reason, ...domain })
+        if (request.suspect) log({ event: 'leak_attempt', profile: profile.name, how: request.suspect, ...domain })
+      },
       () => log({ event: 'blocked_overflow', profile: profile.name }),
     )
-    const record = (request: BlockedRequest) => blocked.record(request)
+    // Счётчик после входа и попытка унести пароль закрываются одинаково, но в журнале различаются: запись или
+    // сокет на другой сайт и пароль в адресе — отдельное событие `leak_attempt`. Полный адрес дальше не идёт.
+    const record = ({ url, ...request }: BlockedRequest) =>
+      blocked.record(request.code === 'refused_leak' && !request.suspect && url !== undefined && passwordIn(url) ? { ...request, suspect: 'пароль в адресе' } : request)
     const userDataDir = join(dataDir, 'profiles', profile.name)
     const lockFile = join(userDataDir, SESSION_LOCK_FILE)
     const lockedBefore = existsSync(lockFile)
@@ -87,7 +94,7 @@ export function createProfiles(options: {
         record(
           reason === 'internal'
             ? { code: 'refused_internal', reason: `соединение с ${describeTarget(target)}: внутренний адрес вне allowedOrigins` }
-            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: ${lockedReason(originHint(target))}`, origin: originHint(target) },
+            : { code: 'refused_leak', reason: `соединение с другим сайтом: ${LOCKED_REASON}`, domain: siteOf(targetUrl(target)), url: targetUrl(target) },
         ),
       ...(proxy ? { upstream: proxy } : {}),
       ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
