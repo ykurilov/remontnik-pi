@@ -274,9 +274,11 @@ services:
 | `REMONTNIK_BROWSER_TOKEN` | ключ врача, не короче 16 знаков |
 | `REMONTNIK_BROWSER_VAULT_KEY` | ключ хранилища входов: 32 байта в base64. Есть только в контейнере браузера |
 | `REMONTNIK_BROWSER_DATA_DIR` | профили, входы, снимки экрана |
-| `REMONTNIK_BROWSER_POLICY` | путь к политике: `allowedOrigins`, `allowedMutations`, `profiles` |
+| `REMONTNIK_BROWSER_POLICY` | путь к политике: `allowedOrigins`, `extraOrigins`, `allowedMutations`, `profiles` |
 | `REMONTNIK_BROWSER_LISTEN` | адрес службы (`127.0.0.1:7700`) |
 | `REMONTNIK_BROWSER_LIVE_LISTEN`, `REMONTNIK_BROWSER_OWNER_TOKEN` | живой экран: адрес в частной сети и ключ владельца |
+
+`extraOrigins` в политике — сторонние адреса, с которых страницы приложения грузят картинки, скрипты и шрифты (CDN). После первого ввода пароля сеанс профиля заперт до конца, и всё, чего нет в `allowedOrigins` и `extraOrigins`, не грузится. Это точные origin без путей и масок, не внутренние адреса; переходы и фреймы на них закрыты. Отказ в журнале службы подсказывает, какой адрес вписать. Счётчики аналитики не вписывайте: туда мог бы уйти пароль. Формат проверяют служба при старте и `check-config`. Подробно — [packages/browser/README.md](../packages/browser/README.md).
 
 ## Консольные команды врача
 
@@ -285,7 +287,7 @@ services:
 | Команда | Что делает |
 |---|---|
 | `remontnik-doctor start` | служба врача; всё — из окружения |
-| `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы и правила GitHub до старта; код 1 — есть ошибки |
+| `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы, политику браузера и правила GitHub до старта; код 1 — есть ошибки |
 | `remontnik-doctor deploys stop` / `resume` | стоп-кран; `resume` — только секретом владельца |
 | `remontnik-doctor deploys confirm <версия>` | подтвердить версию брошенной выкатки; только секретом владельца |
 | `remontnik-doctor fingerprint <отпечаток> release` | снять «нужен человек» после отката; только секретом владельца |

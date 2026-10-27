@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран). `REMONTNIK_BROWSER_LISTEN?` — адрес службы, по умолчанию `127.0.0.1:7700`; «все адреса» — только явно (в образе), порт — только во внутреннюю сеть. Для консольных команд — `REMONTNIK_BROWSER_URL?` (по умолчанию `http://127.0.0.1:7700`).
+`REMONTNIK_BROWSER_TOKEN` (ключ врача), `REMONTNIK_BROWSER_VAULT_KEY` (32 байта, base64; есть только в этом контейнере), `REMONTNIK_BROWSER_DATA_DIR`, `REMONTNIK_BROWSER_POLICY` (путь к JSON с `allowedOrigins`, `extraOrigins?`, `allowedMutations`, профилями), `REMONTNIK_BROWSER_LIVE_LISTEN?`, `REMONTNIK_BROWSER_OWNER_TOKEN?` (живой экран). `REMONTNIK_BROWSER_LISTEN?` — адрес службы, по умолчанию `127.0.0.1:7700`; «все адреса» — только явно (в образе), порт — только во внутреннюю сеть. Для консольных команд — `REMONTNIK_BROWSER_URL?` (по умолчанию `http://127.0.0.1:7700`).
 
 ## HTTP `POST /v1/<команда>` с `Authorization: Bearer`
 
@@ -59,6 +59,8 @@
 - Нет команды выполнения своего кода на странице.
 - Сетевой замок: изменяющие запросы к сайтам приложения — только по `allowedMutations`; остальные блокируются и пишутся в журнал.
 - Переходы верхнего уровня и фреймов — только на `allowedOrigins`; фрейм чужого сайта скрыт из снимка и не принимает действий.
+- С первого вписанного пароля и до конца сеанса профиля, в том числе после перезапуска службы (метка в папке профиля), любые соединения вне `allowedOrigins` и `extraOrigins` закрыты (`refused_leak`). Отказ в журнале называет адрес и подсказывает вписать его в `extraOrigins`. Выключить этот режим нельзя.
+- `extraOrigins` — точные origin `https://` или `http://` без пути и масок, не внутренние адреса (петля, частные сети, имя без точки, `.local`, `.internal`); только подресурсы, без переходов, фреймов и изменяющих запросов. Формат проверяют служба при старте, `remontnik-browser check-policy [путь]` и `remontnik-doctor check-config` (через `docker exec` в контейнер браузера, имя — из `REMONTNIK_BROWSER_URL`).
 - Не ловится: `GET` с побочным действием и запросы под слишком широкий шаблон `allowedMutations`.
 - Фильтр выхода вырезает значения всех сохранённых паролей из любых ответов и журналов (в том числе в HTML, `%xx`, hex, base64); при сбое фильтра текст не выводится. От преобразований страницей не защищает. Пароль короче 8 знаков не сохраняется.
 - Куки живого экрана без `Secure`: только частный шифрованный канал или TLS за прокси. Подбор ключей ограничен по адресу клиента.

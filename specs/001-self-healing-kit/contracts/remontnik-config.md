@@ -116,7 +116,7 @@ export default defineRemontnikConfig({
   browser?: {
     enabled: boolean,
     profile: string,
-    allowedOrigins: string[],
+    allowedOrigins: string[],         // сторонние адреса страниц (CDN) — в extraOrigins политики браузера, не здесь
     allowedMutations: Array<{ method: string; pathPattern: string }>,
     pagesToCheck: Array<{ url: string; expectText?: string }>,
     loginEntryId?: number,

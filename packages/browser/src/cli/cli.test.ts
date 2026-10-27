@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -86,5 +86,21 @@ describe('консольная remontnik-browser', () => {
       { url: 'http://127.0.0.1:7700/v1/click', body: { profile: 'remontnik', ref: 'e5', danger: 'submit' }, authorization: 'Bearer doctor-test-0123' },
       { url: 'http://127.0.0.1:7700/v1/url', body: { profile: 'remontnik', url: 'https://app.example.com/chat' }, authorization: 'Bearer doctor-test-0123' },
     ])
+  })
+
+  it('check-policy проверяет файл настройки без запуска службы', async () => {
+    const { dataDir } = cliEnvironment()
+    const file = join(dataDir, 'browser-policy.json')
+    const policy = { allowedOrigins: ['https://app.example.com'], allowedMutations: [], profiles: [{ name: 'remontnik' }] }
+    writeFileSync(file, JSON.stringify({ ...policy, extraOrigins: ['https://cdn.example.net'] }))
+    expect(await run(['check-policy'], { REMONTNIK_BROWSER_POLICY: file })).toMatchObject({ code: 0, stdout: '{"ok":true,"problems":[]}\n' })
+
+    writeFileSync(file, JSON.stringify({ ...policy, extraOrigins: ['http://10.0.0.5', 'https://cdn.example.net/lib'] }))
+    const wrong = await run(['check-policy', file], {})
+    expect(wrong.code).toBe(1)
+    expect(JSON.parse(wrong.stdout).problems).toEqual([expect.stringMatching(/^extraOrigins\.0: внутренний адрес/), expect.stringMatching(/^extraOrigins\.1: ожидается origin/)])
+
+    writeFileSync(file, '{ не json')
+    expect(JSON.parse((await run(['check-policy', file], {})).stdout)).toMatchObject({ ok: false, problems: [expect.stringContaining('JSON')] })
   })
 })

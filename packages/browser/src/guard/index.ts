@@ -1,7 +1,7 @@
 // Замки браузера: опасные действия, разрешённые сайты, сетевой замок изменяющих запросов, признаки капчи и кодов.
 // Решения — чистые функции; установка на контекст Chromium — installNetworkGuard.
-import type { BrowserContext, CDPSession, Frame, Page, Route, WebSocketRoute } from 'playwright-core'
-import type { SitePolicy } from '../policy/index.js'
+import type { BrowserContext, Frame, Page, Route, WebSocketRoute } from 'playwright-core'
+import { type SitePolicy, sessionOrigins } from '../policy/index.js'
 
 export const DANGER_KINDS = ['none', 'submit', 'send', 'pay', 'delete', 'publish'] as const
 export type DangerKind = (typeof DANGER_KINDS)[number]
@@ -112,8 +112,8 @@ export interface RequestFacts {
   url: string
   isNavigation: boolean
   isMainFrame: boolean
-  /** На странице вписан пароль из хранилища: запросы на другие сайты закрыты, даже чтение. */
-  passwordOnPage?: boolean
+  /** В профиль уже вписывали пароль: запросы вне allowedOrigins и extraOrigins закрыты, даже чтение. */
+  sessionLocked?: boolean
 }
 
 export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak' | 'refused_internal'
@@ -122,6 +122,11 @@ export type RequestDecision = { allow: true } | { allow: false; code: BlockCode;
 export function describeRequest(method: string, url: string): string {
   const origin = originOf(url)
   return origin ? `${method.toUpperCase()} ${new URL(url).pathname}` : `${method.toUpperCase()} ${url.split(/[?#]/)[0]?.slice(0, 40)}`
+}
+
+/** Почему адрес закрыт после входа и что вписать владельцу, если адрес нужен приложению. */
+export function lockedReason(origin: string): string {
+  return `после входа паролем сеанс профиля заперт, адрес вне allowedOrigins и extraOrigins; нужен приложению — впишите ${origin} в extraOrigins настройки браузера`
 }
 
 export function decideRequest(request: RequestFacts, policy: SitePolicy): RequestDecision {
@@ -134,10 +139,11 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
     const where = originOf(request.url) ?? 'адрес без сайта'
     return { allow: false, code: 'refused_mutation', reason: `${describeRequest(request.method, request.url)} на ${where} вне allowedMutations` }
   }
-  // Скрипт страницы прочитал бы вписанный пароль и унёс его в адресе картинки или скрипта с другого сайта.
+  // Скрипт страницы прочитал бы вписанный пароль — из поля или из хранилища страницы, куда его спрятали раньше, —
+  // и унёс в адресе картинки или скрипта с другого сайта.
   const origin = originOf(request.url)
-  if (request.passwordOnPage && origin !== null && !policy.allowedOrigins.includes(origin)) {
-    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: на странице пароль, сайт вне allowedOrigins` }
+  if (request.sessionLocked && origin !== null && !sessionOrigins(policy).includes(origin)) {
+    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: ${lockedReason(origin)}` }
   }
   return { allow: true }
 }
@@ -149,12 +155,12 @@ export interface BlockedRequest {
 
 export interface NetworkGuard {
   /**
-   * На странице вписан пароль: запросы и WebSocket на сайты вне allowedOrigins закрыты во всём контексте, пока
-   * заперта хоть одна страница. Запираются все открытые страницы и окна, открытые позже: они могут прочитать пароль
-   * через `opener` или ссылку на окно.
+   * В профиль вписывается пароль: запросы и WebSocket вне allowedOrigins и extraOrigins закрыты во всём контексте
+   * до конца сеанса. Страница могла спрятать пароль в localStorage, IndexedDB, cookie или `window.name`, и унесёт его
+   * любая следующая страница или окно — поэтому замок не снимается ни новым документом, ни закрытием окон.
    */
-  passwordFilled(page: Page): void
-  /** Заперта ли сейчас хоть одна страница: по этому решает и прокси выхода службы. */
+  passwordFilled(): void
+  /** Заперт ли сеанс: по этому решает и прокси выхода службы. */
   isLocked(): boolean
 }
 
@@ -194,19 +200,18 @@ function sealNetworkChannels(): void {
   }
 }
 
-/** Ставит сетевой замок на весь контекст: действует и для врача, и при ручном управлении владельца. */
+/**
+ * Ставит сетевой замок на весь контекст: действует и для врача, и при ручном управлении владельца.
+ * `locked` — сеанс заперт с самого начала: пароль в профиль уже вписывали до перезапуска службы.
+ */
 export async function installNetworkGuard(
   context: BrowserContext,
   policy: SitePolicy,
   onBlocked: (blocked: BlockedRequest) => void,
+  options: { locked?: boolean } = {},
 ): Promise<NetworkGuard> {
-  /**
-   * Запертые страницы: в них вписан пароль или они жили рядом со страницей с паролем. Значение — номер загрузки
-   * (loaderId) документа верхнего фрейма, при котором страницу заперли; пока не известен — `undefined`.
-   */
-  const locked = new Map<Page, { loaderId: string | undefined }>()
-  // Замок — на весь контекст: окно того же сайта читает пароль у соседа и шлёт его само.
-  const passwordOn = () => locked.size > 0
+  let locked = options.locked === true
+  const origins = sessionOrigins(policy)
 
   await context.addInitScript(sealNetworkChannels)
 
@@ -220,7 +225,7 @@ export async function installNetworkGuard(
       isMainFrame = true
     }
     const decision = decideRequest(
-      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, passwordOnPage: passwordOn() },
+      { method: request.method(), url: request.url(), isNavigation: request.isNavigationRequest(), isMainFrame, sessionLocked: locked },
       policy,
     )
     if (decision.allow) return route.fallback()
@@ -238,62 +243,27 @@ export async function installNetworkGuard(
   const foreignSockets = new Set<WebSocketRoute>()
   const closeForeign = (socket: WebSocketRoute) => {
     foreignSockets.delete(socket)
-    onBlocked({ code: 'refused_leak', reason: `WebSocket на ${originOf(webSocketSite(socket.url())) ?? 'адрес без сайта'}: на странице пароль, сайт вне allowedOrigins` })
+    const origin = originOf(webSocketSite(socket.url()))
+    onBlocked({ code: 'refused_leak', reason: `WebSocket на ${origin ?? 'адрес без сайта'}: ${origin ? lockedReason(origin) : 'после входа паролем сеанс профиля заперт'}` })
     void socket.close({ code: 1008, reason: 'blocked' }).catch(() => {})
   }
   await context.routeWebSocket(/.*/, (socket: WebSocketRoute) => {
-    if (isAllowedOrigin(webSocketSite(socket.url()), policy.allowedOrigins)) {
+    if (isAllowedOrigin(webSocketSite(socket.url()), origins)) {
       socket.connectToServer()
       return
     }
     foreignSockets.add(socket)
     socket.onClose(() => foreignSockets.delete(socket))
-    if (locked.size > 0) return closeForeign(socket)
+    if (locked) return closeForeign(socket)
     socket.connectToServer()
   })
 
-  // Новый документ виден по номеру загрузки верхнего фрейма в Chromium: он меняется, только когда документ
-  // действительно сменился. Ответ 204, скачивание, window.stop(), history API и смена hash его не меняют — пароль
-  // остаётся в DOM, и замок держится. Номер — из событий самого Chromium, скрипт страницы на него не влияет.
-  const watched = new WeakSet<Page>()
-  const sessions = new WeakMap<Page, Promise<CDPSession | undefined>>()
-  const lock = (page: Page) => {
-    const state: { loaderId: string | undefined } = { loaderId: undefined }
-    locked.set(page, state)
-    if (!watched.has(page)) {
-      watched.add(page)
-      page.on('close', () => locked.delete(page))
-      sessions.set(page, watchDocuments(page))
-    }
-    // Номер документа, при котором заперли. Сменился раньше ответа — заперто при новом: держится дольше, не короче.
-    void sessions.get(page)!.then(async (session) => {
-      const tree = await session?.send('Page.getFrameTree').catch(() => undefined)
-      if (tree && locked.get(page) === state) state.loaderId = tree.frameTree.frame.loaderId
-    })
-  }
-  const watchDocuments = async (page: Page): Promise<CDPSession | undefined> => {
-    const session = await context.newCDPSession(page).catch(() => undefined)
-    if (!session) return undefined
-    session.on('Page.frameNavigated', ({ frame, type }) => {
-      const state = locked.get(page)
-      // Восстановление из кэша «назад» возвращает прежний документ — с паролем: замок не снимается.
-      if (frame.parentId || type !== 'Navigation' || !state?.loaderId || frame.loaderId === state.loaderId) return
-      // Новый документ снимает замок страницы, только если других запертых нет: иначе он живёт рядом с паролем.
-      if (locked.size === 1) locked.delete(page)
-      else state.loaderId = frame.loaderId
-    })
-    await session.send('Page.enable').catch(() => {})
-    return session
-  }
-  context.on('page', (page) => {
-    if (locked.size > 0) lock(page)
-  })
   return {
-    passwordFilled(page) {
-      for (const open of new Set([page, ...context.pages()])) lock(open)
+    passwordFilled() {
+      locked = true
       for (const socket of [...foreignSockets]) closeForeign(socket)
     },
-    isLocked: passwordOn,
+    isLocked: () => locked,
   }
 }
 

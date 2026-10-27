@@ -80,6 +80,8 @@ interface DockerScenario {
   errorText?: string
   /** Как у врача смонтирована папка состояния: по умолчанию — тем же путём, что на хосте. */
   stateMount?: 'same' | 'volume'
+  /** Контейнер службы браузера `remontnik-browser`: запущен ли и что отвечает `remontnik-browser check-policy`. */
+  browser?: { running: boolean; problems?: string[]; oldImage?: boolean }
 }
 
 const HEALTHY_DOCKER: DockerScenario = {
@@ -109,6 +111,14 @@ if (a[0] === 'version') out('27.3.1')
 if (a[0] === 'inspect' && a[2].includes('Mounts')) {
   const state = process.env.REMONTNIK_STATE_DIR
   out(JSON.stringify([{ Type: 'bind', Source: '/var/run/docker.sock', Destination: '/var/run/docker.sock' }, s.stateMount === 'volume' ? { Type: 'volume', Source: '/var/lib/docker/volumes/state/_data', Destination: state } : { Type: 'bind', Source: state, Destination: state }]))
+}
+if (a[0] === 'inspect' && a.at(-1) === 'remontnik-browser') { if (!s.browser) { process.stderr.write('No such object: remontnik-browser'); process.exit(1) } out(String(s.browser.running)) }
+if (a[0] === 'exec' && a[1] === 'remontnik-browser' && a[2] === 'remontnik-browser' && a[3] === 'check-policy') {
+  if (!s.browser || !s.browser.running) fail()
+  if (s.browser.oldImage) { process.stdout.write('remontnik-browser: нет команды check-policy\\n'); process.exit(2) }
+  const problems = s.browser.problems || []
+  process.stdout.write(JSON.stringify({ ok: problems.length === 0, problems }) + '\\n')
+  process.exit(problems.length === 0 ? 0 : 1)
 }
 if (a[0] === 'inspect') { const name = a.at(-1); if (name !== 'remontnik-doctor') { process.stderr.write('No such object: ' + name); process.exit(1) } out(JSON.stringify(Object.fromEntries(Object.entries(s.gatewayNetworks || {}).map(([n, ip]) => [n, { IPAddress: ip }])))) }
 if (a[0] === 'network' && a[1] === 'ls') {
@@ -426,6 +436,35 @@ describe('check-config: Docker и сети', () => {
     const problem = errors(findings).join('\n')
     expect(problem).toMatch(/REMONTNIK_CASE_SUBNETS.*office-vpn/)
     expect(formatFindings(findings, {})).not.toMatch(/10\.213\.128/)
+  })
+})
+
+describe('check-config: настройка службы браузера', () => {
+  const withBrowser = (repoDir: string) => serverEnv(repoDir, { REMONTNIK_BROWSER_URL: 'http://remontnik-browser:7700' })
+  const browserFindings = async (browser: DockerScenario['browser']) =>
+    (await checkDoctorConfig(withBrowser(appRepo()), { docker: fakeDocker({ ...HEALTHY_DOCKER, ...(browser ? { browser } : {}) }), gh: fakeGh(GOOD_RULESETS) })).filter(
+      (finding) => finding.area === 'браузер',
+    )
+
+  it('без службы браузера у врача проверки нет', async () => {
+    const findings = await checkDoctorConfig(serverEnv(appRepo()), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+    expect(findings.filter((finding) => finding.area === 'браузер')).toEqual([])
+  })
+
+  it('настройка верна — ok; неверна — ошибка на каждое поле с подсказкой', async () => {
+    expect(await browserFindings({ running: true })).toEqual([expect.objectContaining({ level: 'ok' })])
+    const wrong = await browserFindings({ running: true, problems: ['extraOrigins.0: внутренний адрес в extraOrigins не пускается', 'allowedOrigins: мало'] })
+    expect(wrong.map((finding) => [finding.level, finding.problem])).toEqual([
+      ['error', expect.stringContaining('extraOrigins.0: внутренний адрес')],
+      ['error', expect.stringContaining('allowedOrigins: мало')],
+    ])
+    expect(wrong[0]!.fix).toContain('browser-policy.json')
+  })
+
+  it('контейнер не запущен, не найден или со старым образом — предупреждение, не ошибка', async () => {
+    for (const browser of [{ running: false }, undefined, { running: true, oldImage: true }]) {
+      expect((await browserFindings(browser)).map((finding) => finding.level)).toEqual(['warning'])
+    }
   })
 })
 

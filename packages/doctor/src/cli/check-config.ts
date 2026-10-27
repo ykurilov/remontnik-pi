@@ -22,7 +22,7 @@ export const CHECK_CONFIG_USAGE = `  remontnik-doctor check-config        про
 
 export interface Finding {
   level: 'error' | 'warning' | 'ok'
-  area: 'настройка' | 'окружение' | 'службы' | 'docker' | 'сети' | 'github'
+  area: 'настройка' | 'окружение' | 'службы' | 'docker' | 'сети' | 'браузер' | 'github'
   problem: string
   /** Как исправить; у «ok» — пусто. */
   fix: string
@@ -266,6 +266,41 @@ async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
   return [...findings, ...networkFindings]
 }
 
+const BROWSER_POLICY_FIX = 'исправьте browser-policy.json (поля — packages/browser/README.md) и перезапустите службу браузера'
+
+/**
+ * Настройку браузера (browser-policy.json) видит только контейнер службы браузера: её проверяет сама служба
+ * командой `remontnik-browser check-policy`. Контейнер — по имени хоста из REMONTNIK_BROWSER_URL, как в compose.
+ */
+async function checkBrowserPolicy(env: DoctorEnv, docker: string): Promise<Finding[]> {
+  const url = value(env, 'REMONTNIK_BROWSER_URL')
+  if (!url) return []
+  let container: string
+  try {
+    container = new URL(url).hostname
+  } catch {
+    return [{ level: 'error', area: 'браузер', problem: 'REMONTNIK_BROWSER_URL — не адрес', fix: 'в compose он задан сам: http://<контейнер браузера>:7700' }]
+  }
+  const running = await run(docker, ['inspect', '--format', '{{.State.Running}}', container], env)
+  if (!running.ok) {
+    return [{ level: 'warning', area: 'браузер', problem: `контейнер службы браузера «${container}» не найден: настройку браузера проверить нельзя`, fix: 'запустите службу браузера (compose) или проверьте файл на её сервере: remontnik-browser check-policy <путь>' }]
+  }
+  if (running.stdout.trim() !== 'true') {
+    return [{ level: 'warning', area: 'браузер', problem: `контейнер службы браузера «${container}» не запущен`, fix: `причина — в docker logs ${container}; с неверной настройкой служба не стартует: ${BROWSER_POLICY_FIX}` }]
+  }
+  const checked = await run(docker, ['exec', container, 'remontnik-browser', 'check-policy'], env)
+  let problems: string[] | undefined
+  try {
+    const parsed = JSON.parse(checked.stdout) as { problems?: unknown }
+    if (Array.isArray(parsed.problems)) problems = parsed.problems.map(String)
+  } catch {}
+  if (!problems) {
+    return [{ level: 'warning', area: 'браузер', problem: 'служба браузера не умеет проверять настройку: образ старее врача', fix: 'обновите образ службы браузера до версии врача' }]
+  }
+  if (problems.length === 0) return [{ level: 'ok', area: 'браузер', problem: 'настройка службы браузера верна', fix: '' }]
+  return problems.map((problem) => ({ level: 'error', area: 'браузер', problem: `настройка браузера: ${problem}`, fix: BROWSER_POLICY_FIX }))
+}
+
 interface Ruleset {
   id: number
   target?: string
@@ -385,6 +420,7 @@ export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = 
     ...checkEnvironment(env, config),
     ...(config ? await checkServices(env, config) : []),
     ...(await checkDocker(env, deps.docker ?? 'docker')),
+    ...(await checkBrowserPolicy(env, deps.docker ?? 'docker')),
     ...(await checkGithub(env, deps.gh ?? 'gh', config)),
   ]
 }

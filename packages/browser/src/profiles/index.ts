@@ -1,12 +1,13 @@
 // Профили Ремонтника: у каждого своя постоянная папка Chromium на томе службы, одна рабочая вкладка
 // и сетевой замок на весь контекст. В сеть Chromium выходит только через свой прокси службы (egress): там замок
 // и держится. Прокси профиля, если задан, стоит за ним.
+import { existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type BrowserContext, type Page, chromium } from 'playwright-core'
-import { describeTarget, isAllowedTarget, startEgressProxy } from '../egress/index.js'
-import { type BlockedRequest, type NetworkGuard, installNetworkGuard } from '../guard/index.js'
+import { type EgressTarget, describeTarget, isAllowedTarget, startEgressProxy } from '../egress/index.js'
+import { type BlockedRequest, type NetworkGuard, installNetworkGuard, lockedReason } from '../guard/index.js'
 import { createBlockedJournal } from './blocked-journal.js'
-import type { BrowserPolicy, BrowserProfileConfig } from '../policy/index.js'
+import { type BrowserPolicy, type BrowserProfileConfig, sessionOrigins } from '../policy/index.js'
 import type { ServiceLog } from '../log.js'
 import { type SensitiveFields, createSensitiveFields } from '../snapshot/index.js'
 
@@ -17,7 +18,7 @@ export interface ProfileSession {
   readonly fields: SensitiveFields
   /** Заблокированные запросы с последнего вызова: действие по ним понимает, что его остановил замок. */
   takeBlocked(): BlockedRequest[]
-  /** Сейчас в рабочую вкладку впишется пароль: сетевой замок закрывает другие сайты до новой страницы. */
+  /** Сейчас в рабочую вкладку впишется пароль: сетевой замок закрывает другие сайты до конца сеанса профиля. */
   passwordFilled(): void
 }
 
@@ -28,6 +29,18 @@ export interface Profiles {
 }
 
 const DEFAULT_VIEWPORT = { width: 1280, height: 800 }
+/**
+ * Метка в папке профиля: пароль в профиль уже вписывали. Хранилище страниц (localStorage, IndexedDB, cookie)
+ * переживает перезапуск службы — значит, и замок тоже. Снимается только вместе с папкой профиля.
+ */
+const SESSION_LOCK_FILE = 'remontnik-session-locked'
+
+/** Origin для подсказки владельцу: у туннеля схемы не видно — 443 значит https, 80 — http. */
+function originHint(target: EgressTarget): string {
+  if (target.origin !== undefined) return target.origin
+  const host = target.host.includes(':') ? `[${target.host}]` : target.host
+  return target.port === 443 ? `https://${host}` : target.port === 80 ? `http://${host}` : `https://${host}:${target.port}`
+}
 
 function proxyOf(profile: BrowserProfileConfig, env: NodeJS.ProcessEnv) {
   if (!profile.proxy) return undefined
@@ -58,24 +71,28 @@ export function createProfiles(options: {
       () => log({ event: 'blocked_overflow', profile: profile.name }),
     )
     const record = (request: BlockedRequest) => blocked.record(request)
+    const userDataDir = join(dataDir, 'profiles', profile.name)
+    const lockFile = join(userDataDir, SESSION_LOCK_FILE)
+    const lockedBefore = existsSync(lockFile)
     let guard: NetworkGuard | undefined
-    // Пока замок закрыт, соединения — только с allowedOrigins, что бы ни открывал скрипт страницы: воркеры,
-    // SharedWorker, WebTransport, TURN по TCP, предварительные соединения. Постоянный запрет на весь сеанс —
-    // это `isLocked` всегда истинно и свой список адресов. Внутренние адреса (петля, частные сети, метаданные облака)
-    // закрыты всегда, кроме allowedOrigins.
+    const origins = sessionOrigins(policy)
+    // Пока сеанс заперт, соединения — только с allowedOrigins и extraOrigins, что бы ни открывал скрипт страницы:
+    // воркеры, SharedWorker, WebTransport, TURN по TCP, предварительные соединения. Внутренние адреса (петля,
+    // частные сети, метаданные облака) закрыты всегда, кроме allowedOrigins: адрес из extraOrigins проверяется
+    // по тому IP, который вернул DNS.
     const egress = await startEgressProxy({
-      allows: (target) => !guard?.isLocked() || isAllowedTarget(target, policy.allowedOrigins),
+      allows: (target) => !(guard ? guard.isLocked() : lockedBefore) || isAllowedTarget(target, origins),
       exempt: (target) => isAllowedTarget(target, policy.allowedOrigins),
       onRefused: (target, reason) =>
         record(
           reason === 'internal'
             ? { code: 'refused_internal', reason: `соединение с ${describeTarget(target)}: внутренний адрес вне allowedOrigins` }
-            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: на странице пароль, адрес вне allowedOrigins` },
+            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: ${lockedReason(originHint(target))}` },
         ),
       ...(proxy ? { upstream: proxy } : {}),
       ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
     })
-    const context = await chromium.launchPersistentContext(join(dataDir, 'profiles', profile.name), {
+    const context = await chromium.launchPersistentContext(userDataDir, {
       headless,
       viewport: profile.viewport ?? DEFAULT_VIEWPORT,
       locale: 'ru-RU',
@@ -97,7 +114,7 @@ export function createProfiles(options: {
       throw error
     })
     context.on('close', () => void egress.close())
-    guard = await installNetworkGuard(context, policy, record)
+    guard = await installNetworkGuard(context, policy, record, { locked: lockedBefore })
     const page = context.pages()[0] ?? (await context.newPage())
     // Рабочая вкладка одна: новые окна закрываются, чтобы ничего не шло мимо снимков и замков.
     context.on('page', (extra) => {
@@ -113,7 +130,9 @@ export function createProfiles(options: {
       fields: createSensitiveFields(),
       takeBlocked: () => blocked.take(),
       passwordFilled: () => {
-        guard!.passwordFilled(page)
+        // Сначала метка на диске: служба упадёт посреди ввода — после перезапуска сеанс всё равно заперт.
+        writeFileSync(lockFile, '')
+        guard!.passwordFilled()
         egress.dropRefused()
       },
     }

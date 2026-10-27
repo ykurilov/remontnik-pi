@@ -292,7 +292,7 @@ docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor depl
 Нужен, если врачу надо смотреть страницы приложения.
 
 1. Учётка Ремонтника в кабинете приложения — отдельная, с минимальными правами.
-2. Политика браузера (`browser-policy.json`): только сайты приложения в `allowedOrigins` и узкие `allowedMutations`.
+2. Политика браузера (`browser-policy.json`): только сайты приложения в `allowedOrigins` и узкие `allowedMutations`. Агент приложения при подключении составляет список `extraOrigins`: сторонние адреса, с которых страницы грузят картинки, скрипты и шрифты (CDN), без счётчиков аналитики. После входа паролем всё остальное не грузится.
 3. Ключи браузера (`REMONTNIK_BROWSER_TOKEN`, `REMONTNIK_BROWSER_VAULT_KEY`) — через `secret-handoff` в `REMONTNIK_BROWSER_ENV_FILE`.
 4. Запуск: `docker compose -f deploy/compose.remontnik.yml --profile browser up -d --build`.
 5. Вход сохраняет владелец в консоли сервера. Пароль — только через стандартный ввод, в аргументах и журналах его нет:

@@ -1,6 +1,8 @@
 // Консольная `remontnik-browser`: те же команды страницы, что у HTTP-службы, плюс управление входами,
 // которого по HTTP нет. Пароль — только из стандартного ввода (`--password-stdin`).
+import { readFileSync } from 'node:fs'
 import { BROWSER_COMMANDS } from '../actions/index.js'
+import { browserPolicyProblems } from '../policy/index.js'
 import { loginVaultPath, openLoginVault, parseVaultKey } from '../vault/index.js'
 
 export interface CliIo {
@@ -15,6 +17,7 @@ const USAGE = `remontnik-browser <команда> -p <профиль> [пара�
 
 Служба:
   serve                                   запустить службу (настройки из окружения)
+  check-policy [путь]                     проверить настройку браузера (по умолчанию REMONTNIK_BROWSER_POLICY)
 
 Страница (через службу, REMONTNIK_BROWSER_URL и REMONTNIK_BROWSER_TOKEN):
   open | read | back | shot | status -p <профиль>
@@ -98,6 +101,19 @@ async function logins(action: string | undefined, rest: string[], flags: Map<str
   }
 }
 
+/** Проверка файла настройки без запуска службы: её зовёт и `remontnik-doctor check-config`. */
+function checkPolicy(path: string | undefined, io: CliIo): number {
+  if (!path) throw new UsageError('нужен путь к настройке или REMONTNIK_BROWSER_POLICY')
+  let problems: string[]
+  try {
+    problems = browserPolicyProblems(JSON.parse(readFileSync(path, 'utf8')))
+  } catch (error) {
+    problems = [`файл не читается как JSON: ${(error as Error).message}`]
+  }
+  io.stdout(`${JSON.stringify({ ok: problems.length === 0, problems })}\n`)
+  return problems.length === 0 ? 0 : 1
+}
+
 function commandInput(command: string, rest: string[], flags: Map<string, string | true>): Record<string, unknown> {
   const profile = flags.get('profile')
   if (typeof profile !== 'string' || profile === '') throw new UsageError('профиль обязателен: -p <профиль>')
@@ -168,6 +184,7 @@ export async function runBrowserCli(argv: readonly string[], io: CliIo): Promise
       for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => void service.close().then(() => process.exit(0)))
       return await new Promise<number>(() => {})
     }
+    if (command === 'check-policy') return checkPolicy(rest[0] ?? io.env.REMONTNIK_BROWSER_POLICY, io)
     if (command === 'logins') {
       // Список входов есть и в службе; добавление и удаление — только здесь.
       return await logins(rest[0], rest.slice(1), flags, io)
