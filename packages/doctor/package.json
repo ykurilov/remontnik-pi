@@ -1,6 +1,6 @@
 {
   "name": "@ykurilov/remontnik-doctor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Ремонтник Pi: врач — служба на сервере приложения, принимает случаи и лечит их",
   "license": "MIT",
   "type": "module",

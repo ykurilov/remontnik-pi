@@ -1,6 +1,6 @@
 {
   "name": "@ykurilov/remontnik-browser",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Ремонтник Pi: свой браузер врача — снимки страниц, действия, сохранённые входы без утечки паролей, живой экран владельца",
   "license": "MIT",
   "type": "module",
