@@ -22,6 +22,17 @@ export const BROWSER_COMMANDS = ['open', 'url', 'back', 'read', 'click', 'type',
 export type BrowserCommand = (typeof BROWSER_COMMANDS)[number]
 
 const fail = (code: string, message: string): ActionResult => ({ ok: false, code, message })
+
+const LOCKED_SUMMARY_LIMIT = 10
+
+/** Закрытые адреса запертого сеанса — по одной строке на адрес: что вписать в extraOrigins, если нужно приложению. */
+export function lockedSummary(requests: readonly { origin?: string }[]): string[] {
+  const origins = [...new Set(requests.flatMap((request) => (request.origin ? [request.origin] : [])))]
+  const lines = origins.slice(0, LOCKED_SUMMARY_LIMIT).map((origin) => `${origin}: закрыт после входа паролем; нужен приложению — впишите в extraOrigins`)
+  if (origins.length > LOCKED_SUMMARY_LIMIT) lines.push(`ещё ${origins.length - LOCKED_SUMMARY_LIMIT} адресов закрыто`)
+  if (requests.some((request) => !request.origin)) lines.push('другие отказы — в журнале службы')
+  return lines
+}
 const REF = /^(?:f\d+)?e\d+$/
 const ACTION_TIMEOUT_MS = 5000
 const NAVIGATION_TIMEOUT_MS = 30_000
@@ -175,8 +186,12 @@ export function createBrowserActions(options: {
     return null
   }
 
-  /** Итог действия: снимок, а также отказ, если сработал замок, страница ушла с сайта или нужен человек. */
-  async function outcome(session: ProfileSession): Promise<ActionResult> {
+  /**
+   * Итог действия: снимок, а также отказ, если сработал замок, страница ушла с сайта или нужен человек.
+   * `passwordStep` — действие вписало пароль: попытка страницы унести его роняет действие. На остальных действиях
+   * закрытые подресурсы запертого сеанса (счётчик, CDN) действие не роняют — они в `blocked` результата.
+   */
+  async function outcome(session: ProfileSession, passwordStep = false): Promise<ActionResult> {
     await settle(session.page)
     const page = session.page
     if (page.url() !== 'about:blank' && !isAllowedOrigin(page.url(), policy.allowedOrigins)) {
@@ -189,12 +204,14 @@ export function createBrowserActions(options: {
     if (human.needsHuman) humanChecks.set(session.name, { reason: human.reason, releases: control.releases(session.name) })
     else humanChecks.delete(session.name)
     // Чужой фрейм и подресурс с внутреннего адреса просто не загружены — само действие на странице прошло.
-    const blocked = session.takeBlocked().filter((request) => request.code !== 'refused_frame' && request.code !== 'refused_internal')
+    const taken = session.takeBlocked().filter((request) => request.code !== 'refused_frame' && request.code !== 'refused_internal')
+    const locked = passwordStep ? [] : taken.filter((request) => request.code === 'refused_leak')
+    const blocked = taken.filter((request) => !locked.includes(request))
     if (blocked.length > 0) {
       return fail(blocked[0]!.code, `заблокировано замком: ${blocked.map((request) => request.reason).join('; ')}`)
     }
     if (human.needsHuman) return fail('needs_human', `${human.reason}: нужен человек, браузер остановился`)
-    return { ok: true, url: snapshot.url, title: snapshot.title, snapshot: snapshot.snapshot }
+    return { ok: true, url: snapshot.url, title: snapshot.title, snapshot: snapshot.snapshot, ...(locked.length > 0 ? { blocked: lockedSummary(locked) } : {}) }
   }
 
   async function shot(session: ProfileSession): Promise<ActionResult> {
@@ -234,7 +251,7 @@ export function createBrowserActions(options: {
     await session.fields.mark(handle, 'filled')
     session.passwordFilled()
     await handle.fill(password, { timeout: ACTION_TIMEOUT_MS })
-    return outcome(session)
+    return outcome(session, true)
   }
 
   async function pageCommand(command: BrowserCommand, session: ProfileSession, input: Record<string, unknown>): Promise<ActionResult> {

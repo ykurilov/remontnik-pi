@@ -365,6 +365,15 @@ describe('что видит модель', () => {
     expect(page.text).toContain('Вход: поле пароля ••••••')
   })
 
+  it('закрытые после входа подресурсы — не ошибка: модель видит страницу и подсказку про extraOrigins', async () => {
+    const hint = 'https://counter.example.net: закрыт после входа паролем; нужен приложению — впишите в extraOrigins'
+    const fake = fakeClient(() => ({ ...snapshotOf('Чат готов'), blocked: [hint, 42] }))
+    const answer = await run(depsWith(fake.client, configWith({})), await seededStore(), 'read')
+    expect(answer.isError).toBe(false)
+    expect(answer.text).toContain(`Закрыто замком (страница работает без них): ${hint}`)
+    expect(answer.text).not.toContain('42')
+  })
+
   it('опасное действие: отказ службы refused_danger доходит до модели как ошибка с причиной', async () => {
     const fake = fakeClient(() => ({ ok: false, code: 'refused_danger', message: 'оплата запрещена: кнопка «Оплатить тариф Про»' }))
     const store = await seededStore()
@@ -389,6 +398,14 @@ describe('проверка страниц после выкатки', () => {
     const text = withPageCheck({ short: 'Выкатил.', full: 'Выкатил.' }, check)
     expect(text.short).toContain('Страницы проверил в браузере')
     expect(text.screenshots).toEqual(['/data/shots/p-1.jpg', '/data/shots/p-2.jpg'])
+  })
+
+  it('страница работает, но подресурс закрыт замком — checked, подсказка в подробностях отчёта', async () => {
+    const hint = 'https://cdn.example.net: закрыт после входа паролем; нужен приложению — впишите в extraOrigins'
+    const fake = fakeClient((command) => (command === 'shot' ? { ok: false, code: 'timeout', message: 'нет' } : { ...snapshotOf('Чат готов'), blocked: [hint] }))
+    const check = await checkPages(fake.client, configWith({ pagesToCheck: [pages[0]!] }).browser)
+    expect(check).toMatchObject({ status: 'checked', pages: [{ ok: true, blocked: [hint] }] })
+    expect(withPageCheck({ short: 'Выкатил.', full: 'Выкатил.' }, check).full).toContain(`работает; закрыто замком: ${hint}`)
   })
 
   it('нужного текста нет — failed с адресом страницы', async () => {

@@ -87,7 +87,7 @@ export function createProfiles(options: {
         record(
           reason === 'internal'
             ? { code: 'refused_internal', reason: `соединение с ${describeTarget(target)}: внутренний адрес вне allowedOrigins` }
-            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: ${lockedReason(originHint(target))}` },
+            : { code: 'refused_leak', reason: `соединение с ${describeTarget(target)}: ${lockedReason(originHint(target))}`, origin: originHint(target) },
         ),
       ...(proxy ? { upstream: proxy } : {}),
       ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),

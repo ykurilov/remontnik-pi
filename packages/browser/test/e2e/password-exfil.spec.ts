@@ -104,8 +104,11 @@ test('пароль на странице не уходит на чужой са�
     await call('read')
     expect(stolen).toEqual([])
 
-    // Новая страница без пароля в DOM: сеанс заперт до конца, сторонняя картинка не грузится, причина — в журнале.
-    await call('url', { url: `${siteUrl}/cabinet` })
+    // Новая страница без пароля в DOM: сеанс заперт до конца, счётчик на чужом адресе не грузится. Действие
+    // проходит, в результате — подсказка, что вписать в extraOrigins; в журнале службы — причина отказа.
+    const cabinet = await call('url', { url: `${siteUrl}/cabinet` })
+    expect(cabinet).toMatchObject({ ok: true, title: 'Кабинет' })
+    expect(cabinet.blocked).toContain(`${foreignUrl}: закрыт после входа паролем; нужен приложению — впишите в extraOrigins`)
     await expect.poll(() => logs.some((line) => line.includes('/cabinet.gif') && line.includes('extraOrigins'))).toBe(true)
     expect(stolen).toEqual([])
     expect(innerHits).toEqual([])

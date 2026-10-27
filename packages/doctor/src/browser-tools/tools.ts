@@ -9,7 +9,7 @@ import { browserNeedsHumanReport, type ReportCase } from '../reports/texts.js'
 import { recordTransactionOver } from '../service/harness.js'
 import { TreatmentDoc } from '../treatment/doc.js'
 import { addCaseScreenshotIn, caseBrowserIn, type CaseBrowser } from './case-browser.js'
-import type { BrowserAnswer, BrowserClient } from './client.js'
+import { type BrowserAnswer, type BrowserClient, blockedOf } from './client.js'
 
 // Инструменты `browser_*` модели-врача: команды службы браузера (contracts/browser-api.md) от профиля из настройки.
 // Набор постоянный: инструменты есть всегда, а без браузера (нет в настройке, выключен, служба не отвечает) отвечают
@@ -84,9 +84,11 @@ function loginsOf(logins: unknown): unknown[] {
 function describeAnswer(answer: BrowserAnswer): BrowserToolAnswer {
   if (!answer.ok) return { isError: true, text: `${answer.code}: ${answer.message}` }
   const { url, title, snapshot, path, logins, state, reason } = answer
+  const blocked = blockedOf(answer)
   const lines = [
     ...(typeof url === 'string' ? [`Адрес: ${url}`] : []),
     ...(typeof title === 'string' ? [`Заголовок: ${title}`] : []),
+    ...(blocked.length > 0 ? [`Закрыто замком (страница работает без них): ${blocked.join('; ')}`] : []),
     ...(typeof path === 'string' ? [`Снимок экрана: ${path} (попадёт в отчёт)`] : []),
     ...(logins !== undefined ? [`Входы: ${JSON.stringify(loginsOf(logins))}`] : []),
     ...(typeof state === 'string' ? [`Состояние: ${state}`] : []),

@@ -1,6 +1,6 @@
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import type { ReportText } from '../reports/texts.js'
-import type { BrowserClient } from './client.js'
+import { type BrowserClient, blockedOf } from './client.js'
 
 // Проверка страниц после выкатки (`browser.pagesToCheck`): каждая открывается в браузере врача, на ней ищется
 // `expectText`, снимок экрана идёт в отчёт. Браузер выключен или служба не отвечает — отчёт помечен
@@ -12,7 +12,7 @@ export type PageCheckStatus = 'checked' | 'failed' | 'unavailable' | 'disabled'
 export interface PageCheck {
   status: PageCheckStatus
   /** `unchecked` — до страницы не дошли: служба браузера перестала отвечать. */
-  pages: { url: string; ok: boolean; problem?: string; unchecked?: true }[]
+  pages: { url: string; ok: boolean; problem?: string; unchecked?: true; blocked?: string[] }[]
   screenshots: string[]
   /** Почему проверки не было. */
   note?: string
@@ -44,7 +44,8 @@ export async function checkPages(
       : page.expectText !== undefined && !String(opened.snapshot ?? '').includes(page.expectText)
         ? `на странице нет текста «${page.expectText}»`
         : undefined
-    pages.push({ url: page.url, ok: problem === undefined, ...(problem ? { problem } : {}) })
+    const blocked = blockedOf(opened)
+    pages.push({ url: page.url, ok: problem === undefined, ...(problem ? { problem } : {}), ...(blocked.length > 0 ? { blocked } : {}) })
     signal?.throwIfAborted()
     const shot = await client.call('shot', { profile: browser.profile }, signal)
     if (shot.ok && typeof shot.path === 'string') screenshots.push(shot.path)
@@ -66,7 +67,9 @@ export function withPageCheck(text: ReportText, check: PageCheck | undefined): R
     lines.push(`${what} ${NO_BROWSER_CHECK} (${check.note ?? 'браузер недоступен'}).`)
   }
   const short = lines.join(' ')
-  const details = check.pages.map((page) => `- ${page.url}: ${page.ok ? 'работает' : page.unchecked ? 'не проверена' : page.problem}`)
+  const details = check.pages.map(
+    (page) => `- ${page.url}: ${page.ok ? 'работает' : page.unchecked ? 'не проверена' : page.problem}${page.blocked ? `; закрыто замком: ${page.blocked.join('; ')}` : ''}`,
+  )
   const screenshots = [...(text.screenshots ?? []), ...check.screenshots]
   return {
     ...text,

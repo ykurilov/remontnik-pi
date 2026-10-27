@@ -23,6 +23,7 @@ export interface BrowserResult {
   snapshot?: string
   path?: string
   state?: string
+  blocked?: string[]
   logins?: Array<{ id: number; site: string; login: string; profile: string }>
 }
 

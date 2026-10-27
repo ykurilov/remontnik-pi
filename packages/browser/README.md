@@ -56,6 +56,8 @@ remontnik-browser serve
 | `fill-password` | `{ profile, entryId, ref }` | снимок |
 | `status` | `{ profile }` | `{ ok, state: ready \| busy \| needs_human, reason? }` |
 
+После входа паролем сеанс заперт: подресурс вне `allowedOrigins` и `extraOrigins` (счётчик, CDN) не грузится, но действие не роняет. Снимок тогда приходит с `blocked` — по строке на закрытый адрес, одинаковые слиты, не больше 10: что вписать в `extraOrigins`, если адрес нужен приложению. Попытка страницы унести пароль на самом `fill-password` — отказ `refused_leak`.
+
 Отказ — `{ ok: false, code, message }`:
 
 | `code` | Когда |
@@ -63,6 +65,7 @@ remontnik-browser serve
 | `refused_origin` | сайт вне `allowedOrigins`; элемент во фрейме чужого сайта; вход из хранилища от другого сайта |
 | `refused_danger` | `danger` = `send`, `pay`, `delete`, `publish`, или цель сама похожа на опасное действие |
 | `refused_mutation` | изменяющий запрос вне `allowedMutations` (в `message` — метод и путь) |
+| `refused_leak` | `fill-password`: страница сразу пыталась унести пароль на адрес вне `allowedOrigins` и `extraOrigins` |
 | `refused_field` | `fill-password` не в поле пароля |
 | `refused_profile` | вход из хранилища от другого профиля |
 | `refused_human_control` | управление у владельца |

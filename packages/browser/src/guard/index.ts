@@ -117,7 +117,7 @@ export interface RequestFacts {
 }
 
 export type BlockCode = 'refused_origin' | 'refused_frame' | 'refused_mutation' | 'refused_leak' | 'refused_internal'
-export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string }
+export type RequestDecision = { allow: true } | { allow: false; code: BlockCode; reason: string; origin?: string }
 
 export function describeRequest(method: string, url: string): string {
   const origin = originOf(url)
@@ -143,7 +143,7 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
   // и унёс в адресе картинки или скрипта с другого сайта.
   const origin = originOf(request.url)
   if (request.sessionLocked && origin !== null && !sessionOrigins(policy).includes(origin)) {
-    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: ${lockedReason(origin)}` }
+    return { allow: false, code: 'refused_leak', reason: `${describeRequest(request.method, request.url)} на ${origin}: ${lockedReason(origin)}`, origin }
   }
   return { allow: true }
 }
@@ -151,6 +151,8 @@ export function decideRequest(request: RequestFacts, policy: SitePolicy): Reques
 export interface BlockedRequest {
   code: BlockCode
   reason: string
+  /** У отказа запертого сеанса — закрытый адрес: его владелец впишет в extraOrigins, если он нужен приложению. */
+  origin?: string
 }
 
 export interface NetworkGuard {
@@ -229,7 +231,7 @@ export async function installNetworkGuard(
       policy,
     )
     if (decision.allow) return route.fallback()
-    onBlocked({ code: decision.code, reason: decision.reason })
+    onBlocked({ code: decision.code, reason: decision.reason, ...(decision.origin ? { origin: decision.origin } : {}) })
     if (request.isNavigationRequest()) return route.abort('blockedbyclient')
     return route.fulfill({
       status: 403,
@@ -244,7 +246,11 @@ export async function installNetworkGuard(
   const closeForeign = (socket: WebSocketRoute) => {
     foreignSockets.delete(socket)
     const origin = originOf(webSocketSite(socket.url()))
-    onBlocked({ code: 'refused_leak', reason: `WebSocket на ${origin ?? 'адрес без сайта'}: ${origin ? lockedReason(origin) : 'после входа паролем сеанс профиля заперт'}` })
+    onBlocked({
+      code: 'refused_leak',
+      reason: `WebSocket на ${origin ?? 'адрес без сайта'}: ${origin ? lockedReason(origin) : 'после входа паролем сеанс профиля заперт'}`,
+      ...(origin ? { origin } : {}),
+    })
     void socket.close({ code: 1008, reason: 'blocked' }).catch(() => {})
   }
   await context.routeWebSocket(/.*/, (socket: WebSocketRoute) => {

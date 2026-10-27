@@ -3,6 +3,12 @@
 
 export type BrowserAnswer = { ok: true; [field: string]: unknown } | { ok: false; code: string; message: string }
 
+/** Подресурсы, которые замок браузера закрыл после входа: строки-подсказки, что вписать в extraOrigins. */
+export function blockedOf(answer: BrowserAnswer): string[] {
+  const blocked = answer.ok ? answer.blocked : undefined
+  return Array.isArray(blocked) ? blocked.filter((line): line is string => typeof line === 'string') : []
+}
+
 export interface BrowserClient {
   /** `signal` — врач закрывается: запрос обрывается сразу, а не по тайм-ауту, и вызов бросает причину отмены. */
   call(command: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<BrowserAnswer>
