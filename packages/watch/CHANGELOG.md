@@ -1,5 +1,11 @@
 # @ykurilov/remontnik-watch
 
+## 0.1.2
+
+### Patch Changes
+
+- @ykurilov/remontnik-core@0.1.2
+
 ## 0.1.1
 
 ### Patch Changes
