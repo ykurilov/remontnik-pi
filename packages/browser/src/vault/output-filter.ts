@@ -34,7 +34,27 @@ function exactVariants(password: string): string[] {
   ]
 }
 
-/** Виды, где регистр букв не важен: %xx-кодирование и hex. */
+const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567'
+
+function base32(bytes: Buffer): string {
+  let bits = 0
+  let value = 0
+  let output = ''
+  for (const byte of bytes) {
+    value = (value << 8) | byte
+    bits += 8
+    while (bits >= 5) {
+      output += BASE32[(value >>> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  return bits > 0 ? output + BASE32[(value << (5 - bits)) & 31] : output
+}
+
+/**
+ * Виды, где регистр букв не важен: %xx-кодирование и hex. И виды из имени хоста: браузер переводит его в строчные
+ * буквы, поэтому base64 там сравнивается без регистра, а base32 — обычная запись в DNS.
+ */
 function caseFreeVariants(password: string): string[] {
   const bytes = Buffer.from(password)
   return [
@@ -42,6 +62,8 @@ function caseFreeVariants(password: string): string[] {
     [...bytes].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join(''),
     bytes.toString('hex'),
     escapeHtml(password, HEXADECIMAL),
+    bytes.toString('base64url'),
+    base32(bytes),
   ]
 }
 

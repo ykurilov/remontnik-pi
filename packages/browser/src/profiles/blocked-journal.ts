@@ -16,7 +16,7 @@ export function createBlockedJournal(onFirst: (request: BlockedRequest) => void,
   let dropped = 0
   return {
     record(request) {
-      const key = `${request.code}\n${request.reason}`
+      const key = `${request.code}\n${request.reason}\n${request.domain ?? ''}\n${request.suspect ?? ''}`
       const entry = entries.get(key)
       if (entry) {
         entry.count += 1

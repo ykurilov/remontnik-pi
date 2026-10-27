@@ -46,6 +46,7 @@ export async function startBrowserService(options: BrowserServiceOptions): Promi
     log,
     ...(options.env ? { env: options.env } : {}),
     ...(options.reachableInternal ? { reachableInternal: options.reachableInternal } : {}),
+    passwordIn: (text) => filter.text(text) !== text,
   })
   const runner = createBrowserActions({ profiles, vault, policy: options.policy, shotsDir: join(options.dataDir, 'shots'), control, log })
 
