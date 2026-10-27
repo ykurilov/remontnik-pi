@@ -102,9 +102,12 @@ function pathPatternToRegExp(pattern: string): RegExp {
 
 export function matchesMutation(method: string, url: string, policy: SitePolicy): boolean {
   if (!isMutatingMethod(method) || !isAllowedOrigin(url, policy.allowedOrigins)) return false
-  const { pathname } = new URL(url)
+  const { origin, pathname } = new URL(url)
   return policy.allowedMutations.some(
-    (rule) => (rule.method === '*' || rule.method.toUpperCase() === method.toUpperCase()) && pathPatternToRegExp(rule.pathPattern).test(pathname),
+    (rule) =>
+      (rule.origin === undefined || rule.origin === origin) &&
+      (rule.method === '*' || rule.method.toUpperCase() === method.toUpperCase()) &&
+      pathPatternToRegExp(rule.pathPattern).test(pathname),
   )
 }
 

@@ -152,10 +152,17 @@ const browserSchema = z.strictObject({
   enabled: z.boolean(),
   profile: z.string().min(1),
   allowedOrigins: z.array(z.url()),
-  allowedMutations: z.array(z.strictObject({ method: z.string().min(1), pathPattern: z.string().min(1) })),
+  /** `origin` — точный сайт из allowedOrigins: правило действует только на нём. Без поля — на всех allowedOrigins. */
+  allowedMutations: z.array(z.strictObject({ method: z.string().min(1), pathPattern: z.string().min(1), origin: z.string().optional() })),
   pagesToCheck: z.array(z.strictObject({ url: z.url(), expectText: z.string().optional() })),
   loginEntryId: positiveInt.optional(),
   live: z.strictObject({ enabled: z.boolean(), linkEnv: envName }).optional(),
+}).superRefine((browser, context) => {
+  browser.allowedMutations.forEach((rule, index) => {
+    if (rule.origin !== undefined && !browser.allowedOrigins.includes(rule.origin)) {
+      context.addIssue({ code: 'custom', path: ['allowedMutations', index, 'origin'], message: 'origin правила — только сайт из allowedOrigins' })
+    }
+  })
 })
 
 export const remontnikConfigSchema = z.strictObject({

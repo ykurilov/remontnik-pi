@@ -225,7 +225,7 @@ services:
 | `enabled` | включён ли |
 | `profile` | профиль браузера |
 | `allowedOrigins` | куда можно ходить; в примерах — только `https://app.example.com` |
-| `allowedMutations` | какие изменяющие запросы пропускать: `{ method, pathPattern }`; `*` — кусок пути, `**` — остаток. Держите узкими |
+| `allowedMutations` | какие изменяющие запросы пропускать: `{ method, pathPattern, origin? }`; `*` — кусок пути, `**` — остаток. `origin` — точный сайт из `allowedOrigins`: правило действует только на нём, без поля — на всех сайтах из `allowedOrigins`. `origin` вне `allowedOrigins` — ошибка. Держите узкими |
 | `pagesToCheck` | страницы для проверки после правки: `{ url, expectText? }` |
 | `loginEntryId?` | номер сохранённого входа (`logins list`) |
 | `live?` | живой экран владельца: `{ enabled, linkEnv }`, `linkEnv` — имя переменной с его адресом в частной сети |
@@ -251,7 +251,7 @@ services:
 | `REMONTNIK_SHARED_SECRET` | да | общий секрет сторожа и врача |
 | `REMONTNIK_CONTROL_SECRET` | желательно | секрет владельца: снова пускает выкатки, подтверждает версию брошенной выкатки, снимает «нужен человек». Совпадает с общим — врач не стартует |
 | `REMONTNIK_GATEWAY_CONTAINER` | да | имя контейнера врача: он подключает себя к сетям случая и берёт у себя образ для чтения настройки |
-| `REMONTNIK_LISTEN_NETWORK` | да* | сеть Docker приложения: врач слушает приём событий только на своём адресе в ней |
+| `REMONTNIK_LISTEN_NETWORK` | да* | сеть Docker приложения: врач слушает приём событий только на своём адресе в ней. У приложения в сети сервера — сеть приёма, которую создаёт добавка `compose.remontnik.host-app.yml` |
 | `REMONTNIK_LISTEN` | да* | вместо сети — явный адрес `host:port`; все адреса (`0.0.0.0`, `::`) — отказ |
 | `REMONTNIK_LISTEN_PORT` | нет | порт приёма (7800) |
 | `REMONTNIK_CASE_SUBNETS` | нет | пул подсетей сетей случая (`10.213.0.0/16`); не должен пересекаться с сетями сервера |
@@ -266,11 +266,13 @@ services:
 | переменные из `handoff.paseo.*Env` | да, при `"paseo-first"` | адрес моста, секрет моста, адрес приёма |
 | `REMONTNIK_REPORTS_TOKEN` | нет | забор отчётов `reports pull` без моста |
 | `REMONTNIK_BROWSER_URL`, `REMONTNIK_BROWSER_TOKEN` | при браузере | адрес и ключ браузера врача |
-| `REMONTNIK_DOCTOR_URL` | для команд | адрес врача для консольных команд (`deploys`, `reports`, `fingerprint`). В контейнере врача шаблон compose задаёт его сам: `http://remontnik-doctor-app:7800` — имя врача только в сети приложения |
+| `REMONTNIK_DOCTOR_URL` | для команд | адрес врача для консольных команд (`deploys`, `reports`, `fingerprint`). В контейнере врача шаблон compose задаёт его сам: `http://remontnik-doctor-app:7800` — имя врача только в сети приложения. У сторожа приложения — тоже `REMONTNIK_DOCTOR_URL`: `http://<имя контейнера врача>:7800`, а у приложения в сети сервера — `http://127.0.0.1:<REMONTNIK_HOST_PORT>` |
 
 \* Одна из двух.
 
 Переменные compose (не секреты, в `.env` рядом с шаблоном): `REMONTNIK_APP_DIR`, `REMONTNIK_STATE_DIR`, `REMONTNIK_ENV_FILE`, `REMONTNIK_APP_NETWORK`, `DOCKER_GID`, `REMONTNIK_UID`, `REMONTNIK_GID`, `REMONTNIK_DOCTOR_MEMORY` (2g), `REMONTNIK_CASE_SUBNETS`, `REMONTNIK_IMAGE_TAG`; для браузера — `REMONTNIK_BROWSER_ENV_FILE`, `REMONTNIK_BROWSER_POLICY`.
+
+**Приложение в сети сервера** (`network_mode: host`) — добавка [`deploy/compose.remontnik.host-app.yml`](../deploy/compose.remontnik.host-app.yml) вторым `-f`. Тогда `REMONTNIK_APP_NETWORK` — сеть приёма: её создаёт сам Ремонтник, в ней только врач. Приём опубликован только на `127.0.0.1:<REMONTNIK_HOST_PORT>` сервера (по умолчанию 7800). Нужен Docker 28 или новее. `check-config` проверяет, что порт опубликован только на `127.0.0.1` и у сети приёма самый высокий `gw_priority`: иначе Docker ведёт порт в другую сеть врача.
 
 ## Окружение браузера
 

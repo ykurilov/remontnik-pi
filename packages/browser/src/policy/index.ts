@@ -53,8 +53,16 @@ export const browserPolicySchema = z.strictObject({
    * и подресурсы с других сайтов не грузятся. Это только подресурсы: переходы и фреймы — по-прежнему allowedOrigins.
    */
   extraOrigins: z.array(externalOrigin).optional(),
-  allowedMutations: z.array(z.strictObject({ method: z.string().min(1), pathPattern: z.string().startsWith('/') })),
+  /** `origin` — точный сайт из allowedOrigins: правило действует только на нём. Без поля — на всех allowedOrigins. */
+  allowedMutations: z.array(z.strictObject({ method: z.string().min(1), pathPattern: z.string().startsWith('/'), origin: origin.optional() })),
   profiles: z.array(profileSchema).min(1),
+}).superRefine((policy, context) => {
+  policy.allowedMutations.forEach((rule, index) => {
+    // Неверный по форме origin уже отмечен проверкой поля: второе сообщение о том же не нужно.
+    if (rule.origin !== undefined && origin.safeParse(rule.origin).success && !policy.allowedOrigins.includes(rule.origin)) {
+      context.addIssue({ code: 'custom', path: ['allowedMutations', index, 'origin'], message: 'origin правила — только сайт из allowedOrigins' })
+    }
+  })
 })
 
 export type BrowserPolicy = z.infer<typeof browserPolicySchema>

@@ -219,7 +219,7 @@ handed_off | paseo_working → reclaimed → triage    (срок вышел, «�
 
 ### BrowserPolicy (из настройки приложения)
 
-`{ allowedOrigins: string[], allowedMutations: { method, pathPattern }[], pagesToCheck: { url, expectText? }[] }`.
+`{ allowedOrigins: string[], allowedMutations: { method, pathPattern, origin? }[], pagesToCheck: { url, expectText? }[] }`.
 
 ### ActionResult
 

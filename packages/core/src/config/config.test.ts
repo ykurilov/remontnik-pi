@@ -184,6 +184,25 @@ describe('defineRemontnikConfig', () => {
     expect(config.evalScope[0]?.scenarios).toBe('all')
   })
 
+  it('browser.allowedMutations: origin — только сайт из allowedOrigins', () => {
+    const browser = (origin: string) => ({
+      enabled: true,
+      profile: 'patient',
+      allowedOrigins: ['https://app.example.com', 'https://auth.example.net'],
+      allowedMutations: [{ method: 'POST', pathPattern: '/login', origin }, { method: 'POST', pathPattern: '/api/chat' }],
+      pagesToCheck: [],
+    })
+    const good = minimalConfig()
+    good.browser = browser('https://auth.example.net')
+    expect(defineRemontnikConfig(good).browser?.allowedMutations[0]).toEqual({ method: 'POST', pathPattern: '/login', origin: 'https://auth.example.net' })
+
+    for (const bad of ['https://other.example.org', 'https://auth.example.net/']) {
+      const input = minimalConfig()
+      input.browser = browser(bad)
+      expect(errorOf(() => defineRemontnikConfig(input)).issues, bad).toEqual([expect.stringMatching(/^browser\.allowedMutations\.0\.origin/)])
+    }
+  })
+
   it.each(['schema', 'money', 'access'] as const)('отклоняет пустой forbidden.%s', (zone) => {
     const input = minimalConfig()
     input.forbidden[zone] = []

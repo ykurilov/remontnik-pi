@@ -7,7 +7,9 @@
 #   REMONTNIK_APP_DIR      рабочая копия основной ветки приложения на сервере (абсолютный путь)
 #   REMONTNIK_STATE_DIR    состояние врача: хранилище, копии случаев, HOME копий (абсолютный путь)
 #   REMONTNIK_ENV_FILE     файл окружения врача с секретами (вне репозитория, права 0600)
-#   REMONTNIK_APP_NETWORK  сеть Docker приложения: в ней сторож шлёт события врачу (http://remontnik-doctor:7800)
+#   REMONTNIK_APP_NETWORK  сеть Docker приложения: в ней сторож шлёт события врачу (http://remontnik-doctor:7800).
+#                          Приложение в сети сервера (network_mode: host) к ней не подключить: для него добавка
+#                          compose.remontnik.host-app.yml, приём на 127.0.0.1 сервера
 #   DOCKER_GID             группа сокета Docker на сервере: stat -c %g /var/run/docker.sock
 #   REMONTNIK_UID/GID      владелец папок выше (по умолчанию 10001)
 #   REMONTNIK_DOCTOR_MEMORY предел памяти врача (по умолчанию 2g): зеркало реестра и прокси eval держат ответы в ней
@@ -86,7 +88,7 @@ services:
     networks:
       outside: {}
       app:
-        aliases: [${REMONTNIK_DOCTOR_ALIAS:-remontnik-doctor-app}]
+        aliases: ["${REMONTNIK_DOCTOR_ALIAS:-remontnik-doctor-app}"]
 
   # По желанию: docker compose --profile browser up -d. Адрес для врача — http://remontnik-browser:7700,
   # порт наружу не публикуется. Ключи браузера — в своём файле окружения (REMONTNIK_BROWSER_ENV_FILE).
