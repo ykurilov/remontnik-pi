@@ -47,3 +47,18 @@ describe('настройка браузера: extraOrigins', () => {
     ])
   })
 })
+
+describe('настройка браузера: origin у allowedMutations', () => {
+  const twoSites = { ...base, allowedOrigins: ['https://app.example.com', 'https://auth.example.net'] }
+
+  it('принимает правило без origin и с origin из allowedOrigins', () => {
+    const policy = parseBrowserPolicy({ ...twoSites, allowedMutations: [{ method: 'POST', pathPattern: '/login', origin: 'https://auth.example.net' }, { method: 'POST', pathPattern: '/api/chat' }] })
+    expect(policy.allowedMutations).toEqual([{ method: 'POST', pathPattern: '/login', origin: 'https://auth.example.net' }, { method: 'POST', pathPattern: '/api/chat' }])
+  })
+
+  it('отклоняет origin вне allowedOrigins и не точный origin', () => {
+    for (const bad of ['https://other.example.org', 'https://auth.example.net/', 'https://auth.example.net/login', 'http://auth.example.net']) {
+      expect(browserPolicyProblems({ ...twoSites, allowedMutations: [{ method: 'POST', pathPattern: '/login', origin: bad }] }), bad).toEqual([expect.stringMatching(/^allowedMutations\.0\.origin: /)])
+    }
+  })
+})

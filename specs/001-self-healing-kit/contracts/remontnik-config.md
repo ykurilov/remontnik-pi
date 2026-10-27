@@ -119,7 +119,7 @@ export default defineRemontnikConfig({
     enabled: boolean,
     profile: string,
     allowedOrigins: string[],         // сторонние адреса страниц (CDN) — в extraOrigins политики браузера, не здесь
-    allowedMutations: Array<{ method: string; pathPattern: string }>,
+    allowedMutations: Array<{ method: string; pathPattern: string; origin?: string }>, // origin — сайт из allowedOrigins
     pagesToCheck: Array<{ url: string; expectText?: string }>,
     loginEntryId?: number,
     live?: {                          // живой экран, R12; только при частной сети

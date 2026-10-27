@@ -51,6 +51,23 @@ describe('сетевой замок', () => {
     expect(matchesMutation('POST', 'https://evil.example.com/login', policy)).toBe(false)
   })
 
+  it('правило с origin действует только на свой сайт: вход через сервис авторизации', () => {
+    const withAuth = {
+      allowedOrigins: ['https://app.example.com', 'https://auth.example.net'],
+      allowedMutations: [
+        { method: 'POST', pathPattern: '/login', origin: 'https://auth.example.net' },
+        { method: 'POST', pathPattern: '/api/chat' },
+      ],
+    }
+    expect(matchesMutation('POST', 'https://auth.example.net/login', withAuth)).toBe(true)
+    expect(matchesMutation('POST', 'https://app.example.com/login', withAuth)).toBe(false)
+    expect(matchesMutation('POST', 'https://auth.example.net/api/chat', withAuth)).toBe(true)
+    expect(matchesMutation('POST', 'https://app.example.com/api/chat', withAuth)).toBe(true)
+    const request = { method: 'POST', url: 'https://app.example.com/login', isNavigation: true, isMainFrame: true }
+    expect(decideRequest(request, withAuth)).toMatchObject({ allow: false, code: 'refused_mutation' })
+    expect(decideRequest({ ...request, url: 'https://auth.example.net/login' }, withAuth)).toEqual({ allow: true })
+  })
+
   it('пропускает чтение, режет изменения вне списка и переходы на чужие сайты', () => {
     const request = (method: string, url: string, navigation = false) => ({ method, url, isNavigation: navigation, isMainFrame: navigation })
     expect(decideRequest(request('GET', 'https://app.example.com/cabinet', true), policy)).toEqual({ allow: true })

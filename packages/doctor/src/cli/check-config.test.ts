@@ -73,6 +73,10 @@ interface DockerScenario {
   down?: boolean
   /** Сети, к которым подключён контейнер врача. */
   gatewayNetworks?: Record<string, string>
+  /** gw_priority врача в его сетях: по умолчанию 0. */
+  gwPriority?: Record<string, number>
+  /** Опубликованные порты врача (`HostConfig.PortBindings`): у приложения в сети хоста. */
+  portBindings?: Record<string, { HostIp: string; HostPort: string }[]>
   /** Сети случая: закрыта ли и без адреса моста. */
   caseNetworks?: { id: string; internal: boolean; inhibit: boolean }[]
   /** Все сети Docker с подсетями. */
@@ -113,6 +117,7 @@ if (a[0] === 'inspect' && a[2].includes('Mounts')) {
   const state = process.env.REMONTNIK_STATE_DIR
   out(JSON.stringify([{ Type: 'bind', Source: '/var/run/docker.sock', Destination: '/var/run/docker.sock' }, s.stateMount === 'volume' ? { Type: 'volume', Source: '/var/lib/docker/volumes/state/_data', Destination: state } : { Type: 'bind', Source: state, Destination: state }]))
 }
+if (a[0] === 'inspect' && a[2].includes('PortBindings')) out(JSON.stringify(s.portBindings || {}))
 if (a[0] === 'inspect' && a.at(-1) === 'remontnik-browser') { if (!s.browser) { process.stderr.write('No such object: remontnik-browser'); process.exit(1) } out(String(s.browser.running)) }
 if (a[0] === 'exec' && a[1] === 'remontnik-browser' && a[2] === 'remontnik-browser' && a[3] === 'check-policy') {
   if (!s.browser || !s.browser.running) fail()
@@ -122,7 +127,7 @@ if (a[0] === 'exec' && a[1] === 'remontnik-browser' && a[2] === 'remontnik-brows
   process.stdout.write(JSON.stringify({ ok: problems.length === 0, problems }) + '\\n')
   process.exit(problems.length === 0 ? 0 : 1)
 }
-if (a[0] === 'inspect') { const name = a.at(-1); if (name !== 'remontnik-doctor') { process.stderr.write('No such object: ' + name); process.exit(1) } out(JSON.stringify(Object.fromEntries(Object.entries(s.gatewayNetworks || {}).map(([n, ip]) => [n, { IPAddress: ip }])))) }
+if (a[0] === 'inspect') { const name = a.at(-1); if (name !== 'remontnik-doctor') { process.stderr.write('No such object: ' + name); process.exit(1) } out(JSON.stringify(Object.fromEntries(Object.entries(s.gatewayNetworks || {}).map(([n, ip]) => [n, { IPAddress: ip, GwPriority: (s.gwPriority || {})[n] || 0 }])))) }
 if (a[0] === 'network' && a[1] === 'ls') {
   if (a.includes('label=remontnik.case-network')) out((s.caseNetworks || []).map((n) => n.id).join('\\n'))
   out((s.networks || []).map((n) => n.name).join('\\n'))
@@ -368,6 +373,17 @@ describe('check-config: настройка', () => {
     expect(errors(findings).join('\n')).toContain('REMONTNIK_CONFIG_REPO_DIR')
   })
 
+  it('origin у allowedMutations вне allowedOrigins — ошибка настройки', async () => {
+    const config = testRemontnikConfig()
+    const raw = {
+      ...config,
+      forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access },
+      browser: { enabled: true, profile: 'remontnik', allowedOrigins: ['https://app.example.com'], allowedMutations: [{ method: 'POST', pathPattern: '/login', origin: 'https://auth.example.net' }], pagesToCheck: [] },
+    }
+    const findings = await checkDoctorConfig(serverEnv(appRepo({ config: raw })), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+    expect(errors(findings).join('\n')).toMatch(/browser\.allowedMutations\.0\.origin/)
+  })
+
   it('настройка с ошибками — каждое поле отдельно', async () => {
     const repoDir = appRepo({ config: { app: { name: 'demo' } } })
     const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
@@ -488,6 +504,35 @@ describe('check-config: Docker и сети', () => {
   it('контейнера врача нет в сети приложения — ошибка', async () => {
     const findings = await checkDoctorConfig(serverEnv(appRepo()), { docker: fakeDocker({ ...HEALTHY_DOCKER, gatewayNetworks: { bridge: '172.17.0.2' } }), gh: fakeGh(GOOD_RULESETS) })
     expect(errors(findings).join('\n')).toMatch(/remontnik-app/)
+  })
+
+  describe('приложение в сети хоста: приём на 127.0.0.1 сервера', () => {
+    const hostApp: DockerScenario = {
+      ...HEALTHY_DOCKER,
+      gatewayNetworks: { 'remontnik-app': '10.5.0.3', 'remontnik-outside': '10.6.0.2' },
+      gwPriority: { 'remontnik-app': 1 },
+      portBindings: { '7800/tcp': [{ HostIp: '127.0.0.1', HostPort: '7800' }] },
+    }
+    const dockerErrors = async (scenario: DockerScenario) =>
+      (await checkDoctorConfig(serverEnv(appRepo()), { docker: fakeDocker(scenario), gh: fakeGh(GOOD_RULESETS) })).filter((finding) => finding.level === 'error' && finding.area === 'docker')
+
+    it('порт на 127.0.0.1 и сеть приёма с высшим gw_priority — ошибок нет', async () => {
+      expect(await dockerErrors(hostApp)).toEqual([])
+    })
+
+    it('порт опубликован не только на 127.0.0.1 — ошибка', async () => {
+      for (const HostIp of ['', '0.0.0.0', '::', '10.0.0.5']) {
+        const found = await dockerErrors({ ...hostApp, portBindings: { '7800/tcp': [{ HostIp: '127.0.0.1', HostPort: '7800' }, { HostIp, HostPort: '7801' }] } })
+        expect(found.map((finding) => finding.problem).join('\n')).toMatch(/127\.0\.0\.1/)
+      }
+    })
+
+    it('у сети приёма gw_priority не выше остальных — ошибка: порт ведёт не туда, где слушает врач', async () => {
+      for (const gwPriority of [{}, { 'remontnik-app': 1, 'remontnik-outside': 1 }, { 'remontnik-outside': 2, 'remontnik-app': 1 }]) {
+        const found = await dockerErrors({ ...hostApp, gwPriority })
+        expect(found.map((finding) => `${finding.problem} ${finding.fix}`).join('\n')).toMatch(/gw_priority/)
+      }
+    })
   })
 
   it('сеть случая не закрыта или с адресом моста — ошибка', async () => {

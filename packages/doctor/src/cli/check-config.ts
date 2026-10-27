@@ -216,6 +216,32 @@ async function checkStateMount(env: DoctorEnv, docker: string, container: string
   }]
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1'])
+
+/**
+ * Приложение в сети сервера (`network_mode: host`) ходит к врачу через опубликованный порт. Он должен быть только
+ * на петле сервера, а вести — в сеть приёма: Docker ведёт порт в сеть с высшим `gw_priority`, в другой сети врач
+ * не слушает. Порт не опубликован — проверять нечего.
+ */
+async function checkPublishedIntake(env: DoctorEnv, docker: string, container: string, network: string, networks: Record<string, { GwPriority?: number }>): Promise<Finding[]> {
+  const inspect = await run(docker, ['inspect', '--format', '{{json .HostConfig.PortBindings}}', container], env)
+  let bindings: Record<string, { HostIp?: string }[] | null> = {}
+  try {
+    bindings = JSON.parse(inspect.stdout) ?? {}
+  } catch {}
+  const published = Object.values(bindings).flatMap((list) => list ?? [])
+  if (published.length === 0) return []
+  const findings: Finding[] = []
+  if (published.some((binding) => !LOOPBACK_HOSTS.has(binding.HostIp ?? ''))) {
+    findings.push({ level: 'error', area: 'docker', problem: 'порт врача опубликован не только на 127.0.0.1: приём виден с других адресов сервера', fix: 'публикуйте приём только как 127.0.0.1:<порт>:7800 (добавка deploy/compose.remontnik.host-app.yml)' })
+  }
+  const priority = (name: string) => networks[name]?.GwPriority ?? 0
+  if (Object.keys(networks).some((name) => name !== network && priority(name) >= priority(network))) {
+    findings.push({ level: 'error', area: 'docker', problem: `опубликованный порт врача ведёт не в сеть приёма «${network}»: там, куда он ведёт, врач не слушает`, fix: 'дайте сети приёма gw_priority выше остальных сетей врача (добавка deploy/compose.remontnik.host-app.yml, Docker 28 или новее)' })
+  }
+  return findings
+}
+
 async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
   const version = await run(docker, ['version', '--format', '{{.Server.Version}}'], env)
   if (!version.ok) {
@@ -230,12 +256,14 @@ async function checkDocker(env: DoctorEnv, docker: string): Promise<Finding[]> {
     if (!inspect.ok) {
       findings.push({ level: 'error', area: 'docker', problem: `контейнер врача «${container}» не найден`, fix: 'REMONTNIK_GATEWAY_CONTAINER — имя контейнера, в котором работает врач (в compose его задаёт REMONTNIK_CONTAINER_NAME, по умолчанию remontnik-doctor)' })
     } else if (network) {
-      let networks: Record<string, unknown> = {}
+      let networks: Record<string, { GwPriority?: number }> = {}
       try {
         networks = JSON.parse(inspect.stdout) ?? {}
       } catch {}
       if (!Object.hasOwn(networks, network)) {
         findings.push({ level: 'error', area: 'docker', problem: `контейнер врача не подключён к сети приложения «${network}»`, fix: 'подключите врача к сети приложения в compose (networks) или исправьте REMONTNIK_LISTEN_NETWORK' })
+      } else {
+        findings.push(...(await checkPublishedIntake(env, docker, container, network, networks)))
       }
     }
     const stateDir = value(env, 'REMONTNIK_STATE_DIR')
