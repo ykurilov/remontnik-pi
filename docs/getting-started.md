@@ -221,6 +221,8 @@ export default defineRemontnikConfig({
 docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor check-config
 ```
 
+Запускайте только так, внутри контейнера врача. С хоста из `node_modules` приложения настройку не прочитать: `check-config` скажет «врач запущен не из своего контейнера» и подскажет эту команду.
+
 Врач уже запущен (шаг 7): проверка ищет его контейнер по имени `REMONTNIK_CONTAINER_NAME` (по умолчанию `remontnik-doctor`), а одноразовый контейнер `run --rm` называется иначе и проверку Docker не проходит.
 
 Команда проверяет всё, на чём споткнётся старт врача:

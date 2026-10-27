@@ -27,6 +27,11 @@ export type ConfigSourceErrorCode =
   | 'symlink'
   /** Выполнить код настройки негде (Docker недоступен): сама настройка может быть и в порядке. */
   | 'reader_unavailable'
+  /**
+   * Врач запущен не из своего образа (например, `check-config` на хосте из `node_modules` приложения): контейнер чтения
+   * не находит пакеты Ремонтника по пути этого процесса. Сама настройка может быть и в порядке.
+   */
+  | 'outside_doctor_image'
   | 'unreadable'
   | 'branch_mismatch'
   | 'branch_unknown'
@@ -104,7 +109,11 @@ function symlinkRefusal(path: string): ConfigSourceError {
 //  - свои файлы — только по относительному пути и только из списка файлов настройки (`config-files`): импорт с вычисляемым
 //    путём список не видит, поэтому он отклоняется, а не выполняется;
 //  - любой другой пакет — понятная ошибка, даже если он лежит в `node_modules` рабочей копии.
+/** Метка ошибки чтения: путь пакетов врача есть только у процесса, запустившего чтение, а не в образе врача. */
+const OUTSIDE_DOCTOR_IMAGE = '[вне образа врача]'
+
 const RESOLVE_HOOKS = `
+import { existsSync } from 'node:fs'
 import { isBuiltin } from 'node:module'
 let data
 export function initialize(value) { data = value }
@@ -126,6 +135,7 @@ export async function resolve(specifier, context, next) {
       const url = data.sourceRoot + name + '/src/' + (own[2] ? own[2] + '/' : '') + 'index.ts'
       return next(url, context)
     }
+    if (!existsSync(new URL(data.base))) throw new Error('${OUTSIDE_DOCTOR_IMAGE}')
     return next(specifier, { ...context, parentURL: data.base })
   }
   if (specifier.startsWith('node:') || isBuiltin(specifier)) return next(specifier, context)
@@ -287,6 +297,13 @@ async function readRawConfig(file: string, configFiles: ConfigFiles, reader: Con
     if (error instanceof ConfigSourceError) throw error
     if (error instanceof ConfigReaderUnavailableError) {
       throw new ConfigSourceError('reader_unavailable', `настройку нельзя прочитать: ${error.message}`, { cause: error })
+    }
+    if (error instanceof Error && error.message.includes(OUTSIDE_DOCTOR_IMAGE)) {
+      throw new ConfigSourceError(
+        'outside_doctor_image',
+        `настройку нельзя прочитать: врач запущен не из своего контейнера, и контейнер чтения не находит его пакеты (${file} подключает пакет Ремонтника)`,
+        { cause: error },
+      )
     }
     throw new ConfigSourceError('unreadable', `Файл настройки ${file} не читается: ${error instanceof Error ? error.message : String(error)}`, {
       cause: error,

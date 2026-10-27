@@ -2,8 +2,9 @@ import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { localConfigReaderForTests } from '../service/config-reader.js'
+import { localConfigReaderForTests, type ConfigCodeReader } from '../service/config-reader.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { checkDoctorConfig, formatFindings } from './check-config.js'
 import { runDoctorCommand } from './run-doctor-command.js'
@@ -385,6 +386,37 @@ describe('check-config: настройка', () => {
     expect(warnings(findings)[0]).toContain('src/shared-names.mjs')
     expect(warnings(findings)[0]).toContain('fixablePaths')
     expect(warnings(findings)[0]).toContain('только отчёт человеку')
+  })
+
+  it('check-config запущен не из образа врача (на хосте) — ошибка «запускайте внутри контейнера врача», а не «Cannot find package»', async () => {
+    const config = testRemontnikConfig()
+    const data = { ...config, forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access } }
+    const repoDir = join(tempDir(), 'app')
+    mkdirSync(repoDir)
+    git(repoDir, 'init', '--quiet', '--initial-branch=main')
+    git(repoDir, 'remote', 'add', 'origin', 'https://github.com/example-owner/example-app.git')
+    writeFileSync(join(repoDir, 'deploy.ts'), '// команды выкатки\n')
+    writeFileSync(join(repoDir, 'remontnik.config.mjs'), `import { defineRemontnikConfig } from '@ykurilov/remontnik-core/config'\nexport default defineRemontnikConfig(${JSON.stringify(data)})\n`)
+    git(repoDir, 'add', '-A')
+    git(repoDir, 'commit', '--quiet', '-m', 'настройка')
+    // Контейнер чтения из образа врача: пути пакетов процесса, запустившего чтение, в нём нет.
+    const local = localConfigReaderForTests()
+    const hostOnlyPaths: ConfigCodeReader = {
+      ...local,
+      run: (input) => {
+        const hooks = JSON.parse(input.args.at(-1)!) as Record<string, unknown>
+        const args = [...input.args.slice(0, -1), JSON.stringify({ ...hooks, base: pathToFileURL(join(tempDir(), 'host', 'config-source.js')).href, sourceRoot: null })]
+        return local.run({ ...input, args })
+      },
+    }
+
+    const findings = await checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS), configReader: hostOnlyPaths })
+
+    const settings = findings.filter((finding) => finding.area === 'настройка' && finding.level === 'error')
+    expect(settings).toHaveLength(1)
+    expect(settings[0]!.problem).toContain('не из своего контейнера')
+    expect(settings[0]!.problem).not.toContain('Cannot find package')
+    expect(settings[0]!.fix).toContain('exec doctor remontnik-doctor check-config')
   })
 
   it('код настройки без контейнера врача не выполняется: нет REMONTNIK_GATEWAY_CONTAINER — ошибка, а не чтение в процессе врача', async () => {

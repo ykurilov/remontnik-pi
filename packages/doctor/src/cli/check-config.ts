@@ -105,7 +105,9 @@ async function checkSettings(env: DoctorEnv, deps: CheckConfigDeps): Promise<{ f
       ? `рабочая копия настройки должна стоять на основной ветке (REMONTNIK_MAIN_BRANCH, по умолчанию main)`
       : code === 'not_found'
         ? 'положите remontnik.config в корень рабочей копии основной ветки'
-        : 'исправьте remontnik.config основной ветки (все поля — docs/configuration.md)'
+        : code === 'outside_doctor_image'
+          ? 'запускайте проверку внутри контейнера врача, а не на хосте из node_modules приложения: docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor check-config'
+          : 'исправьте remontnik.config основной ветки (все поля — docs/configuration.md)'
     return { findings: [{ level: 'error', area: 'настройка', problem: (error as Error).message, fix }] }
   }
 }
