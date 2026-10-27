@@ -1,5 +1,12 @@
 # @ykurilov/remontnik-paseo-bridge
 
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [39eb6af]
+  - @ykurilov/remontnik-core@0.1.4
+
 ## 0.1.3
 
 ### Patch Changes
