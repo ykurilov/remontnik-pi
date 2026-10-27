@@ -159,6 +159,42 @@ describe('прокси модели для eval', () => {
     expect(JSON.parse(upstream.seen[0]!.body)).toEqual({ model: 'm', max_tokens: 10 })
   })
 
+  it('заголовки к upstream: значение ставит прокси; одноимённый заголовок клиента не проходит', async () => {
+    const upstream = await startUpstream(chatReply({ input_tokens: 1, output_tokens: 1 }))
+    const proxy = await startProxy()
+    const run = openRun(proxy, upstream, { providers: [provider(upstream, { upstreamHeaderValues: { 'x-gateway-pass': 'gateway-pass-value' } })] })
+    const response = await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm' }, { authorization: `Bearer ${run.token}`, 'X-Gateway-Pass': 'from-client' })
+    expect(response.status).toBe(200)
+    expect(upstream.seen[0]?.headers['x-gateway-pass']).toBe('gateway-pass-value')
+    expect(upstream.seen[0]?.headers.authorization).toBe(`Bearer ${REAL_KEY}`)
+    expect(JSON.stringify(await response.text())).not.toContain('gateway-pass-value')
+  })
+
+  it('заголовок к upstream, которого клиент не слал, всё равно уходит; без поля клиентский заголовок идёт как раньше', async () => {
+    const upstream = await startUpstream(chatReply({ input_tokens: 1, output_tokens: 1 }))
+    const proxy = await startProxy()
+    const withHeader = openRun(proxy, upstream, { providers: [provider(upstream, { upstreamHeaderValues: { 'x-gateway-pass': 'gateway-pass-value' } })] })
+    await post(`${withHeader.env.CHAT_BASE_URL}/chat/completions`, { model: 'm' })
+    const without = openRun(proxy, upstream)
+    await post(`${without.env.CHAT_BASE_URL}/chat/completions`, { model: 'm' }, { 'x-gateway-pass': 'from-client' })
+    expect(upstream.seen[0]?.headers['x-gateway-pass']).toBe('gateway-pass-value')
+    expect(upstream.seen[1]?.headers['x-gateway-pass']).toBe('from-client')
+  })
+
+  it('заголовки, которые ломают смысл прокси, из upstreamHeaderValues не ставятся', async () => {
+    const upstream = await startUpstream(chatReply({ input_tokens: 1, output_tokens: 1 }))
+    const proxy = await startProxy()
+    const values = { authorization: 'Bearer stolen', 'x-api-key': 'stolen', host: 'evil.invalid', 'content-length': '1', 'x-forwarded-for': '10.0.0.1', 'x-gateway-pass': 'gateway-pass-value' }
+    const run = openRun(proxy, upstream, { providers: [provider(upstream, { upstreamHeaderValues: values })] })
+    expect((await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm' })).status).toBe(200)
+    const headers = upstream.seen[0]!.headers
+    expect(headers.authorization).toBe(`Bearer ${REAL_KEY}`)
+    expect(headers['x-api-key']).toBeUndefined()
+    expect(headers['x-forwarded-for']).toBeUndefined()
+    expect(headers.host).not.toBe('evil.invalid')
+    expect(headers['x-gateway-pass']).toBe('gateway-pass-value')
+  })
+
   it('responses — предел max_output_tokens; поток чата — с usage в конце', async () => {
     const upstream = await startUpstream(chatReply({ input_tokens: 1, output_tokens: 1 }))
     const proxy = await startProxy()

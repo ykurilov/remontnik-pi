@@ -420,6 +420,44 @@ describe('проверки', () => {
     expect(result.eval.note).toContain('EVAL_API_KEY')
   })
 
+  describe('заголовки к upstream', () => {
+    const headerConfig = testRemontnikConfig({
+      checks: {
+        test: 'pnpm test',
+        typecheck: 'pnpm typecheck',
+        eval: {
+          run: config.checks.eval!.run,
+          resultFile: 'eval-result.json',
+          repeat: 3,
+          maxScenarios: 3,
+          env: ['PATIENT_BUG'],
+          providers: [
+            { name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'EVAL_API_KEY', upstream: 'https://api.example.com/v1', upstreamHeaders: [{ name: 'x-gateway-pass', valueEnv: 'GATEWAY_PASS' }], models: { 'chat-small': { input: 1, output: 2 } } },
+          ],
+        },
+      },
+      evalScope: [{ paths: ['src/bot/**'], scenarios: ['price-named-plan', 'greeting'] }],
+    })
+
+    it('значения берутся из окружения врача и уходят прокси; в окружение eval они не попадают', async () => {
+      const fake = fakeRunner({})
+      const checks = createChecks({ runner: fake.runner, config: headerConfig, evalEnv: { EVAL_API_KEY: EVAL_KEY, GATEWAY_PASS: 'gateway-pass-value' }, evalProxy: fake.proxy, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60 })
+      await checks.run(runInput())
+      expect(fake.proxy.runs[0]?.options.providers[0]?.upstreamHeaderValues).toEqual({ 'x-gateway-pass': 'gateway-pass-value' })
+      const evalCall = fake.calls.find((call) => call.command.startsWith('node eval'))!
+      expect(JSON.stringify(evalCall.options.env ?? {})).not.toContain('gateway-pass-value')
+    })
+
+    it('переменной нет у врача → eval не запускается, в заметке её имя', async () => {
+      const fake = fakeRunner({})
+      const checks = createChecks({ runner: fake.runner, config: headerConfig, evalEnv: { EVAL_API_KEY: EVAL_KEY }, evalProxy: fake.proxy, baseCache: createMemoryEvalBaseCache(), workDir: tempDir(), timeoutSeconds: 60 })
+      const result = await checks.run(runInput())
+      expect(result.eval.status).toBe('not_run')
+      expect(result.eval.note).toContain('GATEWAY_PASS')
+      expect(fake.calls.some((call) => call.command.startsWith('node eval'))).toBe(false)
+    })
+  })
+
   it('правка задела файлы eval или настройки тестов → eval не запускается: скрипты eval только из основы', async () => {
     const fake = fakeRunner({})
     const result = await checksWith(fake).run(runInput({ changedPaths: ['src/bot/bot.ts', 'eval/run-eval.ts'] }))

@@ -68,7 +68,7 @@ function configEnvNames(config: RemontnikConfig): string[] {
   const names = [config.reports.telegram.botTokenEnv]
   if (config.reports.telegram.chatIdEnv) names.push(config.reports.telegram.chatIdEnv)
   const evalCheck = config.checks.eval
-  if (evalCheck) names.push(...evalCheck.providers.map((provider) => provider.keyEnv))
+  if (evalCheck) names.push(...evalCheck.providers.flatMap((provider) => [provider.keyEnv, ...provider.upstreamHeaders.map((header) => header.valueEnv)]))
   const paseo = config.handoff?.mode === 'paseo-first' ? config.handoff.paseo : undefined
   if (paseo) names.push(paseo.bridgeUrlEnv, paseo.bridgeSecretEnv, paseo.listenEnv)
   return names

@@ -40,6 +40,12 @@ export default defineRemontnikConfig({
         keyEnv: string,               // переменная с настоящим ключом у врача; eval получает в ней разовый пропуск
         upstream: string,             // настоящий адрес API модели
         authHeader?: "authorization" | "x-api-key", // по умолчанию "authorization"
+        upstreamHeaders?: Array<{     // дополнительные заголовки к upstream (обратный прокси перед поставщиком); по умолчанию []
+          name: string,               // имя заголовка; не повторяется; нельзя authorization, x-api-key, api-key, proxy-*, host,
+                                      // content-length, content-type, cookie, forwarded, x-forwarded-*, x-real-ip,
+                                      // accept-encoding и заголовки соединения
+          valueEnv: string,           // переменная у врача со значением, как keyEnv; нет — ошибка при старте и в check-config
+        }>,
         models: Record<string, { input: number, output: number }>, // белый список моделей с ценой за 1 млн токенов, $;
                                       // не пустой; модели нет в списке — прокси отвечает 403
       }>,

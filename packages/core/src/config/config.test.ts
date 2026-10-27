@@ -130,6 +130,70 @@ describe('defineRemontnikConfig', () => {
     expect(config.checks.eval?.providers[0]).toMatchObject({ name: 'chat', authHeader: 'authorization', models: { 'chat-small': { input: 0.5, output: 2 } } })
   })
 
+  it('заголовки к upstream: имя заголовка и переменная врача со значением; имя приводится к нижнему регистру', () => {
+    const input = minimalConfig()
+    input.checks.eval = {
+      run: 'eval {scenarios}',
+      resultFile: 'result.json',
+      env: [],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', upstreamHeaders: [{ name: 'X-Gateway-Pass', valueEnv: 'GATEWAY_PASS' }], models: { m: { input: 1, output: 1 } } }],
+    }
+    expect(defineRemontnikConfig(input).checks.eval?.providers[0]?.upstreamHeaders).toEqual([{ name: 'x-gateway-pass', valueEnv: 'GATEWAY_PASS' }])
+    input.checks.eval.providers![0] = { name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: { m: { input: 1, output: 1 } } }
+    expect(defineRemontnikConfig(input).checks.eval?.providers[0]?.upstreamHeaders).toEqual([])
+  })
+
+  it.each([
+    'authorization',
+    'Authorization',
+    'x-api-key',
+    'api-key',
+    'proxy-authorization',
+    'proxy-anything',
+    'host',
+    'content-length',
+    'content-type',
+    'connection',
+    'keep-alive',
+    'transfer-encoding',
+    'upgrade',
+    'te',
+    'trailer',
+    'accept-encoding',
+    'cookie',
+    'forwarded',
+    'x-real-ip',
+    'x-forwarded-for',
+    'bad name',
+    'x:y',
+    '',
+  ])('заголовок к upstream «%s» отклоняется', (name) => {
+    const input = minimalConfig()
+    input.checks.eval = {
+      run: 'eval {scenarios}',
+      resultFile: 'result.json',
+      env: [],
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', upstreamHeaders: [{ name, valueEnv: 'GATEWAY_PASS' }], models: { m: { input: 1, output: 1 } } }],
+    }
+    expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval.providers.0.upstreamHeaders'))).toBe(true)
+  })
+
+  it.each([
+    ['повтор имени заголовка', { upstreamHeaders: [{ name: 'x-pass', valueEnv: 'PASS_ONE' }, { name: 'X-Pass', valueEnv: 'PASS_TWO' }] }, { env: [] }],
+    ['значение заголовка — не имя переменной', { upstreamHeaders: [{ name: 'x-pass', valueEnv: 'literal-value' }] }, { env: [] }],
+    ['переменная заголовка в eval.env', { upstreamHeaders: [{ name: 'x-pass', valueEnv: 'GATEWAY_PASS' }] }, { env: ['GATEWAY_PASS'] }],
+    ['лишнее поле заголовка', { upstreamHeaders: [{ name: 'x-pass', valueEnv: 'GATEWAY_PASS', value: 'secret' }] }, { env: [] }],
+  ])('заголовки к upstream: %s — ошибка', (_what, provider, evalExtra) => {
+    const input = minimalConfig()
+    input.checks.eval = {
+      run: 'eval {scenarios}',
+      resultFile: 'result.json',
+      ...evalExtra,
+      providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: { m: { input: 1, output: 1 } }, ...provider }],
+    } as NonNullable<RemontnikConfigInput['checks']['eval']>
+    expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval'))).toBe(true)
+  })
+
   it('папка сценариев eval: по умолчанию eval/scenarios, своя — без «./» и «/» в конце', () => {
     const input = minimalConfig()
     input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: [] }

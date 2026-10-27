@@ -72,6 +72,7 @@
 | `keyEnv` | переменная с настоящим ключом в окружении врача. Eval в ней же получает разовый пропуск, а не ключ |
 | `upstream` | настоящий адрес API модели |
 | `authHeader?` (`"authorization"`) | `"authorization"` или `"x-api-key"` |
+| `upstreamHeaders?` (`[]`) | дополнительные заголовки к `upstream`, список `{ name, valueEnv }`. Нужны, когда сервер приложения достаёт до поставщика только через свой обратный прокси и тому нужен свой секрет. `name` — имя заголовка; `valueEnv` — переменная в окружении врача со значением (как `keyEnv`; нет переменной — ошибка `check-config`). Значение ставит только прокси: одноимённый заголовок от eval не проходит, в eval и в журналы значение не попадает. Нельзя задать заголовки прокси: `authorization`, `x-api-key`, `api-key`, `proxy-*`, `host`, `content-length`, `content-type`, `cookie`, `forwarded`, `x-forwarded-*`, `x-real-ip`, `accept-encoding`, заголовки соединения (`connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `transfer-encoding`). Имена не повторяются. `valueEnv` не может быть в `checks.eval.env` |
 | `models` | белый список моделей с ценой за 1 млн токенов, $: `{ "<модель>": { input, output } }`. Не пустой. Модели нет в списке — прокси отвечает `403` |
 
 `proxy`:
@@ -262,6 +263,7 @@ services:
 | `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL`, `PROXY_TOKEN` | нет | свой прокси до моделей |
 | переменные из `reports.telegram.*Env` | да | бот и чат тревог |
 | переменные из `checks.eval.providers[].keyEnv` | да, если есть eval | настоящие ключи моделей для eval |
+| переменные из `checks.eval.providers[].upstreamHeaders[].valueEnv` | да, если заданы | значения дополнительных заголовков к поставщику модели |
 | переменные из `checks.eval.env` | нет | несекретные переменные для eval |
 | переменные из `handoff.paseo.*Env` | да, при `"paseo-first"` | адрес моста, секрет моста, адрес приёма |
 | `REMONTNIK_REPORTS_TOKEN` | нет | забор отчётов `reports pull` без моста |

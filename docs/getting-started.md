@@ -204,6 +204,7 @@ export default defineRemontnikConfig({
 | `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | ключи модели врача |
 | `APP_ALERT_BOT_TOKEN`, `APP_ALERT_CHAT_ID` | бот и чат тревог: имена — из `reports.telegram`. Бот — тот же, что у приложения |
 | ключи из `checks.eval.providers[].keyEnv` | настоящие ключи моделей для eval |
+| значения из `checks.eval.providers[].upstreamHeaders[].valueEnv` | если заданы: секреты дополнительных заголовков к поставщику модели |
 | `REMONTNIK_REPORTS_TOKEN` | по желанию: забор отчётов командой по SSH |
 | `REMONTNIK_BROWSER_TOKEN` | если есть браузер врача |
 

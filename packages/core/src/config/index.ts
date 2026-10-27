@@ -76,12 +76,54 @@ const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|C
 /** Цена модели в долларах за миллион токенов. */
 const modelPriceSchema = z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() })
 
+// Заголовки, которыми владеет сам прокси: доступ, сведения о сети, то, что ставит или считает транспорт.
+// Клиент eval их не передаёт провайдеру, а в `upstreamHeaders` их задать нельзя.
+const PROXY_OWNED_HEADERS: ReadonlySet<string> = new Set([
+  'host',
+  'connection',
+  'keep-alive',
+  'upgrade',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'content-length',
+  'accept-encoding',
+  'authorization',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'cookie',
+  'forwarded',
+  'x-real-ip',
+])
+
+/** Заголовок принадлежит прокси: клиентский с таким именем вырезается, свой значением из настройки не задаётся. */
+export function isProxyOwnedHeader(name: string): boolean {
+  const lower = name.toLowerCase()
+  return PROXY_OWNED_HEADERS.has(lower) || lower.startsWith('x-forwarded-') || lower.startsWith('proxy-')
+}
+
+const upstreamHeaderSchema = z.strictObject({
+  name: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9-]*$/, 'ожидается имя HTTP-заголовка: латинские буквы, цифры, дефис')
+    .transform((name) => name.toLowerCase())
+    .refine((name) => !isProxyOwnedHeader(name) && name !== 'content-type', 'этим заголовком владеет прокси: ключ, соединение, адрес, размер и тип тела, сведения о сети'),
+  /** Переменная окружения врача со значением заголовка (как `keyEnv`). */
+  valueEnv: envName,
+})
+
 const evalProviderSchema = z.strictObject({
   name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, 'строчные латинские буквы, цифры и дефис: имя идёт в адрес прокси'),
   baseUrlEnv: envName,
   keyEnv: envName,
   upstream: z.url(),
   authHeader: z.enum(['authorization', 'x-api-key']).default('authorization'),
+  /** Дополнительные заголовки к upstream: сервер приложения достаёт до поставщика только через свой обратный прокси. */
+  upstreamHeaders: z
+    .array(upstreamHeaderSchema)
+    .default([])
+    .refine((headers) => new Set(headers.map((header) => header.name)).size === headers.length, 'имена заголовков повторяются'),
   /** Белый список моделей с ценами: модель выбирает код правки, поэтому цена — по модели, чужая модель — отказ. */
   models: z.record(z.string().min(1), modelPriceSchema).refine((models) => Object.keys(models).length > 0, 'хотя бы одна модель с ценой'),
 })
@@ -117,7 +159,7 @@ const evalSchema = z
     proxy: evalProxyLimitsSchema,
   })
   .superRefine((evalConfig, context) => {
-    const proxyNames = new Set([evalConfig.tokenEnv, ...evalConfig.providers.flatMap((provider) => [provider.keyEnv, provider.baseUrlEnv])])
+    const proxyNames = new Set([evalConfig.tokenEnv, ...evalConfig.providers.flatMap((provider) => [provider.keyEnv, provider.baseUrlEnv, ...provider.upstreamHeaders.map((header) => header.valueEnv)])])
     evalConfig.env.forEach((name, index) => {
       if (SECRET_LIKE_ENV.test(name) || proxyNames.has(name)) {
         context.addIssue({ code: 'custom', path: ['env', index], message: 'секрет в eval не передаётся: ключи модели — через providers и прокси врача' })

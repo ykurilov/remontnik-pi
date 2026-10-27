@@ -360,6 +360,28 @@ describe('check-config: окружение', () => {
     expect(errors(findings).join('\n')).toContain('EVAL_DEEPSEEK_KEY')
   })
 
+  it('переменные заголовков к upstream нужны врачу', async () => {
+    const config = testRemontnikConfig()
+    const raw = {
+      ...config,
+      checks: {
+        ...config.checks,
+        eval: {
+          run: 'node eval/run.mjs',
+          resultFile: 'eval/out.json',
+          env: [],
+          providers: [{ name: 'deepseek', baseUrlEnv: 'EVAL_BASE_URL', keyEnv: 'EVAL_DEEPSEEK_KEY', upstream: 'https://api.example.com', upstreamHeaders: [{ name: 'x-gateway-pass', valueEnv: 'EVAL_GATEWAY_PASS' }], models: { m: { input: 1, output: 1 } } }],
+          proxy: {},
+        },
+      },
+      forbidden: { schema: config.forbidden.schema, money: config.forbidden.money, access: config.forbidden.access },
+    }
+    const findings = await checkDoctorConfig(serverEnv(appRepo({ config: raw }), { EVAL_DEEPSEEK_KEY: 'k'.repeat(20) }), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+    const text = errors(findings).join('\n')
+    expect(text).toContain('EVAL_GATEWAY_PASS')
+    expect(text).not.toContain('EVAL_DEEPSEEK_KEY')
+  })
+
   it('слушать все адреса нельзя — ошибка с причиной', async () => {
     const repoDir = appRepo()
     const findings = await checkDoctorConfig(serverEnv(repoDir, { REMONTNIK_LISTEN_NETWORK: undefined, REMONTNIK_LISTEN: '0.0.0.0:7800' }), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
