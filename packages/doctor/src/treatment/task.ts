@@ -1081,7 +1081,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         let checks = (await runtime.memo<JsonValue>('checks', context)) as ChecksResult | undefined
         // Eval не пустили: остаток дня держат чужие брони (`wait`) или денег до конца суток нет (`next_day`).
         let evalHeld: 'wait' | 'next_day' | undefined
-        if (!checks && config.checks.eval && selectEvalScenarios({ ...config, maxScenarios: config.checks.eval.maxScenarios }, checkpoint.changedPaths).status !== 'not_needed') {
+        if (!checks && config.checks.eval && selectEvalScenarios({ ...config, maxScenarios: config.checks.eval.maxScenarios, scenariosDir: config.checks.eval.scenariosDir }, checkpoint.changedPaths).status !== 'not_needed') {
           // Случай вот-вот попросит eval: другие случаи оставляют ему долю остатка дня.
           await runtime.commit(async (tx) => {
             await joinEvalQueueIn(recordTransactionOver(tx), caseKey(caseId), deps.now())

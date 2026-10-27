@@ -2,12 +2,14 @@ import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { matchesAnyMask } from '../path-mask/index.js'
 
 // Какие сценарии eval гонять для правки (FR-018): по карте `evalScope` и изменённым путям.
-// Закрытый сценарий (закрытый путь накрывает `eval/scenarios/<id>`) врач не запускает и никуда не передаёт (FR-015).
+// Закрытый сценарий (закрытый путь накрывает `<checks.eval.scenariosDir>/<id>`) врач не запускает и никуда не передаёт (FR-015).
 
 export interface EvalScopeConfig {
   evalScope: RemontnikConfig['evalScope']
   closedPaths: readonly string[]
   maxScenarios: number
+  /** `checks.eval.scenariosDir`: по `<папка>/<id>` закрытые пути узнают закрытый сценарий. */
+  scenariosDir: string
 }
 
 export type EvalScopeSelection = { status: 'not_needed' } | { status: 'run'; scenarios: string[]; truncated: boolean }
@@ -15,8 +17,8 @@ export type EvalScopeSelection = { status: 'not_needed' } | { status: 'run'; sce
 /** Сценарий для «гоняй всё», когда в карте нет ни одного имени: выбор оставлен самому eval. */
 export const ALL_SCENARIOS = 'all'
 
-export function scenarioPath(id: string): string {
-  return `eval/scenarios/${id}`
+export function scenarioPath(scenariosDir: string, id: string): string {
+  return `${scenariosDir}/${id}`
 }
 
 export function selectEvalScenarios(config: EvalScopeConfig, changedPaths: readonly string[]): EvalScopeSelection {
@@ -30,7 +32,7 @@ export function selectEvalScenarios(config: EvalScopeConfig, changedPaths: reado
   // Порядок итога — порядок первых упоминаний в карте, а не порядок срабатывания записей.
   const order = [...named, ALL_SCENARIOS]
   const open = picked
-    .filter((id) => id === ALL_SCENARIOS || !matchesAnyMask(config.closedPaths, scenarioPath(id)))
+    .filter((id) => id === ALL_SCENARIOS || !matchesAnyMask(config.closedPaths, scenarioPath(config.scenariosDir, id)))
     .sort((a, b) => order.indexOf(a) - order.indexOf(b))
   if (open.length === 0) return { status: 'not_needed' }
   const scenarios = open.slice(0, config.maxScenarios)

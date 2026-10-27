@@ -97,10 +97,18 @@ const evalProxyLimitsSchema = z
   })
   .prefault({})
 
+/** Папка сценариев eval от корня репозитория: по ней `closedPaths` узнают закрытый сценарий (`<папка>/<id>`). */
+const scenariosDir = z
+  .string()
+  .trim()
+  .transform((dir) => dir.replace(/^\.\//, '').replace(/\/+$/, ''))
+  .refine((dir) => dir.length > 0 && !dir.startsWith('/') && !dir.includes('\\') && !/[*?[\]{}]/.test(dir) && !dir.split('/').some((part) => part === '..' || part === '.' || part === ''), 'путь от корня репозитория без масок, «..» и «\\», например "eval/scenarios"')
+
 const evalSchema = z
   .strictObject({
     run: command,
     resultFile: z.string().min(1),
+    scenariosDir: scenariosDir.default('eval/scenarios'),
     repeat: positiveInt.default(3),
     maxScenarios: positiveInt.default(3),
     env: z.array(envName),

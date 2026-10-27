@@ -9,6 +9,7 @@ const config: EvalScopeConfig = {
   ],
   closedPaths: [],
   maxScenarios: 3,
+  scenariosDir: 'eval/scenarios',
 }
 
 describe('выбор сценариев eval по изменённым путям', () => {
@@ -48,7 +49,7 @@ describe('выбор сценариев eval по изменённым путя�
   })
 
   it('"all" при карте без имён сценариев → сценарий "all" (решает сам eval)', () => {
-    const onlyAll: EvalScopeConfig = { evalScope: [{ paths: ['src/**'], scenarios: 'all' }], closedPaths: [], maxScenarios: 3 }
+    const onlyAll: EvalScopeConfig = { evalScope: [{ paths: ['src/**'], scenarios: 'all' }], closedPaths: [], maxScenarios: 3, scenariosDir: 'eval/scenarios' }
     expect(selectEvalScenarios(onlyAll, ['src/a.ts'])).toEqual({ status: 'run', scenarios: ['all'], truncated: false })
   })
 
@@ -69,5 +70,11 @@ describe('выбор сценариев eval по изменённым путя�
   it('все подходящие сценарии закрыты → not_needed', () => {
     const closed = { ...config, closedPaths: ['eval/scenarios/**'] }
     expect(selectEvalScenarios(closed, ['src/prices/plan.ts'])).toEqual({ status: 'not_needed' })
+  })
+
+  it('закрытый сценарий в своей папке приложения (checks.eval.scenariosDir) не запускается', () => {
+    const custom = { ...config, scenariosDir: 'evals/scenarios', closedPaths: ['evals/scenarios/price-named-plan*'], maxScenarios: 10 }
+    expect(selectEvalScenarios(custom, ['src/prices/plan.ts'])).toEqual({ status: 'run', scenarios: ['price-default-plan'], truncated: false })
+    expect(selectEvalScenarios({ ...custom, closedPaths: ['evals/scenarios/**'] }, ['src/prices/plan.ts'])).toEqual({ status: 'not_needed' })
   })
 })
