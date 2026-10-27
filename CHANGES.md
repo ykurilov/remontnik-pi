@@ -8,6 +8,7 @@
 
 - **Папка сценариев eval.** Врач считал, что сценарии лежат в `eval/scenarios`. Если у приложения они в другой папке, закрытые пути (`closedPaths`) сценариев не срабатывали, и врач мог запустить закрытый сценарий. Теперь папка задаётся в `checks.eval.scenariosDir` (по умолчанию `eval/scenarios`). `check-config` предупреждает, если папки нет, и пишет ошибку, если закрытый путь сценариев лежит вне неё.
 - **Хуки сторожа и Agent Chat SDK.** `agentChatWatchHooks(...)` теперь подставляется в `createChatService` и `createChatHandler` без приведения типов (раньше — ошибка TS2345 «Index signature is missing»).
+- **`check-config` не в контейнере врача.** Запуск на хосте из `node_modules` приложения раньше давал «Cannot find package '@ykurilov/remontnik-core'». Теперь `check-config` прямо пишет, что запущен не из контейнера врача, и даёт команду: `docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor check-config`.
 - **Документы.** `extraOrigins` — поле политики браузера (`browser-policy.json`, путь в `REMONTNIK_BROWSER_POLICY`), а не `remontnik.config.ts`. В `docs/configuration.md` и `docs/getting-started.md` (шаг 12) теперь сказано, что где задаётся.
 
 ### Как обновить приложение
@@ -16,7 +17,7 @@
 2. Сценарии eval лежат не в `eval/scenarios` — вписать их папку в `checks.eval.scenariosDir` в `remontnik.config.ts`. Проверить, что закрытые пути сценариев начинаются с этой папки.
 3. Если хуки сторожа приводились к типу SDK (`as unknown as ...`) — убрать приведение. `pnpm typecheck` приложения должен остаться зелёным.
 4. Если `extraOrigins` по ошибке вписан в `remontnik.config.ts`, перенести его в политику браузера на сервере.
-5. Проверить: `remontnik-doctor check-config` пишет «ошибок нет» и не предупреждает о папке сценариев.
+5. Проверить внутри контейнера врача (`docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor check-config`, не с хоста): `check-config` пишет «ошибок нет» и не предупреждает о папке сценариев.
 
 ## 0.1.0
 

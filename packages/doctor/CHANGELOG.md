@@ -5,6 +5,7 @@
 ### Patch Changes
 
 - 07720e7: Папка сценариев eval задаётся в `checks.eval.scenariosDir` (по умолчанию `eval/scenarios`): закрытые пути узнают закрытые сценарии и в нестандартной папке. `check-config` предупреждает, если папки нет, и считает ошибкой закрытый путь сценариев вне неё.
+- `check-config`, запущенный не в контейнере врача (на хосте из `node_modules` приложения), вместо «Cannot find package '@ykurilov/remontnik-core'» пишет, что запуск не там, и даёт команду `docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor check-config`.
 - Updated dependencies [07720e7]
   - @ykurilov/remontnik-core@0.1.1
 
