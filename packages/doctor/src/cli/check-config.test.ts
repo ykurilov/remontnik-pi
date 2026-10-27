@@ -261,16 +261,16 @@ describe('check-config: файлы команд выкатки', () => {
 })
 
 describe('check-config: папка сценариев eval', () => {
-  const withEval = (scenariosDir: string | undefined, closedPaths: string[], files: string[]): string => {
+  const withEval = (scenariosDir: string | undefined, closedPaths: string[], files: string[], evalScope: object[] = []): string => {
     const base = testRemontnikConfig()
     const evalCheck = { run: 'node evals/run.mjs', resultFile: 'out.json', env: [], ...(scenariosDir ? { scenariosDir } : {}) }
-    const config = { ...base, checks: { ...base.checks, eval: evalCheck }, closedPaths, forbidden: { schema: base.forbidden.schema, money: base.forbidden.money, access: base.forbidden.access } }
+    const config = { ...base, checks: { ...base.checks, eval: evalCheck }, closedPaths, evalScope, forbidden: { schema: base.forbidden.schema, money: base.forbidden.money, access: base.forbidden.access } }
     return appRepo({ config, deployFiles: { 'deploy.ts': { content: '//\n' }, ...Object.fromEntries(files.map((file) => [file, { content: '{}\n' }])) } })
   }
   const check = (repoDir: string) => checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
 
   it('сценарии не в eval/scenarios, а scenariosDir не задан — ошибка про закрытый путь и предупреждение про папку', async () => {
-    const findings = await check(withEval(undefined, ['evals/scenarios/private*'], ['evals/scenarios/private.json']))
+    const findings = await check(withEval(undefined, ['evals/scenarios/private*'], ['evals/scenarios/private.json'], [{ paths: ['src/**'], scenarios: ['private'] }]))
     expect(errors(findings).join('\n')).toContain('evals/scenarios/private*')
     expect(warnings(findings).join('\n')).toContain('eval/scenarios')
   })
@@ -278,6 +278,19 @@ describe('check-config: папка сценариев eval', () => {
   it('scenariosDir указывает на настоящую папку, закрытые пути в ней — без ошибок и предупреждений про eval', async () => {
     const findings = await check(withEval('evals/scenarios', ['evals/scenarios/private*', 'evals/**/secret*', 'exports/**'], ['evals/scenarios/private.json']))
     expect([...errors(findings), ...warnings(findings)].filter((text) => text.includes('eval'))).toEqual([])
+  })
+
+  it('отложенные сценарии в соседней закрытой папке, evalScope называет только сценарии из scenariosDir — ни ошибки, ни предупреждения', async () => {
+    const repoDir = withEval('evals/scenarios', ['evals/scenarios-holdout/**'], ['evals/scenarios/open.json', 'evals/scenarios-holdout/hidden.json'], [{ paths: ['src/**'], scenarios: ['open'] }])
+    const findings = await check(repoDir)
+    expect([...errors(findings), ...warnings(findings)].filter((text) => text.includes('eval'))).toEqual([])
+  })
+
+  it('сценарий из evalScope лежит под закрытой маской вне scenariosDir — ошибка с названием сценария', async () => {
+    const repoDir = withEval('evals/scenarios', ['evals/scenarios-holdout/**'], ['evals/scenarios/open.json', 'evals/scenarios-holdout/hidden.json'], [{ paths: ['src/**'], scenarios: ['open', 'hidden'] }])
+    const problems = errors(await check(repoDir)).join('\n')
+    expect(problems).toContain('hidden')
+    expect(problems).toContain('evals/scenarios-holdout/**')
   })
 })
 
