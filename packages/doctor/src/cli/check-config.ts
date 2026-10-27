@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { constants } from 'node:fs'
-import { access, readFile } from 'node:fs/promises'
+import { access, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { redactSecrets } from '@ykurilov/remontnik-core/redact'
@@ -450,12 +450,40 @@ async function checkDeployCommands(env: DoctorEnv, config: RemontnikConfig): Pro
   return findings
 }
 
+/** Закрытый путь, который, судя по имени, про сценарии eval. */
+const SCENARIO_LIKE_MASK = /(^|\/)(evals?|scenarios?)(\/|$)/i
+
+/**
+ * Закрытый сценарий врач узнаёт по пути `<checks.eval.scenariosDir>/<id>`. Папки нет или закрытый путь сценариев лежит
+ * в другой папке — закрытые пути сценариев не сработают, и врач запустит закрытый сценарий.
+ */
+async function checkEvalScenarios(env: DoctorEnv, config: RemontnikConfig): Promise<Finding[]> {
+  const repoDir = value(env, 'REMONTNIK_CONFIG_REPO_DIR')
+  const evalCheck = config.checks.eval
+  if (!repoDir || !evalCheck) return []
+  const dir = evalCheck.scenariosDir
+  const findings: Finding[] = []
+  const isDirectory = await stat(resolve(repoDir, dir)).then((entry) => entry.isDirectory(), () => false)
+  if (!isDirectory) {
+    findings.push({ level: 'warning', area: 'настройка', problem: `папки сценариев eval ${dir} нет в основной ветке: закрытые пути не узнают закрытые сценарии`, fix: 'впишите в checks.eval.scenariosDir папку, где лежат сценарии (по умолчанию eval/scenarios)' })
+  }
+  for (const mask of config.closedPaths) {
+    // Папки маски до первого знака маски: на пути к папке сценариев или внутри неё — маска может её накрыть.
+    const literal = mask.slice(0, mask.search(/[*?[{]|$/))
+    const folders = literal.slice(0, literal.lastIndexOf('/') + 1)
+    if (!SCENARIO_LIKE_MASK.test(mask) || `${dir}/`.startsWith(folders) || folders.startsWith(`${dir}/`)) continue
+    findings.push({ level: 'error', area: 'настройка', problem: `закрытый путь ${mask} похож на сценарии eval, но лежит вне checks.eval.scenariosDir (${dir}): такой сценарий врач не узнает и запустит`, fix: 'впишите настоящую папку сценариев в checks.eval.scenariosDir или поправьте закрытый путь' })
+  }
+  return findings
+}
+
 /** Все проверки подряд; ни одна не меняет сервер, репозиторий или GitHub. */
 export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = {}): Promise<Finding[]> {
   const { config, findings: settings } = await checkSettings(env, deps)
   return [
     ...settings,
     ...(config ? await checkDeployCommands(env, config) : []),
+    ...(config ? await checkEvalScenarios(env, config) : []),
     ...checkEnvironment(env, config),
     ...(config ? await checkServices(env, config) : []),
     ...(await checkDocker(env, deps.docker ?? 'docker')),

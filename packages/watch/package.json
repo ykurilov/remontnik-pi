@@ -22,11 +22,14 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p type-tests/tsconfig.json",
     "test:live": "vitest run --config ../../vitest.live.config.ts packages/watch",
     "bench": "pnpm --dir ../.. run bench packages/watch"
   },
   "dependencies": {
     "@ykurilov/remontnik-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@ykurilov/agent-chat-core": "0.87.3"
   }
 }

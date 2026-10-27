@@ -351,7 +351,7 @@ export function createChecks(options: ChecksOptions) {
       return input.evalRequired ? { status: 'not_run', scenarios: [], costUsd: 0, note: 'eval в настройке не задан' } : { status: 'not_needed', scenarios: [], costUsd: 0 }
     }
     const selection = selectEvalScenarios(
-      { evalScope: config.evalScope, closedPaths: config.closedPaths, maxScenarios: evalConfig.maxScenarios },
+      { evalScope: config.evalScope, closedPaths: config.closedPaths, maxScenarios: evalConfig.maxScenarios, scenariosDir: evalConfig.scenariosDir },
       input.changedPaths,
     )
     if (selection.status === 'not_needed') {

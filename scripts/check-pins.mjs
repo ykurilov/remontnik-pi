@@ -1,4 +1,4 @@
-// Проверка точных версий: у pi-durable, pi-ai и chord не должно быть диапазонов,
+// Проверка точных версий: у pi-durable, pi-ai, chord и Agent Chat SDK не должно быть диапазонов,
 // а в репозитории — настроек автообновления (Dependabot, Renovate).
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
@@ -8,6 +8,7 @@ const PINNED_PACKAGES = [
   '@earendil-works/pi-durable',
   '@earendil-works/pi-ai',
   '@earendil-works/chord',
+  '@ykurilov/agent-chat-core',
 ]
 const DEPENDENCY_SECTIONS = [
   'dependencies',

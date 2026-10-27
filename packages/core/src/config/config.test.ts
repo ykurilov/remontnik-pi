@@ -130,6 +130,20 @@ describe('defineRemontnikConfig', () => {
     expect(config.checks.eval?.providers[0]).toMatchObject({ name: 'chat', authHeader: 'authorization', models: { 'chat-small': { input: 0.5, output: 2 } } })
   })
 
+  it('папка сценариев eval: по умолчанию eval/scenarios, своя — без «./» и «/» в конце', () => {
+    const input = minimalConfig()
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: [] }
+    expect(defineRemontnikConfig(input).checks.eval?.scenariosDir).toBe('eval/scenarios')
+    input.checks.eval = { ...input.checks.eval, scenariosDir: './evals/scenarios/' }
+    expect(defineRemontnikConfig(input).checks.eval?.scenariosDir).toBe('evals/scenarios')
+  })
+
+  it.each(['/srv/app/evals', '../evals', 'evals/*', 'evals\\scenarios', ''])('отклоняет папку сценариев «%s»', (dir) => {
+    const input = minimalConfig()
+    input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: [], scenariosDir: dir }
+    expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval.scenariosDir'))).toBe(true)
+  })
+
   it.each([
     ['ключ в eval.env', { env: ['EVAL_API_KEY'] }],
     ['токен в eval.env', { env: ['BOT_TOKEN'] }],

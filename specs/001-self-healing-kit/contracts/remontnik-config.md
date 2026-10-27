@@ -28,6 +28,8 @@ export default defineRemontnikConfig({
     eval?: {
       run: string,                    // шаблон: подставляются {scenarios} {repeat} {maxCostUsd} {outDir}
       resultFile: string,             // путь к итогу в {outDir}, формат — deploy-commands.md
+      scenariosDir?: string,          // папка сценариев от корня репозитория, по умолчанию "eval/scenarios";
+                                      // сценарий <id> = путь <scenariosDir>/<id>: по нему closedPaths закрывают сценарий
       repeat: number,                 // по умолчанию 3
       maxScenarios: number,           // по умолчанию 3
       env: string[],                  // имена обычных переменных для eval; имена с KEY, TOKEN, SECRET, PASS, AUTH, CREDENTIAL,

@@ -161,6 +161,7 @@ export default defineRemontnikConfig({
 
 - `run` — шаблон команды с `{scenarios}`, `{repeat}`, `{maxCostUsd}`, `{outDir}`;
 - `resultFile` — итог в формате договора;
+- `scenariosDir` — папка сценариев, если не `eval/scenarios` (например, `evals/scenarios`). По ней `closedPaths` закрывают сценарии: без верной папки закрытый сценарий запустится;
 - `providers` — модели, к которым eval ходит через прокси врача. Настоящий ключ лежит у врача под именем `keyEnv`. Eval получает в той же переменной разовый пропуск, а в `baseUrlEnv` — адрес прокси;
 - `env` — только несекретные переменные.
 
@@ -292,10 +293,11 @@ docker compose -f deploy/compose.remontnik.yml exec doctor remontnik-doctor depl
 Нужен, если врачу надо смотреть страницы приложения.
 
 1. Учётка Ремонтника в кабинете приложения — отдельная, с минимальными правами.
-2. Политика браузера (`browser-policy.json`): только сайты приложения в `allowedOrigins` и узкие `allowedMutations`. Агент приложения при подключении составляет список `extraOrigins`: сторонние адреса, с которых страницы грузят картинки, скрипты и шрифты (CDN), без счётчиков аналитики. После входа паролем всё остальное не грузится.
-3. Ключи браузера (`REMONTNIK_BROWSER_TOKEN`, `REMONTNIK_BROWSER_VAULT_KEY`) — через `secret-handoff` в `REMONTNIK_BROWSER_ENV_FILE`.
-4. Запуск: `docker compose -f deploy/compose.remontnik.yml --profile browser up -d --build`.
-5. Вход сохраняет владелец в консоли сервера. Пароль — только через стандартный ввод, в аргументах и журналах его нет:
+2. Политика браузера (`browser-policy.json`) — отдельный файл на сервере, путь к нему — в `REMONTNIK_BROWSER_POLICY`. Это не `remontnik.config.ts`: файл читает служба браузера. В нём только сайты приложения в `allowedOrigins` и узкие `allowedMutations`. Агент приложения при подключении составляет список `extraOrigins` и вписывает его сюда: сторонние адреса, с которых страницы грузят картинки, скрипты и шрифты (CDN), без счётчиков аналитики. После входа паролем всё остальное не грузится. Образец файла — в [packages/browser/README.md](../packages/browser/README.md).
+3. В `remontnik.config.ts` — раздел `browser`: `enabled`, `profile`, те же `allowedOrigins` и `allowedMutations`, `pagesToCheck`, `loginEntryId`. Поля `extraOrigins` в нём нет: вписанное туда — ошибка «неизвестное поле». Все поля — в [configuration.md](./configuration.md#browser--браузер-врача).
+4. Ключи браузера (`REMONTNIK_BROWSER_TOKEN`, `REMONTNIK_BROWSER_VAULT_KEY`) — через `secret-handoff` в `REMONTNIK_BROWSER_ENV_FILE`.
+5. Запуск: `docker compose -f deploy/compose.remontnik.yml --profile browser up -d --build`.
+6. Вход сохраняет владелец в консоли сервера. Пароль — только через стандартный ввод, в аргументах и журналах его нет:
 
    ```sh
    docker compose -f deploy/compose.remontnik.yml exec -T browser \

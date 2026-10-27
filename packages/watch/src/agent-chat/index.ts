@@ -2,7 +2,8 @@ import type { IncidentContext } from '@ykurilov/remontnik-core/incident'
 import type { Watch } from '../capture/index.js'
 
 // Хуки для Agent Chat SDK: сбои ходов, моделей и инструментов становятся случаями сторожа.
-// Пакет SDK сторож не тянет: типы ниже — та часть его хуков, которую сторож читает.
+// Пакет SDK сторож не тянет: типы ниже — та часть его хуков, которую сторож читает. Что хуки подставляются
+// в настоящий SDK без приведения, проверяет `type-tests/agent-chat-sdk.ts` в `pnpm typecheck`.
 
 export interface AgentChatMessagePart {
   type: string
@@ -27,10 +28,10 @@ export interface AgentChatTurnResult {
   recovered: boolean
 }
 
+/** Без индексной подписи: вход хука в SDK — пересечение типов, и подпись не дала бы подставить хук без приведения. */
 export interface AgentChatTurnNotStarted {
   reason: string
   chat?: { id: string } | null
-  [key: string]: unknown
 }
 
 /** Хуки приложения, если они уже есть: сторож вызывает их и отдаёт их результат без изменений. */
