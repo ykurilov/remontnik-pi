@@ -12,7 +12,7 @@
 
 ### Как обновить приложение
 
-1. Поднять `@ykurilov/remontnik-watch` и `@ykurilov/remontnik-core` до `0.1.1` точными версиями; образ врача — до `0.1.1`.
+1. Поднять `@ykurilov/remontnik-watch` и `@ykurilov/remontnik-core` до `0.1.1` точными версиями. На сервере перевести клон Ремонтника на метку `v0.1.1` и пересобрать врача (`docker compose -f deploy/compose.remontnik.yml up -d --build`).
 2. Сценарии eval лежат не в `eval/scenarios` — вписать их папку в `checks.eval.scenariosDir` в `remontnik.config.ts`. Проверить, что закрытые пути сценариев начинаются с этой папки.
 3. Если хуки сторожа приводились к типу SDK (`as unknown as ...`) — убрать приведение. `pnpm typecheck` приложения должен остаться зелёным.
 4. Если `extraOrigins` по ошибке вписан в `remontnik.config.ts`, перенести его в политику браузера на сервере.
