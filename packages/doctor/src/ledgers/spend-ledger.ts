@@ -55,6 +55,8 @@ export interface OpenHoldDays {
 /** Расход модели по случаю за всё лечение. */
 export interface CaseSpend {
   modelUsd: number
+  /** Расход до последнего повтора законченного случая владельцем: потолок случая считается от него. */
+  budgetFromUsd?: number
   /** Тот же расход по поставщикам, которые ответили (`deepseek`, `openrouter`): видно, уходил ли случай на запасной путь. */
   byProvider?: Record<string, number>
   /** Последнюю бронь случая не пустили: почему. Снимается следующей удачной бронью. */
@@ -150,7 +152,7 @@ function exceeds(usedUsd: number, addUsd: number, limitUsd: number): boolean {
 
 /**
  * Бронь запроса к модели одной транзакцией. Дневной потолок — с запасом и важнее случая; потолок случая — без запаса
- * и на всё лечение. Брони прошлого запуска врача и слишком старые сначала списываются целиком. Отказ ничего не бронирует.
+ * и на всё лечение (после повтора законченного случая владельцем — на новую попытку, `renewCaseBudgetIn`). Брони прошлого запуска врача и слишком старые сначала списываются целиком. Отказ ничего не бронирует.
  */
 export async function holdModelIn(
   tx: RecordTransaction,
@@ -182,7 +184,7 @@ export async function holdModelIn(
   let block: ModelBlock | undefined
   if (exceeds(modelSpentUsd(day) + heldUsd(), input.maxUsd, usableUsd(input.limits.doctorModelUsdPerDay))) block = 'day_budget'
   const spend = input.caseKey === undefined ? undefined : await caseSpendIn(tx, input.caseKey)
-  if (!block && spend && exceeds(spend.modelUsd + heldUsd(input.caseKey) + pastCaseHeldUsd, input.maxUsd, input.caseLimitUsd)) block = 'budget'
+  if (!block && spend && exceeds(spend.modelUsd - (spend.budgetFromUsd ?? 0) + heldUsd(input.caseKey) + pastCaseHeldUsd, input.maxUsd, input.caseLimitUsd)) block = 'budget'
   if (block) {
     if (spend) spend.refused = block
     return { held: false, block }
@@ -191,6 +193,16 @@ export async function holdModelIn(
   holds[input.holdId] = { caseKey: input.caseKey ?? '', usd: input.maxUsd, boot: input.boot, at: input.now }
   if (!open.days.includes(input.dayKey)) open.days.push(input.dayKey)
   return { held: true }
+}
+
+/**
+ * Владелец снова поставил в работу законченный случай: новой попытке — весь потолок случая. Общий расход случая
+ * копится дальше, дневной потолок тот же.
+ */
+export async function renewCaseBudgetIn(tx: RecordTransaction, caseKey: string): Promise<void> {
+  const spend = await caseSpendIn(tx, caseKey)
+  spend.budgetFromUsd = spend.modelUsd
+  delete spend.refused
 }
 
 /** Брони прошлого запуска и слишком старые списываются целиком в свой день. Возвращает оставшиеся брони. */

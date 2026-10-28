@@ -2,7 +2,7 @@ import { signRequest } from '@ykurilov/remontnik-core/signed-http'
 import type { DoctorCommandIo } from './command-io.js'
 
 // Команда владельца врачу: подписанный `POST` на `REMONTNIK_DOCTOR_URL`, только секретом владельца
-// `REMONTNIK_CONTROL_SECRET`. Ответ врача — в вывод; отказ — кодом ошибки, без тела.
+// `REMONTNIK_CONTROL_SECRET`. Ответ врача — в вывод; отказ — кодом ошибки и подсказкой врача, если она есть.
 
 const REQUEST_TIMEOUT_MS = 30_000
 
@@ -31,10 +31,14 @@ export async function postOwnerCommand(io: DoctorCommandIo, path: string, comman
   const text = await response.text()
   if (!response.ok) {
     let code = `HTTP ${response.status}`
+    let hint: unknown
     try {
-      code = String((JSON.parse(text) as { error?: unknown }).error ?? code)
+      const refusal = JSON.parse(text) as { error?: unknown; hint?: unknown }
+      code = String(refusal.error ?? code)
+      hint = refusal.hint
     } catch {}
     io.stderr(`remontnik-doctor: отказ (${response.status} ${code})\n`)
+    if (typeof hint === 'string') io.stderr(`remontnik-doctor: ${hint}\n`)
     return 1
   }
   io.stdout(`${text}\n`)

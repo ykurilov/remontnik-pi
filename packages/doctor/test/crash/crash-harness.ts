@@ -139,6 +139,8 @@ export interface ChildReport {
 
 export interface ChildState {
   state: string
+  /** Сколько появлений сбоя склеено в случай. */
+  events: number
   reports: ChildReport[]
 }
 
@@ -162,13 +164,16 @@ export interface DoctorProcess {
 export interface RunDoctorOptions {
   /** Где врачу умереть. */
   crashAt?: CrashPoint
-  faultAt?: 'fixing'
+  /** Обычная ошибка один раз: при коммите правки или сразу после того, как мост принял задачу агенту. */
+  faultAt?: 'fixing' | 'handoff_sent'
   /** Прислать сбой «Пациента» сразу после старта. */
   sendEvent?: boolean
   /** Перед смертью врача владелец нажимает стоп-кран. */
   stopBeforeCrash?: boolean
   /** У врача есть браузер, и модель начинает диагноз со страницы, где нужна проверка человеком. */
   browser?: boolean
+  /** Набор врача сломан: тесты в копии не запускаются (`pnpm: not found`), лечение кончается «только отчётом». */
+  brokenChecks?: boolean
 }
 
 /** Запустить врача на мире стенда. */
@@ -179,8 +184,10 @@ export function runDoctor(world: CrashWorld, options: RunDoctorOptions = {}): Do
   delete env.REMONTNIK_TEST_SEND_EVENT
   delete env.REMONTNIK_TEST_STOP_BEFORE_CRASH
   delete env.REMONTNIK_TEST_BROWSER
+  delete env.REMONTNIK_TEST_BROKEN_CHECKS
   if (options.stopBeforeCrash) env.REMONTNIK_TEST_STOP_BEFORE_CRASH = '1'
   if (options.browser) env.REMONTNIK_TEST_BROWSER = '1'
+  if (options.brokenChecks) env.REMONTNIK_TEST_BROKEN_CHECKS = '1'
   if (options.crashAt) env.REMONTNIK_TEST_CRASH_AT = options.crashAt
   if (options.faultAt) env.REMONTNIK_TEST_FAULT_AT = options.faultAt
   if (options.sendEvent) env.REMONTNIK_TEST_SEND_EVENT = '1'

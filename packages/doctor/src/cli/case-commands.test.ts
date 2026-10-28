@@ -10,7 +10,7 @@ import { runDoctorCommand } from './run-doctor-command.js'
 const SHARED = 'shared-secret-for-tests'
 const OWNER = 'owner-secret-for-tests'
 let server: IntakeServer
-let asked: { caseId: number; by: string }[]
+let asked: { caseId: number; by: string; force?: boolean }[]
 let answer: CaseRetryAnswer
 
 beforeEach(async () => {
@@ -24,8 +24,8 @@ beforeEach(async () => {
       caseRetry: createCaseRetryHandler({
         secret: SHARED,
         controlSecret: OWNER,
-        async retryCase(caseId, by) {
-          asked.push({ caseId, by })
+        async retryCase(caseId, by, request) {
+          asked.push({ caseId, by, ...(request?.force ? { force: true } : {}) })
           return answer
         },
       }),
@@ -64,6 +64,20 @@ describe('case <номер> retry', () => {
     expect(finished.err).toContain('409 case_finished')
   })
 
+  it('врач просит согласия → отказ с его подсказкой; --force передаёт согласие', async () => {
+    answer = { error: 'fix_ready', state: 'report_only', branch: 'remontnik/1-price', hint: 'правка готова в ветке remontnik/1-price: case 1 retry --force' }
+    const refused = await run(['case', '1', 'retry'])
+    expect(refused.code).toBe(1)
+    expect(refused.err).toContain('409 fix_ready')
+    expect(refused.err).toContain('правка готова в ветке remontnik/1-price')
+
+    answer = { retried: 'restarted', attempt: 2, previousBranch: 'remontnik/1-price' }
+    const forced = await run(['case', '1', 'retry', '--force', '--by', 'owner'])
+    expect(forced.code).toBe(0)
+    expect(JSON.parse(forced.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2, previousBranch: 'remontnik/1-price' })
+    expect(asked).toEqual([{ caseId: 1, by: 'console' }, { caseId: 1, by: 'owner', force: true }])
+  })
+
   it('без секрета владельца команда не идёт', async () => {
     const { code, err } = await run(['case', '1', 'retry'], { REMONTNIK_DOCTOR_URL: server.url, REMONTNIK_SHARED_SECRET: SHARED })
 
@@ -96,6 +110,7 @@ describe('POST /v1/control/cases', () => {
     expect((await post({ caseId: 1, action: 'forget', by: 'owner' }, OWNER)).status).toBe(400)
     expect((await post({ caseId: '1', action: 'retry', by: 'owner' }, OWNER)).status).toBe(400)
     expect((await post({ caseId: 0, action: 'retry', by: 'owner' }, OWNER)).status).toBe(400)
+    expect((await post({ caseId: 1, action: 'retry', by: 'owner', force: 'yes' }, OWNER)).status).toBe(400)
     expect(asked).toEqual([])
   })
 })

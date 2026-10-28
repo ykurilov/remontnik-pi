@@ -14,7 +14,9 @@ import {
   paseoDoneReport,
   reclaimedReport,
   standBrokenReport,
+  withRetryHint,
 } from './texts.js'
+import { REPORT_FULL_LIMIT, REPORT_SHORT_LIMIT } from './index.js'
 
 const sick = { caseId: 7, appName: 'patient', kind: 'tool_error' as const, where: 'src/bot/tools.ts', message: 'orders storage timeout' }
 const diagnosis = {
@@ -30,6 +32,25 @@ const green: ChecksResult = {
 }
 
 describe('тексты отчётов лечения', () => {
+  it('случай кончился без излечения: в конце отчёта команда повтора, и длинный текст её не съедает', () => {
+    const text = withRetryHint({ short: 'я'.repeat(REPORT_SHORT_LIMIT * 2), full: 'полный' }, 7)
+    expect(text.short.length).toBeLessThanOrEqual(REPORT_SHORT_LIMIT)
+    expect(text.short.endsWith('Лечить заново: remontnik-doctor case 7 retry')).toBe(true)
+    expect(text.full).toBe('полный\n\nЛечить заново: remontnik-doctor case 7 retry')
+
+    const long = withRetryHint({ short: 'кратко', full: 'я'.repeat(REPORT_FULL_LIMIT * 2) }, 7)
+    expect(long.full.length).toBeLessThanOrEqual(REPORT_FULL_LIMIT)
+    expect(long.full.endsWith('Лечить заново: remontnik-doctor case 7 retry')).toBe(true)
+  })
+
+  it('после выкатки нужен человек: сначала разобраться с выкаткой, повтор — с --force', () => {
+    const text = withRetryHint({ short: 'откат не удался', full: 'откат не удался' }, 7, { force: true })
+    for (const body of [text.short, text.full]) {
+      expect(body).toContain('человек разберётся с выкаткой')
+      expect(body.endsWith('remontnik-doctor case 7 retry --force')).toBe(true)
+    }
+  })
+
   it('fix_ready: ветка, проверки и что выкатки не было', () => {
     const text = fixReadyReport({ case: sick, diagnosis, fix, branch: 'remontnik/7-orders', commit: 'abc1234def', checks: green, pushed: true })
     expect(text.short).toContain('Случай 7')

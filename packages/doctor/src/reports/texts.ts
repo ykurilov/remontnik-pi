@@ -1,9 +1,9 @@
-import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
+import { truncateText, type IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
 import type { Deployment, DeployRefusal, RollbackCause } from '../deployer/deploy-sequence.js'
 import type { HandoffResult, ReclaimReason } from '../handoff/doc.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
-import type { ReportType } from './index.js'
+import { REPORT_FULL_LIMIT, REPORT_SHORT_LIMIT, type ReportType } from './index.js'
 
 // Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
 
@@ -28,6 +28,18 @@ const usd = (value: number) => `$${value.toFixed(2)}`
 
 export function head(sick: ReportCase): string {
   return `Случай ${sick.caseId} (${sick.appName})`
+}
+
+/**
+ * Случай кончился без излечения и сам второй раз не лечится: отчёт заканчивается командой повтора. Тексты обрезаются
+ * так, чтобы команда дошла целиком и в Telegram, и в полном отчёте. `force` — после выкатки нужен человек: сначала он
+ * разбирается, что работает, и только потом повтор с явным согласием.
+ */
+export function withRetryHint(text: ReportText, caseId: number, options: { force?: boolean } = {}): ReportText {
+  const command = `remontnik-doctor case ${caseId} retry`
+  const hint = options.force ? `Лечить заново — только когда человек разберётся с выкаткой: ${command} --force` : `Лечить заново: ${command}`
+  const withHint = (body: string, limit: number) => `${truncateText(body, limit - hint.length - 2)}\n\n${hint}`
+  return { ...text, short: withHint(text.short, REPORT_SHORT_LIMIT), full: withHint(text.full, REPORT_FULL_LIMIT) }
 }
 
 export function caseLines(sick: ReportCase): string[] {
