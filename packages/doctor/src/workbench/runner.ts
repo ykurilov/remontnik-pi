@@ -214,6 +214,29 @@ export function envFileText(env: Record<string, string>): string {
     .join('')
 }
 
+export const DEFAULT_WORKBENCH_MEMORY = '4g'
+export const DEFAULT_WORKBENCH_CPUS = '2'
+
+/** Пользователь контейнера по умолчанию — тот же, что у врача: файлы копии остаются его. */
+export function defaultWorkbenchUser(): string | undefined {
+  return process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined
+}
+
+/** Права и пределы контейнера верстака: без прав, лимиты памяти и процессора, корень только для чтения, `/tmp` в памяти. */
+export function workbenchSandboxArgs(spec: { user?: string | undefined; memory: string; cpus: string }): string[] {
+  return [
+    ...(spec.user ? ['--user', spec.user] : []),
+    '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges',
+    '--pids-limit', '1024',
+    '--memory', spec.memory,
+    '--memory-swap', spec.memory,
+    '--cpus', spec.cpus,
+    '--read-only',
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
+  ]
+}
+
 /**
  * Аргументы `docker create` для одной команды: контейнер без прав, с лимитами памяти и процессора, корневая система
  * только для чтения; писать можно в копию, её HOME, разрешённые папки и `/tmp`.
@@ -227,15 +250,7 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     '--label', `${COPY_LABEL}=${copyKey(spec.copyDir)}`,
     '--network', spec.network,
     ...Object.entries(spec.hosts ?? {}).flatMap(([host, ip]) => ['--add-host', `${host}:${ip}`]),
-    ...(spec.user ? ['--user', spec.user] : []),
-    '--cap-drop', 'ALL',
-    '--security-opt', 'no-new-privileges',
-    '--pids-limit', '1024',
-    '--memory', spec.memory,
-    '--memory-swap', spec.memory,
-    '--cpus', spec.cpus,
-    '--read-only',
-    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
+    ...workbenchSandboxArgs(spec),
     ...bindMount(spec.copyDir, spec.copyDir),
     ...bindMount(spec.home, CONTAINER_HOME),
     ...spec.writableDirs.flatMap((dir) => bindMount(dir, dir)),
@@ -328,7 +343,7 @@ export async function removeOrphanWorkbenches(options: { homesDir: string; docke
  */
 export function createDockerRunner(options: DockerRunnerOptions): CommandRunner {
   const docker = options.docker ?? 'docker'
-  const user = options.user ?? (process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined)
+  const user = options.user ?? defaultWorkbenchUser()
   const clientEnv = dockerClientEnv()
   const spoiledMark = (copyDir: string) => spoiledMarkOf(options.homesDir, copyKey(copyDir))
   const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
@@ -364,8 +379,8 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
         ...(lease ? { hosts: { [CASE_GATEWAY_HOST]: lease.network.gatewayIp } } : {}),
         ...(user ? { user } : {}),
         envFile,
-        memory: options.memory ?? '4g',
-        cpus: options.cpus ?? '2',
+        memory: options.memory ?? DEFAULT_WORKBENCH_MEMORY,
+        cpus: options.cpus ?? DEFAULT_WORKBENCH_CPUS,
         command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
         lifetimeSeconds: Math.ceil(runOptions.timeoutSeconds) + CONTAINER_LIFETIME_MARGIN_SECONDS,
       })

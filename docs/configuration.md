@@ -53,7 +53,7 @@ checks: { test: 'pnpm test' },
 "packageManager": "pnpm@10.33.2"
 ```
 
-Без `packageManager` corepack возьмёт свою версию pnpm, а не ту, что записала файл-замок. В образе нет ни pnpm, ни corepack (например, Node 25 и новее)? Тогда нужен образ со своим pnpm: подойдёт `deploy/workbench.Dockerfile`. `check-config` ловит оба случая до первого случая.
+Без `packageManager` corepack возьмёт свою версию pnpm, а не ту, что записала файл-замок. В образе нет ни pnpm, ни corepack (например, Node 25 и новее)? Тогда нужен образ со своим pnpm: подойдёт `deploy/workbench.Dockerfile`. `check-config` ловит оба случая до первого запуска. Проверка срабатывает, когда pnpm или yarn зовёт `workbench.install`, `checks.test` или `checks.typecheck`.
 
 ### `checks` — проверки правки
 

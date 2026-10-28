@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -38,7 +38,7 @@ function git(dir: string, ...args: string[]): void {
 }
 
 /** Репозиторий приложения на основной ветке: настройка и, по желанию, файл служб. */
-function appRepo(options: { config?: object; services?: string; deployFiles?: Record<string, { content: string; executable?: boolean } | null>; packageJson?: object } = {}): string {
+function appRepo(options: { config?: object; services?: string; deployFiles?: Record<string, { content: string; executable?: boolean } | null>; packageJson?: object | string } = {}): string {
   const repoDir = join(tempDir(), 'app')
   mkdirSync(repoDir)
   git(repoDir, 'init', '--quiet', '--initial-branch=main')
@@ -53,7 +53,7 @@ function appRepo(options: { config?: object; services?: string; deployFiles?: Re
     writeFileSync(join(repoDir, name), file.content)
     if (file.executable) chmodSync(join(repoDir, name), 0o755)
   }
-  if (options.packageJson) writeFileSync(join(repoDir, 'package.json'), JSON.stringify(options.packageJson))
+  if (options.packageJson) writeFileSync(join(repoDir, 'package.json'), typeof options.packageJson === 'string' ? options.packageJson : JSON.stringify(options.packageJson))
   if (options.services !== undefined) {
     mkdirSync(join(repoDir, 'ci'))
     writeFileSync(join(repoDir, 'ci/services.yml'), options.services)
@@ -91,7 +91,7 @@ interface DockerScenario {
   /** Контейнер службы браузера `remontnik-browser`: запущен ли и что отвечает `remontnik-browser check-policy`. */
   browser?: { running: boolean; problems?: string[]; oldImage?: boolean; noPolicy?: boolean }
   /** Образ верстака: скачан ли на сервер и какие из pnpm, yarn, corepack в нём есть. */
-  workbench?: { pulled?: boolean; tools: string[] }
+  workbench?: { pulled?: boolean; tools: string[]; noShell?: boolean; runError?: string }
 }
 
 const HEALTHY_DOCKER: DockerScenario = {
@@ -121,7 +121,12 @@ const fail = () => { process.stderr.write(s.errorText || 'Cannot connect to the 
 if (s.down) fail()
 if (a[0] === 'version') out('27.3.1')
 if (a[0] === 'image' && a[1] === 'inspect') { if (!s.workbench || s.workbench.pulled === false) { process.stderr.write('Error: No such image: ' + a.at(-1)); process.exit(1) } out('sha256:' + 'b'.repeat(64)) }
-if (a[0] === 'run' && a.includes('--network') && a[a.indexOf('--network') + 1] === 'none') out((s.workbench ? s.workbench.tools : []).join('\\n'))
+if (a[0] === 'run' && a.includes('--network') && a[a.indexOf('--network') + 1] === 'none') {
+  if (s.workbench && s.workbench.noShell) { process.stderr.write('docker: Error response from daemon: failed to create task: exec: "sh": executable file not found in $PATH'); process.exit(127) }
+  if (s.workbench && s.workbench.runError) { process.stderr.write(s.workbench.runError); process.exit(125) }
+  if (process.env.FAKE_DOCKER_ARGS) require('fs').writeFileSync(process.env.FAKE_DOCKER_ARGS, JSON.stringify(a))
+  out((s.workbench ? s.workbench.tools : []).join('\\n'))
+}
 if (a[0] === 'inspect' && a[2].includes('Mounts')) {
   const state = process.env.REMONTNIK_STATE_DIR
   out(JSON.stringify([{ Type: 'bind', Source: '/var/run/docker.sock', Destination: '/var/run/docker.sock' }, s.stateMount === 'volume' ? { Type: 'volume', Source: '/var/lib/docker/volumes/state/_data', Destination: state } : { Type: 'bind', Source: state, Destination: state }]))
@@ -519,7 +524,7 @@ describe('check-config: настройка', () => {
 })
 
 describe('check-config: pnpm и yarn в образе верстака', () => {
-  const withWorkbench = (workbench: { install: string; test?: string }, packageJson?: object): string => {
+  const withWorkbench = (workbench: { install: string; test?: string }, packageJson?: object | string): string => {
     const base = testRemontnikConfig()
     const config = {
       ...base,
@@ -533,7 +538,7 @@ describe('check-config: pnpm и yarn в образе верстака', () => {
     checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker({ ...HEALTHY_DOCKER, workbench }), gh: fakeGh(GOOD_RULESETS) })
   const about = (findings: Finding[]) => findings.filter((finding) => finding.area === 'верстак')
 
-  it('ни pnpm, ни corepack в образе — ошибка до первого случая: установка упала бы с «pnpm: not found»', async () => {
+  it('ни pnpm, ни corepack в образе — ошибка до первого запуска: установка упала бы с «pnpm: not found»', async () => {
     const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' }), { tools: [] })
     const problem = about(findings).find((finding) => finding.level === 'error')
     expect(problem?.problem).toMatch(/pnpm.*corepack/)
@@ -567,6 +572,42 @@ describe('check-config: pnpm и yarn в образе верстака', () => {
     const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }), { pulled: false, tools: [] })
     expect(errors(findings)).toEqual([])
     expect(about(findings).find((finding) => finding.level === 'warning')?.fix).toMatch(/docker pull/)
+  })
+
+  it('package.json не разбирается — находка, а не падение check-config', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, '{ "name": "app",'), { tools: ['corepack'] })
+    expect(about(findings).find((finding) => finding.level === 'error')?.problem).toMatch(/package\.json не читается/)
+  })
+
+  it('packageManager другого менеджера (команды зовут pnpm, а поле npm@…) — ошибка: corepack откажется', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'npm@10.0.0' }), { tools: ['corepack'] })
+    const problem = about(findings).find((finding) => finding.level === 'error')
+    expect(problem?.problem).toMatch(/npm@10\.0\.0/)
+    expect(about(findings).filter((finding) => finding.level === 'ok')).toEqual([])
+  })
+
+  it('в образе нет sh — ошибка: врач запускает все команды через sh -c', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' }), { tools: [], noShell: true })
+    expect(about(findings).find((finding) => finding.level === 'error')?.problem).toMatch(/нет sh/)
+  })
+
+  it('образ не запустился по другой причине — предупреждение со словами Docker', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' }), { tools: [], runError: 'docker: Error response from daemon: invalid user' })
+    const problem = about(findings).find((finding) => finding.level === 'warning')
+    expect(problem?.problem).toMatch(/не запустился/)
+    expect(problem?.problem).toMatch(/invalid user/)
+  })
+
+  it('пробный запуск образа — как у верстака: пользователь, пределы, без сети, корень только для чтения', async () => {
+    const argsFile = join(tempDir(), 'args.json')
+    const env = { ...serverEnv(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' })), FAKE_DOCKER_ARGS: argsFile, REMONTNIK_WORKBENCH_MEMORY: '3g' }
+    await checkDoctorConfig(env, { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
+    const args = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+    const after = (flag: string) => args[args.indexOf(flag) + 1]
+    expect(after('--network')).toBe('none')
+    expect(after('--user')).toMatch(/^\d+:\d+$/)
+    expect(after('--memory')).toBe('3g')
+    expect(args).toEqual(expect.arrayContaining(['--read-only', '--cap-drop', 'ALL', '--pids-limit', '--cpus', '--tmpfs', 'no-new-privileges']))
   })
 
   it('npm-проект — образ на pnpm и yarn не проверяется', async () => {

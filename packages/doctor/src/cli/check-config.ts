@@ -13,6 +13,7 @@ import { matchesAllowMask } from '../path-mask/index.js'
 import type { ConfigCodeReader } from '../service/config-reader.js'
 import { loadMainBranchConfig } from '../service/config-source.js'
 import { configReaderFromEnv, doctorStartPlan, type DoctorEnv } from '../service/start.js'
+import { DEFAULT_WORKBENCH_CPUS, DEFAULT_WORKBENCH_MEMORY, defaultWorkbenchUser, workbenchSandboxArgs } from '../workbench/runner.js'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 
 // `remontnik-doctor check-config`: всё, на чём споткнётся старт врача, — одним списком и до старта.
@@ -674,36 +675,67 @@ async function checkEvalScenarios(env: DoctorEnv, config: RemontnikConfig): Prom
   return findings
 }
 
-/** pnpm или yarn, которые зовут команды верстака и проверок, и то, что указано в `packageManager` приложения. */
-async function packageManagersOf(config: RemontnikConfig, repoDir: string | undefined): Promise<{ needed: Set<'pnpm' | 'yarn'>; pinned?: string }> {
+type PackageManagerName = 'pnpm' | 'yarn'
+
+/**
+ * pnpm или yarn, которые зовут команды верстака и проверок, и поле `packageManager` приложения: `undefined` — файла
+ * package.json нет, `''` — поля нет. `broken` — package.json есть, но не разбирается.
+ */
+async function packageManagersOf(config: RemontnikConfig, repoDir: string | undefined): Promise<{ needed: Set<PackageManagerName>; pinned?: string; broken?: string }> {
   const commands = [config.workbench.install, config.checks.test, config.checks.typecheck ?? ''].join('\n')
-  const needed = new Set<'pnpm' | 'yarn'>()
+  const needed = new Set<PackageManagerName>()
   if (/(^|[\s;&|(])(pnpm|pnpx)(\s|$)/m.test(commands)) needed.add('pnpm')
   if (/(^|[\s;&|(])yarn(\s|$)/m.test(commands)) needed.add('yarn')
-  const manifest = repoDir ? await readFile(join(repoDir, 'package.json'), 'utf8').then((text) => JSON.parse(text) as { packageManager?: unknown }, () => undefined) : undefined
-  const pinned = typeof manifest?.packageManager === 'string' ? manifest.packageManager : undefined
-  const pinnedName = /^(pnpm|yarn)@/.exec(pinned ?? '')?.[1] as 'pnpm' | 'yarn' | undefined
-  if (pinnedName && needed.size > 0) needed.add(pinnedName)
-  return { needed, ...(manifest ? { pinned: pinned ?? '' } : {}) }
+  if (!repoDir || needed.size === 0) return { needed }
+  const text = await readFile(join(repoDir, 'package.json'), 'utf8').catch(() => undefined)
+  if (text === undefined) return { needed }
+  let manifest: { packageManager?: unknown } | null
+  try {
+    manifest = JSON.parse(text) as { packageManager?: unknown } | null
+  } catch (error) {
+    return { needed, broken: (error as Error).message }
+  }
+  const pinned = typeof manifest?.packageManager === 'string' ? manifest.packageManager : ''
+  return { needed, pinned }
 }
+
+/** Запуск `docker run` образа верстака упал оттого, что в нём нет `sh`. */
+const NO_SHELL = /executable file not found|no such file or directory/i
 
 /**
  * pnpm и yarn в образе верстака: своя программа или corepack (по нему врач подставляет `pnpm` и `yarn` сам). Нет ни того,
- * ни другого — установка в первом же случае упадёт с «pnpm: not found». Образ запускается без сети и только читает.
+ * ни другого — установка в первом же случае упадёт с «pnpm: not found». Образ запускается как у верстака: тот же
+ * пользователь, пределы и PATH образа, без сети, корень только для чтения.
  */
 async function checkWorkbenchTools(env: DoctorEnv, docker: string, config: RemontnikConfig): Promise<Finding[]> {
-  const { needed, pinned } = await packageManagersOf(config, value(env, 'REMONTNIK_CONFIG_REPO_DIR'))
+  const { needed, pinned, broken } = await packageManagersOf(config, value(env, 'REMONTNIK_CONFIG_REPO_DIR'))
   if (needed.size === 0) return []
-  const image = config.workbench.image
   const names = [...needed].join(' и ')
+  if (broken !== undefined) {
+    return [{ level: 'error', area: 'верстак', problem: `package.json не читается (${broken}): ${names} в верстаке не запустится`, fix: 'исправьте package.json в основной ветке и снова check-config' }]
+  }
+  const pinnedName = /^([^@\s]+)@/.exec(pinned ?? '')?.[1]
+  if (pinned && !needed.has(pinnedName as PackageManagerName)) {
+    return [{ level: 'error', area: 'верстак', problem: `команды верстака зовут ${names}, а в package.json "packageManager": "${pinned}": corepack откажется запускать другой менеджер`, fix: `впишите в packageManager тот, что зовут команды: "${[...needed][0]}@<версия>", или поменяйте команды в workbench и checks` }]
+  }
+  const image = config.workbench.image
   // Docker недоступен — об этом уже ошибка в проверке Docker.
   if (!(await run(docker, ['version', '--format', '{{.Server.Version}}'], env)).ok) return []
   if (!(await run(docker, ['image', 'inspect', '--format', '{{.Id}}', image], env)).ok) {
     return [{ level: 'warning', area: 'верстак', problem: `образа верстака ${image} нет на сервере: есть ли в нём ${names}, не проверить`, fix: `docker pull ${image} и снова check-config` }]
   }
-  const probe = await run(docker, ['run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--entrypoint', 'sh', image, '-c', 'for t in pnpm yarn corepack; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; true'], env)
+  const sandbox = workbenchSandboxArgs({
+    user: defaultWorkbenchUser(),
+    memory: value(env, 'REMONTNIK_WORKBENCH_MEMORY') ?? DEFAULT_WORKBENCH_MEMORY,
+    cpus: value(env, 'REMONTNIK_WORKBENCH_CPUS') ?? DEFAULT_WORKBENCH_CPUS,
+  })
+  const probe = await run(docker, ['run', '--rm', '--network', 'none', ...sandbox, '--entrypoint', 'sh', image, '-c', 'for t in pnpm yarn corepack; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; true'], env)
   if (!probe.ok) {
-    return [{ level: 'warning', area: 'верстак', problem: `образ верстака ${image} не запустился для проверки ${names}`, fix: `в образе нужен sh; проверьте: docker run --rm --entrypoint sh ${image} -c "command -v ${[...needed][0]}"` }]
+    const said = redactSecrets(probe.stderr.trim().split('\n').at(-1) ?? '').slice(0, 300)
+    if (NO_SHELL.test(probe.stderr)) {
+      return [{ level: 'error', area: 'верстак', problem: `в образе верстака ${image} нет sh: врач запускает каждую команду через sh -c, ни одна не пойдёт`, fix: `возьмите образ с sh (node:22, node:24) или соберите свой (deploy/workbench.Dockerfile)` }]
+    }
+    return [{ level: 'warning', area: 'верстак', problem: `образ верстака ${image} не запустился для проверки ${names}: ${said || 'docker не сказал почему'}`, fix: `проверьте вручную: docker run --rm --network none --entrypoint sh ${image} -c "command -v ${[...needed][0]}"` }]
   }
   const tools = new Set(probe.stdout.split('\n').map((line) => line.trim()))
   const findings: Finding[] = []
