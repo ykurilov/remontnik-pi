@@ -6,7 +6,7 @@ import { postOwnerCommand } from './owner-command.js'
 // повторных сбоев врача или кончилось без излечения. Подписанный `POST /v1/control/cases`, только секретом владельца
 // `REMONTNIK_CONTROL_SECRET`.
 
-export const CASE_USAGE = `  remontnik-doctor case <номер случая> retry [--by <кто>]
+export const CASE_USAGE = `  remontnik-doctor case <номер случая> retry [--force] [--by <кто>]
 `
 
 export async function caseCommand(args: string[], io: DoctorCommandIo): Promise<number> {
@@ -15,7 +15,7 @@ export async function caseCommand(args: string[], io: DoctorCommandIo): Promise<
   const caseId = Number(id)
   if (!/^[1-9]\d*$/.test(id ?? '') || !Number.isSafeInteger(caseId)) throw new UsageError('номер случая — целое число, как в отчёте')
   const {
-    values: { by = 'console' },
-  } = parseArgs({ args: rest, options: { by: { type: 'string' } } })
-  return postOwnerCommand(io, '/v1/control/cases', { caseId, action, by })
+    values: { by = 'console', force = false },
+  } = parseArgs({ args: rest, options: { by: { type: 'string' }, force: { type: 'boolean' } } })
+  return postOwnerCommand(io, '/v1/control/cases', { caseId, action, by, ...(force ? { force } : {}) })
 }

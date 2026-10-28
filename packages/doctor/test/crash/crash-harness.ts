@@ -164,7 +164,8 @@ export interface DoctorProcess {
 export interface RunDoctorOptions {
   /** Где врачу умереть. */
   crashAt?: CrashPoint
-  faultAt?: 'fixing'
+  /** Обычная ошибка один раз: при коммите правки или сразу после того, как мост принял задачу агенту. */
+  faultAt?: 'fixing' | 'handoff_sent'
   /** Прислать сбой «Пациента» сразу после старта. */
   sendEvent?: boolean
   /** Перед смертью врача владелец нажимает стоп-кран. */

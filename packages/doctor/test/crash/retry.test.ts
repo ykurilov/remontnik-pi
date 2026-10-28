@@ -93,7 +93,8 @@ describe.concurrent('лечение, которое само не продолж
 
     const retried = await doctor.command(['case', '1', 'retry', '--by', 'owner'])
     expect(retried).toMatchObject({ code: 0 })
-    expect(JSON.parse(retried.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2 })
+    // Ветка прошлой попытки остаётся, ответ её называет.
+    expect(JSON.parse(retried.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2, previousBranch: expect.stringMatching(/^remontnik\/1-/) })
 
     const final = await doctor.waitForState(['healed'], 90_000)
     const branches = git(world.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/gm, '').split('\n')

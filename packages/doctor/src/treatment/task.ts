@@ -17,7 +17,7 @@ import {
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { newEventId } from '@ykurilov/remontnik-core/incident'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
-import { setCaseStateIn, UNHEALED_FINAL_STATES, type Case, type CaseState } from '../case-book/index.js'
+import { setCaseStateIn, UNHEALED_FINAL_STATES, type Case, type CaseOutcome, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import { configFilesAt, configFilesOfFix } from '../config-files/index.js'
@@ -197,6 +197,12 @@ export type TreatmentOutcome =
   | 'rolled_back'
   | 'not_helped'
 
+type TreatmentResultLike = Pick<TreatmentResult, 'outcome' | 'why' | 'branch'>
+
+function caseOutcomeOf(result: TreatmentResultLike): CaseOutcome {
+  return { outcome: result.outcome, ...(result.why ? { why: result.why } : {}), ...(result.branch ? { branch: result.branch } : {}) }
+}
+
 export type TreatmentResult = {
   outcome: TreatmentOutcome
   /** Почему нужен человек. */
@@ -336,17 +342,22 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return redactedWith(knownSecretsOf(await deps.loadConfig()), text, baseRunning)
   }
 
-  /** Отчёт и состояние случая внутри фиксации задачи. Готовая правка — без команды повтора: её выкатывает человек. */
-  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, reportText: ReportText): Promise<number> {
-    const text = UNHEALED_FINAL_STATES.includes(state) && type !== 'fix_ready' ? withRetryHint(reportText, caseId) : reportText
+  /**
+   * Отчёт и состояние случая внутри фиксации задачи; `outcome` — итог законченной попытки, случай его помнит. Готовая
+   * правка — без команды повтора: её выкатывает человек. После выкатки, где нужен человек, команда — с `--force`.
+   */
+  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, reportText: ReportText, outcome?: TreatmentResultLike): Promise<number> {
     const opened = await setCaseStateIn(records, caseId, state)
+    if (outcome) opened.lastOutcome = caseOutcomeOf(outcome)
+    const noted = opened.paseoUnavailable ? { ...reportText, full: `${reportText.full}\n${PASEO_UNAVAILABLE_NOTE}` } : reportText
+    const text = UNHEALED_FINAL_STATES.includes(state) && type !== 'fix_ready' ? withRetryHint(noted, caseId, { force: outcome?.why === 'deploy' }) : noted
     // Снимки экрана, снятые браузером врача по случаю, уходят в ближайший отчёт.
     const screenshots = [...(text.screenshots ?? []), ...(await takeCaseScreenshotsIn(records, caseId))]
     const report = await deps.reports.addIn(records, {
       type,
       caseId,
       short: text.short,
-      full: opened.paseoUnavailable ? `${text.full}\n${PASEO_UNAVAILABLE_NOTE}` : text.full,
+      full: text.full,
       telegram: 'pending',
       ...(text.stopSwitch ? { stopSwitch: true } : {}),
       ...(screenshots.length > 0 ? { screenshots } : {}),
@@ -372,7 +383,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     await runtime.commit(async (tx) => {
       const records = recordTransactionOver(tx)
       if (alsoIn) await alsoIn(records)
-      const reportId = await reportIn(records, caseId, state, type, redacted)
+      const reportId = await reportIn(records, caseId, state, type, redacted, result)
       // Агент выкатил после `reclaimed`, пока врач лечил: наблюдение этой выкатки — следующей попыткой.
       if (handedOff) await adoptIn(records, caseId)
       return { status: 'terminal', outcome: { status: 'completed', result: { ...result, reportId } } }
@@ -840,7 +851,10 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
           const handoff = await readHandoff(runtime, caseId, context)
           if (!handoff) {
             await runtime.commit(async (tx) => {
-              ;(await caseIn(recordTransactionOver(tx), caseId)).state = 'handoff_check'
+              const opened = await caseIn(recordTransactionOver(tx), caseId)
+              opened.state = 'handoff_check'
+              // Номер задачи у моста — в случае, а не в памяти задачи: новая попытка после упавшей передачи шлёт тот же.
+              opened.handoffTaskId ??= newEventId(deps.now())
               return { status: 'running', checkpoint: { phase: 'handoff_check' } }
             }, context)
             return
@@ -918,8 +932,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
         const paseo = config.handoff.paseo
         const sick = await readCase(runtime, caseId, context)
         const client = deps.handoff?.client
-        // Номер задачи — один на случай: повтор фазы после перезапуска мост узнаёт и второго письма агенту не шлёт.
-        const taskId = (await runtime.memo<string>('handoffTaskId', context)) ?? (await runtime.memo('handoffTaskId', newEventId(deps.now()), context))
+        // Номер задачи — один на случай: повтор фазы после перезапуска и новая попытка после упавшей передачи мост
+        // узнаёт и второго письма агенту не шлёт. Память задачи — только для передачи, начатой до записи номера в случай.
+        const taskId = sick.handoffTaskId ?? (await runtime.memo<string>('handoffTaskId', context)) ?? (await runtime.memo('handoffTaskId', newEventId(deps.now()), context))
         let offered = false
         let sent = false
         if (client && paseo && (await client.health())) {
@@ -1251,7 +1266,7 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
             closing = closingOf(gate, checks)
           }
           const { text, outcome } = closeWith(closing.kind, gate)
-          const reportId = await reportIn(records, caseId, closing.caseState, closing.report, redactedWith(knownSecrets, text, checkpoint.baseRunning))
+          const reportId = await reportIn(records, caseId, closing.caseState, closing.report, redactedWith(knownSecrets, text, checkpoint.baseRunning), { ...result, ...outcome })
           reported = true
           return { status: 'terminal', outcome: { status: 'completed', result: { ...result, gate, ...outcome, reportId } } }
         }, context)
@@ -1318,6 +1333,8 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     const taskId = await tx.createTask(task, input, { ownership: { kind: 'conversation' }, conversationId: conversation.id, background: true })
     opened.treatmentTaskId = String(taskId)
     opened.state = 'triage'
+    // Итог прежней попытки к новой не относится: повтор владельцем смотрит на итог той, что идёт сейчас.
+    delete opened.lastOutcome
   }
 
   return {

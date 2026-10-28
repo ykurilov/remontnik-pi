@@ -8,6 +8,7 @@ import { createIncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { startFakeTelegram, type FakeTelegramServer } from '@ykurilov/remontnik-core/testing'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { CaseState } from '../case-book/index.js'
+import { runDoctorCommand } from '../cli/run-doctor-command.js'
 import { createGitGuard, type GitGuard } from '../git-guard/index.js'
 import { seedDoctorRecords } from '../testing/doctor-records.js'
 import { startDoctorService, type DoctorService, type DoctorTreatmentOptions } from '../service/index.js'
@@ -149,6 +150,7 @@ function doctorServiceOptions(r: Repo, model: ScriptedModel, options: DoctorOpti
   return {
     stateDir: r.stateDir,
     sharedSecret: 'shared-test-secret',
+    controlSecret: OWNER_SECRET,
     listen: { host: '127.0.0.1', port: 0 },
     telegram: { botToken: '123456:test-bot-token', chatId: 'owner-chat', apiBaseUrl: telegram.baseUrl },
     exit: () => {},
@@ -183,6 +185,19 @@ async function startModelUpstream() {
   cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, seen }
 }
+
+const OWNER_SECRET = 'owner-test-secret'
+
+/** Владелец в консоли: `remontnik-doctor case 1 retry …`. */
+async function ownerRetry(doctor: DoctorService, ...flags: string[]) {
+  let out = ''
+  let err = ''
+  const env = { REMONTNIK_DOCTOR_URL: doctor.url, REMONTNIK_CONTROL_SECRET: OWNER_SECRET }
+  const code = await runDoctorCommand(['case', '1', 'retry', ...flags, '--by', 'owner'], { env, stdout: (text) => (out += text), stderr: (text) => (err += text) })
+  return { code, out, err }
+}
+
+const branchesOf = (r: Repo) => git(r.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/gm, '').split('\n').filter(Boolean)
 
 async function startDoctor(r: Repo, model: ScriptedModel, options: DoctorOptions = {}): Promise<DoctorService> {
   const service = await startDoctorService(doctorServiceOptions(r, model, options))
@@ -363,6 +378,51 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(report?.short).toContain('бюджет')
     expect(model.pending()).toBeGreaterThan(30)
   }, 60_000)
+
+  it('потолок случая кончился → case 1 retry: новая попытка снова зовёт модель со своим потолком', async () => {
+    const r = repo()
+    const model = createScriptedModel({ costPerResponseUsd: 0.3 })
+    model.script(...Array.from({ length: 40 }, () => callTool('bash', { command: 'true' })))
+    const doctor = await startDoctor(r, model, { limits: { diagnoseUsdPerCase: 0.5 } })
+    await doctor.receiveEvents([priceCrash()])
+    expect((await settledCase(doctor)).state).toBe('no_cause_found')
+    const firstAttempt = model.requests.length
+
+    const retried = await ownerRetry(doctor)
+    expect(JSON.parse(retried.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2 })
+    const again = await settledCase(doctor)
+
+    expect(again.state).toBe('no_cause_found')
+    expect(model.requests.length).toBeGreaterThan(firstAttempt)
+    // Новый потолок — тот же, а не бесконечный: попытка снова остановлена бюджетом.
+    expect((await doctor.reports.list({ after: 0, limit: 20 })).at(-1)?.short).toContain('бюджет')
+  }, 60_000)
+
+  it('правка готова → повтор без --force отказывает с веткой; с --force новая попытка на ветке -r2, прежняя ветка остаётся', async () => {
+    const r = repo()
+    const model = createScriptedModel()
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const doctor = await startDoctor(r, model)
+    await doctor.receiveEvents([priceCrash()])
+    expect((await settledCase(doctor)).state).toBe('report_only')
+    const [first] = branchesOf(r)
+
+    const refused = await ownerRetry(doctor)
+    expect(refused.code).toBe(1)
+    expect(refused.err).toContain('409 fix_ready')
+    expect(refused.err).toContain(first)
+    expect(refused.err).toContain('case 1 retry --force')
+
+    model.script(...diagnosisSteps(), ...fixSteps())
+    const forced = await ownerRetry(doctor, '--force')
+    expect(JSON.parse(forced.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2, previousBranch: first })
+    expect((await settledCase(doctor)).state).toBe('report_only')
+
+    const branches = branchesOf(r)
+    expect(branches).toHaveLength(2)
+    expect(branches).toContain(first)
+    expect(branches.find((branch) => branch !== first)).toMatch(/^remontnik\/1-.*-r2$/)
+  }, 90_000)
 
   it('перезапуск врача посреди правки: задача продолжает с чекпойнта, диагноз не повторяется', async () => {
     const r = repo()

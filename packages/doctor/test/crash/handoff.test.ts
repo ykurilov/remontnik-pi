@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { crashAndRestart, createCrashWorld, type CrashWorld, type DoctorProcess } from './crash-harness.js'
+import { crashAndRestart, createCrashWorld, runDoctor, type CrashWorld, type DoctorProcess } from './crash-harness.js'
 import { STAND_BRIDGE_SILENCE_MS } from './world.js'
 
 // Врач падает посреди передачи случая агенту Paseo (T124): фазы передачи — чекпойнты, после перезапуска передача
@@ -37,6 +37,28 @@ describe.concurrent('врач падает посреди передачи сл�
     expect(world.bridge!.tasks).toHaveLength(1)
     expect(types(final.reports)).toEqual(['case_received', 'handed_off', 'paseo_done'])
     expect(world.appState().promotes).toBe(0)
+  }, 180_000)
+
+  it('мост принял задачу, передача упала насовсем → case 1 retry: новая попытка шлёт тот же номер, второго агента нет', async ({ onTestFinished }) => {
+    const world = await createCrashWorld({ paseo: true })
+    onTestFinished(() => world.close())
+    const doctor = runDoctor(world, { faultAt: 'handoff_sent', sendEvent: true })
+    onTestFinished(async () => void (await doctor.stop()))
+    world.bridge!.connect(await doctor.bridgeUrl())
+
+    const problem = await doctor.waitForReport('doctor_problem')
+    expect(problem.short).toContain('remontnik-doctor case 1 retry')
+    expect(world.bridge!.tasks).toHaveLength(1)
+
+    const retried = await doctor.command(['case', '1', 'retry', '--by', 'owner'])
+    expect(JSON.parse(retried.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2 })
+    await doctor.waitForReport('handed_off')
+    expect((await world.bridge!.accept(1)).status).toBe(200)
+    expect((await world.bridge!.done(1, { commit: 'abc1234' })).status).toBe(200)
+
+    const final = await doctor.waitForState(['healed_by_paseo'], 90_000)
+    expect(world.bridge!.tasks).toHaveLength(1)
+    expect(types(final.reports)).toEqual(['case_received', 'doctor_problem', 'handed_off', 'paseo_done'])
   }, 180_000)
 
   it('агент работает → после перезапуска врач ждёт его дальше, а не лечит сам', async ({ onTestFinished }) => {

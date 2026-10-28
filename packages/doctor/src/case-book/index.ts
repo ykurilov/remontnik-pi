@@ -66,10 +66,23 @@ export interface Case {
   treatmentAttempt?: number
   /** Режим «сначала Paseo»: мост не ответил, врач лечит сам — отчёты случая это говорят. */
   paseoUnavailable?: boolean
+  /** Номер задачи у моста Paseo: один на случай, назначается до первого письма агенту. Новая попытка после упавшей
+   * передачи шлёт тот же номер, и мост второго агента на случай не заводит. */
+  handoffTaskId?: string
+  /** Итог последней законченной попытки: по нему повтор владельцем решает, нужно ли явное согласие (`--force`). */
+  lastOutcome?: CaseOutcome
   /** Кто и когда последним снова поставил случай в работу (`case <id> retry`). */
   retriedBy?: string
   retriedAt?: string
   reportIds: number[]
+}
+
+export interface CaseOutcome {
+  outcome: string
+  /** Почему нужен человек (`deploy` — после выкатки неясно, что работает). */
+  why?: string
+  /** Ветка с правкой этой попытки. */
+  branch?: string
 }
 
 interface CaseIndex {

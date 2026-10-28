@@ -11,12 +11,19 @@ import { createCaseRetry, type CaseRetryDeps } from './case-retry.js'
 
 type TaskView = 'terminal' | 'parked' | 'running'
 
-async function world(state: CaseState, initial: TaskView, options: { treatment?: boolean; onTaskCheck?: (records: ReturnType<typeof createMemoryRecordStore>) => Promise<void> } = {}) {
+interface WorldOptions {
+  treatment?: boolean
+  /** Ещё поля случая: итог прошлой попытки, номер задачи моста. */
+  sick?: Partial<Case>
+  onTaskCheck?: (records: ReturnType<typeof createMemoryRecordStore>) => Promise<void>
+}
+
+async function world(state: CaseState, initial: TaskView, options: WorldOptions = {}) {
   let task = initial
   const records = createMemoryRecordStore()
   await records.transaction(async (tx) => {
     const opened = await tx.doc<Case>('case', '1', {} as Case)
-    Object.assign(opened, { caseId: 1, appName: 'app', fingerprint: 'f', state, treatmentTaskId: '5', reportIds: [] })
+    Object.assign(opened, { caseId: 1, appName: 'app', fingerprint: 'f', state, treatmentTaskId: '5', reportIds: [] }, options.sick)
     ;(await tx.doc<CaseSpend>('spend-case', '1', { modelUsd: 0 })).modelUsd = 0.7
   })
   const retried: number[] = []
@@ -46,6 +53,7 @@ async function world(state: CaseState, initial: TaskView, options: { treatment?:
       opened.treatmentTaskId = '6'
       opened.treatmentAttempt = (opened.treatmentAttempt ?? 1) + 1
       opened.state = 'triage'
+      delete opened.lastOutcome
       return opened.treatmentAttempt
     },
   } as unknown as Treatment
@@ -132,6 +140,60 @@ describe('повтор лечения случая', () => {
       const running = await world(state, 'running')
       expect(await running.retryCase(1, 'owner'), state).toEqual({ error: 'already_running', state })
     }
+  })
+
+  it('случай у агента Paseo, задача упала насовсем → новая попытка: номер задачи моста в случае, второго агента не будет', async () => {
+    for (const state of ['handoff_check', 'handed_off', 'paseo_working', 'reclaimed'] as const) {
+      const w = await world(state, 'terminal', { sick: { handoffTaskId: 'T1' } })
+      expect(await w.retryCase(1, 'owner'), state).toEqual({ retried: 'restarted', attempt: 2 })
+      expect(await w.read()).toMatchObject({ state: 'triage', treatmentTaskId: '6', handoffTaskId: 'T1' })
+      // Лечение не кончилось, а упало: потолок случая прежний.
+      expect((await w.spend()).budgetFromUsd).toBeUndefined()
+    }
+  })
+
+  it('передача упала, номер задачи моста помнила только задача (врач до обновления) → handoff_unconfirmed; с force — новая попытка', async () => {
+    const w = await world('handoff_check', 'terminal')
+
+    const refused = await w.retryCase(1, 'owner')
+    expect(refused).toMatchObject({ error: 'handoff_unconfirmed', state: 'handoff_check' })
+    expect('hint' in refused && refused.hint).toContain('remontnik-doctor case 1 retry --force')
+    expect(w.restarted).toEqual([])
+
+    expect(await w.retryCase(1, 'owner', { force: true })).toEqual({ retried: 'restarted', attempt: 2 })
+    // Задача остальных состояний Paseo без номера в случае: документ передачи уже записан, номер в нём.
+    for (const state of ['handed_off', 'paseo_working', 'reclaimed'] as const) {
+      expect(await (await world(state, 'terminal')).retryCase(1, 'owner'), state).toEqual({ retried: 'restarted', attempt: 2 })
+    }
+  })
+
+  it('правка готова (fix_ready) → отказ с веткой и командой; с force — новая попытка, ответ называет прежнюю ветку', async () => {
+    const sick = { lastOutcome: { outcome: 'fix_ready', branch: 'remontnik/1-price' } }
+    const w = await world('report_only', 'terminal', { sick })
+
+    const refused = await w.retryCase(1, 'owner')
+    expect(refused).toMatchObject({ error: 'fix_ready', state: 'report_only', branch: 'remontnik/1-price' })
+    expect('hint' in refused && refused.hint).toContain('remontnik-doctor case 1 retry --force')
+    expect(w.restarted).toEqual([])
+    expect((await w.spend()).budgetFromUsd).toBeUndefined()
+
+    expect(await w.retryCase(1, 'owner', { force: true })).toEqual({ retried: 'restarted', attempt: 2, previousBranch: 'remontnik/1-price' })
+    expect((await w.spend()).budgetFromUsd).toBeCloseTo(0.7)
+    expect((await w.read()).lastOutcome).toBeUndefined()
+  })
+
+  it('после выкатки нужен человек (откат не удался, выкатка брошена, человек выкатил своё) → deploy_needs_human; с force — новая попытка', async () => {
+    const w = await world('needs_human', 'terminal', { sick: { lastOutcome: { outcome: 'needs_human', why: 'deploy', branch: 'remontnik/1-price' } } })
+
+    const refused = await w.retryCase(1, 'owner')
+    expect(refused).toMatchObject({ error: 'deploy_needs_human', state: 'needs_human' })
+    expect('hint' in refused && refused.hint).toContain('какая версия работает')
+    expect(w.restarted).toEqual([])
+
+    expect(await w.retryCase(1, 'owner', { force: true })).toEqual({ retried: 'restarted', attempt: 2, previousBranch: 'remontnik/1-price' })
+    // Человек нужен по другой причине (правку не пропустили проверки) → согласия не нужно.
+    const gate = await world('needs_human', 'terminal', { sick: { lastOutcome: { outcome: 'needs_human', why: 'gate' } } })
+    expect(await gate.retryCase(1, 'owner')).toEqual({ retried: 'restarted', attempt: 2 })
   })
 
   it('лечение идёт → already_running, ничего не трогается', async () => {

@@ -41,7 +41,7 @@ import {
 
 const world = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as ChildWorld
 const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
-/** `fixing` — коммит правки один раз падает обычной ошибкой: задача лечения падает насовсем (task_faulted). */
+/** `fixing` — коммит правки, `handoff_sent` — передача после приёма мостом один раз падает обычной ошибкой: задача лечения падает насовсем (task_faulted). */
 let faultAt = process.env.REMONTNIK_TEST_FAULT_AT
 const stopBeforeCrash = process.env.REMONTNIK_TEST_STOP_BEFORE_CRASH === '1'
 const withBrowser = process.env.REMONTNIK_TEST_BROWSER === '1'
@@ -194,6 +194,10 @@ function crashingBridge(client: PaseoBridgeClient): PaseoBridgeClient {
     },
     async sendTask(task) {
       const sent = await client.sendTask(task)
+      if (sent && faultAt === 'handoff_sent') {
+        faultAt = undefined
+        throw new Error('подстроенный сбой передачи')
+      }
       if (sent && crashAt === 'handoff_sent') {
         await printState()
         crash('handoff_sent')
