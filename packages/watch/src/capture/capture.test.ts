@@ -406,6 +406,167 @@ describe('wrapModelCatalog', () => {
     await until(() => doctor.batches.length === 1)
   })
 
+  describe('неизменяемые и ненастраиваемые свойства', () => {
+    /** Как SDK задаёт `connect`: `Object.defineProperty` без writable и configurable. */
+    const locked = <T extends object>(target: T, property: string, value: unknown): T =>
+      Object.defineProperty(target, property, { value, enumerable: false })
+
+    class PrivateModel {
+      readonly #fail: boolean
+      constructor(fail: boolean) {
+        this.#fail = fail
+      }
+      get failing(): boolean {
+        return this.#fail
+      }
+    }
+
+    function lockedModel(fail: boolean) {
+      const model = new PrivateModel(fail)
+      locked(model, 'doGenerate', async function (this: PrivateModel) {
+        if (this.failing) throw new Error('503 locked model')
+        return { text: 'ok' }
+      })
+      locked(model, 'doStream', async function (this: PrivateModel) {
+        if (this.failing) throw new Error('503 locked stream')
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'error', error: new Error('locked stream broke') })
+              controller.close()
+            },
+          }),
+        }
+      })
+      locked(model, 'modelId', 'locked-model')
+      return model as PrivateModel & {
+        doGenerate(): Promise<{ text: string }>
+        doStream(): Promise<{ stream: ReadableStream<{ type: string }> }>
+        modelId: string
+      }
+    }
+
+    function lockedCatalog(fail: boolean) {
+      const connected = { id: 'locked', createLanguageModel: () => lockedModel(fail) }
+      const provider = locked({ id: 'locked', createLanguageModel: (_id: string, _key: string) => lockedModel(fail) }, 'connect', () => connected)
+      const catalog = locked({ models: [{ id: 'locked-model' }] }, 'providers', [provider])
+      locked(catalog, 'describe', function (this: { models: unknown[] }) {
+        return `models: ${this.models.length}`
+      })
+      return catalog as typeof catalog & {
+        providers: (typeof provider & { connect(): typeof connected })[]
+        describe(): string
+      }
+    }
+
+    it('каталог, поставщик и модель с неизменяемыми свойствами: ошибки ловятся, this верный', async () => {
+      const watch = openWatch()
+      const wrapped = watch.wrapModelCatalog(lockedCatalog(true))
+
+      expect(wrapped.describe()).toBe('models: 1')
+      const provider = wrapped.providers[0]!
+      expect(provider.connect().id).toBe('locked')
+      const model = provider.createLanguageModel('locked-model', 'key')
+      expect(model.modelId).toBe('locked-model')
+      expect(model.failing).toBe(true)
+
+      await expect(model.doGenerate()).rejects.toThrow('503 locked model')
+      await expect(model.doStream()).rejects.toThrow('503 locked stream')
+      await until(() => doctor.batches.flat().length === 2)
+      expect(doctor.batches.flat()).toMatchObject([
+        { kind: 'model_error', context: { model: 'locked-model', provider: 'locked' } },
+        { kind: 'model_error', context: { model: 'locked-model', provider: 'locked' } },
+      ])
+    })
+
+    it('замороженные каталог, поставщик и модель', async () => {
+      const watch = openWatch()
+      const model = Object.freeze(new FakeModel(false))
+      const catalog = Object.freeze({
+        models: Object.freeze([{ id: 'fake-model' }]),
+        providers: Object.freeze([Object.freeze({ id: 'frozen', createLanguageModel: () => model })]),
+      })
+
+      const wrapped = watch.wrapModelCatalog(catalog).providers[0]!.createLanguageModel()
+
+      await expect(wrapped.doGenerate()).resolves.toEqual({ text: 'ok' })
+      const { stream } = await wrapped.doStream()
+      for await (const part of stream) void part
+      await until(() => doctor.batches.length === 1)
+      expect(doctor.batches[0]?.[0]).toMatchObject({ kind: 'model_error', message: 'stream broke', context: { provider: 'frozen' } })
+    })
+
+    it('обёртка выглядит для приложения как прежний объект', () => {
+      const watch = openWatch()
+      const original = lockedCatalog(false)
+      const wrapped = watch.wrapModelCatalog(original)
+
+      expect(Object.keys(wrapped)).toEqual(Object.keys(original))
+      expect('providers' in wrapped).toBe(true)
+      expect(Object.getOwnPropertyDescriptor(wrapped, 'providers')?.value).toBe(wrapped.providers)
+      expect(wrapped.providers).toBe(wrapped.providers)
+      expect(Object.getOwnPropertyNames(wrapped.providers[0]!)).toContain('connect')
+      expect({ ...wrapped }.models).toBe(original.models)
+    })
+  })
+
+  describe('настоящий Agent Chat SDK', () => {
+    const failingFetch = (async () =>
+      new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 400, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const prompt = { prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }
+    type SdkModel = { doGenerate(options: unknown): Promise<unknown> }
+
+    it('createFireworksProvider: connect читается, неперечисляемый, подключённый поставщик под присмотром', async () => {
+      const { createFireworksProvider } = await import('@ykurilov/agent-chat-core')
+      const watch = openWatch()
+      const original = createFireworksProvider()
+
+      const provider = watch.wrapModelCatalog({ providers: [original], models: [] }).providers[0]!
+
+      expect(typeof provider.connect).toBe('function')
+      expect(Object.keys(provider)).toEqual(Object.keys(original))
+      expect(Object.keys(provider)).not.toContain('connect')
+      expect(Object.getOwnPropertyDescriptor(provider, 'connect')?.enumerable).toBe(false)
+      expect({ ...provider }).not.toHaveProperty('connect')
+      for (const key of Reflect.ownKeys(original)) {
+        const value: unknown = Reflect.get(original, key)
+        if (typeof value === 'function') expect(typeof Reflect.get(provider, key)).toBe('function')
+        else expect(Reflect.get(provider, key)).toBe(value)
+      }
+
+      const connected = provider.connect!({ baseURL: 'http://127.0.0.1:9/v1' })
+      expect(connected.id).toBe('fireworks')
+      expect(typeof connected.connect).toBe('function')
+      const model = connected.createLanguageModel('accounts/fireworks/models/x', 'key', { fetch: failingFetch }) as SdkModel
+      await expect(model.doGenerate(prompt)).rejects.toThrow()
+      await until(() => doctor.batches.length === 1)
+      expect(doctor.batches[0]).toHaveLength(1)
+      expect(doctor.batches[0]?.[0]).toMatchObject({ kind: 'model_error', context: { model: 'accounts/fireworks/models/x', provider: 'fireworks' } })
+    })
+
+    it('standardCatalog и extendCatalog с connectProviders: ошибки моделей ловятся один раз', async () => {
+      const { standardCatalog, extendCatalog } = await import('@ykurilov/agent-chat-core')
+      const watch = openWatch()
+
+      const wrapped = watch.wrapModelCatalog(standardCatalog)
+
+      expect(wrapped.models).toBe(standardCatalog.models)
+      for (const provider of wrapped.providers) {
+        for (const key of Reflect.ownKeys(provider)) expect(() => Reflect.get(provider, key)).not.toThrow()
+      }
+      // Каталог, собранный из обёрнутого, обёрнутый ещё раз: поставщики не оборачиваются повторно.
+      const extended = watch.wrapModelCatalog(extendCatalog(wrapped, { connectProviders: { deepseek: { baseURL: 'http://127.0.0.1:9/v1' } } }))
+      const deepseek = extended.providers.find((provider) => provider.id === 'deepseek')!
+      const model = deepseek.createLanguageModel('deepseek-chat', 'key', { fetch: failingFetch }) as SdkModel
+
+      await expect(model.doGenerate(prompt)).rejects.toThrow()
+      await until(() => doctor.batches.length === 1)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(doctor.batches.flat()).toHaveLength(1)
+      expect(doctor.batches[0]?.[0]).toMatchObject({ kind: 'model_error', context: { model: 'deepseek-chat', provider: 'deepseek' } })
+    })
+  })
+
   it('удачный ответ не трогает, ошибка в потоке — model_error', async () => {
     const watch = openWatch()
     const model = watch.wrapModelCatalog(catalog(false)).providers[0]!.createLanguageModel('fake-model', 'key')

@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
@@ -8,7 +9,8 @@ import type { IncidentEvent } from '@ykurilov/remontnik-core/incident'
 // неудачная попытка `{ retry, attempts, nextAttemptAt }`, отправленная тревога `{ notified }`,
 // склеенный повтор `{ repeats, count }`, вытеснение `{ drop }`, счётчик потерь `{ lost }`.
 // Запись синхронная: событие на диске раньше, чем процесс успеет упасть.
-// Файл держит замок `outbox-<имя>.lock` (`pid:метка`); второй живой экземпляр пишет в свой файл.
+// Файл держит замок `outbox-<имя>.lock` (`pid:метка:запуск`); второй живой экземпляр пишет в свой файл.
+// «Запуск» отличает живого хозяина от нового процесса с тем же номером: после перезапуска в контейнере номер снова 1.
 
 /** Паузы между попытками доставки врачу; дальше — последняя пауза. */
 export const OUTBOX_RETRY_DELAYS_MS = Object.freeze([5_000, 30_000, 120_000, 600_000]) as readonly [number, number, number, number]
@@ -160,11 +162,57 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Время запуска процесса в виде `источник:значение`: `/proc` на Linux, `ps` на остальных; `''` — узнать нечем.
+ * Сравнивать можно только метки одного источника.
+ */
+function processStartMark(pid: number): string {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    // Имя процесса в скобках может содержать пробелы: поля считаем после последней «)». Поле 22 — время запуска.
+    const startTicks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+    if (startTicks) return `proc:${startTicks}`
+  } catch {
+    // Нет /proc: спросим ps.
+  }
+  if (process.platform === 'win32') return ''
+  try {
+    const started = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim()
+    return started === '' ? '' : `ps:${started}`
+  } catch {
+    return ''
+  }
+}
+
+let ownStartMark: string | undefined
+const currentStartMark = () => (ownStartMark ??= processStartMark(process.pid))
+
+/** Метки замков, открытых этим процессом: запасной способ узнать свой замок, когда время запуска не узнать. */
+const ownLockTokens = new Set<string>()
+
+const sourceOf = (mark: string) => mark.slice(0, mark.indexOf(':') + 1)
+
 /** Держит ли замок живой хозяин. Нет замка или хозяин мёртв — свободно. */
 function lockHeld(lockFile: string): boolean {
   const content = readText(lockFile)
   if (content === '') return false
-  return processAlive(Number(content.split(':')[0]))
+  const [pidText = '', token = '', ...rest] = content.split(':')
+  const started = rest.join(':')
+  const pid = Number(pidText)
+  // Свой номер: замок либо открыт в этом процессе, либо остался от прошлой жизни (Docker перезапустил процесс, номер тот же).
+  // Замок без времени запуска (0.1.3) с нашим номером — всегда прошлая жизнь.
+  if (pid === process.pid) return ownLockTokens.has(token) || (started !== '' && started === currentStartMark())
+  if (!processAlive(pid)) return false
+  // Номер мог достаться другому процессу. Сверяем время запуска, если есть с чем.
+  if (started === '') return true
+  const current = processStartMark(pid)
+  if (current === '' || sourceOf(current) !== sourceOf(started)) return true
+  return current === started
 }
 
 /** Берёт замок; `false` — его держит живой экземпляр. */
@@ -200,21 +248,23 @@ export function openOutbox(options: OpenOutboxOptions): Outbox {
   const maxEntries = Math.max(1, options.maxEntries ?? OUTBOX_MAX_ENTRIES)
   const base = `outbox-${safeFileName(options.processName)}`
   const token = randomBytes(6).toString('hex')
+  const lockContent = `${process.pid}:${token}:${currentStartMark()}`
 
   mkdirSync(options.dir, { recursive: true })
   let lockFile = join(options.dir, `${base}.lock`)
   let file = join(options.dir, `${base}.jsonl`)
-  const owner = acquireLock(lockFile, `${process.pid}:${token}`)
+  const owner = acquireLock(lockFile, lockContent)
   if (!owner) {
     const own = `${base}.${process.pid}-${token}`
     lockFile = join(options.dir, `${own}.lock`)
     file = join(options.dir, `${own}.jsonl`)
-    writeFileSync(lockFile, `${process.pid}:${token}`)
+    writeFileSync(lockFile, lockContent)
     console.error(
       `[remontnik] очередь «${options.processName}» уже открыта другим живым экземпляром; пишу в ${own}.jsonl. ` +
         'Дайте экземплярам разные processName.',
     )
   }
+  ownLockTokens.add(token)
 
   const entries = new Map<string, OutboxEntry>()
   /** Отпечаток → последняя ждущая доставки запись: в неё склеиваются повторы при полной очереди. */
@@ -406,7 +456,8 @@ export function openOutbox(options: OpenOutboxOptions): Outbox {
     close() {
       if (closed) return
       closed = true
-      if (readText(lockFile) === `${process.pid}:${token}`) removeQuietly(lockFile)
+      ownLockTokens.delete(token)
+      if (readText(lockFile) === lockContent) removeQuietly(lockFile)
     },
   }
 }

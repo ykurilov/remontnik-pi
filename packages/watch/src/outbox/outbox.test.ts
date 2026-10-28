@@ -1,6 +1,8 @@
+import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createIncidentEvent, type IncidentEvent } from '@ykurilov/remontnik-core/incident'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OUTBOX_RETRY_DELAYS_MS, openOutbox as openOutboxRaw, type OpenOutboxOptions, type Outbox } from './index.js'
@@ -216,6 +218,130 @@ describe('очередь сторожа', () => {
     const outbox = openOutbox({ dir, processName: 'web', now: () => start })
 
     expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
+  })
+
+  describe('перезапуск процесса в том же контейнере (тот же номер процесса, та же папка)', () => {
+    const pid = process.pid
+
+    it.each([
+      ['замок 0.1.3', `${pid}:oldtoken`],
+      ['замок с меткой запуска прошлой жизни', `${pid}:oldtoken:proc:1`],
+    ])('%s с нашим номером — основной файл снова свой, без предупреждения', (_name, lock) => {
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const left = event('left by previous life')
+      writeFileSync(join(dir, 'outbox-web.jsonl'), `${JSON.stringify({ event: left, state: 'pending', attempts: 0, nextAttemptAt: 0, notify: true })}\n`)
+      writeFileSync(join(dir, 'outbox-web.lock'), lock)
+
+      const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+      expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
+      expect(outbox.due(start).map((entry) => entry.event.eventId)).toEqual([left.eventId])
+      expect(errors).not.toHaveBeenCalled()
+      expect(readdirSync(dir).sort()).toEqual(['outbox-web.jsonl', 'outbox-web.lock'])
+    })
+
+    it('сироты 0.1.3 с нашим номером подбираются в основной файл', () => {
+      writeFileSync(join(dir, 'outbox-web.lock'), `${pid}:main`)
+      const orphans = [event('orphan a'), event('orphan b')]
+      orphans.forEach((orphan, index) => {
+        const name = `outbox-web.${pid}-tok${index}`
+        writeFileSync(join(dir, `${name}.jsonl`), `${JSON.stringify({ event: orphan, state: 'pending', attempts: 0, nextAttemptAt: 0, notify: false })}\n`)
+        writeFileSync(join(dir, `${name}.lock`), `${pid}:tok${index}`)
+      })
+
+      const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+      expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
+      expect(outbox.due(start).map((entry) => entry.event.eventId).sort()).toEqual(orphans.map((orphan) => orphan.eventId).sort())
+      expect(readdirSync(dir).sort()).toEqual(['outbox-web.jsonl', 'outbox-web.lock'])
+    })
+
+    it('много перезапусков подряд не плодят файлов', () => {
+      for (let restart = 0; restart < 8; restart += 1) {
+        const outbox = openOutboxRaw({ dir, processName: 'worker', now: () => start })
+        outbox.append(event(`restart ${restart}`), { notify: false })
+        // Процесс падает, не сняв замок; следующая жизнь получает тот же номер, а замок остаётся от прошлой.
+        writeFileSync(join(dir, 'outbox-worker.lock'), `${pid}:life${restart}:proc:1`)
+      }
+
+      expect(readdirSync(dir).sort()).toEqual(['outbox-worker.jsonl', 'outbox-worker.lock'])
+      expect(openOutbox({ dir, processName: 'worker', now: () => start }).stats().pending).toBe(8)
+    })
+
+    it('замок того же процесса, открытый вторым экземпляром той же копии модуля, держится', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const first = openOutbox({ dir, processName: 'web', now: () => start })
+      const second = openOutbox({ dir, processName: 'web', now: () => start })
+      const third = openOutbox({ dir, processName: 'web', now: () => start })
+
+      expect(new Set([first.file, second.file, third.file]).size).toBe(3)
+      third.close()
+      const fourth = openOutbox({ dir, processName: 'web', now: () => start })
+      expect([first.file, second.file]).not.toContain(fourth.file)
+    })
+  })
+
+  describe('другой живой процесс', () => {
+    const loader = fileURLToPath(new URL('../../../../scripts/source-loader/register.mjs', import.meta.url))
+    const holderScript = fileURLToPath(new URL('../../test/fixtures/outbox-holder.ts', import.meta.url))
+    const children: ChildProcess[] = []
+
+    afterEach(() => {
+      for (const child of children.splice(0)) child.kill('SIGKILL')
+    })
+
+    function startHolder(): Promise<{ child: ChildProcess; file: string }> {
+      const child = spawn(process.execPath, ['--import', loader, '--no-warnings', holderScript], {
+        env: { ...process.env, OUTBOX_DIR: dir, OUTBOX_PROCESS: 'web' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      children.push(child)
+      return new Promise((resolve, reject) => {
+        let output = ''
+        child.stdout!.on('data', (chunk: Buffer) => {
+          output += chunk.toString()
+          const line = output.split('\n')[0]
+          if (output.includes('\n') && line) resolve({ child, file: (JSON.parse(line) as { file: string }).file })
+        })
+        child.once('exit', (code) => reject(new Error(`держатель очереди вышел с кодом ${code}`)))
+      })
+    }
+
+    it('живой процесс держит основной файл: мы пишем в свой, его файл не подбираем', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const holder = await startHolder()
+
+      const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+      expect(holder.file).toBe(join(dir, 'outbox-web.jsonl'))
+      expect(outbox.file).not.toBe(holder.file)
+    }, 20_000)
+
+    it('мы держим основной файл: живой процесс пишет в свой и не подбирает наш', async () => {
+      const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+      const holder = await startHolder()
+
+      expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
+      expect(holder.file).not.toBe(outbox.file)
+      expect(existsSync(outbox.file)).toBe(true)
+    }, 20_000)
+
+    it('живой процесс с номером из замка, но запущенный позже — замок свободен', async () => {
+      const stranger = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+      children.push(stranger)
+      // Метка запуска того вида, каким её читает эта система: /proc на Linux, ps на остальных.
+      const earlier = existsSync('/proc/self/stat') ? 'proc:1' : 'ps:Thu Jan  1 00:00:00 1970'
+      writeFileSync(join(dir, 'outbox-web.lock'), `${stranger.pid}:oldtoken:${earlier}`)
+      const orphan = event('orphan')
+      writeFileSync(join(dir, 'outbox-web.x-1.jsonl'), `${JSON.stringify({ event: orphan, state: 'pending', attempts: 0, nextAttemptAt: 0, notify: false })}\n`)
+      writeFileSync(join(dir, 'outbox-web.x-1.lock'), `${stranger.pid}:x:${earlier}`)
+
+      const outbox = openOutbox({ dir, processName: 'web', now: () => start })
+
+      expect(outbox.file).toBe(join(dir, 'outbox-web.jsonl'))
+      expect(outbox.due(start).map((entry) => entry.event.eventId)).toEqual([orphan.eventId])
+    })
   })
 
   it('повторы через 5 с, 30 с, 2 мин, 10 мин, дальше каждые 10 мин', () => {
