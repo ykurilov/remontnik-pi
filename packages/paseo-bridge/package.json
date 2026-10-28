@@ -1,6 +1,6 @@
 {
   "name": "@ykurilov/remontnik-paseo-bridge",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Ремонтник Pi: мост Paseo — плагин на компьютере владельца, передаёт случаи врача агенту приложения",
   "license": "MIT",
   "type": "module",
