@@ -57,15 +57,17 @@ interface FakeOptions {
   evalStillRunning?: boolean
   /** Расход, который eval пишет в свой файл итога: врач ему не верит. */
   claimedCostUsd?: number
+  /** Клиент модели в eval идёт мимо адреса прокси: прокси не видит ни одного запроса. */
+  evalBypassesProxy?: boolean
 }
 
 /** Подставной прокси модели: eval «тратит» через него, как через настоящий. */
 function fakeProxy() {
-  const runs: { options: EvalProxyRunOptions; spentUsd: number; closed: boolean; overBudget: AbortController }[] = []
+  const runs: { options: EvalProxyRunOptions; spentUsd: number; requests: number; closed: boolean; overBudget: AbortController }[] = []
   return {
     runs,
     openRun(options: EvalProxyRunOptions): EvalProxyRun {
-      const run = { options, spentUsd: 0, closed: false, overBudget: new AbortController() }
+      const run = { options, spentUsd: 0, requests: 0, closed: false, overBudget: new AbortController() }
       runs.push(run)
       const token = `run-token-${runs.length}`
       const env: Record<string, string> = { [options.tokenEnv]: token }
@@ -78,6 +80,7 @@ function fakeProxy() {
         env,
         overBudget: run.overBudget.signal,
         spentUsd: () => run.spentUsd,
+        requests: () => run.requests,
         close: async () => {
           run.closed = true
         },
@@ -86,6 +89,7 @@ function fakeProxy() {
     /** Eval потратил `usd` через прокси последнего прогона. */
     async spend(usd: number) {
       const run = runs.at(-1)!
+      run.requests += 1
       run.spentUsd += usd
       await run.options.onSpend?.({ spentUsd: run.spentUsd, inFlightUsd: 0 })
     },
@@ -127,7 +131,7 @@ function fakeRunner(options: FakeOptions) {
           })
           return { exitCode: null, timedOut: false, aborted: true, output: '' }
         }
-        await proxy.spend(options.evalCostUsd ?? 0.1)
+        if (!options.evalBypassesProxy) await proxy.spend(options.evalCostUsd ?? 0.1)
         writeFileSync(
           join(outDir, 'eval-result.json'),
           JSON.stringify({
@@ -264,6 +268,31 @@ describe('проверки', () => {
     const fake = fakeRunner({ evalOutcomes: () => ({ pass: 2, standBroken: 1 }) })
     const result = await checksWith(fake).run(runInput())
     expect(result.eval.status).toBe('stand_broken')
+  })
+
+  it('стенд сломан, а к прокси не пришло ни одного запроса — заметка: клиент модели идёт мимо baseUrlEnv', async () => {
+    const fake = fakeRunner({ evalOutcomes: () => ({ pass: 0, standBroken: 3 }), evalBypassesProxy: true })
+    const result = await checksWith(fake).run(runInput())
+    expect(result.eval.status).toBe('stand_broken')
+    expect(result.eval.note).toMatch(/к прокси eval не пришло ни одного запроса.*мимо CHAT_BASE_URL/)
+
+    const viaProxy = fakeRunner({ evalOutcomes: () => ({ pass: 0, standBroken: 3 }) })
+    expect((await checksWith(viaProxy).run(runInput())).eval.note).toBeUndefined()
+  })
+
+  it('eval упал без итога и ни разу не позвал прокси — та же заметка рядом с кодом выхода', async () => {
+    const fake = fakeRunner({ evalBypassesProxy: true })
+    const runner: CommandRunner = {
+      ...fake.runner,
+      async run(command, runOptions) {
+        const text = typeof command === 'string' ? command : command.join(' ')
+        if (text.startsWith('node eval/run-eval.ts')) return { exitCode: 1, timedOut: false, aborted: false, output: 'fetch failed' }
+        return fake.runner.run(command, runOptions)
+      },
+    }
+    const result = await checksWith({ ...fake, runner }).run(runInput())
+    expect(result.eval.status).toBe('stand_broken')
+    expect(result.eval.note).toMatch(/не оставил итог: код 1[\s\S]*к прокси eval не пришло ни одного запроса/)
   })
 
   it('правка вне карты → not_needed, eval не запускается', async () => {

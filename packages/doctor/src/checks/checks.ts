@@ -166,6 +166,14 @@ interface EvalRun {
   scenarios: EvalScenarioResult[]
   costUsd: number
   note?: string
+  /** Прогон сломан, а к прокси не пришло ни одного запроса: клиент модели в eval идёт мимо `baseUrlEnv`. */
+  proxyUnused?: boolean
+}
+
+/** Заметка для отчёта, когда eval ни разу не позвал прокси. */
+function proxyUnusedNote(providers: readonly EvalProxyProvider[]): string {
+  const names = providers.map((provider) => provider.baseUrlEnv).join(', ')
+  return `к прокси eval не пришло ни одного запроса — клиент модели в eval идёт мимо ${names}: каждый клиент (агент, персонаж, судьи) должен брать адрес из этой переменной, напрямую из сети проверок поставщик недоступен`
 }
 
 export function createChecks(options: ChecksOptions) {
@@ -337,6 +345,8 @@ export function createChecks(options: ChecksOptions) {
       await proxyRun?.close()
     }
     const costUsd = proxyRun?.spentUsd() ?? 0
+    const proxyUnused = proxyRun !== undefined && proxyRun.requests() === 0
+    const withProxyNote = (note: string) => (proxyUnused ? `${note}\n${proxyUnusedNote(providers)}` : note)
     // Только отказ 402 рвёт eval; дошёл до доли без отказа — итог принимается.
     if (proxyRun?.overBudget.aborted) {
       return { ok: false, overBudget: true, scenarios: [], costUsd, note: `eval (${label}) прерван: запрос не влез в бюджет $${formatUsd(maxCostUsd)}` }
@@ -345,13 +355,20 @@ export function createChecks(options: ChecksOptions) {
     try {
       parsed = JSON.parse(readFileSync(join(outDir, evalConfig.resultFile), 'utf8'))
     } catch {
-      return { ok: false, scenarios: [], costUsd, note: `eval (${label}) не оставил итог: код ${result.exitCode ?? '—'}\n${tail(result.output)}` }
+      return { ok: false, scenarios: [], costUsd, note: withProxyNote(`eval (${label}) не оставил итог: код ${result.exitCode ?? '—'}\n${tail(result.output)}`) }
     }
     const record = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>
     if (!Array.isArray(record.scenarios) || !record.scenarios.every(isScenarioResult)) {
-      return { ok: false, scenarios: [], costUsd, note: `итог eval (${label}) не по контракту` }
+      return { ok: false, scenarios: [], costUsd, note: withProxyNote(`итог eval (${label}) не по контракту`) }
     }
-    return { ok: result.exitCode === 0, scenarios: record.scenarios, costUsd, ...(result.exitCode === 0 ? {} : { note: `eval (${label}) завершился с кодом ${result.exitCode ?? '—'}` }) }
+    const broken = record.scenarios.some((scenario) => scenario.standBroken + scenario.personaBroken > 0)
+    return {
+      ok: result.exitCode === 0,
+      scenarios: record.scenarios,
+      costUsd,
+      ...(result.exitCode === 0 ? {} : { note: withProxyNote(`eval (${label}) завершился с кодом ${result.exitCode ?? '—'}`) }),
+      ...(proxyUnused && broken ? { proxyUnused: true } : {}),
+    }
   }
 
   async function runEvalChecks(input: ChecksInput, tests: TestsOutcome, services: Services): Promise<EvalOutcome> {
@@ -400,6 +417,7 @@ export function createChecks(options: ChecksOptions) {
       }
     }
     const missingScenarios = runAll ? [ALL_SCENARIOS] : ids.filter((id) => !base.has(id))
+    let baseProxyUnused = false
     if (missingScenarios.length > 0) {
       const remaining = budgetUsd - costUsd
       if (remaining <= 0) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: 'на eval основы не осталось денег' }
@@ -409,6 +427,7 @@ export function createChecks(options: ChecksOptions) {
       if (servicesError) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, note: `службы для тестов основы: ${servicesError}` }
       const baseRun = await runEval(input.baseDir, 'base', missingScenarios, remaining, providers, onSpend)
       costUsd += baseRun.costUsd
+      baseProxyUnused = baseRun.proxyUnused === true
       if (baseRun.overBudget) return { status: 'not_run', scenarios: [], costUsd, ...truncated, note: baseRun.note! }
       if (!baseRun.ok) return { status: 'stand_broken', scenarios: [], costUsd, ...truncated, ...(baseRun.note ? { note: baseRun.note } : {}) }
       for (const result of baseRun.scenarios) {
@@ -433,7 +452,8 @@ export function createChecks(options: ChecksOptions) {
       scenarios.push({ id, basePass: baseResult.pass, candidatePass: candidateResult.pass, repeats: candidateResult.repeats })
     }
     const status = broken ? 'stand_broken' : worse ? 'worse' : 'not_worse'
-    return { status, scenarios, costUsd, ...truncated }
+    const proxyNote = broken && (candidate.proxyUnused || baseProxyUnused) ? { note: proxyUnusedNote(providers) } : {}
+    return { status, scenarios, costUsd, ...truncated, ...proxyNote }
   }
 
   return {

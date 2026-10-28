@@ -92,7 +92,7 @@ function provider(upstream: Upstream, extra: Partial<EvalProxyProvider> = {}): E
 
 const LIMITS: EvalProxyLimits = { maxRequestBytes: 64 * 1024, maxResponseBytes: 64 * 1024, maxConcurrentRequests: 4, maxOutputTokens: 1000 }
 
-async function startProxy(options: { upstreamTimeoutMs?: number } = {}): Promise<EvalProxy> {
+async function startProxy(options: { upstreamTimeoutMs?: number; log?: (line: string) => void } = {}): Promise<EvalProxy> {
   const proxy = await createEvalProxy({ listen: { host: '127.0.0.1', port: 0 }, ...options })
   closers.push(() => proxy.close())
   return proxy
@@ -436,6 +436,51 @@ describe('прокси модели для eval', () => {
     expect(run.spentUsd()).toBeCloseTo(0.05)
     expect(spends.at(-1)!.inFlightUsd).toBe(0)
     await inFlight
+  })
+
+  it('сбои — в журнал врача: метод, путь без пропуска и запроса, статус поставщика, текст исключения; без ключей и тел', async () => {
+    const SECRET_BODY = 'upstream-error-body-0000'
+    const upstream = await startUpstream((seen) => (JSON.parse(seen.body).model === 'busy' ? { status: 503, body: SECRET_BODY } : { body: '{"usage":{"completion_tokens":1}}' }))
+    const lines: string[] = []
+    const proxy = await startProxy({ log: (line) => lines.push(line) })
+    const headerValue = 'gateway-pass-0000-1111'
+    const run = proxy.openRun({
+      providers: [provider(upstream, { models: { m: { input: 0, output: 1 }, busy: { input: 0, output: 1 } }, upstreamHeaderValues: { 'x-proxy-token': headerValue } })],
+      tokenEnv: 'REMONTNIK_EVAL_TOKEN',
+      budgetUsd: 1,
+      limits: LIMITS,
+    })
+
+    expect((await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 10 })).status).toBe(200)
+    expect(lines).toEqual([])
+
+    expect((await post(`${run.env.CHAT_BASE_URL}/chat/completions?key=${REAL_KEY}`, { model: 'busy', max_tokens: 10, messages: [{ role: 'user', content: 'private-prompt' }] })).status).toBe(503)
+    expect(lines.at(-1)).toMatch(/POST \/chat\/chat\/completions: поставщик ответил 503/)
+
+    expect((await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'other', max_tokens: 10 })).status).toBe(403)
+    expect(lines.at(-1)).toMatch(/POST \/chat\/chat\/completions: 403 модели нет в списке/)
+
+    await upstream.close()
+    expect((await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 10 })).status).toBe(502)
+    expect(lines.at(-1)).toMatch(/POST \/chat\/chat\/completions: поставщик не ответил: .*ECONNREFUSED/)
+
+    expect((await post(`${proxy.url}/wrong-token/chat/chat/completions`, { model: 'm' })).status).toBe(401)
+    expect(lines.at(-1)).toMatch(/POST \/chat\/chat\/completions: 401 неизвестный прогон eval/)
+
+    const journal = lines.join('\n')
+    for (const secret of [REAL_KEY, run.token, 'wrong-token', headerValue, SECRET_BODY, 'private-prompt']) expect(journal).not.toContain(secret)
+    expect(lines.every((line) => line.startsWith('[прокси eval] '))).toBe(true)
+  })
+
+  it('прогон считает запросы, которые до него дошли: ноль — eval к прокси не ходил', async () => {
+    const upstream = await startUpstream(chatReply({ completion_tokens: 1 }))
+    const proxy = await startProxy()
+    const run = openRun(proxy, upstream)
+    expect(run.requests()).toBe(0)
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 10 })
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'other' })
+    await post(`${run.env.CHAT_BASE_URL}/models`, {})
+    expect(run.requests()).toBe(3)
   })
 
   it('слушает и показывается только на адресе частной сети', async () => {
