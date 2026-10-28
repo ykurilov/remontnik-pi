@@ -19,7 +19,7 @@ FROM docker:29-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb148093
 
 FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 remontnik \
  && printf '#!/bin/sh\nexec node /app/dist/cli/remontnik-doctor.js "$@"\n' > /usr/local/bin/remontnik-doctor \

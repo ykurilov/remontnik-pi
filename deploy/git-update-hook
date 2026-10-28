@@ -1,0 +1,65 @@
+#!/bin/sh
+# Хук update своего хранилища Ремонтника (bare-репозиторий на сервере, пользователь git с git-shell).
+# Ставит владелец от root: install -o root -g root -m 755 deploy/git-update-hook <хранилище>/hooks/update
+# Рецепт целиком — docs/security.md, раздел «Своё хранилище на сервере».
+#
+# Перезапись и удаление веток git отклоняет сам, до хука (receive.denyNonFastForwards, receive.denyDeletes).
+# Хук держит то же ещё раз и сверх того:
+#   - метки refs/tags/remontnik/** только создаются: не двигаются и не удаляются;
+#   - не удаляется никакая ссылка;
+#   - ключ врача (REMONTNIK_GIT_ROLE=doctor ставит его принудительная команда remontnik-doctor) пишет только
+#     в основную ветку и в ссылки remontnik/**.
+# Пробные ссылки check-config (имя с remontnik-probe) хук отклоняет всегда; на refs/remontnik-probe/status он
+# ещё сообщает, куда пользователь git может писать. Ответы — строки «remontnik-guard: …»: их читает check-config.
+
+ref=$1
+old=$2
+new=$3
+VERSION=1
+
+say() { echo "remontnik-guard: $*" >&2; }
+reject() { say "отказ $1 $ref: $2"; exit 1; }
+is_zero() { case $1 in *[!0]*) return 1 ;; *) return 0 ;; esac; }
+
+if [ "$ref" = refs/remontnik-probe/status ]; then
+  writable=
+  check() { if [ -e "$2" ] && [ -w "$2" ]; then writable="$writable${writable:+,}$1"; fi; }
+  hooks=$(git rev-parse --git-path hooks)
+  # Само хранилище — папка root с битом sticky (1775, группа git): git ставит в ней свои замки (HEAD.lock),
+  # но чужие файлы — config, HEAD, hooks — не удалит и не подменит. Плохо, если папка его или без sticky.
+  if [ -w . ] && { [ -O . ] || [ ! -k . ]; }; then writable=repo; fi
+  check config config
+  check HEAD HEAD
+  check hooks "$hooks"
+  for file in "$hooks"/*; do check "hooks/${file##*/}" "$file"; done
+  if [ -n "${HOME:-}" ]; then
+    check '~' "$HOME"
+    for file in .gitconfig .config .config/git .config/git/config .ssh .ssh/authorized_keys git-shell-commands; do check "~/$file" "$HOME/$file"; done
+    for file in "$HOME"/git-shell-commands/*; do check "~/git-shell-commands/${file##*/}" "$file"; done
+  fi
+  say "состояние v$VERSION запись=${writable:--}"
+  reject probe 'пробная ссылка'
+fi
+
+case $ref in
+  refs/tags/remontnik/*) is_zero "$old" || reject tag-immutable 'метки remontnik/** не двигают и не удаляют' ;;
+esac
+is_zero "$new" && reject delete 'удалять ссылки нельзя'
+case $ref in
+  refs/heads/*)
+    if ! is_zero "$old" && ! git merge-base --is-ancestor "$old" "$new" 2>/dev/null; then
+      reject non-fast-forward 'ветку двигают только вперёд'
+    fi
+    ;;
+esac
+if [ "${REMONTNIK_GIT_ROLE:-}" = doctor ]; then
+  main=$(git symbolic-ref --quiet HEAD) || main=refs/heads/main
+  case $ref in
+    "$main" | refs/heads/remontnik/* | refs/tags/remontnik/*) ;;
+    *) reject doctor-ref 'ключу врача можно писать только в основную ветку и в ссылки remontnik/**' ;;
+  esac
+fi
+case $ref in
+  *remontnik-probe*) reject probe 'пробная ссылка: правила её пропустили бы' ;;
+esac
+exit 0

@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TEST_SSH_KEY } from '../../test/git-storage-fixtures.js'
 import { testRemontnikConfig } from '../testing/config.js'
 import { assertOwnerSecrets } from '../intake/http-kit.js'
 import { startDoctorService } from './index.js'
@@ -120,6 +121,15 @@ describe('настройка запуска из окружения', () => {
     })
   })
 
+  it('ключ git по SSH: git врача ходит в хранилище с этим ключом и known_hosts; без known_hosts — отказ; без ключа — как раньше', () => {
+    const env = serverEnv({ REMONTNIK_GIT_SSH_KEY: Buffer.from(TEST_SSH_KEY).toString('base64'), REMONTNIK_GIT_KNOWN_HOSTS: 'host.docker.internal ssh-ed25519 AAAA' })
+    const plan = doctorStartPlan(env, testRemontnikConfig(), { gitSshDir: '/tmp/remontnik-git-ssh-test' })
+    expect(plan.gitSsh?.env.GIT_SSH_COMMAND).toContain("'/tmp/remontnik-git-ssh-test/key'")
+    expect(plan.gitSsh?.env.GIT_SSH_COMMAND).toContain("'StrictHostKeyChecking=yes'")
+    expect(doctorStartPlan(serverEnv(), testRemontnikConfig()).gitSsh).toBeUndefined()
+    expect(() => doctorStartPlan(serverEnv({ REMONTNIK_GIT_SSH_KEY: TEST_SSH_KEY }), testRemontnikConfig())).toThrow(/REMONTNIK_GIT_KNOWN_HOSTS/)
+  })
+
   it('адрес host:port и [ipv6]:port', () => {
     expect(parseListen('[fd00::2]:7810', 'X')).toEqual({ host: 'fd00::2', port: 7810 })
     expect(() => parseListen('10.0.0.2:99999', 'X')).toThrow(/host:port/)
@@ -187,6 +197,28 @@ describe('старт врача', () => {
       // Остатки чтений настройки прошлого запуска: контейнеры с меткой этого врача и копии файлов.
       expect(calls).toContain('ps -aq --filter label=remontnik.config-read=remontnik-doctor')
       expect(readdirSync(join(repoDir, '..', 'state', 'config-read'))).toEqual([])
+    } finally {
+      await doctor.close()
+    }
+  })
+
+  it('с ключом git по SSH: до старта службы ключ и known_hosts — файлами 0600 в папке 0700', async () => {
+    const repoDir = appRepo()
+    const gitSshDir = join(repoDir, '..', 'git-ssh')
+    const fake = fakeDocker({ 'remontnik-app': '127.0.0.1' })
+    const env = serverEnv({
+      REMONTNIK_CONFIG_REPO_DIR: repoDir,
+      REMONTNIK_STATE_DIR: join(repoDir, '..', 'state'),
+      REMONTNIK_LISTEN_PORT: '0',
+      REMONTNIK_GIT_SSH_KEY: TEST_SSH_KEY,
+      REMONTNIK_GIT_KNOWN_HOSTS: 'host.docker.internal ssh-ed25519 AAAA',
+    })
+    const doctor = await startDoctorFromEnv(env, { docker: fake.docker, gitSshDir })
+    try {
+      expect(statSync(gitSshDir).mode & 0o777).toBe(0o700)
+      expect(statSync(join(gitSshDir, 'key')).mode & 0o777).toBe(0o600)
+      expect(readFileSync(join(gitSshDir, 'key'), 'utf8')).toBe(`${TEST_SSH_KEY}\n`)
+      expect(readFileSync(join(gitSshDir, 'known_hosts'), 'utf8')).toBe('host.docker.internal ssh-ed25519 AAAA\n')
     } finally {
       await doctor.close()
     }

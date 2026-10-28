@@ -4,7 +4,7 @@
 
 ## Окружение (только имена)
 
-`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_CONTROL_SECRET` (секрет владельца: только им снова пускают выкатки, подтверждают версию брошенной выкатки и снимают «нужен человек» по отпечатку; должен отличаться от общего — иначе врач не запускается), `REMONTNIK_GIT_TOKEN`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`, `REMONTNIK_DOCTOR_URL` (для консольных команд: адрес врача в контейнере), переменные из `handoff.paseo.*Env` (адрес моста, секрет моста, адрес частной сети для приёма).
+`REMONTNIK_CONFIG_REPO_DIR` (рабочая копия основной ветки), `REMONTNIK_STATE_DIR`, `REMONTNIK_SHARED_SECRET`, `REMONTNIK_CONTROL_SECRET` (секрет владельца: только им снова пускают выкатки, подтверждают версию брошенной выкатки и снимают «нужен человек» по отпечатку; должен отличаться от общего — иначе врач не запускается), `REMONTNIK_GIT_TOKEN` (или для своего хранилища по SSH — `REMONTNIK_GIT_SSH_KEY?` и `REMONTNIK_GIT_KNOWN_HOSTS?`), `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL?`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL?`, `PROXY_TOKEN?`, переменные из `reports.telegram.*Env`, `REMONTNIK_BROWSER_URL?`, `REMONTNIK_BROWSER_TOKEN?`, `REMONTNIK_REPORTS_TOKEN`, `REMONTNIK_DOCTOR_URL` (для консольных команд: адрес врача в контейнере), переменные из `handoff.paseo.*Env` (адрес моста, секрет моста, адрес частной сети для приёма).
 
 ## HTTP
 

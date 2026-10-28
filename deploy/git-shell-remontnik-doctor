@@ -1,0 +1,17 @@
+#!/bin/sh
+# Принудительная команда ключа врача в своём хранилище Ремонтника.
+# Ставит владелец от root: install -o root -g root -m 755 deploy/git-shell-remontnik-doctor <дом git>/git-shell-commands/remontnik-doctor
+# В authorized_keys пользователя git ключ врача — с command="remontnik-doctor": git-shell запускает этот файл,
+# а он — обычный git-shell с ролью врача. По роли хук update пускает ключ только в основную ветку и remontnik/**.
+# Рецепт целиком — docs/security.md, раздел «Своё хранилище на сервере».
+
+case ${SSH_ORIGINAL_COMMAND:-} in
+  "git-receive-pack '"* | "git-upload-pack '"*) ;;
+  *)
+    echo "remontnik-doctor: ключу врача доступны только git-receive-pack и git-upload-pack" >&2
+    exit 1
+    ;;
+esac
+REMONTNIK_GIT_ROLE=doctor
+export REMONTNIK_GIT_ROLE
+exec git-shell -c "$SSH_ORIGINAL_COMMAND"
