@@ -74,7 +74,13 @@ const timeZone = z.string().refine((value) => {
 const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|COOKIE|SESSION/
 
 /** Цена модели в долларах за миллион токенов. */
-const modelPriceSchema = z.strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative() })
+/** Цена модели, долларов за миллион токенов. `cachedInput` — вход из кэша поставщика; нет — кэш по цене `input`. */
+const modelPriceSchema = z
+  .strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative(), cachedInput: z.number().nonnegative().optional() })
+  .refine((price) => price.cachedInput === undefined || price.cachedInput <= price.input, {
+    message: 'cachedInput — цена входа из кэша — не может быть дороже input',
+    path: ['cachedInput'],
+  })
 
 // Заголовки, которыми владеет сам прокси: доступ, сведения о сети, то, что ставит или считает транспорт.
 // Клиент eval их не передаёт провайдеру, а в `upstreamHeaders` их задать нельзя.

@@ -194,6 +194,23 @@ describe('defineRemontnikConfig', () => {
     expect(errorOf(() => defineRemontnikConfig(input)).issues.some((issue) => issue.startsWith('checks.eval'))).toBe(true)
   })
 
+  it('цена модели eval: cachedInput — цена входа из кэша, не дороже input', () => {
+    const input = minimalConfig()
+    const withPrice = (price: Record<string, number>) => {
+      input.checks.eval = {
+        run: 'eval {scenarios}',
+        resultFile: 'result.json',
+        env: [],
+        providers: [{ name: 'chat', baseUrlEnv: 'CHAT_BASE_URL', keyEnv: 'CHAT_API_KEY', upstream: 'https://api.example.com/v1', models: { m: price as { input: number; output: number } } }],
+      }
+      return input
+    }
+    expect(defineRemontnikConfig(withPrice({ input: 0.3, output: 1.2, cachedInput: 0.03 })).checks.eval?.providers[0]?.models.m).toEqual({ input: 0.3, output: 1.2, cachedInput: 0.03 })
+    expect(defineRemontnikConfig(withPrice({ input: 0.3, output: 1.2 })).checks.eval?.providers[0]?.models.m).toEqual({ input: 0.3, output: 1.2 })
+    const issues = errorOf(() => defineRemontnikConfig(withPrice({ input: 0.3, output: 1.2, cachedInput: 3 }))).issues
+    expect(issues.some((issue) => issue.startsWith('checks.eval.providers.0.models.m') && issue.includes('cachedInput'))).toBe(true)
+  })
+
   it('папка сценариев eval: по умолчанию eval/scenarios, своя — без «./» и «/» в конце', () => {
     const input = minimalConfig()
     input.checks.eval = { run: 'eval {scenarios}', resultFile: 'result.json', env: [] }
