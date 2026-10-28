@@ -221,7 +221,7 @@ export interface CaseGateway {
 /** Зеркало реестра, прокси eval и сети случая, к которым они подключаются; исполнитель команд поверх них. */
 export async function createCaseGateway(plan: DoctorStartPlan, options: { docker?: string; log?: (line: string) => void } = {}): Promise<CaseGateway> {
   const mirror = createRegistryMirror({ publicUrl: `http://${CASE_GATEWAY_HOST}:${MIRROR_PORT}`, ...(options.log ? { log: options.log } : {}) })
-  const evalProxy = await createEvalProxy({ port: EVAL_PROXY_PORT, publicUrl: `http://${CASE_GATEWAY_HOST}:${EVAL_PROXY_PORT}` })
+  const evalProxy = await createEvalProxy({ port: EVAL_PROXY_PORT, publicUrl: `http://${CASE_GATEWAY_HOST}:${EVAL_PROXY_PORT}`, ...(options.log ? { log: options.log } : {}) })
   const listenerCloser = (listener: { close(): Promise<void> }) => () => listener.close()
   const caseNetworks = createCaseNetworks({
     ...(options.docker ? { docker: options.docker } : {}),

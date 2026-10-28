@@ -341,7 +341,7 @@ export async function startDoctorService(options: DoctorServiceOptions): Promise
   if (evalProxyOption && 'openRun' in evalProxyOption) evalProxy = evalProxyOption
   else if (evalProxyOption) {
     try {
-      evalProxy = ownEvalProxy = await createEvalProxy(evalProxyOption)
+      evalProxy = ownEvalProxy = await createEvalProxy({ log, ...evalProxyOption })
     } catch (error) {
       await opened.close().catch(() => {})
       throw error

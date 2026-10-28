@@ -16,6 +16,8 @@ import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from 
 // После ответа бронь меняется на факт по `usage`; обрыв, тайм-аут, слишком большой ответ или успешный
 // ответ без `usage` засчитываются всей бронью. Поток идёт в eval по ходу чтения.
 // Память врача ограничена пределами тела запроса, ответа и числа одновременных запросов.
+// Отказы и сбои идут в журнал врача: метод, путь без пропуска и строки запроса, статус, текст исключения.
+// Ключей, значений заголовков и тел в журнале нет.
 
 export interface EvalModelPrice {
   /** Долларов за миллион токенов. */
@@ -76,6 +78,8 @@ export interface EvalProxyRun {
   /** Прерывается, когда запрос не влез в долю бюджета (402). */
   overBudget: AbortSignal
   spentUsd(): number
+  /** Сколько запросов с пропуском прогона дошло до прокси, включая отказы. Ноль — eval к прокси не ходил. */
+  requests(): number
   /** Токен больше не действует; ждёт запросы, которые ещё идут. */
   close(): Promise<void>
 }
@@ -101,6 +105,8 @@ export interface EvalProxyOptions {
   upstreamTimeoutMs?: number
   /** Пределы соединений: всего, на один контейнер и срок до первого запроса. */
   limits?: Partial<GuardedHttpLimits>
+  /** Журнал врача: отказы прокси, ошибки поставщика и сбои соединения. */
+  log?: (line: string) => void
 }
 
 const UPSTREAM_TIMEOUT_MS = 300_000
@@ -316,11 +322,26 @@ interface OpenRun {
   limits: EvalProxyLimits
   spentUsd: number
   inFlightUsd: number
+  requests: number
   active: number
   pending: Set<Promise<void>>
   closed: boolean
   overBudget: AbortController
   onSpend?: (spend: EvalSpend) => Promise<void> | void
+}
+
+/** Текст исключения с причиной (`fetch failed` сам по себе ничего не говорит). */
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error)
+  const cause = error.cause instanceof Error ? `: ${(error.cause as Error & { code?: string }).code ?? ''} ${error.cause.message}`.replace(/: {2}/, ': ') : ''
+  return `${error.message}${cause}`
+}
+
+/** Секреты, которые не должны попасть в журнал, даже если их повторит текст исключения. */
+function withoutSecrets(text: string, secrets: readonly string[]): string {
+  let clean = text
+  for (const secret of secrets) if (secret.length > 0) clean = clean.replaceAll(secret, '***')
+  return clean
 }
 
 function urlHost(url: string): string {
@@ -340,6 +361,15 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
   const runs = new Map<string, OpenRun>()
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS
 
+  /** Строка журнала про запрос; `where` — метод и путь без пропуска. */
+  function log(where: string, text: string, secrets: readonly string[] = []): void {
+    options.log?.(`[прокси eval] ${where}: ${withoutSecrets(text, secrets)}`)
+  }
+
+  function providerSecrets(provider: EvalProxyProvider, token: string): string[] {
+    return [token, provider.key, ...Object.values(provider.upstreamHeaderValues ?? {})]
+  }
+
   async function report(run: OpenRun): Promise<void> {
     await run.onSpend?.({ spentUsd: run.spentUsd, inFlightUsd: run.inFlightUsd })
   }
@@ -350,9 +380,10 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
   }
 
   /** Отправка и ответ по ходу чтения. Возвращает, сколько засчитать: факт или вся бронь. */
-  async function relay(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, body: string, reserveUsd: number, price: EvalModelPrice): Promise<number> {
+  async function relay(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, body: string, reserveUsd: number, price: EvalModelPrice, where: string, secrets: readonly string[]): Promise<number> {
     try {
       const upstream = await fetch(url, { method: 'POST', headers: forwardedHeaders(request, provider), body, redirect: 'manual', signal: AbortSignal.timeout(upstreamTimeoutMs) })
+      if (!upstream.ok) log(where, `поставщик ответил ${upstream.status}`)
       const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
       response.writeHead(upstream.status, { 'content-type': contentType })
       const meter = createUsageMeter(contentType)
@@ -369,15 +400,16 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
       const usage = meter.finish()
       if (usage) return priceOf(usage, price)
       return upstream.ok ? reserveUsd : 0
-    } catch {
+    } catch (error) {
       // Обрыв, тайм-аут, слишком большой ответ: провайдер мог успеть сделать всю работу.
+      log(where, `${response.headersSent ? 'ответ поставщика оборвался' : 'поставщик не ответил'}: ${describeError(error)}`, secrets)
       if (!response.headersSent) reply(response, 502, 'провайдер модели не ответил')
       else response.destroy()
       return reserveUsd
     }
   }
 
-  async function forward(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, endpoint: Endpoint): Promise<void> {
+  async function forward(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, endpoint: Endpoint, where: string, secrets: readonly string[]): Promise<void> {
     const { body, price, reserveUsd } = preparedRequest(await readBody(request, run.limits.maxRequestBytes), provider, endpoint, run.limits)
     if (run.spentUsd + run.inFlightUsd + reserveUsd > run.budgetUsd) {
       run.overBudget.abort()
@@ -392,7 +424,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
     }
     let chargeUsd = reserveUsd
     try {
-      chargeUsd = await relay(request, response, run, provider, url, body, reserveUsd, price)
+      chargeUsd = await relay(request, response, run, provider, url, body, reserveUsd, price, where, secrets)
     } finally {
       run.inFlightUsd -= reserveUsd
       run.spentUsd += chargeUsd
@@ -400,29 +432,42 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
     }
   }
 
-  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  function requestPath(request: IncomingMessage) {
     const raw = request.url ?? '/'
     const queryAt = raw.indexOf('?')
     const path = queryAt === -1 ? raw : raw.slice(0, queryAt)
     const search = queryAt === -1 ? '' : raw.slice(queryAt)
     const [, token = '', name = '', ...restParts] = path.split('/')
+    // Пропуск прогона — первая часть пути, строка запроса может нести ключ: в журнал ни то, ни другое.
+    const where = `${request.method ?? '?'} /${[name, ...restParts].join('/')}`
+    return { search, token, name, restParts, where }
+  }
+
+  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const { search, token, name, restParts, where } = requestPath(request)
+    const refuse = (status: number, text: string, secrets: readonly string[] = []) => {
+      log(where, `${status} ${text}`, [token, ...secrets])
+      reply(response, status, text)
+    }
     const run = runs.get(token)
-    if (!run || run.closed) return reply(response, 401, 'неизвестный прогон eval')
+    if (!run || run.closed) return refuse(401, 'неизвестный прогон eval')
+    run.requests += 1
     const provider = run.providers.get(name)
-    if (!provider) return reply(response, 404, 'неизвестный провайдер')
+    if (!provider) return refuse(404, 'неизвестный провайдер')
+    const secrets = providerSecrets(provider, token)
     let target: { url: URL; endpoint: Endpoint }
     try {
       target = upstreamTarget(provider, `/${restParts.join('/')}`, search)
       if (request.method !== 'POST') throw new Refusal(403, 'только POST')
     } catch (error) {
-      if (error instanceof Refusal) return reply(response, error.status, error.message)
+      if (error instanceof Refusal) return refuse(error.status, error.message, secrets)
       throw error
     }
-    if (run.active >= run.limits.maxConcurrentRequests) return reply(response, 429, 'слишком много одновременных запросов eval')
+    if (run.active >= run.limits.maxConcurrentRequests) return refuse(429, 'слишком много одновременных запросов eval')
     run.active += 1
-    const done = forward(request, response, run, provider, target.url, target.endpoint).catch((error: unknown) => {
+    const done = forward(request, response, run, provider, target.url, target.endpoint, where, secrets).catch((error: unknown) => {
       if (!(error instanceof Refusal)) throw error
-      reply(response, error.status, error.message)
+      refuse(error.status, error.message, secrets)
     })
     const tracked = done.finally(() => {
       run.active -= 1
@@ -435,7 +480,10 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
   const http = createGuardedHttp((request, response) => {
     // Eval мог уйти, не дочитав ответ: запись в закрытое соединение — не сбой прокси.
     response.on('error', () => {})
-    handle(request, response).catch(() => {
+    handle(request, response).catch((error: unknown) => {
+      const { token, name, where } = requestPath(request)
+      const provider = runs.get(token)?.providers.get(name)
+      log(where, `сбой прокси: ${describeError(error)}`, provider ? providerSecrets(provider, token) : [token])
       if (!response.headersSent) reply(response, 500, 'сбой прокси')
       else response.destroy()
     })
@@ -454,6 +502,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
         limits: runOptions.limits,
         spentUsd: 0,
         inFlightUsd: 0,
+        requests: 0,
         active: 0,
         pending: new Set(),
         closed: false,
@@ -471,6 +520,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
         env,
         overBudget: run.overBudget.signal,
         spentUsd: () => run.spentUsd,
+        requests: () => run.requests,
         async close() {
           run.closed = true
           while (run.pending.size > 0) await Promise.allSettled([...run.pending])
