@@ -413,6 +413,49 @@ describe('прокси модели для eval', () => {
     expect(run.spentUsd()).toBeCloseTo(RESERVE_100K)
   })
 
+  it('засчитанная бронь — в журнал врача с причиной', async () => {
+    let answer: Answer = { body: '{"ok":true}' }
+    const upstream = await startUpstream(() => answer)
+    const lines: string[] = []
+    const proxy = await startProxy({ log: (line) => lines.push(line) })
+    const run = openRun(proxy, upstream)
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 100_000 })
+    expect(lines.at(-1)).toMatch(/POST \/chat\/chat\/completions: в ответе поставщика нет usage — засчитана бронь \$0\.1/)
+    answer = { contentType: 'text/event-stream', chunks: [`data: ${JSON.stringify({ choices: [{ delta: { content: 'a' } }] })}\n\n`], cut: true }
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 100_000, stream: true })
+      .then((response) => response.text())
+      .catch(() => undefined)
+    await run.close()
+    expect(lines.at(-1)).toMatch(/ответ поставщика оборвался: .* — засчитана бронь \$0\.1/)
+  })
+
+  it('поток с входом из кэша: списание по цене cachedInput', async () => {
+    const usage = { prompt_tokens: 100_000, prompt_cache_hit_tokens: 90_000, prompt_cache_miss_tokens: 10_000, completion_tokens: 1_000 }
+    const events = [`data: ${JSON.stringify({ choices: [{ delta: { content: 'да' } }], usage: null })}\n\n`, `data: ${JSON.stringify({ choices: [], usage })}\n\ndata: [DONE]\n\n`]
+    const upstream = await startUpstream(() => ({ contentType: 'text/event-stream', chunks: events }))
+    const lines: string[] = []
+    const proxy = await startProxy({ log: (line) => lines.push(line) })
+    const run = openRun(proxy, upstream, { providers: [provider(upstream, { models: { m: { input: 1, output: 2, cachedInput: 0.1 } } })] })
+    await (await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 1_000, stream: true })).text()
+    await run.close()
+    // 10 тыс. × $1 + 90 тыс. × $0.1 + 1 тыс. × $2 за миллион.
+    expect(run.spentUsd()).toBeCloseTo(0.021, 6)
+    expect(lines).toEqual([])
+  })
+
+  it('вход из кэша без цены cachedInput — по цене input и одна строка в журнале на модель за прогон', async () => {
+    const upstream = await startUpstream(chatReply({ prompt_tokens: 100_000, prompt_tokens_details: { cached_tokens: 90_000 }, completion_tokens: 0 }))
+    const lines: string[] = []
+    const proxy = await startProxy({ log: (line) => lines.push(line) })
+    const run = openRun(proxy, upstream, { providers: [provider(upstream, { models: { m: { input: 1, output: 1 } } })] })
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 10 })
+    await post(`${run.env.CHAT_BASE_URL}/chat/completions`, { model: 'm', max_tokens: 10 })
+    await run.close()
+    expect(run.spentUsd()).toBeCloseTo(0.2)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/у модели m нет цены cachedInput: вход из кэша посчитан по цене input/)
+  })
+
   it('расход дошёл до доли без отказов — прогон не прерван; следующий запрос — 402 и прерывание', async () => {
     const upstream = await startUpstream(chatReply({ completion_tokens: 100_000 }))
     const proxy = await startProxy()
@@ -550,5 +593,39 @@ describe('стоимость ответа модели', () => {
 
   it('ответ без usage — цены нет', () => {
     expect(usageCostUsd('{"error":"rate"}', price)).toBeUndefined()
+  })
+
+  // Вход 1 млн токенов, из них 900 тыс. из кэша: 0.1 × $1 + 0.9 × $0.1 = $0.19.
+  const cachedPrice = { input: 1, output: 2, cachedInput: 0.1 }
+  it.each([
+    ['DeepSeek', { usage: { prompt_tokens: 1_000_000, prompt_cache_hit_tokens: 900_000, prompt_cache_miss_tokens: 100_000, completion_tokens: 0 } }],
+    ['OpenAI-совместимый чат', { usage: { prompt_tokens: 1_000_000, prompt_tokens_details: { cached_tokens: 900_000 }, completion_tokens: 0 } }],
+    ['responses', { response: { usage: { input_tokens: 1_000_000, input_tokens_details: { cached_tokens: 900_000 }, output_tokens: 0 } } }],
+    ['Anthropic', { usage: { input_tokens: 100_000, cache_read_input_tokens: 900_000, output_tokens: 0 } }],
+    ['Gemini', { usageMetadata: { promptTokenCount: 1_000_000, cachedContentTokenCount: 900_000, candidatesTokenCount: 0 } }],
+  ])('вход из кэша по цене cachedInput: %s', (_format, body) => {
+    expect(usageCostUsd(JSON.stringify(body), cachedPrice)).toBeCloseTo(0.19)
+  })
+
+  it('поток DeepSeek: кэш из последнего события с usage', () => {
+    const stream = [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'да' } }], usage: null })}`,
+      `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1_000_000, prompt_cache_hit_tokens: 900_000, prompt_cache_miss_tokens: 100_000, completion_tokens: 500_000 } })}`,
+      'data: [DONE]',
+    ].join('\n\n')
+    expect(usageCostUsd(stream, cachedPrice)).toBeCloseTo(1.19)
+  })
+
+  it('без цены cachedInput вход из кэша — по цене input', () => {
+    expect(usageCostUsd(JSON.stringify({ usage: { prompt_tokens: 1_000_000, prompt_cache_hit_tokens: 900_000, completion_tokens: 0 } }), price)).toBeCloseTo(1)
+  })
+
+  it('готовая цена usage.cost важнее цены кэша', () => {
+    expect(usageCostUsd(JSON.stringify({ usage: { cost: 0.0001, prompt_tokens: 1_000_000, prompt_tokens_details: { cached_tokens: 900_000 } } }), cachedPrice)).toBeCloseTo(0.0001)
+  })
+
+  it('OpenRouter со своим ключом поставщика: к cost прибавляется upstream_inference_cost', () => {
+    const usage = { cost: 0.01, is_byok: true, cost_details: { upstream_inference_cost: 0.5 }, prompt_tokens: 1_000, completion_tokens: 10 }
+    expect(usageCostUsd(JSON.stringify({ usage }), price)).toBeCloseTo(0.51)
   })
 })

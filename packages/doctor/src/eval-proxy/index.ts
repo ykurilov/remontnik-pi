@@ -13,8 +13,9 @@ import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from 
 // (`max_tokens`; нет — подставляется из настройки) по цене выхода. Бронь записывается в учёт врача
 // до отправки, с ожиданием записи: после падения врача она видна. Запрос, который вместе с бронями
 // запросов в пути не влезает в долю прогона, получает 402, и прогон прерывается (`overBudget`).
-// После ответа бронь меняется на факт по `usage`; обрыв, тайм-аут, слишком большой ответ или успешный
-// ответ без `usage` засчитываются всей бронью. Поток идёт в eval по ходу чтения.
+// После ответа бронь меняется на факт по `usage`: готовая `cost` поставщика, иначе токены × цены модели,
+// вход из кэша — по `cachedInput`. Обрыв, тайм-аут, слишком большой ответ или успешный ответ без `usage`
+// засчитываются всей бронью, с причиной в журнале врача. Поток идёт в eval по ходу чтения.
 // Память врача ограничена пределами тела запроса, ответа и числа одновременных запросов.
 // Отказы и сбои идут в журнал врача: метод, путь без пропуска и строки запроса, статус, текст исключения.
 // Ключей, значений заголовков и тел в журнале нет.
@@ -23,6 +24,8 @@ export interface EvalModelPrice {
   /** Долларов за миллион токенов. */
   input: number
   output: number
+  /** Вход из кэша поставщика. Нет — кэш считается по цене `input`, и журнал врача говорит об этом раз за прогон. */
+  cachedInput?: number
 }
 
 export interface EvalProxyProvider {
@@ -145,28 +148,54 @@ class Refusal extends Error {
 
 interface Usage {
   cost?: number
+  /** Весь вход, включая кэш. */
   input: number
+  /** Часть входа из кэша поставщика. */
+  cached: number
   output: number
 }
 
+function nonNegative(record: unknown, key: string): number | undefined {
+  if (typeof record !== 'object' || record === null) return undefined
+  const value = (record as Record<string, unknown>)[key]
+  return typeof value === 'number' && value >= 0 ? value : undefined
+}
+
+function mergeUsage(into: Usage, from: Usage): void {
+  if (from.cost !== undefined) into.cost = Math.max(into.cost ?? 0, from.cost)
+  into.input = Math.max(into.input, from.input)
+  into.cached = Math.max(into.cached, from.cached)
+  into.output = Math.max(into.output, from.output)
+}
+
+/**
+ * Один `usage` любого формата. Кэш: DeepSeek — `prompt_cache_hit_tokens`, OpenAI-совместимый чат и OpenRouter —
+ * `prompt_tokens_details.cached_tokens`, responses — `input_tokens_details.cached_tokens`, Gemini —
+ * `cachedContentTokenCount` (все — часть входа); Anthropic — `cache_read_input_tokens` (к входу прибавляется).
+ */
 function usageIn(value: unknown, usage: Usage): void {
   if (typeof value !== 'object' || value === null) return
   const record = value as Record<string, unknown>
-  const number = (key: string) => (typeof record[key] === 'number' && (record[key] as number) >= 0 ? (record[key] as number) : undefined)
-  const cost = number('cost')
-  if (cost !== undefined) usage.cost = Math.max(usage.cost ?? 0, cost)
-  const input =
-    (number('prompt_tokens') ?? number('input_tokens') ?? number('promptTokenCount') ?? 0) +
-    (number('cache_creation_input_tokens') ?? 0) +
-    (number('cache_read_input_tokens') ?? 0)
+  const number = (key: string) => nonNegative(record, key)
+  let cost = number('cost')
+  // OpenRouter со своим ключом поставщика: `cost` — только его доля, поставщик берёт `upstream_inference_cost`.
+  if (cost !== undefined && record.is_byok === true) cost += nonNegative(record.cost_details, 'upstream_inference_cost') ?? 0
+  const anthropicCached = number('cache_read_input_tokens') ?? 0
+  const input = (number('prompt_tokens') ?? number('input_tokens') ?? number('promptTokenCount') ?? 0) + (number('cache_creation_input_tokens') ?? 0) + anthropicCached
+  const cached =
+    anthropicCached ||
+    (number('prompt_cache_hit_tokens') ??
+      nonNegative(record.prompt_tokens_details, 'cached_tokens') ??
+      nonNegative(record.input_tokens_details, 'cached_tokens') ??
+      number('cachedContentTokenCount') ??
+      0)
   const output = (number('completion_tokens') ?? number('output_tokens') ?? number('candidatesTokenCount') ?? 0) + (number('thoughtsTokenCount') ?? 0)
-  usage.input = Math.max(usage.input, input)
-  usage.output = Math.max(usage.output, output)
+  mergeUsage(usage, { ...(cost !== undefined ? { cost } : {}), input, cached: Math.min(cached, input), output })
 }
 
 /** `usage` ответа: целый JSON или поток событий (`data: {…}`); по каждому полю — наибольшее из событий. */
 function usageOf(body: string): Usage | undefined {
-  const usage: Usage = { input: 0, output: 0 }
+  const usage: Usage = { input: 0, cached: 0, output: 0 }
   let found = false
   const events: unknown[] = []
   try {
@@ -195,10 +224,12 @@ function usageOf(body: string): Usage | undefined {
 }
 
 function priceOf(usage: Usage, price: EvalModelPrice): number {
-  return usage.cost ?? (usage.input * price.input + usage.output * price.output) / TOKENS_PER_MTOK
+  if (usage.cost !== undefined) return usage.cost
+  const cachedPrice = price.cachedInput ?? price.input
+  return ((usage.input - usage.cached) * price.input + usage.cached * cachedPrice + usage.output * price.output) / TOKENS_PER_MTOK
 }
 
-/** Стоимость ответа по его `usage`: готовая `cost`, иначе токены × цены модели (кэш — по цене входа). Нет `usage` — `undefined`. */
+/** Стоимость ответа по его `usage`: готовая `cost`, иначе токены × цены модели (кэш — по `cachedInput`, нет её — по `input`). Нет `usage` — `undefined`. */
 export function usageCostUsd(body: string, price: EvalModelPrice): number | undefined {
   const usage = usageOf(body)
   return usage ? priceOf(usage, price) : undefined
@@ -213,10 +244,8 @@ function createUsageMeter(contentType: string) {
   const takeLines = (lines: string[]) => {
     const found = usageOf(lines.join('\n'))
     if (!found) return
-    usage ??= { input: 0, output: 0 }
-    if (found.cost !== undefined) usage.cost = Math.max(usage.cost ?? 0, found.cost)
-    usage.input = Math.max(usage.input, found.input)
-    usage.output = Math.max(usage.output, found.output)
+    usage ??= { input: 0, cached: 0, output: 0 }
+    mergeUsage(usage, found)
   }
   return {
     push(chunk: Uint8Array): void {
@@ -268,7 +297,7 @@ function positiveInteger(value: unknown, field: string): number {
 }
 
 /** Запрос к модели: модель из белого списка, предел ответа на месте. Возвращает тело для отправки и наибольшую цену. */
-function preparedRequest(raw: Buffer, provider: EvalProxyProvider, endpoint: Endpoint, limits: EvalProxyLimits): { body: string; price: EvalModelPrice; reserveUsd: number } {
+function preparedRequest(raw: Buffer, provider: EvalProxyProvider, endpoint: Endpoint, limits: EvalProxyLimits): { body: string; model: string; price: EvalModelPrice; reserveUsd: number } {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw.toString('utf8'))
@@ -280,6 +309,7 @@ function preparedRequest(raw: Buffer, provider: EvalProxyProvider, endpoint: End
   const model = request.model
   const price = typeof model === 'string' && Object.hasOwn(provider.models, model) ? provider.models[model]! : undefined
   if (!price) throw new Refusal(403, 'модели нет в списке eval.providers[].models')
+  const modelName = model as string
 
   let outputTokens = 0
   const defaultField = DEFAULT_OUTPUT_LIMIT_FIELD[endpoint]
@@ -298,7 +328,7 @@ function preparedRequest(raw: Buffer, provider: EvalProxyProvider, endpoint: End
   }
   const body = JSON.stringify(request)
   const inputTokens = Buffer.byteLength(body) / RESERVE_BYTES_PER_TOKEN
-  return { body, price, reserveUsd: priceOf({ input: inputTokens, output: outputTokens }, price) }
+  return { body, model: modelName, price, reserveUsd: priceOf({ input: inputTokens, cached: 0, output: outputTokens }, price) }
 }
 
 function forwardedHeaders(request: IncomingMessage, provider: EvalProxyProvider): Headers {
@@ -327,6 +357,8 @@ interface OpenRun {
   pending: Set<Promise<void>>
   closed: boolean
   overBudget: AbortController
+  /** Модели, про которые журнал уже сказал: кэш без цены `cachedInput`. */
+  cachePriceMissingLogged: Set<string>
   onSpend?: (spend: EvalSpend) => Promise<void> | void
 }
 
@@ -342,6 +374,11 @@ function withoutSecrets(text: string, secrets: readonly string[]): string {
   let clean = text
   for (const secret of secrets) if (secret.length > 0) clean = clean.replaceAll(secret, '***')
   return clean
+}
+
+/** Брони запросов бывают в доли цента. */
+function formatUsd(value: number): string {
+  return String(Number(value.toFixed(6)))
 }
 
 function urlHost(url: string): string {
@@ -379,8 +416,18 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
     response.end(text)
   }
 
+  /** Факт по `usage`. Кэш без цены `cachedInput` считается по `input` — расход завышен, журнал говорит об этом раз за прогон. */
+  function chargeOf(usage: Usage, run: OpenRun, provider: EvalProxyProvider, model: string, price: EvalModelPrice, where: string): number {
+    const missingKey = `${provider.name}/${model}`
+    if (usage.cost === undefined && usage.cached > 0 && price.cachedInput === undefined && !run.cachePriceMissingLogged.has(missingKey)) {
+      run.cachePriceMissingLogged.add(missingKey)
+      log(where, `у модели ${model} нет цены cachedInput: вход из кэша посчитан по цене input, расход завышен — впишите cachedInput в eval.providers[].models`)
+    }
+    return priceOf(usage, price)
+  }
+
   /** Отправка и ответ по ходу чтения. Возвращает, сколько засчитать: факт или вся бронь. */
-  async function relay(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, body: string, reserveUsd: number, price: EvalModelPrice, where: string, secrets: readonly string[]): Promise<number> {
+  async function relay(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, body: string, reserveUsd: number, model: string, price: EvalModelPrice, where: string, secrets: readonly string[]): Promise<number> {
     try {
       const upstream = await fetch(url, { method: 'POST', headers: forwardedHeaders(request, provider), body, redirect: 'manual', signal: AbortSignal.timeout(upstreamTimeoutMs) })
       if (!upstream.ok) log(where, `поставщик ответил ${upstream.status}`)
@@ -398,11 +445,13 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
       }
       response.end()
       const usage = meter.finish()
-      if (usage) return priceOf(usage, price)
-      return upstream.ok ? reserveUsd : 0
+      if (usage) return chargeOf(usage, run, provider, model, price, where)
+      if (!upstream.ok) return 0
+      log(where, `в ответе поставщика нет usage — засчитана бронь $${formatUsd(reserveUsd)}`)
+      return reserveUsd
     } catch (error) {
       // Обрыв, тайм-аут, слишком большой ответ: провайдер мог успеть сделать всю работу.
-      log(where, `${response.headersSent ? 'ответ поставщика оборвался' : 'поставщик не ответил'}: ${describeError(error)}`, secrets)
+      log(where, `${response.headersSent ? 'ответ поставщика оборвался' : 'поставщик не ответил'}: ${describeError(error)} — засчитана бронь $${formatUsd(reserveUsd)}`, secrets)
       if (!response.headersSent) reply(response, 502, 'провайдер модели не ответил')
       else response.destroy()
       return reserveUsd
@@ -410,7 +459,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
   }
 
   async function forward(request: IncomingMessage, response: ServerResponse, run: OpenRun, provider: EvalProxyProvider, url: URL, endpoint: Endpoint, where: string, secrets: readonly string[]): Promise<void> {
-    const { body, price, reserveUsd } = preparedRequest(await readBody(request, run.limits.maxRequestBytes), provider, endpoint, run.limits)
+    const { body, model, price, reserveUsd } = preparedRequest(await readBody(request, run.limits.maxRequestBytes), provider, endpoint, run.limits)
     if (run.spentUsd + run.inFlightUsd + reserveUsd > run.budgetUsd) {
       run.overBudget.abort()
       throw new Refusal(402, 'бюджет eval: запрос не влезает в остаток доли')
@@ -424,7 +473,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
     }
     let chargeUsd = reserveUsd
     try {
-      chargeUsd = await relay(request, response, run, provider, url, body, reserveUsd, price, where, secrets)
+      chargeUsd = await relay(request, response, run, provider, url, body, reserveUsd, model, price, where, secrets)
     } finally {
       run.inFlightUsd -= reserveUsd
       run.spentUsd += chargeUsd
@@ -507,6 +556,7 @@ export async function createEvalProxy(options: EvalProxyOptions): Promise<EvalPr
         pending: new Set(),
         closed: false,
         overBudget: new AbortController(),
+        cachePriceMissingLogged: new Set(),
         ...(runOptions.onSpend ? { onSpend: runOptions.onSpend } : {}),
       }
       runs.set(token, run)
