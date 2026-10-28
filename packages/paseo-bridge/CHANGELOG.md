@@ -1,5 +1,11 @@
 # @ykurilov/remontnik-paseo-bridge
 
+## 0.1.7
+
+### Patch Changes
+
+- @ykurilov/remontnik-core@0.1.7
+
 ## 0.1.6
 
 ### Patch Changes

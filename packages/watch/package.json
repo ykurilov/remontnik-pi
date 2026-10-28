@@ -1,6 +1,6 @@
 {
   "name": "@ykurilov/remontnik-watch",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Ремонтник Pi: сторож внутри приложения — ловит сбои, шлёт тревогу в Telegram и надёжно доставляет случаи врачу",
   "license": "MIT",
   "type": "module",
