@@ -25,7 +25,7 @@ export const CHECK_CONFIG_USAGE = `  remontnik-doctor check-config        про
 
 export interface Finding {
   level: 'error' | 'warning' | 'ok'
-  area: 'настройка' | 'окружение' | 'службы' | 'docker' | 'сети' | 'браузер' | 'github' | 'хранилище'
+  area: 'настройка' | 'окружение' | 'службы' | 'docker' | 'верстак' | 'сети' | 'браузер' | 'github' | 'хранилище'
   problem: string
   /** Как исправить; у «ok» — пусто. */
   fix: string
@@ -674,6 +674,57 @@ async function checkEvalScenarios(env: DoctorEnv, config: RemontnikConfig): Prom
   return findings
 }
 
+/** pnpm или yarn, которые зовут команды верстака и проверок, и то, что указано в `packageManager` приложения. */
+async function packageManagersOf(config: RemontnikConfig, repoDir: string | undefined): Promise<{ needed: Set<'pnpm' | 'yarn'>; pinned?: string }> {
+  const commands = [config.workbench.install, config.checks.test, config.checks.typecheck ?? ''].join('\n')
+  const needed = new Set<'pnpm' | 'yarn'>()
+  if (/(^|[\s;&|(])(pnpm|pnpx)(\s|$)/m.test(commands)) needed.add('pnpm')
+  if (/(^|[\s;&|(])yarn(\s|$)/m.test(commands)) needed.add('yarn')
+  const manifest = repoDir ? await readFile(join(repoDir, 'package.json'), 'utf8').then((text) => JSON.parse(text) as { packageManager?: unknown }, () => undefined) : undefined
+  const pinned = typeof manifest?.packageManager === 'string' ? manifest.packageManager : undefined
+  const pinnedName = /^(pnpm|yarn)@/.exec(pinned ?? '')?.[1] as 'pnpm' | 'yarn' | undefined
+  if (pinnedName && needed.size > 0) needed.add(pinnedName)
+  return { needed, ...(manifest ? { pinned: pinned ?? '' } : {}) }
+}
+
+/**
+ * pnpm и yarn в образе верстака: своя программа или corepack (по нему врач подставляет `pnpm` и `yarn` сам). Нет ни того,
+ * ни другого — установка в первом же случае упадёт с «pnpm: not found». Образ запускается без сети и только читает.
+ */
+async function checkWorkbenchTools(env: DoctorEnv, docker: string, config: RemontnikConfig): Promise<Finding[]> {
+  const { needed, pinned } = await packageManagersOf(config, value(env, 'REMONTNIK_CONFIG_REPO_DIR'))
+  if (needed.size === 0) return []
+  const image = config.workbench.image
+  const names = [...needed].join(' и ')
+  // Docker недоступен — об этом уже ошибка в проверке Docker.
+  if (!(await run(docker, ['version', '--format', '{{.Server.Version}}'], env)).ok) return []
+  if (!(await run(docker, ['image', 'inspect', '--format', '{{.Id}}', image], env)).ok) {
+    return [{ level: 'warning', area: 'верстак', problem: `образа верстака ${image} нет на сервере: есть ли в нём ${names}, не проверить`, fix: `docker pull ${image} и снова check-config` }]
+  }
+  const probe = await run(docker, ['run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--entrypoint', 'sh', image, '-c', 'for t in pnpm yarn corepack; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done; true'], env)
+  if (!probe.ok) {
+    return [{ level: 'warning', area: 'верстак', problem: `образ верстака ${image} не запустился для проверки ${names}`, fix: `в образе нужен sh; проверьте: docker run --rm --entrypoint sh ${image} -c "command -v ${[...needed][0]}"` }]
+  }
+  const tools = new Set(probe.stdout.split('\n').map((line) => line.trim()))
+  const findings: Finding[] = []
+  for (const name of needed) {
+    if (tools.has(name)) {
+      findings.push({ level: 'ok', area: 'верстак', problem: `${name} есть в образе верстака`, fix: '' })
+      continue
+    }
+    if (!tools.has('corepack')) {
+      findings.push({ level: 'error', area: 'верстак', problem: `в образе верстака ${image} нет ни ${name}, ни corepack: установка упадёт с «${name}: not found»`, fix: `возьмите образ с corepack (node:22, node:24) или со своим ${name} (deploy/workbench.Dockerfile); пример — docs/configuration.md, раздел workbench` })
+      continue
+    }
+    if (pinned === '') {
+      findings.push({ level: 'warning', area: 'верстак', problem: `${name} в верстаке — через corepack, а поля packageManager в package.json нет: corepack возьмёт свою версию, не ту, что у файла-замка`, fix: `закрепите версию в package.json: "packageManager": "${name}@<версия>" (${name} --version)` })
+      continue
+    }
+    findings.push({ level: 'ok', area: 'верстак', problem: `${name} в верстаке — через corepack, версия из packageManager`, fix: '' })
+  }
+  return findings
+}
+
 /** Все проверки подряд; ни одна не меняет сервер, репозиторий, GitHub или своё хранилище. */
 export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = {}): Promise<Finding[]> {
   const { config, findings: settings } = await checkSettings(env, deps)
@@ -684,6 +735,7 @@ export async function checkDoctorConfig(env: DoctorEnv, deps: CheckConfigDeps = 
     ...checkEnvironment(env, config),
     ...(config ? await checkServices(env, config) : []),
     ...(await checkDocker(env, deps.docker ?? 'docker')),
+    ...(config ? await checkWorkbenchTools(env, deps.docker ?? 'docker', config) : []),
     ...(await checkBrowserPolicy(env, deps.docker ?? 'docker')),
     ...(await checkOrigin(env, deps, config)),
   ]

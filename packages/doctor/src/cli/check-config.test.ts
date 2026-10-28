@@ -38,7 +38,7 @@ function git(dir: string, ...args: string[]): void {
 }
 
 /** Репозиторий приложения на основной ветке: настройка и, по желанию, файл служб. */
-function appRepo(options: { config?: object; services?: string; deployFiles?: Record<string, { content: string; executable?: boolean } | null> } = {}): string {
+function appRepo(options: { config?: object; services?: string; deployFiles?: Record<string, { content: string; executable?: boolean } | null>; packageJson?: object } = {}): string {
   const repoDir = join(tempDir(), 'app')
   mkdirSync(repoDir)
   git(repoDir, 'init', '--quiet', '--initial-branch=main')
@@ -53,6 +53,7 @@ function appRepo(options: { config?: object; services?: string; deployFiles?: Re
     writeFileSync(join(repoDir, name), file.content)
     if (file.executable) chmodSync(join(repoDir, name), 0o755)
   }
+  if (options.packageJson) writeFileSync(join(repoDir, 'package.json'), JSON.stringify(options.packageJson))
   if (options.services !== undefined) {
     mkdirSync(join(repoDir, 'ci'))
     writeFileSync(join(repoDir, 'ci/services.yml'), options.services)
@@ -89,6 +90,8 @@ interface DockerScenario {
   stateMount?: 'same' | 'volume'
   /** Контейнер службы браузера `remontnik-browser`: запущен ли и что отвечает `remontnik-browser check-policy`. */
   browser?: { running: boolean; problems?: string[]; oldImage?: boolean; noPolicy?: boolean }
+  /** Образ верстака: скачан ли на сервер и какие из pnpm, yarn, corepack в нём есть. */
+  workbench?: { pulled?: boolean; tools: string[] }
 }
 
 const HEALTHY_DOCKER: DockerScenario = {
@@ -99,6 +102,8 @@ const HEALTHY_DOCKER: DockerScenario = {
     { name: 'remontnik-app', subnet: '10.5.0.0/24' },
     { name: 'remontnik-case-1', subnet: '10.213.0.0/27', caseNetwork: true },
   ],
+  // Как официальный образ Node 22: pnpm нет, corepack есть.
+  workbench: { tools: ['corepack'] },
 }
 
 /** Подставной docker: node-скрипт отвечает по сценарию из соседнего JSON. */
@@ -115,6 +120,8 @@ const out = (text) => { process.stdout.write(text + '\\n'); process.exit(0) }
 const fail = () => { process.stderr.write(s.errorText || 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock'); process.exit(1) }
 if (s.down) fail()
 if (a[0] === 'version') out('27.3.1')
+if (a[0] === 'image' && a[1] === 'inspect') { if (!s.workbench || s.workbench.pulled === false) { process.stderr.write('Error: No such image: ' + a.at(-1)); process.exit(1) } out('sha256:' + 'b'.repeat(64)) }
+if (a[0] === 'run' && a.includes('--network') && a[a.indexOf('--network') + 1] === 'none') out((s.workbench ? s.workbench.tools : []).join('\\n'))
 if (a[0] === 'inspect' && a[2].includes('Mounts')) {
   const state = process.env.REMONTNIK_STATE_DIR
   out(JSON.stringify([{ Type: 'bind', Source: '/var/run/docker.sock', Destination: '/var/run/docker.sock' }, s.stateMount === 'volume' ? { Type: 'volume', Source: '/var/lib/docker/volumes/state/_data', Destination: state } : { Type: 'bind', Source: state, Destination: state }]))
@@ -508,6 +515,63 @@ describe('check-config: настройка', () => {
   it('файла служб нет в основной ветке — ошибка', async () => {
     const findings = await checkDoctorConfig(serverEnv(appRepo({ config: configWithServices() })), { docker: fakeDocker(HEALTHY_DOCKER), gh: fakeGh(GOOD_RULESETS) })
     expect(errors(findings).join('\n')).toMatch(/ci\/services\.yml/)
+  })
+})
+
+describe('check-config: pnpm и yarn в образе верстака', () => {
+  const withWorkbench = (workbench: { install: string; test?: string }, packageJson?: object): string => {
+    const base = testRemontnikConfig()
+    const config = {
+      ...base,
+      workbench: { ...base.workbench, install: workbench.install },
+      checks: { ...base.checks, test: workbench.test ?? base.checks.test },
+      forbidden: { schema: base.forbidden.schema, money: base.forbidden.money, access: base.forbidden.access },
+    }
+    return appRepo({ config, ...(packageJson ? { packageJson } : {}) })
+  }
+  const check = (repoDir: string, workbench: DockerScenario['workbench']) =>
+    checkDoctorConfig(serverEnv(repoDir), { docker: fakeDocker({ ...HEALTHY_DOCKER, workbench }), gh: fakeGh(GOOD_RULESETS) })
+  const about = (findings: Finding[]) => findings.filter((finding) => finding.area === 'верстак')
+
+  it('ни pnpm, ни corepack в образе — ошибка до первого случая: установка упала бы с «pnpm: not found»', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' }), { tools: [] })
+    const problem = about(findings).find((finding) => finding.level === 'error')
+    expect(problem?.problem).toMatch(/pnpm.*corepack/)
+    expect(problem?.fix).toMatch(/node:22|corepack/)
+  })
+
+  it('yarn нет, а в образе только pnpm — ошибка про yarn', async () => {
+    const findings = await check(withWorkbench({ install: 'yarn install --immutable', test: 'yarn test' }, { packageManager: 'yarn@4.5.0' }), { tools: ['pnpm'] })
+    expect(about(findings).filter((finding) => finding.level === 'error').map((finding) => finding.problem).join('\n')).toMatch(/yarn/)
+  })
+
+  it('pnpm через corepack и packageManager закреплён — в порядке', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { packageManager: 'pnpm@10.33.2' }), { tools: ['corepack'] })
+    expect(errors(findings)).toEqual([])
+    expect(warnings(findings)).toEqual([])
+    expect(about(findings)).toEqual([expect.objectContaining({ level: 'ok', problem: expect.stringMatching(/corepack/) })])
+  })
+
+  it('pnpm через corepack, а packageManager в package.json нет — предупреждение: версия pnpm не та, что у файла-замка', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { name: 'app' }), { tools: ['corepack'] })
+    expect(errors(findings)).toEqual([])
+    expect(about(findings).find((finding) => finding.level === 'warning')?.problem).toMatch(/packageManager/)
+  })
+
+  it('свой pnpm в образе — в порядке', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }, { name: 'app' }), { tools: ['pnpm'] })
+    expect(about(findings)).toEqual([expect.objectContaining({ level: 'ok' })])
+  })
+
+  it('образа верстака на сервере нет — предупреждение: проверить нельзя', async () => {
+    const findings = await check(withWorkbench({ install: 'pnpm install --frozen-lockfile' }), { pulled: false, tools: [] })
+    expect(errors(findings)).toEqual([])
+    expect(about(findings).find((finding) => finding.level === 'warning')?.fix).toMatch(/docker pull/)
+  })
+
+  it('npm-проект — образ на pnpm и yarn не проверяется', async () => {
+    const findings = await check(withWorkbench({ install: 'npm ci', test: 'npm test' }, { name: 'app' }), { tools: [] })
+    expect(about(findings)).toEqual([])
   })
 })
 

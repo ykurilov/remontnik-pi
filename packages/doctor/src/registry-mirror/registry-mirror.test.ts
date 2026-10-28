@@ -14,6 +14,8 @@ afterEach(async () => {
 })
 
 const PUBLIC_URL = 'http://remontnik-gateway:7801'
+/** Куски по 64 КБ: 160 МБ метаданных. */
+const GIANT_CHUNKS = 2560
 
 interface Seen {
   path: string
@@ -43,6 +45,32 @@ async function fakeRegistry(): Promise<{ url: string; seen: Seen[]; streamed: { 
           },
         }),
       )
+      return
+    }
+    if (path === '/pnpm/10.33.2' || path === '/pnpm/latest' || path === '/@scope%2fpkg/1.0.0') {
+      // Одна версия пакета: так её просит corepack, прежде чем скачать pnpm или yarn.
+      const name = path.startsWith('/pnpm') ? 'pnpm' : '@scope/pkg'
+      const file = path.startsWith('/pnpm') ? 'pnpm-10.33.2.tgz' : 'pkg-1.0.0.tgz'
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ name, version: path.startsWith('/pnpm') ? '10.33.2' : '1.0.0', dist: { tarball: `${url}/${name}/-/${file}`, integrity: 'sha512-test' } }))
+      return
+    }
+    if (path === '/giant') {
+      // Полные метаданные крупного пакета (у @prisma/client уже под 70 МБ) кусками и без длины.
+      response.writeHead(200, { 'content-type': 'application/json' })
+      const chunk = Buffer.from(`"${url}/giant/-/giant-1.0.0.tgz",`.padEnd(64 * 1024, ' '))
+      let left = GIANT_CHUNKS
+      response.once('close', () => (streamed.closed = true))
+      Readable.from(
+        (function* () {
+          yield Buffer.from('[')
+          while (left-- > 0) {
+            streamed.bytes += chunk.length
+            yield chunk
+          }
+          yield Buffer.from('0]')
+        })(),
+      ).pipe(response)
       return
     }
     if (path === '/is-number/-/is-number-7.0.0.tgz') {
@@ -203,6 +231,22 @@ describe('зеркало реестра: что пропускает', () => {
     }
   })
 
+  it('одна версия пакета (её просит corepack): адрес архива переписан на зеркало', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url)
+    for (const [path, tarball] of [
+      ['/pnpm/10.33.2', `${PUBLIC_URL}/pnpm/-/pnpm-10.33.2.tgz`],
+      ['/pnpm/latest', `${PUBLIC_URL}/pnpm/-/pnpm-10.33.2.tgz`],
+      ['/@scope/pkg/1.0.0', `${PUBLIC_URL}/@scope/pkg/-/pkg-1.0.0.tgz`],
+      ['/@scope%2fpkg/1.0.0', `${PUBLIC_URL}/@scope/pkg/-/pkg-1.0.0.tgz`],
+    ]) {
+      const answer = await raw(url, path!)
+      expect(answer.status, path).toBe(200)
+      expect(JSON.parse(answer.body.toString('utf8')).dist.tarball).toBe(tarball)
+    }
+    expect(registry.seen.map((seen) => seen.path)).toEqual(['/pnpm/10.33.2', '/pnpm/latest', '/@scope%2fpkg/1.0.0', '/@scope%2fpkg/1.0.0'])
+  })
+
   it('архив пакета отдаётся как есть', async () => {
     const registry = await fakeRegistry()
     const { url } = await mirror(registry.url)
@@ -238,11 +282,14 @@ describe('зеркало реестра: чужой адрес недостиж�
     ['/is-number/../../x'],
     ['/-/v1/search?text=x'],
     ['/-/npm/v1/security/audits'],
-    ['/is-number/latest'],
+    ['/is-number/1.0.0/extra'],
+    ['/is-number/..'],
+    ['/is-number/-'],
+    ['/is-number/-/'],
     ['/is-number/-/../../x.tgz'],
     ['/is-number/-/x.tar'],
     ['/@scope'],
-    ['/@scope/pkg/extra'],
+    ['/@scope/pkg/1.0.0/extra'],
     ['/is%20number'],
     ['/'],
   ])('путь %s → 400, в реестр не уходит', async (path) => {
@@ -284,6 +331,23 @@ describe('зеркало реестра: пределы', () => {
     const registry = await fakeRegistry()
     const { url } = await mirror(registry.url, { maxTarballBytes: 1000 })
     expect((await raw(url, '/huge/-/huge-1.0.0.tgz')).status).toBe(502)
+  })
+
+  it('предел метаданных по умолчанию с запасом: 160 МБ полных метаданных проходят целиком', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url)
+    const answer = await rawLoose(url, '/giant')
+    expect(answer).toMatchObject({ status: 200, complete: true })
+    expect(answer.bytes).toBeGreaterThan(GIANT_CHUNKS * 64 * 1024)
+  }, 60_000)
+
+  it('медленный клиент: огромные метаданные тоже идут потоком, а не копятся в памяти врача', async () => {
+    const registry = await fakeRegistry()
+    const { url } = await mirror(registry.url)
+    const client = await stalledClient(url, '/giant')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    expect(registry.streamed.bytes).toBeLessThan(32 * 1024 * 1024)
+    client.destroy()
   })
 
   it('реестр молчит → 504 по сроку', async () => {

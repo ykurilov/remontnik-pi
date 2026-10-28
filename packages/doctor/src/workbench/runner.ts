@@ -183,11 +183,21 @@ const COPY_LABEL = 'remontnik.copy'
 /** Запас срока жизни контейнера сверх тайм-аута команды: обычно её убивает врач, обёртка — когда врача нет. */
 export const CONTAINER_LIFETIME_MARGIN_SECONDS = 60
 /**
+ * pnpm и yarn для образов, где их нет, но есть corepack (официальные образы Node 22 и 24): корень контейнера только
+ * для чтения, `corepack enable` туда не пишет. Поэтому в `/tmp` контейнера кладутся заглушки `pnpm`, `pnpx`, `yarn`
+ * → `corepack <имя>`, и папка идёт в конец PATH: своя программа образа важнее. Версию corepack берёт из поля
+ * `packageManager` приложения, скачивает через зеркало врача (`COREPACK_NPM_REGISTRY`), сверяя подпись, и хранит в HOME копии.
+ */
+const PACKAGE_MANAGER_SHIMS =
+  'if command -v corepack >/dev/null 2>&1; then d="${TMPDIR:-/tmp}/remontnik-bin"; for pm in pnpm pnpx yarn; do ' +
+  `command -v "$pm" >/dev/null 2>&1 || { mkdir -p "$d" && printf '#!/bin/sh\\nexec corepack %s "$@"\\n' "$pm" > "$d/$pm" && chmod +x "$d/$pm"; }; ` +
+  'done; PATH="$PATH:$d"; export PATH; fi; '
+/**
  * Обёртка — первый процесс контейнера (`sh -c <обёртка> remontnik <срок> <команда>`). Команда идёт дочерним `sh`,
  * обёртка раз в секунду сверяет часы и по сроку убивает все процессы контейнера, кроме себя, — контейнер кончается.
  * Счёт ведёт сам первый процесс: сигналы от процессов контейнера ему не доходят, команда срок не отменит.
  */
-const LIFETIME_WRAPPER = 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
+const LIFETIME_WRAPPER = PACKAGE_MANAGER_SHIMS + 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
 
 function bindMount(source: string, target: string): string[] {
   if (/[,\n]/.test(source) || /[,\n]/.test(target)) throw new Error(`путь с запятой нельзя смонтировать: ${source}`)

@@ -493,6 +493,49 @@ describe('контейнеры верстака после падения вра
     expect(wrapper).toContain('kill -KILL -1')
   })
 
+  /** Обёртка из аргументов `docker create`, выполненная здесь: `bin` — что лежит в PATH «образа». */
+  async function runWrapper(command: string, bin: Record<string, string>): Promise<{ status: number; output: string }> {
+    const b = await bench()
+    const fake = fakeDocker(b.root)
+    const runner = createDockerRunner({ image: 'example.test/app-dev:1', homesDir: join(b.root, 'homes'), docker: fake.docker })
+    await runner.run(command, { cwd: b.workbench.path, copyDir: b.workbench.path, timeoutSeconds: 40 })
+    const [args] = fake.calls()
+    const wrapperArgs = args!.slice(args!.indexOf('-c') + 1)
+    const binDir = join(b.root, 'image-bin')
+    mkdirSync(binDir)
+    for (const [name, body] of Object.entries(bin)) writeFileSync(join(binDir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+    // Только нужные утилиты системы, без pnpm и corepack машины, где идёт тест.
+    for (const tool of ['sh', 'date', 'sleep', 'mkdir', 'chmod', 'cat', 'printf']) {
+      const path = execFileSync('/bin/sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).trim()
+      if (path.startsWith('/') && !existsSync(join(binDir, tool))) symlinkSync(path, join(binDir, tool))
+    }
+    const tmp = join(b.root, 'container-tmp')
+    mkdirSync(tmp)
+    try {
+      const output = execFileSync(join(binDir, 'sh'), ['-c', ...wrapperArgs], { encoding: 'utf8', env: { PATH: binDir, TMPDIR: tmp }, stdio: ['ignore', 'pipe', 'pipe'] })
+      return { status: 0, output }
+    } catch (error) {
+      const failed = error as { status: number; stdout: string; stderr: string }
+      return { status: failed.status, output: `${failed.stdout}${failed.stderr}` }
+    }
+  }
+
+  it('pnpm и yarn в образе нет, а corepack есть → команды pnpm, pnpx и yarn идут через corepack', async () => {
+    const result = await runWrapper('pnpm install --frozen-lockfile && pnpx x && yarn test', { corepack: 'echo "corepack $*"' })
+    expect(result).toEqual({ status: 0, output: 'corepack pnpm install --frozen-lockfile\ncorepack pnpx x\ncorepack yarn test\n' })
+  })
+
+  it('свой pnpm в образе важнее corepack', async () => {
+    const result = await runWrapper('pnpm -v', { corepack: 'echo "corepack $*"', pnpm: 'echo "pnpm образа $*"' })
+    expect(result).toEqual({ status: 0, output: 'pnpm образа -v\n' })
+  })
+
+  it('ни pnpm, ни corepack в образе нет → «pnpm: not found», как без врача', async () => {
+    const result = await runWrapper('pnpm -v', {})
+    expect(result.status).toBe(127)
+    expect(result.output).toMatch(/pnpm.*not found/)
+  })
+
   /** Подставной docker со «старыми» контейнерами верстака: `ps` их выдаёт, `rm` записывает; `stuck` не удаляются. */
   function orphanDocker(root: string, rows: string[], stuck: string[] = []) {
     const log = join(root, 'orphan-docker.log')

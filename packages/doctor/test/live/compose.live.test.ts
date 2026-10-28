@@ -350,6 +350,36 @@ describe.skipIf(!dockerReady)('шаблон compose на настоящем Dock
     expect(caseNetworks()).toEqual([])
   })
 
+  it('pnpm-приложение на node:22 без pnpm в образе: pnpm через corepack и зеркало, полные метаданные @prisma/client проходят', () => {
+    const dir = join(stateDir, 'copies', 'pnpm-node22')
+    mkdirSync(dir, { recursive: true })
+    // Как у боевого приложения: packageManager без хеша, engines, рабочая область из одного пакета.
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'pnpm-node22', private: true, packageManager: 'pnpm@10.33.2', engines: { node: '>=22' }, dependencies: { '@prisma/client': '7.10.1' } }))
+    writeFileSync(join(dir, 'pnpm-workspace.yaml'), 'packages:\n  - "."\n')
+    const out = inDoctor(
+      String.raw`
+  const { createDockerRunner, caseWorkbenchEnv } = await import('/app/dist/index.js')
+  const plan = doctorStartPlan(process.env, config)
+  const node22 = createDockerRunner({ ...plan.runner, image: arg.image, caseNetworks: gateway.caseNetworks, workbenchEnv: caseWorkbenchEnv() })
+  const inNode22 = (command, network) => node22.run(command, { cwd: arg.dir, copyDir: arg.dir, timeoutSeconds: 300, ...(network ? { network } : {}) })
+  out.lock = await inNode22('pnpm install --lockfile-only')
+  out.install = await inNode22('pnpm install --frozen-lockfile && node -p \"require(\'@prisma/client/package.json\').version\"')
+  out.full = await inNode22('pnpm view @prisma/client@7.10.1 version --json')
+  out.offline = await inNode22('pnpm --version', 'internal')
+`,
+      { dir, image: 'node:22-bookworm-slim' },
+    )
+    expect(out.lock.exitCode, out.lock.output).toBe(0)
+    expect(out.install.exitCode, out.install.output).toBe(0)
+    expect(out.install.output).toContain('using pnpm v10.33.2')
+    // `pnpm view` просит полный документ (как pnpm 10 для необязательных зависимостей): у @prisma/client он больше 64 МБ.
+    expect(out.full.exitCode, out.full.output).toBe(0)
+    expect(out.full.output).toContain('7.10.1')
+    // В сети проверок зеркала нет: pnpm берётся из HOME копии, куда его положил corepack при установке.
+    expect(out.offline.exitCode, out.offline.output).toBe(0)
+    expect(out.offline.output.trim()).toBe('10.33.2')
+  })
+
   it('сеть проверок: виден только прокси eval врача; зеркала, приёма, хоста и приложения нет', () => {
     const dir = copy('checks')
     const out = inDoctor(`out.probe = await probe(arg.dir, arg.targets, 'internal')`, {
