@@ -181,6 +181,38 @@ function assertWatchOptions(options: WatchOptions): void {
   }
 }
 
+/**
+ * Обёртка, которая для приложения выглядит как `real`, но значения свойств отдаёт `read`.
+ * Цель Proxy — пустая тень, а не сам объект: правила Proxy запрещают подменять у цели неизменяемое и ненастраиваемое
+ * свойство (так SDK задаёт `connect`), а у тени таких свойств нет. Остальное читается и пишется у `real`.
+ */
+function lookalike<T extends object>(real: T, read: (property: string | symbol) => unknown): T {
+  const shadow = Object.create(null) as T
+  return new Proxy(shadow, {
+    get: (_shadow, property) => read(property),
+    set: (_shadow, property, value) => Reflect.set(real, property, value),
+    has: (_shadow, property) => Reflect.has(real, property),
+    deleteProperty: (_shadow, property) => Reflect.deleteProperty(real, property),
+    defineProperty: (_shadow, property, descriptor) => Reflect.defineProperty(real, property, descriptor),
+    ownKeys: () => Reflect.ownKeys(real),
+    getOwnPropertyDescriptor(_shadow, property) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(real, property)
+      if (!descriptor) return undefined
+      // Ненастраиваемым можно назвать только свойство самой тени.
+      const reported: PropertyDescriptor = { ...descriptor, configurable: true }
+      if ('value' in descriptor) reported.value = read(property)
+      return reported
+    },
+    getPrototypeOf: () => Reflect.getPrototypeOf(real),
+    setPrototypeOf: (_shadow, prototype) => Reflect.setPrototypeOf(real, prototype),
+  })
+}
+
+const isProviderLike = (value: unknown): value is ModelCatalogLike['providers'][number] =>
+  typeof value === 'object' && value !== null && typeof (value as { createLanguageModel?: unknown }).createLanguageModel === 'function'
+
+const bound = (value: unknown, target: object) => (typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value)
+
 export function createWatch(options: WatchOptions): Watch {
   assertWatchOptions(options)
   const now = options.now ?? Date.now
@@ -599,49 +631,49 @@ export function createWatch(options: WatchOptions): Watch {
     )
   }
 
+  /** Уже обёрнутые поставщики: каталог из обёрнутых поставщиков, обёрнутый ещё раз, не сообщает о сбое дважды. */
+  const wrappedProviders = new WeakSet<object>()
+
   function wrapModel(model: unknown, place: { model: string; provider: string }): unknown {
     if (typeof model !== 'object' || model === null) return model
     const report = (error: unknown) => {
       if (isCancellation(error)) return
       capture(error, { kind: 'model_error', where: place.model, context: { model: place.model, provider: place.provider } })
     }
-    return new Proxy(model, {
-      get(target, property) {
-        const value: unknown = Reflect.get(target, property, target)
-        if (typeof value !== 'function') return value
-        if (property === 'doGenerate') {
-          return async (...args: unknown[]) => {
-            try {
-              return await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
-            } catch (error) {
-              report(error)
-              throw error
-            }
+    return lookalike(model, (property) => {
+      const value: unknown = Reflect.get(model, property, model)
+      if (typeof value === 'function' && property === 'doGenerate') {
+        return async (...args: unknown[]) => {
+          try {
+            return await (value as (...a: unknown[]) => Promise<unknown>).apply(model, args)
+          } catch (error) {
+            report(error)
+            throw error
           }
         }
-        if (property === 'doStream') {
-          return async (...args: unknown[]) => {
-            let result: { stream?: unknown }
-            try {
-              result = (await (value as (...a: unknown[]) => Promise<{ stream?: unknown }>).apply(target, args)) ?? {}
-            } catch (error) {
-              report(error)
-              throw error
-            }
-            if (!(result.stream instanceof ReadableStream)) return result
-            const watched = result.stream.pipeThrough(
-              new TransformStream<{ type?: string; error?: unknown }, { type?: string; error?: unknown }>({
-                transform(part, controller) {
-                  if (part?.type === 'error') report(part.error)
-                  controller.enqueue(part)
-                },
-              }),
-            )
-            return { ...result, stream: watched }
+      }
+      if (typeof value === 'function' && property === 'doStream') {
+        return async (...args: unknown[]) => {
+          let result: { stream?: unknown }
+          try {
+            result = (await (value as (...a: unknown[]) => Promise<{ stream?: unknown }>).apply(model, args)) ?? {}
+          } catch (error) {
+            report(error)
+            throw error
           }
+          if (!(result.stream instanceof ReadableStream)) return result
+          const watched = result.stream.pipeThrough(
+            new TransformStream<{ type?: string; error?: unknown }, { type?: string; error?: unknown }>({
+              transform(part, controller) {
+                if (part?.type === 'error') report(part.error)
+                controller.enqueue(part)
+              },
+            }),
+          )
+          return { ...result, stream: watched }
         }
-        return (value as (...a: unknown[]) => unknown).bind(target)
-      },
+      }
+      return bound(value, model)
     })
   }
 
@@ -650,35 +682,41 @@ export function createWatch(options: WatchOptions): Watch {
     installProcessHandlers,
     handleStopButton,
     wrapModelCatalog<C extends ModelCatalogLike>(catalog: C): C {
-      const wrapProvider = (provider: C['providers'][number]) =>
-        new Proxy(provider, {
-          get(target, property) {
-            const value: unknown = Reflect.get(target, property, target)
-            if (property !== 'createLanguageModel' || typeof value !== 'function') {
-              return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
-            }
+      const wrapProvider = (provider: C['providers'][number]): C['providers'][number] => {
+        if (wrappedProviders.has(provider)) return provider
+        const wrapper = lookalike(provider, (property) => {
+          const value: unknown = Reflect.get(provider, property, provider)
+          if (typeof value !== 'function') return value
+          if (property === 'createLanguageModel') {
             return (modelId: string, ...rest: unknown[]) =>
-              wrapModel((value as (...a: unknown[]) => unknown).call(target, modelId, ...rest), {
+              wrapModel((value as (...a: unknown[]) => unknown).call(provider, modelId, ...rest), {
                 model: modelId,
-                provider: target.id,
+                provider: provider.id,
               })
-          },
+          }
+          // Поставщик, подключённый через прокси (`connect` у поставщиков SDK), тоже под присмотром.
+          if (property === 'connect') {
+            return (...args: unknown[]) => {
+              const connected = (value as (...a: unknown[]) => unknown).apply(provider, args)
+              return isProviderLike(connected) ? wrapProvider(connected as C['providers'][number]) : connected
+            }
+          }
+          return bound(value, provider)
         })
+        wrappedProviders.add(wrapper)
+        return wrapper
+      }
       // Каталог остаётся тем же объектом для приложения: прототип и методы на месте, подменяется только список поставщиков.
       let source: C['providers'] | null = null
       let wrapped: C['providers'] = []
-      return new Proxy(catalog, {
-        get(target, property) {
-          const value: unknown = Reflect.get(target, property, target)
-          if (property === 'providers') {
-            if (value !== source) {
-              source = value as C['providers']
-              wrapped = Array.isArray(value) ? value.map(wrapProvider) : (value as C['providers'])
-            }
-            return wrapped
-          }
-          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
-        },
+      return lookalike(catalog, (property) => {
+        const value: unknown = Reflect.get(catalog, property, catalog)
+        if (property !== 'providers') return bound(value, catalog)
+        if (value !== source) {
+          source = value as C['providers']
+          wrapped = Array.isArray(value) ? value.map(wrapProvider) : (value as C['providers'])
+        }
+        return wrapped
       })
     },
     conversationFinished(conversation) {
