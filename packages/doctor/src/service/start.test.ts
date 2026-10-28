@@ -118,6 +118,7 @@ describe('настройка запуска из окружения', () => {
     expect(caseWorkbenchEnv()).toMatchObject({
       npm_config_registry: 'http://remontnik-gateway:7801/',
       COREPACK_NPM_REGISTRY: 'http://remontnik-gateway:7801',
+      COREPACK_ENABLE_AUTO_PIN: '0',
     })
   })
 

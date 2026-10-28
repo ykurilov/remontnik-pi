@@ -40,6 +40,21 @@
 | `install` | команда установки зависимостей. Врач добавляет `npm_config_frozen_lockfile=true`: pnpm ставит строго по файлу-замку. Для npm пишите `npm ci` |
 | `bashTimeoutMs?` (600 000) | предел одной команды модели, мс |
 
+pnpm и yarn. В официальных образах Node 22 и 24 (`node:22`, `node:22-bookworm-slim`) pnpm нет, зато есть corepack. Врач видит это сам: если в образе нет `pnpm` или `yarn`, а corepack есть, команды `pnpm`, `pnpx` и `yarn` в верстаке идут через corepack. `corepack enable` в настройке не нужен и не сработает: корень контейнера только для чтения. Версию corepack берёт из поля `packageManager` в `package.json`. Скачивает её через зеркало реестра врача и сверяет подпись. Хранит в HOME копии, поэтому проверки без сети её тоже видят. Приложение на pnpm:
+
+```ts
+workbench: { image: 'node:22', install: 'pnpm install --frozen-lockfile' },
+checks: { test: 'pnpm test' },
+```
+
+И в `package.json` — версия pnpm, которой записан файл-замок:
+
+```json
+"packageManager": "pnpm@10.33.2"
+```
+
+Без `packageManager` corepack возьмёт свою версию pnpm, а не ту, что записала файл-замок. В образе нет ни pnpm, ни corepack (например, Node 25 и новее)? Тогда нужен образ со своим pnpm: подойдёт `deploy/workbench.Dockerfile`. `check-config` ловит оба случая до первого запуска. Проверка срабатывает, когда pnpm или yarn зовёт `workbench.install`, `checks.test` или `checks.typecheck`.
+
 ### `checks` — проверки правки
 
 | Поле | Что это |

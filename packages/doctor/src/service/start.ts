@@ -43,10 +43,13 @@ export function parseListen(text: string, name: string): { host: string; port: n
   return { host: (match[1] ?? match[2])!, port }
 }
 
-/** Переменные команд в сети верстака: pnpm, npm, yarn и corepack берут пакеты только через зеркало врача. */
+/**
+ * Переменные команд в сети верстака: pnpm, npm, yarn и corepack берут пакеты только через зеркало врача.
+ * corepack не дописывает `packageManager` в package.json копии: правка модели осталась бы без лишнего.
+ */
 export function caseWorkbenchEnv(): Record<string, string> {
   const mirror = `http://${CASE_GATEWAY_HOST}:${MIRROR_PORT}`
-  return { npm_config_registry: `${mirror}/`, COREPACK_NPM_REGISTRY: mirror, npm_config_audit: 'false', npm_config_fund: 'false' }
+  return { npm_config_registry: `${mirror}/`, COREPACK_NPM_REGISTRY: mirror, npm_config_audit: 'false', npm_config_fund: 'false', COREPACK_ENABLE_AUTO_PIN: '0' }
 }
 
 /** Доступ git к origin по токену (HTTPS): заголовок через `GIT_CONFIG_*`, без записи в настройки репозитория. */

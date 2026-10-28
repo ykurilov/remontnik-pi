@@ -183,11 +183,21 @@ const COPY_LABEL = 'remontnik.copy'
 /** Запас срока жизни контейнера сверх тайм-аута команды: обычно её убивает врач, обёртка — когда врача нет. */
 export const CONTAINER_LIFETIME_MARGIN_SECONDS = 60
 /**
+ * pnpm и yarn для образов, где их нет, но есть corepack (официальные образы Node 22 и 24): корень контейнера только
+ * для чтения, `corepack enable` туда не пишет. Поэтому в `/tmp` контейнера кладутся заглушки `pnpm`, `pnpx`, `yarn`
+ * → `corepack <имя>`, и папка идёт в конец PATH: своя программа образа важнее. Версию corepack берёт из поля
+ * `packageManager` приложения, скачивает через зеркало врача (`COREPACK_NPM_REGISTRY`), сверяя подпись, и хранит в HOME копии.
+ */
+const PACKAGE_MANAGER_SHIMS =
+  'if command -v corepack >/dev/null 2>&1; then d="${TMPDIR:-/tmp}/remontnik-bin"; for pm in pnpm pnpx yarn; do ' +
+  `command -v "$pm" >/dev/null 2>&1 || { mkdir -p "$d" && printf '#!/bin/sh\\nexec corepack %s "$@"\\n' "$pm" > "$d/$pm" && chmod +x "$d/$pm"; }; ` +
+  'done; PATH="$PATH:$d"; export PATH; fi; '
+/**
  * Обёртка — первый процесс контейнера (`sh -c <обёртка> remontnik <срок> <команда>`). Команда идёт дочерним `sh`,
  * обёртка раз в секунду сверяет часы и по сроку убивает все процессы контейнера, кроме себя, — контейнер кончается.
  * Счёт ведёт сам первый процесс: сигналы от процессов контейнера ему не доходят, команда срок не отменит.
  */
-const LIFETIME_WRAPPER = 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
+const LIFETIME_WRAPPER = PACKAGE_MANAGER_SHIMS + 'end=$(( $(date +%s) + $1 )); sh -c "$2" & cmd=$!; while kill -0 "$cmd" 2>/dev/null; do if [ "$(date +%s)" -ge "$end" ]; then echo "remontnik: срок жизни контейнера истёк" >&2; kill -KILL -1; exit 137; fi; sleep 1; done; wait "$cmd"'
 
 function bindMount(source: string, target: string): string[] {
   if (/[,\n]/.test(source) || /[,\n]/.test(target)) throw new Error(`путь с запятой нельзя смонтировать: ${source}`)
@@ -204,6 +214,29 @@ export function envFileText(env: Record<string, string>): string {
     .join('')
 }
 
+export const DEFAULT_WORKBENCH_MEMORY = '4g'
+export const DEFAULT_WORKBENCH_CPUS = '2'
+
+/** Пользователь контейнера по умолчанию — тот же, что у врача: файлы копии остаются его. */
+export function defaultWorkbenchUser(): string | undefined {
+  return process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined
+}
+
+/** Права и пределы контейнера верстака: без прав, лимиты памяти и процессора, корень только для чтения, `/tmp` в памяти. */
+export function workbenchSandboxArgs(spec: { user?: string | undefined; memory: string; cpus: string }): string[] {
+  return [
+    ...(spec.user ? ['--user', spec.user] : []),
+    '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges',
+    '--pids-limit', '1024',
+    '--memory', spec.memory,
+    '--memory-swap', spec.memory,
+    '--cpus', spec.cpus,
+    '--read-only',
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
+  ]
+}
+
 /**
  * Аргументы `docker create` для одной команды: контейнер без прав, с лимитами памяти и процессора, корневая система
  * только для чтения; писать можно в копию, её HOME, разрешённые папки и `/tmp`.
@@ -217,15 +250,7 @@ export function dockerCreateArgs(spec: DockerRunSpec): string[] {
     '--label', `${COPY_LABEL}=${copyKey(spec.copyDir)}`,
     '--network', spec.network,
     ...Object.entries(spec.hosts ?? {}).flatMap(([host, ip]) => ['--add-host', `${host}:${ip}`]),
-    ...(spec.user ? ['--user', spec.user] : []),
-    '--cap-drop', 'ALL',
-    '--security-opt', 'no-new-privileges',
-    '--pids-limit', '1024',
-    '--memory', spec.memory,
-    '--memory-swap', spec.memory,
-    '--cpus', spec.cpus,
-    '--read-only',
-    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
+    ...workbenchSandboxArgs(spec),
     ...bindMount(spec.copyDir, spec.copyDir),
     ...bindMount(spec.home, CONTAINER_HOME),
     ...spec.writableDirs.flatMap((dir) => bindMount(dir, dir)),
@@ -318,7 +343,7 @@ export async function removeOrphanWorkbenches(options: { homesDir: string; docke
  */
 export function createDockerRunner(options: DockerRunnerOptions): CommandRunner {
   const docker = options.docker ?? 'docker'
-  const user = options.user ?? (process.getuid && process.getgid ? `${process.getuid()}:${process.getgid()}` : undefined)
+  const user = options.user ?? defaultWorkbenchUser()
   const clientEnv = dockerClientEnv()
   const spoiledMark = (copyDir: string) => spoiledMarkOf(options.homesDir, copyKey(copyDir))
   const failed = (spawnError: string): Promise<RunResult> => Promise.resolve({ exitCode: null, timedOut: false, aborted: false, output: '', spawnError })
@@ -354,8 +379,8 @@ export function createDockerRunner(options: DockerRunnerOptions): CommandRunner 
         ...(lease ? { hosts: { [CASE_GATEWAY_HOST]: lease.network.gatewayIp } } : {}),
         ...(user ? { user } : {}),
         envFile,
-        memory: options.memory ?? '4g',
-        cpus: options.cpus ?? '2',
+        memory: options.memory ?? DEFAULT_WORKBENCH_MEMORY,
+        cpus: options.cpus ?? DEFAULT_WORKBENCH_CPUS,
         command: typeof command === 'string' ? command : command.map(shellQuote).join(' '),
         lifetimeSeconds: Math.ceil(runOptions.timeoutSeconds) + CONTAINER_LIFETIME_MARGIN_SECONDS,
       })

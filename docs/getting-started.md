@@ -82,6 +82,7 @@ import { defineRemontnikConfig } from '@ykurilov/remontnik-core/config'
 export default defineRemontnikConfig({
   app: { name: 'my-app', timeZone: 'UTC' },
   repo: { mainBranch: 'main' },
+  // В node:22 pnpm нет: врач берёт его через corepack по полю packageManager в package.json (docs/configuration.md, workbench).
   workbench: { image: 'node:22', install: 'pnpm install --frozen-lockfile' },
   checks: { test: 'pnpm test', typecheck: 'pnpm typecheck' },
   evalScope: [],

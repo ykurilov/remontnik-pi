@@ -6,7 +6,8 @@ import { createGuardedHttp, type GuardedHttpLimits, type GuardedListener } from 
 
 // Зеркало реестра пакетов для контейнеров верстака. Им нужен реестр (установка зависимостей), а больше ничего.
 // Туннеля нет: соединение с реестром по TLS ставит сам врач, адрес реестра задан здесь, а контейнер выбирает
-// только имя пакета. Пропускаются `GET` и `HEAD` метаданных пакета и его архива; путь проверяется до запроса,
+// только имя пакета. Пропускаются `GET` и `HEAD` метаданных пакета, одной его версии (по ней corepack скачивает
+// pnpm и yarn) и его архива; путь проверяется до запроса,
 // `Host`, куки и прочие заголовки контейнера не уходят. Адреса архивов в метаданных переписываются на зеркало.
 //
 // Ответ идёт потоком: у реестра забирается не больше, чем прочёл контейнер, а метаданные переписываются по ходу,
@@ -40,15 +41,17 @@ export interface RegistryMirror {
   close(): Promise<void>
 }
 
-const MAX_METADATA_BYTES = 64 * 1024 * 1024
+// Полные метаданные крупных пакетов растут быстро (у `@prisma/client` уже под 70 МБ). Ответ идёт потоком,
+// поэтому предел держит не память врача, а бесконечный или раздутый ответ.
+const MAX_METADATA_BYTES = 256 * 1024 * 1024
 const MAX_TARBALL_BYTES = 256 * 1024 * 1024
 const UPSTREAM_TIMEOUT_MS = 120_000
 const WRITE_TIMEOUT_MS = 60_000
 const MAX_CONCURRENT_RESPONSES = 32
 const QUEUE_TIMEOUT_MS = 30_000
 const NAME = '[A-Za-z0-9][A-Za-z0-9._~-]*'
-// `/name`, `/@scope/name`, `/@scope%2fname`; архив — `<пакет>/-/<файл>.tgz`.
-const PACKAGE_PATH = new RegExp(`^/(?:(@${NAME})(?:/|%2[fF]))?(${NAME})(?:/-/(${NAME}\\.tgz))?$`)
+// `/name`, `/@scope/name`, `/@scope%2fname`; версия или метка — `<пакет>/<версия>`; архив — `<пакет>/-/<файл>.tgz`.
+const PACKAGE_PATH = new RegExp(`^/(?:(@${NAME})(?:/|%2[fF]))?(${NAME})(?:/-/(${NAME}\\.tgz)|/(${NAME}))?$`)
 const ACCEPT = /^[\w.+\-/*;=, ]{1,200}$/
 
 class Refusal extends Error {
@@ -63,12 +66,13 @@ export function registryPath(url: string): { path: string; tarball: boolean } {
   const path = queryAt === -1 ? url : url.slice(0, queryAt)
   const match = PACKAGE_PATH.exec(path)
   if (!match) throw new Refusal(400, 'зеркало отдаёт только пакеты: /имя, /@область/имя и их архивы')
-  const [, scope, name, file] = match
-  if ([scope, name, file].some((part) => part !== undefined && /(^|[@/])\.\.?($|\/)/.test(part))) throw new Refusal(400, 'недопустимое имя пакета')
+  const [, scope, name, file, version] = match
+  if ([scope, name, file, version].some((part) => part !== undefined && /(^|[@/])\.\.?($|\/)/.test(part))) throw new Refusal(400, 'недопустимое имя пакета')
   const packagePath = scope ? `/${scope}/${name}` : `/${name}`
   // Метаданные пакета с областью реестр отдаёт по `%2f`, архив — по обычному пути.
   if (file) return { path: `${packagePath}/-/${file}`, tarball: true }
-  return { path: scope ? `/${scope}%2f${name}` : packagePath, tarball: false }
+  const metadataPath = scope ? `/${scope}%2f${name}` : packagePath
+  return { path: version ? `${metadataPath}/${version}` : metadataPath, tarball: false }
 }
 
 function checkedUrl(text: string, what: string, protocols: string[]): URL {
