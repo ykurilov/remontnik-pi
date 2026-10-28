@@ -286,6 +286,8 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(ready?.short).toContain(branch)
     expect(ready?.short).toContain('тесты зелёные')
     expect(reports.map((report) => report.type)).toEqual(['case_received', 'fix_ready'])
+    // Правка готова: повторять лечение незачем, команды в отчёте нет.
+    expect(ready?.short).not.toContain('retry')
 
     // Промпт и набор инструментов одни и те же во всех запросах; сведения о сбое — только в сообщениях.
     // pi-durable передаёт промпт ведущим сообщением `system`; других сообщений `system` быть не должно.
@@ -325,6 +327,9 @@ describe('лечение: задача remontnik.treatment', () => {
     expect(reports.at(-1)).toMatchObject({ type: 'no_cause_found', caseId: 1 })
     expect(reports.at(-1)?.full).toContain('src/price.mjs прочитан')
     expect(reports.at(-1)?.full).not.toContain(LEAKED_KEY)
+    // Сам случай второй раз не лечится: отчёт говорит владельцу, как поставить его в работу снова.
+    expect(reports.at(-1)?.short).toContain('remontnik-doctor case 1 retry')
+    expect(reports.at(-1)?.full).toContain('remontnik-doctor case 1 retry')
   }, 60_000)
 
   it('инструменты одного хода модели идут по очереди: запись не успевает между проверкой пути и командой', async () => {

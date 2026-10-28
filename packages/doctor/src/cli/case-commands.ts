@@ -2,8 +2,9 @@ import { parseArgs } from 'node:util'
 import { UsageError, type DoctorCommandIo } from './command-io.js'
 import { postOwnerCommand } from './owner-command.js'
 
-// `remontnik-doctor case <номер> retry`: снова поставить в работу случай, чьё лечение упало или остановилось после
-// повторных сбоев врача. Подписанный `POST /v1/control/cases`, только секретом владельца `REMONTNIK_CONTROL_SECRET`.
+// `remontnik-doctor case <номер> retry`: снова поставить в работу случай, чьё лечение упало, остановилось после
+// повторных сбоев врача или кончилось без излечения. Подписанный `POST /v1/control/cases`, только секретом владельца
+// `REMONTNIK_CONTROL_SECRET`.
 
 export const CASE_USAGE = `  remontnik-doctor case <номер случая> retry [--by <кто>]
 `

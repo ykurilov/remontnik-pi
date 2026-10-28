@@ -1,15 +1,16 @@
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import type { Harness, TaskId } from '@earendil-works/pi-durable'
-import type { Case, CaseState } from '../case-book/index.js'
+import { CLOSED_CASE_STATES, UNHEALED_FINAL_STATES, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseRetryAnswer } from '../intake/case-retry.js'
+import { renewCaseBudgetIn } from '../ledgers/spend-ledger.js'
 import type { RecordStore } from '../records/index.js'
 import type { Treatment } from '../treatment/index.js'
 
 // Повтор лечения по команде владельца (`case <id> retry`): задача, остановленная после повторных падений врача,
-// продолжается со своего чекпойнта; упавшая насовсем — заменяется новой попыткой со своей копией и веткой.
+// продолжается со своего чекпойнта; упавшая насовсем — заменяется новой попыткой со своей копией и веткой. Случай,
+// чьё лечение кончилось без излечения (`UNHEALED_FINAL_STATES`), лечится новой попыткой со своим потолком расходов.
+// Закрытый случай (вылечен или откачен) не повторяется: новый сбой с тем же отпечатком сам откроет новый случай.
 
-/** Лечение случая ещё не дошло до итога: только такой случай можно поставить в работу снова. */
-const UNFINISHED_STATES: readonly CaseState[] = ['received', 'triage', 'diagnosing', 'fixing', 'verifying', 'gated', 'deploying', 'observing', 'deferred_budget']
 /** Новая попытка здесь начала бы вторую выкатку поверх незаконченной: сначала владелец смотрит, что с приложением. */
 const DEPLOY_STATES: readonly CaseState[] = ['deploying', 'observing']
 
@@ -38,7 +39,7 @@ export function createCaseRetry(deps: CaseRetryDeps): (caseId: number, by: strin
   async function retryOnce(caseId: number, by: string): Promise<CaseRetryAnswer> {
     const sick = await deps.records.read<Case>('case', String(caseId))
     if (sick?.caseId !== caseId) return { error: 'unknown_case' }
-    if (!UNFINISHED_STATES.includes(sick.state)) return { error: 'case_finished', state: sick.state }
+    if (CLOSED_CASE_STATES.includes(sick.state)) return { error: 'case_finished', state: sick.state }
     if (!deps.treatment) return { error: 'treatment_off', state: sick.state }
     const attempt = sick.treatmentAttempt ?? 1
     const status = sick.treatmentTaskId === undefined ? 'over' : await taskStatus(sick.treatmentTaskId)
@@ -52,8 +53,12 @@ export function createCaseRetry(deps: CaseRetryDeps): (caseId: number, by: strin
     const treatment = deps.treatment
     return deps.records.transaction(async (tx): Promise<CaseRetryAnswer> => {
       const opened = await tx.doc<Case>('case', String(caseId), {} as Case)
-      // Пока шла проверка задачи, случай мог сдвинуться (вторая команда повтора): тогда ничего не делать.
+      // Пока шла проверка задачи, случай мог сдвинуться (вторая команда повтора, поздняя выкатка агента
+      // Paseo взята под наблюдение): тогда ничего не делать.
       if (opened.treatmentTaskId !== sick.treatmentTaskId || opened.state !== sick.state) return { error: 'already_running', state: opened.state }
+      // Владелец лечит законченный случай заново: потолок случая — новой попытке, иначе после «бюджет исчерпан» она
+      // кончилась бы, не начавшись. Задача, упавшая посреди лечения, продолжает тратить свой потолок.
+      if (UNHEALED_FINAL_STATES.includes(opened.state)) await renewCaseBudgetIn(tx, String(caseId))
       const next = await treatment.restartIn(tx, opened)
       markRetried(opened, by)
       return { retried: 'restarted', attempt: next }

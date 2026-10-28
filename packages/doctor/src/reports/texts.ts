@@ -1,9 +1,9 @@
-import type { IncidentKind } from '@ykurilov/remontnik-core/incident'
+import { truncateText, type IncidentKind } from '@ykurilov/remontnik-core/incident'
 import type { ChecksResult, EvalOutcome } from '../checks/index.js'
 import type { Deployment, DeployRefusal, RollbackCause } from '../deployer/deploy-sequence.js'
 import type { HandoffResult, ReclaimReason } from '../handoff/doc.js'
 import type { Diagnosis, FixSummary } from '../treatment/doc.js'
-import type { ReportType } from './index.js'
+import { REPORT_SHORT_LIMIT, type ReportType } from './index.js'
 
 // Тексты отчётов лечения: короткий — для Telegram, полный — для журнала и Paseo.
 
@@ -28,6 +28,15 @@ const usd = (value: number) => `$${value.toFixed(2)}`
 
 export function head(sick: ReportCase): string {
   return `Случай ${sick.caseId} (${sick.appName})`
+}
+
+/**
+ * Случай кончился без излечения и сам второй раз не лечится: отчёт заканчивается командой повтора. Короткий текст
+ * обрезается так, чтобы команда в Telegram дошла целиком.
+ */
+export function withRetryHint(text: ReportText, caseId: number): ReportText {
+  const hint = `Лечить заново: remontnik-doctor case ${caseId} retry`
+  return { ...text, short: `${truncateText(text.short, REPORT_SHORT_LIMIT - hint.length - 2)}\n\n${hint}`, full: `${text.full}\n\n${hint}` }
 }
 
 export function caseLines(sick: ReportCase): string[] {

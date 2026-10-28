@@ -20,6 +20,7 @@ import {
   type SpendDay,
   joinEvalQueueIn,
   leaveEvalQueueIn,
+  renewCaseBudgetIn,
   reserveEvalIn,
   usableUsd,
   type EvalQueue,
@@ -128,6 +129,23 @@ describe('бронь запроса к модели: потолок до зап�
     await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.1 }))
     expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.3, caseLimitUsd: 0.5 })).toEqual({ held: true })
     expect((await store.read<CaseSpend>('spend-case', '1'))?.refused).toBeUndefined()
+  })
+
+  it('повтор владельцем законченного случая: потолок случая считается заново, общий расход случая копится', async () => {
+    const store = createMemoryRecordStore()
+    await hold(store, { caseKey: '1', holdId: 'h1', maxUsd: 0.3, caseLimitUsd: 0.3 })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h1', actualUsd: 0.3 }))
+    expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.1, caseLimitUsd: 0.3 })).toEqual({ held: false, block: 'budget' })
+
+    await store.transaction((tx) => renewCaseBudgetIn(tx, '1'))
+
+    expect(await hold(store, { caseKey: '1', holdId: 'h2', maxUsd: 0.1, caseLimitUsd: 0.3 })).toEqual({ held: true })
+    await store.transaction((tx) => settleModelHoldIn(tx, { dayKey, holdId: 'h2', actualUsd: 0.25 }))
+    // Новая попытка тоже упирается в свой потолок: 0.25 + 0.1 больше 0.3.
+    expect(await hold(store, { caseKey: '1', holdId: 'h3', maxUsd: 0.1, caseLimitUsd: 0.3 })).toEqual({ held: false, block: 'budget' })
+    const spend = await store.read<CaseSpend>('spend-case', '1')
+    expect(spend?.modelUsd).toBeCloseTo(0.55)
+    expect(spend?.budgetFromUsd).toBeCloseTo(0.3)
   })
 
   it('бронь прошлого запуска врача (упал посреди запроса) списывается целиком', async () => {

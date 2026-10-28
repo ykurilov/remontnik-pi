@@ -14,7 +14,9 @@ import {
   paseoDoneReport,
   reclaimedReport,
   standBrokenReport,
+  withRetryHint,
 } from './texts.js'
+import { REPORT_SHORT_LIMIT } from './index.js'
 
 const sick = { caseId: 7, appName: 'patient', kind: 'tool_error' as const, where: 'src/bot/tools.ts', message: 'orders storage timeout' }
 const diagnosis = {
@@ -30,6 +32,13 @@ const green: ChecksResult = {
 }
 
 describe('тексты отчётов лечения', () => {
+  it('случай кончился без излечения: в конце отчёта команда повтора, и длинный текст её не съедает', () => {
+    const text = withRetryHint({ short: 'я'.repeat(REPORT_SHORT_LIMIT * 2), full: 'полный' }, 7)
+    expect(text.short.length).toBeLessThanOrEqual(REPORT_SHORT_LIMIT)
+    expect(text.short.endsWith('Лечить заново: remontnik-doctor case 7 retry')).toBe(true)
+    expect(text.full).toBe('полный\n\nЛечить заново: remontnik-doctor case 7 retry')
+  })
+
   it('fix_ready: ветка, проверки и что выкатки не было', () => {
     const text = fixReadyReport({ case: sick, diagnosis, fix, branch: 'remontnik/7-orders', commit: 'abc1234def', checks: green, pushed: true })
     expect(text.short).toContain('Случай 7')

@@ -6,10 +6,10 @@ import { createOwnerCommandHandler, parseBy } from './owner-command.js'
 // Только секретом владельца: повтор тратит модель и может кончиться выкаткой.
 
 export type CaseRetryAnswer =
-  /** `parked` — задача, остановленная после повторных падений, продолжена со своего чекпойнта; `restarted` — упавшая задача заменена новой попыткой. */
+  /** `parked` — задача, остановленная после повторных падений, продолжена со своего чекпойнта; `restarted` — новая попытка вместо упавшей задачи или лечения, кончившегося без излечения. */
   | { retried: 'parked' | 'restarted'; attempt: number }
   | { error: 'unknown_case' }
-  /** Случай закончен (`case_finished`), его лечение идёт (`already_running`), выкатка не закончена (`deploy_unfinished`), лечения у врача нет (`treatment_off`). */
+  /** Случай закрыт (`case_finished`), его лечение идёт (`already_running`), выкатка не закончена (`deploy_unfinished`), лечения у врача нет (`treatment_off`). */
   | { error: 'case_finished' | 'already_running' | 'deploy_unfinished' | 'treatment_off'; state?: string }
 
 export interface CaseRetryOptions {

@@ -17,7 +17,7 @@ import {
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { newEventId } from '@ykurilov/remontnik-core/incident'
 import { redactSecrets, redactValue } from '@ykurilov/remontnik-core/redact'
-import { setCaseStateIn, type Case, type CaseState } from '../case-book/index.js'
+import { setCaseStateIn, UNHEALED_FINAL_STATES, type Case, type CaseState } from '../case-book/index.js'
 import type { CaseServices } from '../case-services/index.js'
 import { createChecks, selectEvalScenarios, type ChecksResult, type EvalBaseCache } from '../checks/index.js'
 import { configFilesAt, configFilesOfFix } from '../config-files/index.js'
@@ -64,6 +64,7 @@ import {
   PASEO_UNAVAILABLE_NOTE,
   reclaimedReport,
   standBrokenReport,
+  withRetryHint,
   type MainlineResult,
   type ReportText,
 } from '../reports/texts.js'
@@ -335,8 +336,9 @@ export function createTreatment(deps: TreatmentDeps): Treatment {
     return redactedWith(knownSecretsOf(await deps.loadConfig()), text, baseRunning)
   }
 
-  /** Отчёт и состояние случая внутри фиксации задачи. */
-  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, text: ReportText): Promise<number> {
+  /** Отчёт и состояние случая внутри фиксации задачи. Готовая правка — без команды повтора: её выкатывает человек. */
+  async function reportIn(records: RecordTransaction, caseId: number, state: CaseState, type: ReportType, reportText: ReportText): Promise<number> {
+    const text = UNHEALED_FINAL_STATES.includes(state) && type !== 'fix_ready' ? withRetryHint(reportText, caseId) : reportText
     const opened = await setCaseStateIn(records, caseId, state)
     // Снимки экрана, снятые браузером врача по случаю, уходят в ближайший отчёт.
     const screenshots = [...(text.screenshots ?? []), ...(await takeCaseScreenshotsIn(records, caseId))]

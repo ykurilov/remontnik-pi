@@ -3,7 +3,8 @@ import { createCrashWorld, FINAL_STATES, git, runDoctor } from './crash-harness.
 import { priceCrash } from './world.js'
 
 // Задача лечения, которая сама не продолжится (T085): упала насовсем или остановлена после повторных падений врача.
-// Владелец получает отчёт со случаем и командой, `case <id> retry` ставит случай в работу снова.
+// Владелец получает отчёт со случаем и командой, `case <id> retry` ставит случай в работу снова. Так же — случай,
+// закончившийся без излечения: сам он второй раз не лечится, только командой владельца.
 
 describe.concurrent('лечение, которое само не продолжится, владелец ставит в работу снова', () => {
   it('задача упала насовсем → отчёт с командой; case 1 retry → новая попытка на своей ветке, случай healed', async ({ onTestFinished }) => {
@@ -70,5 +71,36 @@ describe.concurrent('лечение, которое само не продолж
     expect(branch).toMatch(/^remontnik\/1-/)
     expect(branch).not.toMatch(/-r\d+$/)
     expect(world.appState().promotes).toBe(1)
+  }, 180_000)
+
+  it('лечение кончилось «только отчётом» из-за поломки набора → повтор сбоя сам не лечится; после обновления врача case 1 retry → новая попытка, случай healed', async ({ onTestFinished }) => {
+    const world = await createCrashWorld()
+    onTestFinished(() => world.close())
+    const broken = runDoctor(world, { brokenChecks: true, sendEvent: true })
+    onTestFinished(async () => void (await broken.stop()))
+    const first = await broken.waitForState(FINAL_STATES, 90_000)
+    expect(first.state).toBe('report_only')
+    expect(first.reports.at(-1)?.type).toBe('cause_found')
+    expect(first.reports.at(-1)?.short).toContain('remontnik-doctor case 1 retry')
+    await broken.stop()
+
+    // Набор починен, врач перезапущен, сбой повторился: он склеивается со случаем, лечение само не начинается.
+    const doctor = runDoctor(world, { sendEvent: true })
+    onTestFinished(async () => void (await doctor.stop()))
+    const glued = await doctor.waitForState(['report_only'])
+    expect(glued.events).toBe(2)
+    expect(glued.reports.map((report) => report.type)).toEqual(['case_received', 'cause_found'])
+
+    const retried = await doctor.command(['case', '1', 'retry', '--by', 'owner'])
+    expect(retried).toMatchObject({ code: 0 })
+    expect(JSON.parse(retried.out)).toEqual({ caseId: 1, retried: 'restarted', attempt: 2 })
+
+    const final = await doctor.waitForState(['healed'], 90_000)
+    const branches = git(world.origin, 'branch', '--list', 'remontnik/*').replace(/^[*\s]+/gm, '').split('\n')
+    expect(branches.some((branch) => /^remontnik\/1-.*-r2$/.test(branch))).toBe(true)
+    expect(world.appState().promotes).toBe(1)
+    expect(final.reports.map((report) => report.type)).toEqual(['case_received', 'cause_found', 'deployed', 'deployed'])
+    const again = await doctor.command(['case', '1', 'retry'])
+    expect(again.err).toContain('409 case_finished')
   }, 180_000)
 })

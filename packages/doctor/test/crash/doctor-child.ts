@@ -35,7 +35,8 @@ import {
 // врача, git, состояние подставного приложения и сдвиг часов. С `REMONTNIK_TEST_CRASH_AT=<точка>` процесс убивает
 // себя (SIGKILL) в этой точке, как убил бы его сбой сервера; без неё — работает, пока его не остановят (SIGTERM).
 // `REMONTNIK_TEST_STOP_BEFORE_CRASH` — перед смертью владелец жмёт стоп-кран; `REMONTNIK_TEST_BROWSER` — у врача есть
-// браузер, и диагноз начинается со страницы, где нужна проверка человеком. С `paseoBridgeUrl` в мире — режим
+// браузер, и диагноз начинается со страницы, где нужна проверка человеком; `REMONTNIK_TEST_BROKEN_CHECKS` — набор врача
+// сломан, тесты в копии не запускаются. С `paseoBridgeUrl` в мире — режим
 // «сначала Paseo»: случай уходит подставному мосту стенда, адрес врача для моста — строкой `BRIDGE`.
 
 const world = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as ChildWorld
@@ -44,6 +45,7 @@ const crashAt = process.env.REMONTNIK_TEST_CRASH_AT as CrashPoint | undefined
 let faultAt = process.env.REMONTNIK_TEST_FAULT_AT
 const stopBeforeCrash = process.env.REMONTNIK_TEST_STOP_BEFORE_CRASH === '1'
 const withBrowser = process.env.REMONTNIK_TEST_BROWSER === '1'
+const brokenChecks = process.env.REMONTNIK_TEST_BROKEN_CHECKS === '1'
 const knownPoints: readonly string[] = [...CRASH_POINTS, ROLLBACK_CRASH_POINT, BROWSER_CRASH_POINT, ...PASEO_CRASH_POINTS]
 if (crashAt && !knownPoints.includes(crashAt)) throw new Error(`нет такой точки падения: ${crashAt}`)
 const SITE = 'http://127.0.0.1:4100'
@@ -270,12 +272,13 @@ function crashingGuard(guard: GitGuard): GitGuard {
   }
 }
 
-/** Проверки с точкой падения посреди тестов правки. */
+/** Проверки с точкой падения посреди тестов правки; при сломанном наборе тесты не запускаются. */
 function crashingChecks(runner: CommandRunner): CommandRunner {
   return {
     ...runner,
-    run(command, options) {
+    async run(command, options) {
       if (String(command).includes('node --test')) crash('verifying')
+      if (brokenChecks && String(command).includes('node --test')) return { exitCode: 127, timedOut: false, aborted: false, output: 'sh: 1: pnpm: not found\n' }
       return runner.run(command, options)
     },
   }
@@ -312,6 +315,7 @@ const config = testRemontnikConfig({
     : {}),
 })
 let caseState: string | undefined
+let caseEvents = 0
 let reportCount = 0
 let doctor: DoctorService | undefined
 
@@ -319,10 +323,11 @@ async function printState(): Promise<void> {
   if (!doctor) return
   const found = await doctor.caseBook.getCase(1)
   const reports = found ? await doctor.reports.list({ after: 0, limit: 50 }) : []
-  if (found && (found.state !== caseState || reports.length !== reportCount)) {
+  if (found && (found.state !== caseState || found.events !== caseEvents || reports.length !== reportCount)) {
     caseState = found.state
+    caseEvents = found.events
     reportCount = reports.length
-    process.stdout.write(`STATE ${JSON.stringify({ state: found.state, reports: reports.map((report) => ({ type: report.type, short: report.short })) })}\n`)
+    process.stdout.write(`STATE ${JSON.stringify({ state: found.state, events: found.events, reports: reports.map((report) => ({ type: report.type, short: report.short })) })}\n`)
   }
 }
 const loadConfig = async () => {

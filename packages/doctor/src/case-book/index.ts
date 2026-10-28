@@ -37,6 +37,13 @@ export type CaseState =
  */
 export const CLOSED_CASE_STATES: readonly CaseState[] = ['healed', 'healed_by_paseo', 'rolled_back']
 
+/**
+ * Лечение кончилось, а случай не вылечен и остаётся открытым: повторы сбоя склеиваются в него, само лечение второй раз
+ * не начинается — иначе круг «сбой → отчёт → тот же сбой» тратил бы модель без человека. Снова лечит только команда
+ * владельца `case <id> retry`: новая попытка со своим потолком расходов на случай.
+ */
+export const UNHEALED_FINAL_STATES: readonly CaseState[] = ['report_only', 'no_cause_found', 'stand_broken', 'needs_human', 'not_helped']
+
 export interface Case {
   caseId: number
   appName: string
