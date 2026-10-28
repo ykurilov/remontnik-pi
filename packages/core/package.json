@@ -1,6 +1,6 @@
 {
   "name": "@ykurilov/remontnik-core",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Ремонтник Pi: общие части — настройка, случаи, вычистка, путь к модели, Telegram, подпись запросов",
   "license": "MIT",
   "type": "module",

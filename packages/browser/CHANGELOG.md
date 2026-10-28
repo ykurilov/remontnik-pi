@@ -1,5 +1,11 @@
 # @ykurilov/remontnik-browser
 
+## 0.1.6
+
+### Patch Changes
+
+- @ykurilov/remontnik-core@0.1.6
+
 ## 0.1.5
 
 ### Patch Changes
