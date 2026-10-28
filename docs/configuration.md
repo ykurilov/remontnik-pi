@@ -256,7 +256,9 @@ services:
 | `REMONTNIK_LISTEN` | да* | вместо сети — явный адрес `host:port`; все адреса (`0.0.0.0`, `::`) — отказ |
 | `REMONTNIK_LISTEN_PORT` | нет | порт приёма (7800) |
 | `REMONTNIK_CASE_SUBNETS` | нет | пул подсетей сетей случая (`10.213.0.0/16`); не должен пересекаться с сетями сервера |
-| `REMONTNIK_GIT_TOKEN` | желательно | ключ git врача: только этот репозиторий |
+| `REMONTNIK_GIT_TOKEN` | желательно | ключ git врача на GitHub: только этот репозиторий |
+| `REMONTNIK_GIT_SSH_KEY` | нет | своё хранилище по SSH: закрытый ключ врача. Текст ключа, он же с `\n` вместо переносов или в base64 одной строкой. Врач пишет его во временную папку (права `0600`) и ходит только с ним. Рецепт — [security.md](security.md#своё-хранилище-на-сервере) |
+| `REMONTNIK_GIT_KNOWN_HOSTS` | с ключом — да | строки `known_hosts` для хранилища: `host.docker.internal <тип> <ключ>`, с портом — `[host.docker.internal]:<порт> …`. Без неё врач с ключом не стартует: незнакомому серверу он не верит |
 | `REMONTNIK_GIT_AUTHOR_NAME`, `REMONTNIK_GIT_AUTHOR_EMAIL` | нет | автор коммитов врача |
 | `REMONTNIK_WORKBENCH_MEMORY`, `REMONTNIK_WORKBENCH_CPUS` | нет | пределы контейнера верстака |
 | `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | да | ключи модели врача |
@@ -296,7 +298,7 @@ services:
 | Команда | Что делает |
 |---|---|
 | `remontnik-doctor start` | служба врача; всё — из окружения |
-| `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы, политику браузера и правила GitHub до старта; код 1 — есть ошибки |
+| `remontnik-doctor check-config` | проверить настройку, окружение, Docker, сети, службы, политику браузера и защиту origin (правила GitHub или своё хранилище) до старта; код 1 — есть ошибки |
 | `remontnik-doctor deploys stop` / `resume` | стоп-кран; `resume` — только секретом владельца |
 | `remontnik-doctor deploys confirm <версия>` | подтвердить версию брошенной выкатки; только секретом владельца |
 | `remontnik-doctor fingerprint <отпечаток> release` | снять «нужен человек» после отката; только секретом владельца |

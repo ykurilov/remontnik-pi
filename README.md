@@ -21,7 +21,7 @@
 - [Безопасность](./docs/security.md) — что врачу можно и нельзя, сети случая, деньги, пароли, остаток риска.
 - Договоры между частями — [specs/001-self-healing-kit/contracts](./specs/001-self-healing-kit/contracts).
 
-Перед стартом врача: `remontnik-doctor check-config` — проверка настройки, окружения, Docker и правил GitHub.
+Перед стартом врача: `remontnik-doctor check-config` — проверка настройки, окружения, Docker и защиты origin (правила GitHub или своё хранилище на сервере).
 
 ## Разработка
 

@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { RemontnikConfig } from '@ykurilov/remontnik-core/config'
 import { containerAddress, createCaseNetworks, type CaseNetworks } from '../case-networks/index.js'
@@ -5,6 +6,7 @@ import { createCaseServices, type CaseServices } from '../case-services/index.js
 import { createServerDeployer } from '../deployer/index.js'
 import { createEvalProxy, type EvalProxy } from '../eval-proxy/index.js'
 import { createGitGuard } from '../git-guard/index.js'
+import { gitSshAccess, writeGitSshFiles, type GitSshAccess } from '../git-storage/index.js'
 import { assertOwnerSecrets, secretProblems } from '../intake/http-kit.js'
 import { createDoctorModels } from '../model/provider-fallback.js'
 import { createRegistryMirror, type RegistryMirror } from '../registry-mirror/index.js'
@@ -62,7 +64,12 @@ export interface DoctorStartPlan {
   runner: Omit<DockerRunnerOptions, 'caseNetworks' | 'workbenchEnv'>
   /** Контейнер врача и пул подсетей сетей случая. */
   gateway: { container: string; subnetPool: string }
+  /** Доступ git к своему хранилищу по SSH-ключу: файлы ключа и known_hosts пишет `startDoctorFromEnv`. */
+  gitSsh?: GitSshAccess
 }
+
+/** Ключ и known_hosts врача: в контейнере `/tmp` — tmpfs, на диск сервера они не попадают. */
+const DEFAULT_GIT_SSH_DIR = join(tmpdir(), 'remontnik-git-ssh')
 
 function listenOf(env: DoctorEnv): DoctorStartPlan['listen'] {
   const explicit = env.REMONTNIK_LISTEN?.trim()
@@ -119,7 +126,7 @@ function configSourceOf(env: DoctorEnv, mainBranch: string, options: { docker?: 
 export function doctorStartPlan(
   env: DoctorEnv,
   config: RemontnikConfig,
-  options: { log?: (line: string) => void; docker?: string; configSource?: MainBranchConfigSource } = {},
+  options: { log?: (line: string) => void; docker?: string; configSource?: MainBranchConfigSource; gitSshDir?: string } = {},
 ): DoctorStartPlan {
   const repoDir = required(env, 'REMONTNIK_CONFIG_REPO_DIR')
   const stateDir = required(env, 'REMONTNIK_STATE_DIR')
@@ -150,13 +157,14 @@ export function doctorStartPlan(
   if (problems.length > 0) throw new Error(`секреты врача: ${problems.join('; ')}`)
   assertOwnerSecrets({ secret: sharedSecret, controlSecret, bridgeSecret: bridge?.secret })
 
+  const gitSsh = gitSshAccess(env, options.gitSshDir ?? DEFAULT_GIT_SSH_DIR)
   const guard = createGitGuard({
     repoDir,
     worktreesDir,
     mainBranch: config.repo.mainBranch,
     mainline: config.repo.mainline,
     author: { name: env.REMONTNIK_GIT_AUTHOR_NAME?.trim() || 'Ремонтник', email: env.REMONTNIK_GIT_AUTHOR_EMAIL?.trim() || 'remontnik@example.invalid' },
-    env: gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()),
+    env: { ...gitTokenEnv(env.REMONTNIK_GIT_TOKEN?.trim()), ...gitSsh?.env },
   })
   const configSource = options.configSource ?? configSourceOf(env, config.repo.mainBranch, options)
   const loadConfig = async () => (await configSource.load()).config
@@ -164,6 +172,7 @@ export function doctorStartPlan(
   return {
     listen,
     gateway,
+    ...(gitSsh ? { gitSsh } : {}),
     runner: {
       image: config.workbench.image,
       homesDir: join(stateDir, 'homes'),
@@ -238,7 +247,7 @@ export async function createCaseGateway(plan: DoctorStartPlan, options: { docker
 }
 
 /** Запуск врача из окружения сервера: настройка основной ветки, адрес приёма, сети случая, служба. */
-export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string } = {}): Promise<DoctorService> {
+export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line: string) => void; docker?: string; gitSshDir?: string } = {}): Promise<DoctorService> {
   const mainBranch = env.REMONTNIK_MAIN_BRANCH?.trim() || 'main'
   const configSource = configSourceOf(env, mainBranch, options)
   // Чтения настройки, оборванные падением врача: их контейнеры и копии файлов. До первого чтения — даже если оно упадёт.
@@ -254,6 +263,7 @@ export async function startDoctorFromEnv(env: DoctorEnv, options: { log?: (line:
   }
   const { config } = await configSource.load()
   const plan = doctorStartPlan(env, config, { ...options, configSource })
+  if (plan.gitSsh) await writeGitSshFiles(plan.gitSsh)
   const listen = 'network' in plan.listen
     ? { host: await containerAddress(plan.gateway.container, plan.listen.network, options.docker), port: plan.listen.port }
     : plan.listen

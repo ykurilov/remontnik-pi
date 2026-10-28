@@ -1,0 +1,56 @@
+#!/bin/sh
+# Принудительная команда ключей своего хранилища Ремонтника: и врача, и человека.
+# Ставит владелец от root: install -o root -g root -m 755 deploy/git-shell-remontnik-git <дом git>/git-shell-commands/remontnik-git
+# В authorized_keys пользователя git у каждого ключа — своя строка с ролью и хранилищем (правит только root):
+#   restrict,command="remontnik-git doctor /srv/git/app.git" <ключ врача>
+#   restrict,command="remontnik-git person /srv/git/app.git /srv/git/other.git" <ключ человека>
+# git-shell запускает этот файл, а он пускает ключ только к git-receive-pack и git-upload-pack и только в свои
+# хранилища. Врачу — ровно одно, и роль врача: по ней хук update пускает его только в основную ветку и remontnik/**.
+# Ключ без command= сюда не попадает, и при Subsystem sftp internal-sftp ему открыт sftp мимо git-shell и хука.
+# Рецепт целиком — docs/security.md, раздел «Своё хранилище на сервере».
+#
+# Отказы — строки «remontnik-guard: отказ <код> ключ: …»; их читает check-config.
+
+refuse() { echo "remontnik-guard: отказ $1 ключ: $2" >&2; exit 1; }
+
+role=${1:-}
+case $role in
+  doctor) [ $# -eq 2 ] || refuse setup 'ключу врача — ровно одно хранилище: command="remontnik-git doctor <путь>"' ;;
+  person) [ $# -ge 2 ] || refuse setup 'ключу человека нужен путь хранилища: command="remontnik-git person <путь> …"' ;;
+  *) refuse setup 'в authorized_keys нужна команда «remontnik-git doctor|person <путь хранилища>»' ;;
+esac
+shift
+
+command=${SSH_ORIGINAL_COMMAND:-}
+case $command in
+  "git-receive-pack '"*"'") service=git-receive-pack ;;
+  "git-upload-pack '"*"'") service=git-upload-pack ;;
+  *) refuse command 'этому ключу доступны только git-receive-pack и git-upload-pack' ;;
+esac
+path=${command#"$service '"}
+path=${path%"'"}
+
+# Папка хранилища без ссылок, как её найдёт git (enter_repo): путь, путь/.git, путь.git/.git, путь.git — первое,
+# что есть. Относительный путь — от дома. «~» и кавычки внутри пути не нужны и не разбираются.
+cd "$HOME" 2>/dev/null || refuse setup 'нет дома пользователя git'
+repository() {
+  case $1 in '' | "~"* | *"'"* | *'\'*) return 1 ;; esac
+  base=$1
+  while [ "${#base}" -gt 1 ] && [ "${base%/}" != "$base" ]; do base=${base%/}; done
+  for candidate in "$base/.git" "$base" "$base.git/.git" "$base.git"; do
+    if [ -d "$candidate" ]; then (cd "$candidate" 2>/dev/null && pwd -P); return; fi
+    [ -e "$candidate" ] && return 1
+  done
+  return 1
+}
+
+asked=$(repository "$path") || refuse foreign-repo 'этому ключу открыты только его хранилища'
+for bound in "$@"; do
+  real=$(repository "$bound") || continue
+  if [ "$real" = "$asked" ]; then
+    if [ "$role" = doctor ]; then REMONTNIK_GIT_ROLE=doctor; export REMONTNIK_GIT_ROLE; else unset REMONTNIK_GIT_ROLE; fi
+    # git получает путь из authorized_keys, а не из запроса: найти другое хранилище ему уже не из чего.
+    exec git-shell -c "$service '$real'"
+  fi
+done
+refuse foreign-repo 'этому ключу открыты только его хранилища'
