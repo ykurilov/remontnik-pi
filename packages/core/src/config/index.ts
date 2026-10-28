@@ -73,7 +73,6 @@ const timeZone = z.string().refine((value) => {
 // подсказка против ошибки, а не гарантия: секрет под невинным именем он не узнает.
 const SECRET_LIKE_ENV = /KEY|TOKEN|SECRET|PASS|AUTH|CREDENTIAL|PRIVATE|URL|DSN|COOKIE|SESSION/
 
-/** Цена модели в долларах за миллион токенов. */
 /** Цена модели, долларов за миллион токенов. `cachedInput` — вход из кэша поставщика; нет — кэш по цене `input`. */
 const modelPriceSchema = z
   .strictObject({ input: z.number().nonnegative(), output: z.number().nonnegative(), cachedInput: z.number().nonnegative().optional() })
