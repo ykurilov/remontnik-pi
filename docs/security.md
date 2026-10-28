@@ -54,7 +54,7 @@ done
 
 - `receive.denyNonFastForwards` и `receive.denyDeletes` в config хранилища: ветки не переписать и не удалить никому, ни врачу, ни человеку;
 - хук `update` из [`deploy/git-update-hook`](../deploy/git-update-hook): метки `remontnik/**` только создаются, их не двигают и не удаляют. Ключ врача пишет только в основную ветку (на неё указывает `HEAD` хранилища), в ветки `remontnik/**` и метки `remontnik/**`. Запреты config хук повторяет ещё раз;
-- роль врача ставит принудительная команда [`deploy/git-shell-remontnik-doctor`](../deploy/git-shell-remontnik-doctor) в строке его ключа. Кроме приёма и отдачи git по этому ключу не запустить ничего;
+- у каждого ключа — принудительная команда [`deploy/git-shell-remontnik-git`](../deploy/git-shell-remontnik-git). Она пускает ключ только в его хранилища и только к приёму и отдаче git: ни оболочки, ни scp, ни sftp. Ключу врача она же ставит роль врача;
 - config, `HEAD` и хуки принадлежат root. Пользователь git пишет только объекты и ссылки, поэтому через push ни врач, ни человек не поменяют ни хук, ни настройки.
 
 ### Хранилище
@@ -66,7 +66,9 @@ done
 grep -qx /usr/bin/git-shell /etc/shells || echo /usr/bin/git-shell >> /etc/shells
 useradd --system --no-create-home --home-dir /srv/git --shell /usr/bin/git-shell git
 install -d -o root -g root -m 755 /srv/git /srv/git/.ssh /srv/git/git-shell-commands
-install -o root -g root -m 755 deploy/git-shell-remontnik-doctor /srv/git/git-shell-commands/remontnik-doctor
+install -o root -g root -m 755 deploy/git-shell-remontnik-git /srv/git/git-shell-commands/remontnik-git
+printf '#!/bin/sh\necho "здесь только git: интерактивного входа нет" >&2\nexit 128\n' > /srv/git/git-shell-commands/no-interactive-login
+chmod 755 /srv/git/git-shell-commands/no-interactive-login
 install -o root -g root -m 644 /dev/null /srv/git/.ssh/authorized_keys
 
 # Хранилище: config, HEAD и хук — у root; git пишет только objects/ и refs/.
@@ -80,6 +82,8 @@ chgrp git /srv/git/app.git && chmod 1775 /srv/git/app.git
 git config --system --add safe.directory /srv/git/app.git
 ```
 
+Зачем `no-interactive-login`: без него `ssh git@сервер` без команды открыл бы диалог git-shell, а так — только отказ.
+
 Зачем последние две строки:
 
 - папка хранилища — группы git с битом sticky (`1775`). Свой замок `HEAD.lock` git ставит прямо в ней, без права записи push в основную ветку не пройдёт. А sticky не даёт пользователю git удалить или подменить чужие файлы в этой папке: config, `HEAD`, `hooks`;
@@ -92,12 +96,18 @@ git config --system --add safe.directory /srv/git/app.git
 В `/srv/git/.ssh/authorized_keys` — по строке на ключ. Файл правит только root.
 
 ```text
-restrict,command="remontnik-doctor" ssh-ed25519 AAAA… remontnik-doctor
-restrict ssh-ed25519 AAAA… ключ человека
+restrict,command="remontnik-git doctor /srv/git/app.git" ssh-ed25519 AAAA… remontnik-doctor
+restrict,command="remontnik-git person /srv/git/app.git" ssh-ed25519 AAAA… ключ человека
 ```
 
+В каждой строке — `restrict` и `command="remontnik-git …"` с путями хранилищ этого ключа. Строк без них в файле нет. Почему так:
+
+- путь из запроса команда сверяет со своим, в каком бы виде его ни прислали: с `.git` и без, относительно дома, через ссылку. Чужой путь — отказ до git. Без этого ключ врача одного приложения писал бы в основную ветку другого, если хранилища лежат рядом в `/srv/git`;
+- принудительная команда срабатывает и на запрос sftp. Ключ без неё при `Subsystem sftp internal-sftp` в `/etc/ssh/sshd_config` прошёл бы мимо git-shell и правил бы файлы ссылок напрямую, в обход хука. `ForceCommand` в `Match User git` здесь не годится: он заменил бы и команду ключа врача;
+- `restrict` закрывает пересылку портов, агента и терминал.
+
 - **Ключ врача** — отдельная пара только для этого хранилища, без пароля: `ssh-keygen -t ed25519 -N '' -C remontnik-doctor -f <временная папка>/remontnik-doctor`. Открытая часть — в первую строку. Закрытая — в окружение врача `REMONTNIK_GIT_SSH_KEY` через `secret-handoff` (можно одной строкой: `base64 -w0 <файл>`), после чего файл удалить. Врач кладёт ключ во временную папку своего контейнера (в памяти, права `0600`) и ходит только с ним. Свой ssh-agent и чужие ключи он не берёт.
-- **Ключ человека** — его обычный ключ с компьютера. Без `command=`: человек пишет в любые ветки, но тоже не переписывает и не удаляет их и не трогает метки `remontnik/**`.
+- **Ключ человека** — его обычный ключ с компьютера. Роль `person`: человек пишет в любые ветки своих хранилищ (их пути — через пробел), но тоже не переписывает и не удаляет ветки и не трогает метки `remontnik/**`.
 - **Ключ сервера для врача** — `REMONTNIK_GIT_KNOWN_HOSTS`. Без этой строки врач к хранилищу не подключится: незнакомому серверу он не верит. Строка — имя, под которым врач видит сервер, и открытый ключ SSH сервера: `printf 'host.docker.internal %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"`. Если sshd не на порту 22 — имя пишется как `[host.docker.internal]:<порт>`.
 
 ### Как врач находит сервер
@@ -127,13 +137,20 @@ chown -R 10001:10001 <REMONTNIK_APP_DIR>
 - Код приходит в хранилище с компьютера человека: `git remote add origin ssh://git@<сервер>/srv/git/app.git`, затем `git push origin main`. Ключ — строка «ключ человека» выше.
 - Правки врача человек забирает обычным `git pull`, метки — `git fetch --tags`.
 - Копия на компьютере — запасная копия хранилища. После `git fetch --tags` в ней вся история, ветки и метки врача. Пропал сервер — новое хранилище по этому же рецепту и `git push origin --all && git push origin --tags` из этой копии. Забирайте изменения регулярно: чего нет в копии, того нет и в запасе.
-- Если однажды правда нужно переписать историю или удалить ветку, root на сервере на время ставит `receive.denyNonFastForwards` или `receive.denyDeletes` в `false` и сразу возвращает `true`. Метки `remontnik/**` хук не даст тронуть и тогда: это делают только руками root прямо в хранилище.
+- Если однажды правда нужно переписать историю, удалить ветку или метку, через push этого не сделать: настройки config и хук отклонят. Это делает root на сервере прямо в хранилище, от имени пользователя git (так файлы ссылок останутся его). Хук при этом не вызывается:
+
+  ```sh
+  runuser -u git -- git -C /srv/git/app.git update-ref refs/heads/main <коммит>      # перевести ветку
+  runuser -u git -- git -C /srv/git/app.git update-ref -d refs/heads/<ветка>         # удалить ветку
+  runuser -u git -- git -C /srv/git/app.git update-ref -d refs/tags/remontnik/<метка> # удалить метку
+  ```
 
 ### Что проверяет check-config
 
-Для origin вида `ssh://…` вместо правил GitHub `check-config` подключается к хранилищу ключом врача и проверяет:
+Для origin по SSH при заданном `REMONTNIK_GIT_SSH_KEY` вместо правил GitHub `check-config` подключается к хранилищу ключом врача и проверяет:
 
 - ключ и строку `REMONTNIK_GIT_KNOWN_HOSTS`, вход и что за ключом — git-shell;
+- что ключ врача привязан к хранилищу из origin: проба в соседнее несуществующее хранилище должна получить отказ;
 - `receive.denyNonFastForwards` и `receive.denyDeletes`;
 - что хук стоит и не даёт двигать и удалять метки `remontnik/**`;
 - что у ключа врача есть принудительная команда и хук не пускает его в чужие ветки;

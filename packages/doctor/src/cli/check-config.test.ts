@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -670,7 +670,7 @@ describe('check-config: своё хранилище по SSH', () => {
   it.skipIf(asRoot)('исправное хранилище: ошибок нет, правила GitHub не нужны; чего не проверить по SSH — предупреждение с командой владельцу; ничего не записано', async () => {
     const { repoDir, store } = ownStorage({ locked: true })
     const before = store.refs()
-    const ssh = fakeSsh({ home: store.home, role: 'doctor' })
+    const ssh = fakeSsh({ home: store.home, forced: ['doctor', store.bare] })
     const findings = await check(repoDir, ssh)
     expect(errors(findings)).toEqual([])
     expect(warnings(findings)).toEqual([expect.stringMatching(/по SSH не проверить/)])
@@ -678,6 +678,8 @@ describe('check-config: своё хранилище по SSH', () => {
     expect(findings.filter((finding) => finding.area === 'хранилище' && finding.level === 'ok')).not.toEqual([])
     expect(findings.some((finding) => finding.area === 'github')).toBe(false)
     expect(store.refs()).toBe(before)
+    // git получил путь из принудительной команды и роль врача.
+    expect(ssh.gitShellCalls()).toContain(`receive-pack ${realpathSync(store.bare)} doctor`)
     const calls = ssh.calls()
     expect(calls).not.toEqual([])
     for (const call of calls) {
@@ -690,7 +692,7 @@ describe('check-config: своё хранилище по SSH', () => {
 
   it('receive.denyNonFastForwards и receive.denyDeletes выключены — ошибки с названием настройки', async () => {
     const { repoDir, store } = ownStorage({ denyNonFastForwards: false, denyDeletes: false })
-    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, role: 'doctor' })))
+    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, forced: ['doctor', store.bare] })))
     expect(problems.map((finding) => finding.problem).join('\n')).toMatch(/receive\.denyNonFastForwards/)
     expect(problems.map((finding) => finding.problem).join('\n')).toMatch(/receive\.denyDeletes/)
   })
@@ -698,7 +700,7 @@ describe('check-config: своё хранилище по SSH', () => {
   it('хука нет — ошибки: хук не ответил, метки remontnik/** не защищены; ни одна ссылка не изменилась', async () => {
     const { repoDir, store } = ownStorage({ hook: false })
     const before = store.refs()
-    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, role: 'doctor' })))
+    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, forced: ['doctor', store.bare] })))
     const text = problems.map((finding) => finding.problem).join('\n')
     expect(text).toMatch(/хук update не ответил/)
     expect(text).toMatch(/метки remontnik\/\*\*/)
@@ -706,15 +708,31 @@ describe('check-config: своё хранилище по SSH', () => {
     expect(store.refs()).toBe(before)
   })
 
-  it('ключ врача без принудительной команды — ошибка с подсказкой command="remontnik-doctor"', async () => {
+  it('ключ врача без принудительной команды — ошибка с подсказкой command="remontnik-git doctor <путь>"', async () => {
     const { repoDir, store } = ownStorage({ locked: true })
     const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home })))
-    expect(problems.map((finding) => finding.fix).join('\n')).toContain('command="remontnik-doctor"')
+    expect(problems.map((finding) => finding.fix).join('\n')).toContain('command="remontnik-git doctor <путь хранилища>"')
+  })
+
+  it.skipIf(asRoot)('принудительная команда не сверяет путь — ошибка: ключ врача открывает и другие хранилища', async () => {
+    const { repoDir, store } = ownStorage({ locked: true })
+    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, role: 'doctor' })))
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.problem).toMatch(/другие хранилища/)
+    expect(problems[0]!.fix).toContain('command="remontnik-git doctor <путь хранилища>"')
+  })
+
+  it('ключ врача привязан к другому хранилищу, чем в origin — ошибка про путь', async () => {
+    const { repoDir, store } = ownStorage()
+    const other = storage()
+    const problems = storageErrors(await check(repoDir, fakeSsh({ home: store.home, forced: ['doctor', other.bare] })))
+    expect(problems).toHaveLength(1)
+    expect(problems[0]!.problem).toMatch(/привязан к другому хранилищу/)
   })
 
   it.skipIf(asRoot)('пользователь git может писать в хук и config — ошибка со списком и подсказкой про root', async () => {
     const { repoDir, store } = ownStorage()
-    const problem = storageErrors(await check(repoDir, fakeSsh({ home: store.home, role: 'doctor' }))).find((finding) => /может писать/.test(finding.problem))!
+    const problem = storageErrors(await check(repoDir, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }))).find((finding) => /может писать/.test(finding.problem))!
     expect(problem.problem).toMatch(/config/)
     expect(problem.problem).toMatch(/hooks\/update/)
     expect(problem.fix).toMatch(/root/)
@@ -733,23 +751,28 @@ describe('check-config: своё хранилище по SSH', () => {
     expect(await fixFor('ssh: connect to host storage.invalid port 22: Connection refused')).toMatch(/host-gateway/)
   })
 
-  it('origin по SSH, а ключа врача нет — ошибка про REMONTNIK_GIT_SSH_KEY, хранилище не трогаем', async () => {
-    const { repoDir, store } = ownStorage()
-    const ssh = fakeSsh({ home: store.home, role: 'doctor' })
-    const problems = storageErrors(await check(repoDir, ssh, { REMONTNIK_GIT_SSH_KEY: undefined }))
-    expect(problems.map((finding) => finding.problem).join('\n')).toMatch(/REMONTNIK_GIT_SSH_KEY/)
-    expect(ssh.calls()).toEqual([])
+  it('origin по SSH без ключа врача — не своё хранилище: прежнее предупреждение, по SSH никуда не ходим', async () => {
+    for (const origin of [undefined, 'git@gitlab.invalid:group/app.git', 'ssh://git@gitlab.invalid/group/app.git']) {
+      const { repoDir, store } = ownStorage()
+      if (origin) git(repoDir, 'remote', 'set-url', 'origin', origin)
+      const ssh = fakeSsh({ home: store.home, forced: ['doctor', store.bare] })
+      const findings = await check(repoDir, ssh, { REMONTNIK_GIT_SSH_KEY: undefined, REMONTNIK_GIT_KNOWN_HOSTS: undefined })
+      expect(findings.filter((finding) => finding.area === 'хранилище')).toEqual([])
+      expect(errors(findings)).toEqual([])
+      expect(warnings(findings)).toEqual([expect.stringMatching(/не на GitHub и не своё хранилище.*не проверена/)])
+      expect(ssh.calls()).toEqual([])
+    }
   })
 
   it('ключ задан без known_hosts — ошибка окружения', async () => {
     const { repoDir, store } = ownStorage()
-    const findings = await check(repoDir, fakeSsh({ home: store.home, role: 'doctor' }), { REMONTNIK_GIT_KNOWN_HOSTS: undefined })
+    const findings = await check(repoDir, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }), { REMONTNIK_GIT_KNOWN_HOSTS: undefined })
     expect(findings.filter((finding) => finding.area === 'окружение' && finding.level === 'error').map((finding) => finding.problem).join('\n')).toMatch(/REMONTNIK_GIT_KNOWN_HOSTS/)
   })
 
   it('вывод: ни ключа, ни адреса и пути хранилища, ни known_hosts', async () => {
     const { repoDir, store } = ownStorage({ hook: false })
-    const ssh = fakeSsh({ home: store.home, role: 'doctor' })
+    const ssh = fakeSsh({ home: store.home, forced: ['doctor', store.bare] })
     let out = ''
     const env = { ...sshEnv(repoDir), PATH: pathWith(fakeDocker(HEALTHY_DOCKER), fakeGh([]), ssh.ssh) }
     const code = await runDoctorCommand(['check-config'], { env, stdout: (text) => (out += text), stderr: (text) => (out += text) })

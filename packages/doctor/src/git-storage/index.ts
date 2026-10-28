@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { chmod, mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 
 // Своё хранилище git на сервере: bare-репозиторий под пользователем git с git-shell, врач ходит туда по SSH
 // ключом развёртывания. Здесь — доступ врача (ключ и known_hosts из окружения, команда ssh для git) и пробы
@@ -109,7 +109,7 @@ export type StorageProbeOutcome =
   | { kind: 'hook'; code: string }
   | { kind: 'accepted' }
 
-export type StorageFailure = 'host-key' | 'denied' | 'network' | 'not-repository' | 'not-git-shell' | 'other'
+export type StorageFailure = 'host-key' | 'denied' | 'network' | 'not-repository' | 'not-git-shell' | 'foreign-repository' | 'other'
 
 export interface StorageProbeResult {
   /** Не дошли до хранилища: почему, по тексту ssh и git (сам текст наружу не идёт — в нём адреса). */
@@ -119,6 +119,11 @@ export interface StorageProbeResult {
   /** Строка состояния хука: версия и куда пользователь git может писать. */
   status?: { version: number; writable: string[] }
   outcomes: Partial<Record<StorageProbeName, StorageProbeOutcome>>
+  /**
+   * Пустил ли ключ к соседнему хранилищу: `refused` — принудительная команда сверила путь и отказала, `open` — нет
+   * (git сам искал хранилище по пути из запроса). Только когда основная проба дошла до хранилища.
+   */
+  foreignRepository?: 'refused' | 'open'
 }
 
 export interface StorageProbeOptions {
@@ -146,10 +151,12 @@ function emptyPack(objectFormat: string): Buffer {
 }
 
 function classifyFailure(stderr: string): StorageFailure {
+  if (/remontnik-guard: отказ foreign-repo /.test(stderr)) return 'foreign-repository'
+  if (/remontnik-guard: отказ (setup|command) /.test(stderr)) return 'not-git-shell'
   if (/Host key verification failed|REMOTE HOST IDENTIFICATION|host key .*(not known|mismatch)|No \S+ host key is known/i.test(stderr)) return 'host-key'
   if (/Permission denied/i.test(stderr)) return 'denied'
   if (/does not appear to be a git repository|not a git repository|dubious ownership|safe\.directory/i.test(stderr)) return 'not-repository'
-  if (/unrecognized command|ключу врача доступны|git-shell|Interactive git shell/i.test(stderr)) return 'not-git-shell'
+  if (/unrecognized command|доступны только git-receive-pack|git-shell|Interactive git shell/i.test(stderr)) return 'not-git-shell'
   if (/Could not resolve|Connection refused|timed out|No route to host|Network is unreachable|Connection closed|Connection reset|kex_exchange/i.test(stderr)) return 'network'
   return 'other'
 }
@@ -199,24 +206,56 @@ function pktReader(stream: NodeJS.ReadableStream) {
  * не существуют, а ожидаемое старое значение у каждой — настоящий коммит, так что даже хранилище без защиты
  * отклонит обновление. Отказ git до хука значит, что держит config; отказ хука — что держит хук.
  */
-export async function probeGitStorage(options: StorageProbeOptions): Promise<StorageProbeResult> {
+/** git-receive-pack хранилища `path` по ssh: поток, текст ошибок и конец разговора. */
+function receivePack(options: StorageProbeOptions, path: string) {
   const { remote } = options
   const target = remote.user ? `${remote.user}@${remote.host}` : remote.host
-  const child = spawn(options.ssh ?? 'ssh', [...options.sshOptions, ...(remote.port ? ['-p', remote.port] : []), target, `git-receive-pack ${shellQuote(remote.path)}`], {
+  const child = spawn(options.ssh ?? 'ssh', [...options.sshOptions, ...(remote.port ? ['-p', remote.port] : []), target, `git-receive-pack ${shellQuote(path)}`], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: Object.fromEntries(Object.entries({ ...process.env, ...options.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }).filter((entry): entry is [string, string] => entry[1] !== undefined)),
   })
-  let stderr = ''
-  child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')))
+  const session = { child, stderr: '', exited: Promise.resolve() }
+  child.stderr.on('data', (chunk: Buffer) => (session.stderr += chunk.toString('utf8')))
   child.stdin.on('error', () => {})
-  const exited = new Promise<void>((resolve) => {
+  session.exited = new Promise<void>((resolve) => {
     child.on('close', () => resolve())
     child.on('error', (error) => {
-      stderr += String(error)
+      session.stderr += String(error)
       resolve()
     })
   })
   const timer = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs ?? PROBE_TIMEOUT_MS)
+  const close = () => {
+    clearTimeout(timer)
+    if (child.exitCode === null) child.kill('SIGKILL')
+  }
+  return { session, close }
+}
+
+/**
+ * Тем же ключом — в несуществующее хранилище рядом. Принудительная команда, привязанная к хранилищу, откажет до git;
+ * без привязки git сам будет искать хранилище по пути. Писать некуда: хранилища нет, а команд проба не шлёт.
+ */
+async function probeForeignRepository(options: StorageProbeOptions): Promise<'refused' | 'open'> {
+  const path = posix.join(posix.dirname(options.remote.path), `remontnik-probe-${randomBytes(4).toString('hex')}.git`)
+  const { session, close } = receivePack(options, path)
+  try {
+    session.child.stdin.end(Buffer.from('0000'))
+    await session.exited
+    return /remontnik-guard: отказ foreign-repo /.test(session.stderr) ? 'refused' : 'open'
+  } finally {
+    close()
+  }
+}
+
+export async function probeGitStorage(options: StorageProbeOptions): Promise<StorageProbeResult> {
+  const result = await probeMainRepository(options)
+  return result.failure || !result.mainHead ? result : { ...result, foreignRepository: await probeForeignRepository(options) }
+}
+
+async function probeMainRepository(options: StorageProbeOptions): Promise<StorageProbeResult> {
+  const { session, close } = receivePack(options, options.remote.path)
+  const { child, exited } = session
   const read = pktReader(child.stdout)
   try {
     const refs = new Map<string, string>()
@@ -225,7 +264,7 @@ export async function probeGitStorage(options: StorageProbeOptions): Promise<Sto
       const line = await read()
       if (line === undefined) {
         await exited
-        return { failure: classifyFailure(stderr), outcomes: {} }
+        return { failure: classifyFailure(session.stderr), outcomes: {} }
       }
       if (line === null) break
       const [head, caps] = line.split('\0')
@@ -269,6 +308,7 @@ export async function probeGitStorage(options: StorageProbeOptions): Promise<Sto
       if (ng) report.set(ng[1]!, ng[2]!)
     }
     await exited
+    const { stderr } = session
     const hookCodes = new Map([...stderr.matchAll(/remontnik-guard: отказ (\S+) (\S+):/g)].map((match) => [match[2]!, match[1]!]))
     const statusLine = /remontnik-guard: состояние v(\d+) запись=(\S+)/.exec(stderr)
     const outcomes: StorageProbeResult['outcomes'] = {}
@@ -285,7 +325,6 @@ export async function probeGitStorage(options: StorageProbeOptions): Promise<Sto
       outcomes,
     }
   } finally {
-    clearTimeout(timer)
-    if (child.exitCode === null) child.kill('SIGKILL')
+    close()
   }
 }

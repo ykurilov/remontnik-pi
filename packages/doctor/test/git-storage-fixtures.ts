@@ -5,9 +5,11 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // Заготовки для тестов своего хранилища: настоящий bare-репозиторий с хуком из deploy/ и подставной ssh,
-// который, как git-shell на сервере, запускает git-receive-pack или git-upload-pack локально.
+// который, как git-shell на сервере, запускает git-receive-pack или git-upload-pack локально — сам или через
+// настоящую принудительную команду deploy/git-shell-remontnik-git.
 
 export const HOOK = fileURLToPath(new URL('../../../deploy/git-update-hook', import.meta.url))
+export const FORCED_COMMAND = fileURLToPath(new URL('../../../deploy/git-shell-remontnik-git', import.meta.url))
 export const asRoot = process.getuid?.() === 0
 
 /** Закрытый ключ для тестов: не настоящий, собран по частям, чтобы проверка открытости репозитория не путала его с ключом. */
@@ -114,13 +116,51 @@ export interface FakeSsh {
 }
 
 /**
- * Подставной ssh: как git-shell на сервере, запускает git-receive-pack или git-upload-pack из команды.
- * `role` — что поставила бы принудительная команда ключа врача; `failure` — текст ssh, который не дошёл до сервера.
+ * git-shell для принудительной команды: `-c "git-receive-pack '<путь>'"` — из дома, как на сервере.
+ * Записывает, какой путь получил git, в журнал — его читает `gitShellCalls`.
  */
-export function fakeSsh(options: { home: string; role?: 'doctor'; failure?: string }): FakeSsh {
+function fakeGitShell(dir: string, home: string): { bin: string; log: string } {
+  const bin = join(dir, 'bin')
+  mkdirSync(bin)
+  const log = join(dir, 'git-shell.log')
+  writeFileSync(
+    join(bin, 'git-shell'),
+    `#!/bin/sh
+[ "$1" = -c ] || exit 128
+cd ${JSON.stringify(home)} || exit 128
+case $2 in
+  "git-receive-pack '"*"'") service=receive-pack; path=\${2#"git-receive-pack '"} ;;
+  "git-upload-pack '"*"'") service=upload-pack; path=\${2#"git-upload-pack '"} ;;
+  *) echo "fatal: unrecognized command '$2'" >&2; exit 128 ;;
+esac
+path=\${path%"'"}
+echo "$service $path \${REMONTNIK_GIT_ROLE:-}" >> ${JSON.stringify(log)}
+exec git "$service" "$path"
+`,
+    { mode: 0o755 },
+  )
+  return { bin, log }
+}
+
+export interface FakeSshOptions {
+  home: string
+  /** Как старая команда без пути: роль врача ставится, путь не сверяется. */
+  role?: 'doctor'
+  /** Аргументы настоящей принудительной команды из authorized_keys: `['doctor', <хранилище>]`. */
+  forced?: string[]
+  /** Текст ssh, который не дошёл до сервера. */
+  failure?: string
+}
+
+/**
+ * Подставной ssh: как git-shell на сервере, запускает git-receive-pack или git-upload-pack из команды.
+ * С `forced` — через deploy/git-shell-remontnik-git, как ключ с command= в authorized_keys.
+ */
+export function fakeSsh(options: FakeSshOptions): FakeSsh & { gitShellCalls: () => string[] } {
   const dir = fixtureDir()
   const log = join(dir, 'calls.jsonl')
   const file = join(dir, 'ssh')
+  const shell = fakeGitShell(dir, options.home)
   writeFileSync(
     file,
     `#!/usr/bin/env node
@@ -133,10 +173,17 @@ try { key = keyAt === -1 ? undefined : fs.readFileSync(args[keyAt + 1], 'utf8') 
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, key }) + '\\n')
 const failure = ${JSON.stringify(options.failure ?? null)}
 if (failure) { process.stderr.write(failure + '\\n'); process.exit(255) }
-const match = /^git-(receive-pack|upload-pack) '(.*)'$/.exec(args.at(-1))
-if (!match) { process.stderr.write("fatal: unrecognized command '" + args.at(-1) + "'\\n"); process.exit(128) }
 const env = { ...process.env, HOME: ${JSON.stringify(options.home)}, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }
 delete env.REMONTNIK_GIT_ROLE
+const forced = ${JSON.stringify(options.forced ?? null)}
+if (forced) {
+  env.SSH_ORIGINAL_COMMAND = args.at(-1)
+  env.PATH = ${JSON.stringify(shell.bin)} + ':' + env.PATH
+  const result = spawnSync('sh', [${JSON.stringify(FORCED_COMMAND)}, ...forced], { stdio: 'inherit', env, cwd: ${JSON.stringify(options.home)} })
+  process.exit(result.status === null ? 1 : result.status)
+}
+const match = /^git-(receive-pack|upload-pack) '(.*)'$/.exec(args.at(-1))
+if (!match) { process.stderr.write("fatal: unrecognized command '" + args.at(-1) + "'\\n"); process.exit(128) }
 ${options.role ? `env.REMONTNIK_GIT_ROLE = ${JSON.stringify(options.role)}` : ''}
 const result = spawnSync('git', [match[1], match[2]], { stdio: 'inherit', env })
 process.exit(result.status === null ? 1 : result.status)
@@ -146,5 +193,6 @@ process.exit(result.status === null ? 1 : result.status)
   return {
     ssh: file,
     calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : []),
+    gitShellCalls: () => (existsSync(shell.log) ? readFileSync(shell.log, 'utf8').split('\n').filter(Boolean) : []),
   }
 }

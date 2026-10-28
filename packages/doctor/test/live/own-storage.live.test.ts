@@ -8,7 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 // Живая проверка своего хранилища: настоящий sshd и git-shell в контейнере, хранилище по рецепту
 // (own-storage/setup-storage.sh — те же шаги, что в docs/security.md), хук и принудительная команда из deploy/.
 // Врач — его образ из deploy/doctor.Dockerfile, как в compose: только чтение, uid 10001, HOME=/tmp, путь к SSH
-// хоста через host.docker.internal (host-gateway). Человек — отдельный контейнер со своим ключом.
+// хоста через host.docker.internal (host-gateway). Человек — отдельный контейнер со своим ключом. Рядом — второе
+// хранилище other.git, а sftp у sshd — internal-sftp: ключи не должны дойти ни туда, ни туда.
 // Запуск: pnpm exec vitest run -c vitest.live.config.ts packages/doctor/test/live/own-storage.live.test.ts
 
 const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
@@ -19,6 +20,8 @@ const STORAGE = 'remontnik-live-storage'
 const DOCTOR = 'remontnik-live-storage-doctor'
 const OWNER = 'remontnik-live-storage-owner'
 const REPO = '/srv/git/app.git'
+const OTHER = '/srv/git/other.git'
+const DOCTOR_KEY_LINE = `restrict,command="remontnik-git doctor ${REPO}"`
 const PORT = 22_422
 const BASE_IMAGE = 'node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d'
 
@@ -61,30 +64,32 @@ let origin: string
 beforeAll(() => {
   if (!dockerReady) return
   work = mkdtempSync(join(tmpdir(), 'remontnik-own-storage-'))
-  for (const name of ['git-update-hook', 'git-shell-remontnik-doctor']) copyFileSync(join(repoRoot, 'deploy', name), join(work, name))
+  for (const name of ['git-update-hook', 'git-shell-remontnik-git']) copyFileSync(join(repoRoot, 'deploy', name), join(work, name))
   for (const name of ['setup-storage.sh', 'entry.sh']) copyFileSync(join(fixtures, name), join(work, name))
   writeFileSync(
     join(work, 'Dockerfile'),
     `FROM ${BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends git openssh-server && rm -rf /var/lib/apt/lists/*
-COPY git-update-hook git-shell-remontnik-doctor setup-storage.sh entry.sh /opt/remontnik/
-RUN sh /opt/remontnik/setup-storage.sh
+COPY git-update-hook git-shell-remontnik-git setup-storage.sh entry.sh /opt/remontnik/
+RUN sh /opt/remontnik/setup-storage.sh && REPO_NAME=other sh /opt/remontnik/setup-storage.sh
 ENTRYPOINT ["sh", "/opt/remontnik/entry.sh"]
 `,
   )
   docker(['build', '-q', '-t', STORAGE_IMAGE, work])
   docker(['build', '-q', '-f', 'deploy/doctor.Dockerfile', '-t', DOCTOR_IMAGE, '.'])
 
-  for (const role of ['doctor', 'owner']) execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', `${role}-live`, '-f', join(work, role)])
+  // raw — ключ без принудительной команды: только чтобы показать, что он открыл бы.
+  for (const role of ['doctor', 'owner', 'raw']) execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', `${role}-live`, '-f', join(work, role)])
   const doctorPub = readFileSync(join(work, 'doctor.pub'), 'utf8').trim()
   const ownerPub = readFileSync(join(work, 'owner.pub'), 'utf8').trim()
+  const rawPub = readFileSync(join(work, 'raw.pub'), 'utf8').trim()
   for (const name of [STORAGE, DOCTOR, OWNER]) spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' })
 
   // SSH хранилища опубликован на хосте Docker, как sshd сервера, к которому врач идёт по host.docker.internal
   // (host-gateway). В Colima этот адрес — сам Mac, и порт до него доходит через переброс портов Colima.
   docker([
     'run', '-d', '--name', STORAGE, '-p', `${PORT}:22`,
-    '-e', `AUTHORIZED_KEYS=restrict,command="remontnik-doctor" ${doctorPub}\nrestrict ${ownerPub}`,
+    '-e', `AUTHORIZED_KEYS=${DOCTOR_KEY_LINE} ${doctorPub}\nrestrict,command="remontnik-git person ${REPO}" ${ownerPub}\nrestrict ${rawPub}`,
     STORAGE_IMAGE,
   ])
   for (let attempt = 0; attempt < 50 && !sh(STORAGE, 'test -s /etc/ssh/ssh_host_ed25519_key.pub && pgrep sshd').ok; attempt++) execFileSync('sleep', ['0.2'])
@@ -100,9 +105,11 @@ ENTRYPOINT ["sh", "/opt/remontnik/entry.sh"]
     '--entrypoint', 'sleep', DOCTOR_IMAGE, 'infinity',
   ])
   docker(['run', '-d', '--name', OWNER, '--add-host', 'host.docker.internal:host-gateway', '--entrypoint', 'sleep', STORAGE_IMAGE, 'infinity'])
-  must(OWNER, 'mkdir -p /root/.ssh && printf "%s" "$KEY" | base64 -d > /root/.ssh/id_ed25519 && chmod 600 /root/.ssh/id_ed25519 && printf "%s\\n" "$KNOWN" > /root/.ssh/known_hosts', {
-    env: { KEY: readFileSync(join(work, 'owner')).toString('base64'), KNOWN: knownHosts },
-  })
+  must(
+    OWNER,
+    'mkdir -p /root/.ssh && printf "%s" "$KEY" | base64 -d > /root/.ssh/id_ed25519 && printf "%s" "$RAW" | base64 -d > /root/.ssh/raw && chmod 600 /root/.ssh/id_ed25519 /root/.ssh/raw && printf "%s\\n" "$KNOWN" > /root/.ssh/known_hosts',
+    { env: { KEY: readFileSync(join(work, 'owner')).toString('base64'), RAW: readFileSync(join(work, 'raw')).toString('base64'), KNOWN: knownHosts } },
+  )
 
   // Человек кладёт приложение в пустое хранилище со своего компьютера.
   must(
@@ -184,12 +191,49 @@ console.log(JSON.stringify({ base, commit, keyMode: (statSync('/tmp/remontnik-gi
     expect(refs()).toBe(before)
   })
 
+  it('ключи привязаны к своему хранилищу: в соседнее — отказ в любом написании пути; своё — и без .git', () => {
+    // В соседнем хранилище есть что читать и куда писать.
+    must(STORAGE, `git -C ${REPO} bundle create /tmp/app.bundle main && runuser -u git -- git -C ${OTHER} fetch --quiet /tmp/app.bundle main:main`)
+    const otherBefore = must(STORAGE, `git -C ${OTHER} for-each-ref --format='%(refname) %(objectname)'`)
+    expect(otherBefore).toMatch(/refs\/heads\/main/)
+    const url = (path: string) => `ssh://git@host.docker.internal:${PORT}${path}`
+    for (const path of [OTHER, '/srv/git/other', `${REPO}/../other.git`, '/srv/git/./other.git/']) {
+      const read = doctorGit(`git ls-remote ${url(path)}`)
+      expect(read.ok, path).toBe(false)
+      expect(read.out).toMatch(/remontnik-guard: отказ foreign-repo/)
+      expect(doctorGit(`git push --porcelain ${url(path)} origin/main:refs/heads/main`).out).toMatch(/remontnik-guard: отказ foreign-repo/)
+      expect(ownerGit(`git push --porcelain ${url(path)} HEAD:refs/heads/feature`).out).toMatch(/remontnik-guard: отказ foreign-repo/)
+    }
+    expect(doctorGit(`git ls-remote ${url('/srv/git/app')}`).out).toMatch(/refs\/heads\/main/)
+    expect(ownerGit(`git ls-remote ${url('/srv/git/app/')}`).out).toMatch(/refs\/heads\/main/)
+    expect(must(STORAGE, `git -C ${OTHER} for-each-ref --format='%(refname) %(objectname)'`)).toBe(otherBefore)
+  })
+
+  it('sftp при internal-sftp: ключ без принудительной команды прошёл бы к файлам ссылок, ключи врача и человека — отказ', () => {
+    const sftp = (key: string) => sh(OWNER, `printf 'ls ${REPO}/refs/heads\n' | sftp -b - -o BatchMode=yes -i ${key} -P ${PORT} git@host.docker.internal`)
+    const raw = sftp('/root/.ssh/raw')
+    expect(raw.ok, raw.out).toBe(true)
+    expect(raw.out).toMatch(/main/)
+    const person = sftp('/root/.ssh/id_ed25519')
+    expect(person.ok).toBe(false)
+    expect(person.out).not.toMatch(/main/)
+    // Врач — тот же запрос подсистемы sftp своей командой ssh.
+    const doctor = sh(DOCTOR, `eval "set -- $(cat /tmp/git-ssh-command)"; "$@" -p ${PORT} -s git@host.docker.internal sftp < /dev/null`)
+    expect(doctor.ok).toBe(false)
+    // Текст ошибок подсистемы sshd клиенту не отдаёт; что запрос ушёл в принудительную команду — по журналу sshd.
+    const log = spawnSync('docker', ['logs', STORAGE], { encoding: 'utf8' })
+    const sessions = `${log.stdout}${log.stderr}`
+    expect(sessions).toMatch(/Starting session: subsystem 'sftp' for git/)
+    expect(sessions).toContain(`Starting session: forced-command (key-option) 'remontnik-git person ${REPO}' for git`)
+    expect(sessions).toContain(`Starting session: forced-command (key-option) 'remontnik-git doctor ${REPO}' for git`)
+  })
+
   it('пользователь git не меняет хук и config: ни по SSH, ни с оболочкой на сервере', () => {
     const before = storageFiles()
-    // По SSH ключ врача пускают только к git, ключ человека — только в git-shell.
+    // По SSH ключи врача и человека пускают только к git.
     const shellCommand = { CMD: `sh -c 'echo x >> ${REPO}/config'` }
-    expect(sh(DOCTOR, `eval "set -- $(cat /tmp/git-ssh-command)"; "$@" -p ${PORT} git@host.docker.internal "$CMD"`, { env: shellCommand }).out).toMatch(/ключу врача доступны только git-receive-pack/)
-    expect(sh(OWNER, `ssh -o BatchMode=yes -p ${PORT} git@host.docker.internal "$CMD"`, { env: shellCommand }).out).toMatch(/unrecognized command/)
+    expect(sh(DOCTOR, `eval "set -- $(cat /tmp/git-ssh-command)"; "$@" -p ${PORT} git@host.docker.internal "$CMD"`, { env: shellCommand }).out).toMatch(/remontnik-guard: отказ command/)
+    expect(sh(OWNER, `ssh -o BatchMode=yes -p ${PORT} git@host.docker.internal "$CMD"`, { env: shellCommand }).out).toMatch(/remontnik-guard: отказ command/)
     // Даже с оболочкой пользователя git на самом сервере.
     for (const attempt of [`echo x >> ${REPO}/config`, `rm -f ${REPO}/config`, `mv ${REPO}/HEAD ${REPO}/HEAD.old`, `echo x >> ${REPO}/hooks/update`, `rm -f ${REPO}/hooks/update`, `echo x > ${REPO}/hooks/pre-receive`]) {
       const result = sh(STORAGE, attempt, { user: 'git' })
@@ -211,17 +255,24 @@ console.log(JSON.stringify({ base, commit, keyMode: (statSync('/tmp/remontnik-gi
     expect(refs()).toBe(before)
 
     // Владелец ошибся: выключил запрет удаления, отдал хук пользователю git, снял принудительную команду с ключа врача.
-    must(STORAGE, `git -C ${REPO} config receive.denyDeletes false && chown git ${REPO}/hooks/update && sed -i 's/^restrict,command="remontnik-doctor" /restrict /' /srv/git/.ssh/authorized_keys`)
+    must(STORAGE, `git -C ${REPO} config receive.denyDeletes false && chown git ${REPO}/hooks/update && sed -i 's|^${DOCTOR_KEY_LINE} |restrict |' /srv/git/.ssh/authorized_keys`)
     try {
       const broken = checkConfig()
       const problems = broken.lines.filter((line) => line.startsWith('✗')).join('\n')
       expect(problems).toMatch(/receive\.denyDeletes/)
       expect(problems).toMatch(/может писать: hooks\/update/)
-      expect(problems).toMatch(/нет принудительной команды/)
+      expect(problems).toMatch(/другие хранилища на сервере: у него нет принудительной команды/)
       expect(refs()).toBe(before)
       for (const leak of [REPO, 'host.docker.internal:', String(PORT), 'OPENSSH']) expect(broken.out).not.toContain(leak)
     } finally {
       must(STORAGE, `git -C ${REPO} config receive.denyDeletes true && chown root ${REPO}/hooks/update`)
     }
+  })
+
+  it('аварийный путь из рецепта: root удаляет ветку прямо в хранилище от имени git, хук не вызывается', () => {
+    expect(refs()).toContain('refs/heads/feature ')
+    must(STORAGE, `runuser -u git -- git -C ${REPO} update-ref -d refs/heads/feature`)
+    expect(refs()).not.toContain('refs/heads/feature ')
+    expect(must(STORAGE, `find ${REPO}/refs ${REPO}/objects ! -user git | wc -l`)).toBe('0')
   })
 })

@@ -281,11 +281,11 @@ gh api /repos/OWNER/REPO/rulesets
 **Своё хранилище на сервере.** Bare-репозиторий на том же сервере под пользователем git с git-shell. Врач пишет в него по SSH своим ключом, токен не нужен. Рецепт целиком — [security.md, «Своё хранилище на сервере»](security.md#своё-хранилище-на-сервере). Коротко:
 
 1. root на сервере заводит пользователя git и хранилище: `receive.denyNonFastForwards` и `receive.denyDeletes` включены, хук [`deploy/git-update-hook`](../deploy/git-update-hook) стоит в `hooks/update`, config и хук принадлежат root.
-2. Ключ врача — в `authorized_keys` с `restrict,command="remontnik-doctor"`, закрытая часть — в `REMONTNIK_GIT_SSH_KEY`. Строка ключа сервера — в `REMONTNIK_GIT_KNOWN_HOSTS`.
+2. Ключ врача — в `authorized_keys` с `restrict,command="remontnik-git doctor <путь хранилища>"`, ключ человека — с `restrict,command="remontnik-git person <путь хранилища>"`. Закрытая часть ключа врача — в `REMONTNIK_GIT_SSH_KEY`, строка ключа сервера — в `REMONTNIK_GIT_KNOWN_HOSTS`.
 3. Человек кладёт код со своего компьютера своим ключом: `git push` по SSH. Его копия — заодно запасная копия хранилища.
 4. `REMONTNIK_APP_DIR` — клон хранилища, origin — `ssh://git@host.docker.internal/<путь>.git`. Имя `host.docker.internal` — это сервер со стороны контейнера врача, его даёт шаблон compose.
 
-`check-config` проверяет настройки, хук и роль ключа врача по SSH и ничего не записывает. Что хук и config принадлежат root, по SSH не проверить: об этом всегда будет предупреждение с командой для root.
+`check-config` проверяет настройки, хук, роль ключа врача и его привязку к хранилищу по SSH и ничего не записывает. Что хук и config принадлежат root, по SSH не проверить: об этом всегда будет предупреждение с командой для root.
 
 ## 10. Правила приложения
 

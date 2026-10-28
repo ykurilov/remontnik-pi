@@ -7,7 +7,7 @@
 # Хук держит то же ещё раз и сверх того:
 #   - метки refs/tags/remontnik/** только создаются: не двигаются и не удаляются;
 #   - не удаляется никакая ссылка;
-#   - ключ врача (REMONTNIK_GIT_ROLE=doctor ставит его принудительная команда remontnik-doctor) пишет только
+#   - ключ врача (REMONTNIK_GIT_ROLE=doctor ставит его принудительная команда «remontnik-git doctor <путь>») пишет только
 #     в основную ветку и в ссылки remontnik/**.
 # Пробные ссылки check-config (имя с remontnik-probe) хук отклоняет всегда; на refs/remontnik-probe/status он
 # ещё сообщает, куда пользователь git может писать. Ответы — строки «remontnik-guard: …»: их читает check-config.

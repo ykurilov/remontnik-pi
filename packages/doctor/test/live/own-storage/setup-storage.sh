@@ -1,6 +1,6 @@
 #!/bin/sh
 # Своё хранилище Ремонтника на сервере — те же шаги, что в рецепте docs/security.md («Своё хранилище на сервере»).
-# Запуск от root; рядом лежат git-update-hook и git-shell-remontnik-doctor из deploy/. Ключи (authorized_keys) — отдельно.
+# Запуск от root; рядом лежат git-update-hook и git-shell-remontnik-git из deploy/. Ключи (authorized_keys) — отдельно.
 set -eu
 here=$(dirname "$0")
 home=${GIT_HOME:-/srv/git}
@@ -10,7 +10,7 @@ repo=$home/${REPO_NAME:-app}.git
 grep -qx /usr/bin/git-shell /etc/shells || echo /usr/bin/git-shell >> /etc/shells
 id git >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$home" --shell /usr/bin/git-shell git
 install -d -o root -g root -m 755 "$home" "$home/.ssh" "$home/git-shell-commands"
-install -o root -g root -m 755 "$here/git-shell-remontnik-doctor" "$home/git-shell-commands/remontnik-doctor"
+install -o root -g root -m 755 "$here/git-shell-remontnik-git" "$home/git-shell-commands/remontnik-git"
 printf '#!/bin/sh\necho "здесь только git: интерактивного входа нет" >&2\nexit 128\n' > "$home/git-shell-commands/no-interactive-login"
 chmod 755 "$home/git-shell-commands/no-interactive-login"
 touch "$home/.ssh/authorized_keys"

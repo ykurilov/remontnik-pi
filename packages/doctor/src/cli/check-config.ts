@@ -409,9 +409,17 @@ async function checkOrigin(env: DoctorEnv, deps: CheckConfigDeps, config: Remont
   const mainBranch = config?.repo.mainBranch ?? value(env, 'REMONTNIK_MAIN_BRANCH') ?? 'main'
   const repo = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/.exec(origin)
   if (repo) return checkGithub(env, deps.gh ?? 'gh', repo[1]!, repo[2]!, mainBranch)
-  const remote = parseSshRemote(origin)
+  // Своё хранилище — origin по SSH и ключ врача к нему. Без ключа это чужой git-хостинг: пробы туда не шлём.
+  const remote = value(env, 'REMONTNIK_GIT_SSH_KEY') ? parseSshRemote(origin) : undefined
   if (remote) return checkOwnStorage(env, deps.ssh ?? 'ssh', repoDir, remote, mainBranch)
-  return [{ level: 'warning', area: 'github', problem: 'origin не на GitHub и не своё хранилище по SSH — защита ветки и меток не проверена', fix: 'защитите основную ветку и метки remontnik/* от перезаписи и удаления средствами своего git-хостинга' }]
+  return [
+    {
+      level: 'warning',
+      area: 'github',
+      problem: 'origin не на GitHub и не своё хранилище по SSH — защита ветки и меток не проверена',
+      fix: `защитите основную ветку и метки remontnik/* от перезаписи и удаления средствами своего git-хостинга; своё хранилище проверяется с ключом врача REMONTNIK_GIT_SSH_KEY (${STORAGE_RECIPE})`,
+    },
+  ]
 }
 
 async function checkGithub(env: DoctorEnv, gh: string, owner: string, name: string, mainBranch: string): Promise<Finding[]> {
@@ -449,6 +457,7 @@ async function checkGithub(env: DoctorEnv, gh: string, owner: string, name: stri
 }
 
 const STORAGE_RECIPE = 'docs/security.md, раздел «Своё хранилище на сервере»'
+const DOCTOR_KEY_FIX = `в authorized_keys пользователя git перед ключом врача — restrict,command="remontnik-git doctor <путь хранилища>"; deploy/git-shell-remontnik-git — от root в <дом git>/git-shell-commands/remontnik-git (${STORAGE_RECIPE})`
 const STORAGE_HOOK_FIX = `поставьте хук от root: install -o root -g root -m 755 deploy/git-update-hook <хранилище>/hooks/update (${STORAGE_RECIPE})`
 
 /** Почему врач не дошёл до хранилища. Текст ssh наружу не идёт: в нём адрес сервера. */
@@ -459,7 +468,7 @@ const STORAGE_FAILURES: Record<StorageFailure, Pick<Finding, 'problem' | 'fix'>>
   },
   denied: {
     problem: 'хранилище не пустило ключ врача',
-    fix: 'открытый ключ врача — в authorized_keys пользователя git с restrict,command="remontnik-doctor"; в REMONTNIK_GIT_SSH_KEY — его закрытая пара',
+    fix: 'открытый ключ врача — в authorized_keys пользователя git с restrict,command="remontnik-git doctor <путь хранилища>"; в REMONTNIK_GIT_SSH_KEY — его закрытая пара',
   },
   network: {
     problem: 'врач не достучался до SSH хранилища',
@@ -471,7 +480,11 @@ const STORAGE_FAILURES: Record<StorageFailure, Pick<Finding, 'problem' | 'fix'>>
   },
   'not-git-shell': {
     problem: 'вход ключом врача не ведёт к git-receive-pack',
-    fix: `оболочка пользователя git — git-shell, принудительная команда ключа врача — remontnik-doctor (${STORAGE_RECIPE})`,
+    fix: `оболочка пользователя git — git-shell, ключ врача — с restrict,command="remontnik-git doctor <путь хранилища>" (${STORAGE_RECIPE})`,
+  },
+  'foreign-repository': {
+    problem: 'ключ врача привязан к другому хранилищу, не к тому, что в origin',
+    fix: 'путь в command="remontnik-git doctor <путь>" ключа врача и путь в origin должны вести к одному хранилищу',
   },
   other: { problem: 'проверка хранилища по SSH не удалась', fix: `проверьте доступ врача по рецепту (${STORAGE_RECIPE})` },
 }
@@ -516,12 +529,10 @@ function storageFindings(result: StorageProbeResult): Finding[] {
   }
 
   if (isHookRefusal(outcomes.foreignBranch, 'probe')) {
-    error(
-      'ключ врача пишет в любые ветки: у него нет принудительной команды',
-      'в authorized_keys пользователя git перед ключом врача — restrict,command="remontnik-doctor"; deploy/git-shell-remontnik-doctor — от root в <дом git>/git-shell-commands/remontnik-doctor',
-    )
-  } else if (status && !isHookRefusal(outcomes.foreignBranch, 'doctor-ref')) {
-    error('хук не ограничил ключ врача его ссылками', STORAGE_HOOK_FIX)
+    error('ключ врача пишет в любые ветки и в другие хранилища на сервере: у него нет принудительной команды', DOCTOR_KEY_FIX)
+  } else {
+    if (status && !isHookRefusal(outcomes.foreignBranch, 'doctor-ref')) error('хук не ограничил ключ врача его ссылками', STORAGE_HOOK_FIX)
+    if (result.foreignRepository === 'open') error('ключ врача открывает и другие хранилища на сервере: принудительная команда не сверяет путь', DOCTOR_KEY_FIX)
   }
 
   if (findings.length === 0) {
@@ -530,8 +541,8 @@ function storageFindings(result: StorageProbeResult): Finding[] {
   findings.push({
     level: 'warning',
     area: 'хранилище',
-    problem: 'что хук и config принадлежат root и хук совпадает с шаблоном, по SSH не проверить: хук отвечает сам о себе',
-    fix: 'сверьте на сервере от root: stat -c "%U:%G %a %n" <хранилище> <хранилище>/config <хранилище>/hooks <хранилище>/hooks/update <дом git>/.ssh/authorized_keys && cmp deploy/git-update-hook <хранилище>/hooks/update',
+    problem: 'что хук и config принадлежат root, хук совпадает с шаблоном и у каждого ключа есть принудительная команда, по SSH не проверить: хук отвечает сам о себе',
+    fix: 'сверьте на сервере от root: stat -c "%U:%G %a %n" <хранилище> <хранилище>/config <хранилище>/hooks <хранилище>/hooks/update <дом git>/.ssh/authorized_keys && cmp deploy/git-update-hook <хранилище>/hooks/update; grep -vc \'^restrict,command="remontnik-git \' <дом git>/.ssh/authorized_keys — должно быть 0',
   })
   return findings
 }
@@ -548,9 +559,6 @@ async function olderStorageCommit(env: DoctorEnv, repoDir: string, mainBranch: s
 
 /** Своё хранилище по SSH: ключом врача, пробами, которые ничего не записывают. Ключ — во временной папке на время проверки. */
 async function checkOwnStorage(env: DoctorEnv, ssh: string, repoDir: string, remote: SshRemote, mainBranch: string): Promise<Finding[]> {
-  if (!value(env, 'REMONTNIK_GIT_SSH_KEY')) {
-    return [{ level: 'error', area: 'хранилище', problem: 'origin — своё хранилище по SSH, а ключа врача нет (REMONTNIK_GIT_SSH_KEY)', fix: `заведите ключ развёртывания врача по рецепту (${STORAGE_RECIPE}); ${SECRETS_FIX}` }]
-  }
   const dir = await mkdtemp(join(tmpdir(), 'remontnik-check-git-ssh-'))
   try {
     let access: GitSshAccess

@@ -82,7 +82,7 @@ describe('пробы check-config', () => {
   it.skipIf(asRoot)('исправное хранилище: git сам отклоняет перезапись и удаление, хук — метки и чужую ветку врача; записи нет', async () => {
     const store = storage({ locked: true })
     const before = store.refs()
-    const result = await probe(store, fakeSsh({ home: store.home, role: 'doctor' }))
+    const result = await probe(store, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }))
     expect(result.failure).toBeUndefined()
     expect(result.status).toEqual({ version: 1, writable: [] })
     expect(result.outcomes).toEqual({
@@ -93,18 +93,32 @@ describe('пробы check-config', () => {
       deleteTag: { kind: 'hook', code: 'tag-immutable' },
       foreignBranch: { kind: 'hook', code: 'doctor-ref' },
     })
+    expect(result.foreignRepository).toBe('refused')
     expect(store.refs()).toBe(before)
+  })
+
+  it('принудительная команда без пути хранилища: соседнее хранилище не закрыто — так и видно', async () => {
+    const store = storage()
+    expect((await probe(store, fakeSsh({ home: store.home, role: 'doctor' }))).foreignRepository).toBe('open')
+    expect((await probe(store, fakeSsh({ home: store.home }))).foreignRepository).toBe('open')
+  })
+
+  it('ключ врача привязан к другому хранилищу — причина, пробы не отправлены', async () => {
+    const store = storage()
+    const other = storage()
+    const result = await probe(store, fakeSsh({ home: store.home, forced: ['doctor', other.bare] }))
+    expect(result).toEqual({ failure: 'foreign-repository', outcomes: {} })
   })
 
   it('хук сообщает, куда пользователь git может писать', async () => {
     const store = storage()
-    const result = await probe(store, fakeSsh({ home: store.home, role: 'doctor' }))
+    const result = await probe(store, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }))
     if (!asRoot) expect(result.status?.writable).toEqual(expect.arrayContaining(['repo', 'config', 'hooks', 'hooks/update', '~']))
   })
 
   it('без config: перезапись и удаление ловит только хук — так и видно', async () => {
     const store = storage({ denyNonFastForwards: false, denyDeletes: false })
-    const result = await probe(store, fakeSsh({ home: store.home, role: 'doctor' }))
+    const result = await probe(store, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }))
     expect(result.outcomes.nonFastForward).toEqual({ kind: 'hook', code: 'non-fast-forward' })
     expect(result.outcomes.deleteBranch).toEqual({ kind: 'hook', code: 'delete' })
   })
@@ -118,7 +132,7 @@ describe('пробы check-config', () => {
   it('ни хука, ни config: ни одна проба ничего не записала', async () => {
     const store = storage({ hook: false, denyNonFastForwards: false, denyDeletes: false })
     const before = store.refs()
-    const result = await probe(store, fakeSsh({ home: store.home, role: 'doctor' }))
+    const result = await probe(store, fakeSsh({ home: store.home, forced: ['doctor', store.bare] }))
     expect(result.status).toBeUndefined()
     for (const outcome of Object.values(result.outcomes)) expect(outcome.kind).toBe('git')
     expect(Object.keys(result.outcomes)).toHaveLength(6)
@@ -175,7 +189,7 @@ describe('доступ врача по SSH-ключу', () => {
 
   it('врач через ssh: fetch, своя ветка, метка и основная ветка вперёд; ключ ssh взял из файла', async () => {
     const store = storage()
-    const ssh = fakeSsh({ home: store.home, role: 'doctor' })
+    const ssh = fakeSsh({ home: store.home, forced: ['doctor', store.bare] })
     const root = tempDir()
     const repoDir = join(root, 'app')
     mustGit(root, ['clone', '--quiet', store.bare, repoDir])
