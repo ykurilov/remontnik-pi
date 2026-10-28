@@ -89,7 +89,7 @@ git config --system --add safe.directory /srv/git/app.git
 - папка хранилища — группы git с битом sticky (`1775`). Свой замок `HEAD.lock` git ставит прямо в ней, без права записи push в основную ветку не пройдёт. А sticky не даёт пользователю git удалить или подменить чужие файлы в этой папке: config, `HEAD`, `hooks`;
 - `safe.directory`: хранилище принадлежит root, и без этой строки git откажется работать с ним от имени git («dubious ownership»).
 
-`--initial-branch` — имя основной ветки приложения (`REMONTNIK_MAIN_BRANCH`). Хук считает основной ту ветку, на которую указывает `HEAD`.
+`--initial-branch` — имя основной ветки приложения (`REMONTNIK_MAIN_BRANCH`). Хук считает основной ту ветку, на которую указывает `HEAD`. Если основную ветку приложения сменили, root переводит на неё и хранилище: `git -C /srv/git/app.git symbolic-ref HEAD refs/heads/<ветка>`. Иначе ключ врача будет писать в старую ветку, а в новую получит отказ.
 
 ### Ключи
 
@@ -117,7 +117,7 @@ restrict,command="remontnik-git person /srv/git/app.git" ssh-ed25519 AAAA… к�
 Что нужно на сервере:
 
 - sshd слушает не только `127.0.0.1`: адрес Docker-моста сервера ему тоже нужен (обычно sshd слушает все адреса, и делать ничего не надо);
-- межсетевой экран пускает SSH из подсетей Docker. Подсеть сети: `docker network inspect <сеть> -f '{{(index .IPAM.Config 0).Subnet}}'`. Сети врача — `REMONTNIK_APP_NETWORK` и `REMONTNIK_OUTSIDE_NETWORK`;
+- межсетевой экран пускает SSH из сетей врача на адрес моста `docker0`. `host-gateway` — это адрес `docker0` (`ip -4 addr show docker0`, обычно `172.17.0.1`), а сам врач живёт не в `docker0`, а в своих сетях. Поэтому при строгих входящих правилах (`INPUT`) разрешить нужно: источник — подсети сетей врача, назначение — адрес `docker0`, порт 22 (или порт sshd). Сети врача: `docker inspect <контейнер врача> -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}'`, подсеть сети: `docker network inspect <сеть> -f '{{(index .IPAM.Config 0).Subnet}}'`;
 - `REMONTNIK_UID` — по умолчанию `10001`. ssh не запускается от пользователя, которого нет в образе врача, а в образе есть только он.
 
 ### Рабочая копия врача
